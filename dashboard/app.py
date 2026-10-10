@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import secrets
+import time
+from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import Request
@@ -19,35 +21,51 @@ from nicegui import app, ui
 
 from dashboard.auth import SecretFilter, verify_api_key
 from dashboard.data import DataStore
-from dashboard.format_util import clock_utc
-from dashboard.panels.common import show_unavailable
+from dashboard.format_util import fmt_rate
+from dashboard.panels.common import panel_box, panel_guard, show_unavailable
+from dashboard.panels.markets import render_markets
 from dashboard.panels.registry import PANELS
-from dashboard.settings import allow_insecure, api_secret, bind_host, db_root, port, refresh_seconds
+from dashboard.panels.shell import (
+    db_status_line,
+    heartbeat_summary,
+    live_caption,
+    panel_group,
+    refresh_age_label,
+    session_clock,
+)
+from dashboard.settings import allow_insecure, api_secret, bind_host, db_root, port, read_gates, refresh_seconds
+
+try:
+    # Optional module: AI CHAT stays a stub when dashboard.chat is absent.
+    from dashboard import chat as chat_module
+except ImportError:
+    chat_module = None
 
 log = logging.getLogger("dashboard")
 Access = Literal["ok", "open", "needed", "unconfigured"]
+Section = Literal["home", "chat"]
 _health_ready = False
 _logging_ready = False
 
 THEME_CSS = """
 :root {
   color-scheme: dark;
-  --bg: #0a0c10;
-  --bg-2: #0f1318;
-  --panel: #12161c;
-  --panel-2: #171c24;
-  --line: #2a3340;
-  --text: #d7dde6;
-  --muted: #7d8a99;
-  --accent: #ff9100;
+  --bg: #080808;
+  --bg-2: #111111;
+  --panel: #0a0a0a;
+  --panel-2: #111111;
+  --line: #1a1a1a;
+  --text: #e5e5e5;
+  --muted: #808080;
+  --accent: #d97706;
   --accent-dim: #3a2408;
-  --mint: #3dd68c;
-  --mint-dim: #123528;
-  --warn: #f0b429;
+  --mint: #16a34a;
+  --mint-dim: #052e16;
+  --warn: #ca8a04;
   --warn-dim: #3a2f0e;
-  --bad: #ff5c5c;
+  --bad: #dc2626;
   --bad-dim: #3a1518;
-  --ok: #3dd68c;
+  --ok: #16a34a;
   --mono: "IBM Plex Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --sans: "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
@@ -63,73 +81,288 @@ body { margin: 0; }
   margin: 0 auto;
   padding: 0 12px 40px;
 }
-.term-strip {
+.shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  width: 100%;
+}
+/* Top bar: brand / status-group (margin-left:auto) / actions */
+.topbar, .ft-top {
   position: sticky;
   top: 0;
-  z-index: 40;
-  background: linear-gradient(180deg, #0d1015 0%, #0a0c10 100%);
-  border-bottom: 1px solid var(--line);
-  margin: 0 -12px 12px;
-  padding: 8px 12px 10px;
-  backdrop-filter: blur(8px);
-}
-.term-strip-row {
+  z-index: 50;
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px 16px;
+  gap: 24px;
+  height: 48px;
+  min-height: 48px;
+  padding: 0 16px;
+  background: #111111;
+  border-bottom: 1px solid #1a1a1a;
+  width: 100%;
+  box-sizing: border-box;
+  flex-wrap: nowrap;
 }
-.term-brand {
+.topbar .brand, .ft-brand {
   display: flex;
   align-items: baseline;
   gap: 10px;
-  min-width: 220px;
+  white-space: nowrap;
+  min-width: 0;
+  flex-shrink: 0;
 }
-.term-mark {
-  color: var(--accent);
+.topbar .brand .name, .ft-brand-name {
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: #e5e5e5;
+  font-size: 13px;
+}
+.topbar .brand .name span, .ft-brand .name-word { margin-right: 2px; }
+.ft-brand-crypto {
+  color: #d97706;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  margin-right: 2px;
+}
+.ft-brand-sub, .topbar .brand .tag {
+  font-size: 11px;
+  color: #d97706;
+}
+.topbar .status-group, .ft-status-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.topbar .live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #16a34a;
+  box-shadow: 0 0 6px #16a34a;
+}
+.ft-live { color: #16a34a; font-size: 12px; font-family: var(--mono); }
+.ft-live-warn { color: #ca8a04; }
+.ft-live-muted { color: #525252; }
+.ft-proc, .ft-clock, .ft-status-item, .statusbar .proc {
+  color: #808080;
   font-family: var(--mono);
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  font-size: 12px;
+  font-size: 11px;
 }
-.term-title {
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-}
-.term-meta { color: var(--muted); font-family: var(--mono); font-size: 11px; }
-.kpi-strip {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+.topbar .actions, .ft-actions {
+  display: flex;
   gap: 6px;
-  margin-top: 8px;
+  align-items: center;
+  flex-shrink: 0;
 }
-.kpi-tile {
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-left: 2px solid var(--accent);
-  padding: 6px 8px 7px;
+.topbar .actions button, .ft-actions .q-btn, .ft-refresh, .ghost-btn.q-btn {
+  height: 26px !important;
+  min-height: 26px !important;
+  padding: 0 12px !important;
+  font-size: 11px !important;
+  background: #161616 !important;
+  color: #e5e5e5 !important;
+  border: 1px solid #222222 !important;
+  border-radius: 4px !important;
+}
+.topbar .actions button:hover, .ft-actions .q-btn:hover, .ft-refresh:hover, .ghost-btn.q-btn:hover {
+  border-color: #d97706 !important;
+  color: #d97706 !important;
+}
+.ft-body {
+  width: 100%;
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 0 12px 40px;
+  flex: 1 1 auto;
+  box-sizing: border-box;
+}
+/* Main tabs: 32px uppercase amber active */
+.ft-tabbar .q-tabs__content {
+  background: #0a0a0a;
+  border-bottom: 1px solid #1a1a1a;
+  min-height: 32px;
+  height: 32px;
+}
+.ft-tabbar .q-tab {
+  padding: 0 8px;
+  min-height: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #808080;
+  font-size: 12px;
+  font-weight: 600;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+.ft-tabbar .q-tab:hover { color: #d97706; background: #161616; }
+.ft-tabbar .q-tab.q-tab--active {
+  background: #161616;
+  color: #d97706;
+  font-weight: 600;
+  border-bottom-color: #d97706;
+}
+.ft-tabbar .q-tab__indicator, .ft-subtab .q-tab__indicator { display: none; }
+/* Nested subtabs under DASHBOARD: 22px muted */
+.ft-subtab .q-tabs__content {
+  background: #0a0a0a;
+  border-bottom: 1px solid #1a1a1a;
+  min-height: 22px;
+  height: 22px;
+  padding: 4px 8px;
+  gap: 4px;
+}
+.ft-subtab .q-tab {
+  padding: 0 10px;
+  min-height: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #525252;
+  font-size: 10px;
+  border-radius: 3px;
+  border-bottom: none;
+  cursor: pointer;
+}
+.ft-subtab .q-tab:hover { color: #808080; background: #161616; }
+.ft-subtab .q-tab.q-tab--active {
+  color: #d97706;
+  font-weight: 600;
+  background: #1a1a1a;
+  border-bottom: none;
+}
+.ft-panels, .ft-panels .q-tab-panel, .ft-subpanels, .ft-subpanels .q-tab-panel {
+  background: transparent !important;
+  padding: 8px 0 0;
+  width: 100% !important;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.ft-panels, .ft-subpanels {
+  width: 100% !important;
+}
+.ft-panels > .q-panel, .ft-subpanels > .q-panel,
+.ft-panels .q-tab-panels, .ft-subpanels .q-tab-panels {
+  width: 100% !important;
+}
+.ft-chain { min-width: 140px; margin-bottom: 8px; }
+/* Single bottom statusbar */
+.statusbar, .ft-status {
+  position: sticky;
+  bottom: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 32px;
+  min-height: 32px;
+  padding: 0 12px;
+  font-size: 10px;
+  color: #808080;
+  font-family: var(--mono);
+  border-top: 1px solid #1a1a1a;
+  background: #0a0a0a;
+  width: 100%;
+  box-sizing: border-box;
+  flex-wrap: nowrap;
+}
+.statusbar .left, .statusbar .right {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}
+.ft-status-miss { color: #ca8a04; }
+/* Overview 4-col grid — fixes left-narrow / empty-right */
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.overview-grid > .card {
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  border-radius: 6px;
+  padding: 12px;
+  min-height: 110px;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.overview-grid > .card.full,
+.overview-grid > .panel,
+.overview-grid > section.panel {
+  grid-column: 1 / -1;
+  width: 100%;
   min-width: 0;
 }
+.overview-grid .card .kpi-label {
+  color: #808080;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.overview-grid .card .kpi-value {
+  font-family: var(--mono);
+  font-size: 24px;
+  font-weight: 650;
+  color: #e5e5e5;
+  margin-top: 4px;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.overview-grid .card .kpi-hint {
+  color: #525252;
+  font-size: 10px;
+  margin-top: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-top: 0;
+  width: 100%;
+}
+.kpi-tile {
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  border-radius: 6px;
+  border-left: 2px solid var(--accent);
+  padding: 12px;
+  min-width: 0;
+  min-height: 110px;
+}
 .kpi-tile .kpi-label {
-  color: var(--muted);
+  color: #808080;
   font-size: 10px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 .kpi-tile .kpi-value {
   font-family: var(--mono);
-  font-size: 16px;
+  font-size: 24px;
   font-weight: 650;
-  margin-top: 2px;
+  margin-top: 4px;
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
+  color: #e5e5e5;
 }
 .kpi-tile .kpi-hint {
-  color: var(--muted);
+  color: #525252;
   font-size: 10px;
-  margin-top: 2px;
+  margin-top: 6px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -140,14 +373,10 @@ body { margin: 0; }
 .kpi-tile.tone-bad .kpi-value { color: var(--bad); }
 .kpi-tile.tone-ok { border-left-color: var(--mint); }
 .kpi-tile.tone-ok .kpi-value { color: var(--mint); }
-.topbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 10px;
-}
+.overview-grid > .card.tone-warn .kpi-value { color: var(--warn); }
+.overview-grid > .card.tone-bad .kpi-value { color: var(--bad); }
+.overview-grid > .card.tone-ok .kpi-value { color: var(--mint); }
+.overview-grid > .card.tone-bad { border-color: #7a3036; background: #1a1012; }
 .brand-kicker {
   color: var(--accent);
   font-family: var(--mono);
@@ -191,9 +420,12 @@ body { margin: 0; }
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 2px;
+  border-radius: 6px;
   padding: 12px 12px 14px;
-  margin-bottom: 10px;
+  margin-bottom: 0;
+  width: 100%;
+  box-sizing: border-box;
+  min-width: 0;
 }
 .risk-live {
   border-color: var(--bad);
@@ -220,6 +452,7 @@ body { margin: 0; }
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 8px;
+  width: 100%;
 }
 .kpi {
   background: var(--panel-2);
@@ -243,7 +476,7 @@ body { margin: 0; }
 .tone-bad { border-color: #7a3036; background: #1a1012; }
 .tone-bad .kpi-value { color: var(--bad); }
 .gate-note { font-size: 11px; margin-top: 6px; font-family: var(--mono); }
-.proc-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.proc-row { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
 .proc {
   flex: 1 1 160px;
   border: 1px solid var(--line);
@@ -301,14 +534,14 @@ body { margin: 0; }
 .news-item { padding: 5px 0; border-top: 1px solid var(--line); }
 .news-link { color: var(--accent) !important; }
 .slow { color: var(--warn); font-size: 11px; margin-top: 3px; font-family: var(--mono); }
-.footer-note { color: var(--muted); font-size: 11px; margin-top: 8px; font-family: var(--mono); }
+.footer-note { color: var(--muted); font-size: 11px; margin-top: 8px; font-family: var(--mono); grid-column: 1 / -1; }
 .gate-wrap {
   min-height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 24px 16px;
-  background: radial-gradient(ellipse at top, #151820 0%, var(--bg) 55%);
+  background: radial-gradient(ellipse at top, #111111 0%, var(--bg) 55%);
 }
 .gate-card {
   width: min(420px, 100%);
@@ -325,7 +558,9 @@ body { margin: 0; }
 @media (max-width: 720px) {
   .brand-title { font-size: 18px; }
   .kpi-value { font-size: 18px; }
+  .overview-grid { grid-template-columns: repeat(2, 1fr); }
   .page { padding: 0 8px 28px; }
+  .topbar, .ft-top { gap: 12px; height: auto; min-height: 48px; flex-wrap: wrap; padding: 8px 12px; }
 }
 """
 
@@ -361,6 +596,7 @@ def register_health() -> None:
 
 def apply_theme() -> None:
     ui.dark_mode(True)
+    ui.colors(primary="#d97706")
     ui.add_css(THEME_CSS)
     ui.add_head_html('<meta name="robots" content="noindex, nofollow">')
 
@@ -399,22 +635,30 @@ def _access(request: Request) -> Access:
 def register_pages() -> None:
     @ui.page("/")
     def home(request: Request) -> None:
-        apply_theme()
-        mode = _access(request)
-        if mode == "unconfigured":
-            _render_locked()
-            return
-        if mode == "needed":
-            _render_login()
-            return
-        _render_dashboard(insecure=mode == "open")
+        _open(request, "home")
+
+    @ui.page("/chat")
+    def chat(request: Request) -> None:
+        _open(request, "chat")
+
+
+def _open(request: Request, section: Section) -> None:
+    apply_theme()
+    mode = _access(request)
+    if mode == "unconfigured":
+        _render_locked()
+        return
+    if mode == "needed":
+        _render_login("/chat" if section == "chat" else "/")
+        return
+    _render_dashboard(insecure=mode == "open", section=section)
 
 
 def _render_locked() -> None:
     with ui.element("div").classes("gate-wrap"):
         with ui.element("div").classes("gate-card"):
-            ui.label("只读").classes("brand-kicker")
-            ui.label("交易监控看板").classes("gate-title")
+            ui.label("CRYPTO TERMINAL").classes("brand-kicker")
+            ui.label("链上新币投研终端").classes("gate-title")
             ui.label(
                 "未配置 API_SECRET，数据视图已关闭。在环境中设置 API_SECRET 后重启看板，"
                 "并用请求头 X-API-Key 或登录框进入。本地调试可设 ALLOW_INSECURE_API=1，"
@@ -422,11 +666,12 @@ def _render_locked() -> None:
             ).classes("gate-copy")
 
 
-def _render_login() -> None:
+def _render_login(next_path: str) -> None:
+    target = "/chat" if next_path == "/chat" else "/"
     with ui.element("div").classes("gate-wrap"):
         with ui.element("div").classes("gate-card"):
-            ui.label("只读").classes("brand-kicker")
-            ui.label("交易监控看板").classes("gate-title")
+            ui.label("CRYPTO TERMINAL").classes("brand-kicker")
+            ui.label("链上新币投研终端").classes("gate-title")
             ui.label(
                 "数据视图需要 API Key。输入与环境变量 API_SECRET 相同的值，"
                 "校验方式与 api_server 的 X-API-Key 一致。密钥不会写入页面或日志。"
@@ -447,7 +692,7 @@ def _render_login() -> None:
                     return
                 if ok:
                     _grant_session()
-                    ui.navigate.to("/")
+                    ui.navigate.to(target)
                     return
                 message.set_text("密钥无效")
 
@@ -455,61 +700,212 @@ def _render_login() -> None:
             ui.button("进入", on_click=submit).classes("enter-btn")
 
 
-def _render_dashboard(*, insecure: bool) -> None:
+def _render_dashboard(*, insecure: bool, section: Section) -> None:
     store = DataStore()
     interval = int(refresh_seconds())
+    chain_filter = {"value": "all"}
+    refreshed_at = {"mono": time.monotonic()}
+    opened_at = time.monotonic()
+
+    def on_chain(event: object) -> None:
+        value = getattr(event, "value", None) or "all"
+        text = str(value)
+        if text == chain_filter["value"]:
+            return
+        chain_filter["value"] = text
+        markets_tab.refresh()
 
     @ui.refreshable
-    def content() -> None:
-        _status_strip(store)
-        _db_chips(store)
-        for spec in PANELS:
-            try:
-                spec.render(store)
-            except Exception:
-                log.warning("panel render failed: %s", spec.id)
-                with ui.element("section").classes("panel"):
-                    show_unavailable(f"{spec.title} 渲染失败")
-        ui.label("阶段一只读监控。手动交易确认不在本看板内。").classes("footer-note")
+    def overview_tab() -> None:
+        with ui.element("div").classes("overview-grid"):
+            _status_strip(store)
+            _render_panel_group(store, "overview", overview_tab.refresh)
+            ui.label("阶段一只读监控。手动交易确认不在本看板内。").classes("footer-note")
+
+    @ui.refreshable
+    def signals_tab() -> None:
+        _render_panel_group(store, "signals", signals_tab.refresh)
+
+    @ui.refreshable
+    def execution_tab() -> None:
+        _render_panel_group(store, "execution", execution_tab.refresh)
+
+    @ui.refreshable
+    def markets_tab() -> None:
+        panel_guard(
+            "链上行情",
+            lambda: render_markets(
+                store,
+                chain=chain_filter["value"],
+                on_chain=on_chain,
+                on_retry=markets_tab.refresh,
+            ),
+            on_retry=markets_tab.refresh,
+        )
+
+    @ui.refreshable
+    def chat_tab() -> None:
+        panel_guard("AI 问答", lambda: _render_chat(store), on_retry=chat_tab.refresh)
+
+    def paint_clock() -> None:
+        clock_lbl.set_text(_clock_text())
+        age = int(time.monotonic() - refreshed_at["mono"])
+        age_lbl.set_text(refresh_age_label(age))
+        up_lbl.set_text(session_clock(int(time.monotonic() - opened_at)))
+
+    def paint_status() -> None:
+        try:
+            live = store.process_liveness()
+            if not live.available:
+                text, tone = "心跳：不可用", "muted"
+            else:
+                text, tone = heartbeat_summary([item.state for item in live.data])
+            proc_lbl.set_text(text)
+            foot_proc.set_text(text)
+            _paint_live(live_lbl, tone)
+            db_text = db_status_line(store.file_status())
+            db_lbl.set_text(db_text)
+            db_lbl.classes(remove="ft-status-miss")
+            if "缺失" in db_text:
+                db_lbl.classes(add="ft-status-miss")
+        except Exception:
+            log.warning("status strip failed")
+            proc_lbl.set_text("心跳：不可用")
+            foot_proc.set_text("心跳：不可用")
 
     def tick() -> None:
         if api_secret() and not _session_ok():
             ui.navigate.to("/")
             return
         try:
-            content.refresh()
-            stamp.set_text(f"上次刷新 {clock_utc()} · 每 {interval} 秒")
+            overview_tab.refresh()
+            signals_tab.refresh()
+            execution_tab.refresh()
+            markets_tab.refresh()
+            paint_status()
+            refreshed_at["mono"] = time.monotonic()
+            paint_clock()
         except Exception:
             log.warning("refresh failed")
-            stamp.set_text("刷新失败")
+            age_lbl.set_text("刷新失败")
 
-    with ui.element("div").classes("page"):
-        with ui.element("div").classes("term-strip"):
-            with ui.element("div").classes("term-strip-row"):
-                with ui.element("div").classes("term-brand"):
-                    ui.label("TRADE").classes("term-mark")
-                    ui.label("交易监控看板").classes("term-title")
-                    ui.label("READ-ONLY · 127.0.0.1").classes("term-meta")
-                with ui.element("div").classes("top-actions"):
-                    stamp = ui.label(f"REFRESH {clock_utc()} · {interval}s").classes("term-meta")
-                    ui.button("刷新", on_click=tick).props("outline dense").classes("ghost-btn")
-                    if api_secret():
-                        ui.button("退出", on_click=_revoke_session).props("flat dense").classes("ghost-btn")
-        if insecure:
-            ui.label("本地未鉴权模式（ALLOW_INSECURE_API=1）。不要暴露到公网。").classes("banner")
-        content()
+    with ui.element("div").classes("shell"):
+        with ui.element("div").classes("topbar"):
+            with ui.element("div").classes("brand"):
+                ui.label("CRYPTO").classes("ft-brand-crypto")
+                ui.label("TERMINAL").classes("ft-brand-name")
+                ui.label("链上新币投研终端").classes("ft-brand-sub")
+            with ui.element("div").classes("status-group"):
+                live_lbl = ui.label("● 实时").classes("ft-live")
+                proc_lbl = ui.label("进程 —").classes("ft-proc")
+                clock_lbl = ui.label(_clock_text()).classes("ft-clock")
+            with ui.element("div").classes("actions"):
+                ui.button("刷新", on_click=tick).props("flat dense size=sm").classes("ft-refresh")
+                if api_secret():
+                    ui.button("退出", on_click=_revoke_session).props("flat dense size=sm").classes("ghost-btn")
+        with ui.element("div").classes("ft-body"):
+            if insecure:
+                ui.label("本地未鉴权模式（ALLOW_INSECURE_API=1）。不要暴露到公网。").classes("banner")
+            _module_tabs(
+                section,
+                overview_tab,
+                signals_tab,
+                execution_tab,
+                markets_tab,
+                chat_tab,
+            )
+        with ui.element("div").classes("statusbar"):
+            with ui.element("div").classes("left"):
+                ui.label("v0.1.0").classes("ft-status-item")
+                up_lbl = ui.label(session_clock(0)).classes("ft-status-item")
+                db_lbl = ui.label("库 —").classes("ft-status-item")
+                foot_proc = ui.label("进程 —").classes("ft-status-item")
+            with ui.element("div").classes("right"):
+                age_lbl = ui.label(refresh_age_label(0)).classes("ft-status-item")
+                ui.label(f"每 {interval}s").classes("ft-status-item")
+    paint_status()
+    paint_clock()
+    ui.timer(1.0, paint_clock)
     ui.timer(refresh_seconds(), tick, immediate=False)
 
 
-def _status_strip(store: DataStore) -> None:
-    """Fincept/Bloomberg-like dense KPI strip. Read-only."""
-    from dashboard.format_util import fmt_rate
-    from dashboard.settings import read_gates
+def _module_tabs(
+    section: Section,
+    overview_tab: ui.refreshable,
+    signals_tab: ui.refreshable,
+    execution_tab: ui.refreshable,
+    markets_tab: ui.refreshable,
+    chat_tab: ui.refreshable,
+) -> None:
+    initial = "AI CHAT" if section == "chat" else "DASHBOARD"
+    with ui.tabs(value=initial).classes("w-full ft-tabbar") as tabs:
+        dash = ui.tab("DASHBOARD")
+        markets = ui.tab("MARKETS")
+        chat = ui.tab("AI CHAT")
+    with ui.tab_panels(tabs, value=initial).classes("w-full ft-panels"):
+        with ui.tab_panel(dash):
+            with ui.tabs(value="OVERVIEW").classes("w-full ft-subtab").props("dense") as sub:
+                overview = ui.tab("OVERVIEW")
+                signals = ui.tab("SIGNALS")
+                execution = ui.tab("EXECUTION")
+            with ui.tab_panels(sub, value="OVERVIEW").classes("w-full ft-subpanels"):
+                with ui.tab_panel(overview):
+                    overview_tab()
+                with ui.tab_panel(signals):
+                    signals_tab()
+                with ui.tab_panel(execution):
+                    execution_tab()
+        with ui.tab_panel(markets):
+            markets_tab()
+        with ui.tab_panel(chat):
+            chat_tab()
+            ui.link("在 /chat 打开", "/chat").classes("news-link")
 
+
+def _render_panel_group(store: DataStore, group: str, on_retry) -> None:
+    for spec in PANELS:
+        if panel_group(spec.id) != group:
+            continue
+        panel_guard(spec.title, lambda bound=spec: bound.render(store), on_retry=on_retry)
+
+
+def _render_chat(store: DataStore) -> None:
+    render = getattr(chat_module, "render", None) if chat_module is not None else None
+    if not callable(render):
+        with panel_box("AI 问答", "路径 /chat。只读，不写业务库。"):
+            show_unavailable(
+                "未挂载 dashboard.chat（Grok 与工具白名单）。"
+                "本页不调用模型，也不写入 dashboard_state.db。"
+            )
+        return
+    render(store)
+
+
+def _clock_text() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _paint_live(label: ui.label, tone: str) -> None:
+    if tone == "ok":
+        label.set_text(live_caption("ok"))
+    elif tone == "warn":
+        label.set_text(live_caption("warn"))
+        label.classes(remove="ft-live-muted")
+        label.classes(add="ft-live-warn")
+        return
+    else:
+        label.set_text(live_caption("muted"))
+        label.classes(remove="ft-live-warn")
+        label.classes(add="ft-live-muted")
+        return
+    label.classes(remove="ft-live-warn ft-live-muted")
+
+
+def _status_strip(store: DataStore) -> None:
+    """Dense KPI strip on OVERVIEW. Read-only."""
     gates = read_gates()
     today = store.today_execution_stats()
     pos = store.open_positions()
-    live = store.process_liveness()
 
     paper = "ON" if gates.paper_enabled else "OFF"
     pm = "ON" if gates.pm_enabled else "OFF"
@@ -533,38 +929,20 @@ def _status_strip(store: DataStore) -> None:
     else:
         n_pos, eq = "—", "—"
 
-    crawl = "—"
-    if live.available:
-        items = live.data if isinstance(live.data, list) else list(live.data)
-        try:
-            from dashboard.format_util import liveness_label
-            pick = None
-            for probe in items:
-                name = str(getattr(probe, "name", ""))
-                if any(k in name for k in ("爬虫", "采集", "main", "crawler")):
-                    pick = probe
-                    break
-            if pick is None and items:
-                pick = items[0]
-            if pick is not None:
-                crawl = liveness_label(getattr(pick, "state", "unknown"))
-        except Exception:
-            crawl = "见风险面板"
-
-    with ui.element("div").classes("kpi-strip"):
-        _tile("模拟盘", paper, "PAPER", paper_tone)
-        _tile("仓位闸", pm, "PM", pm_tone)
-        _tile("实盘", live_lbl, gates.live_block_reason or "LIVE", live_tone)
-        _tile("今日信号", n, "execution_log")
-        _tile("校验通过", ok, "validation_ok")
-        _tile("已执行", exe, "executed")
-        _tile("持仓数", n_pos, "paper positions")
-        _tile("权益$", eq, "cash+mtm")
-        _tile("主爬虫", str(crawl)[:18], "heartbeat")
+    # Four primary KPI cards fill the first overview-grid row.
+    _tile("模拟盘", paper, "PAPER", paper_tone)
+    _tile("仓位闸", pm, "PM", pm_tone)
+    _tile("实盘", live_lbl, gates.live_block_reason or "LIVE", live_tone)
+    _tile("今日信号", n, "execution_log")
+    # Remaining stats continue on subsequent grid rows (still 4-col).
+    _tile("校验通过", ok, "validation_ok")
+    _tile("已执行", exe, "executed")
+    _tile("持仓数", n_pos, "paper positions")
+    _tile("权益$", eq, "cash+mtm")
 
 
 def _tile(label: str, value: str, hint: str = "", tone: str = "") -> None:
-    classes = "kpi-tile"
+    classes = "card"
     if tone:
         classes = f"{classes} {tone}"
     with ui.element("div").classes(classes):
@@ -573,14 +951,6 @@ def _tile(label: str, value: str, hint: str = "", tone: str = "") -> None:
         if hint:
             ui.label(hint).classes("kpi-hint")
 
-
-
-def _db_chips(store: DataStore) -> None:
-    with ui.element("div").classes("chips"):
-        for label, name, ready in store.file_status():
-            state = "就绪" if ready else "缺失"
-            klass = "chip chip-ok" if ready else "chip chip-miss"
-            ui.label(f"{label} {name} {state}").classes(klass)
 
 
 def main() -> None:
@@ -604,7 +974,7 @@ def main() -> None:
     ui.run(
         host=bind_host(),
         port=listen_port,
-        title="交易监控看板",
+        title="CRYPTO TERMINAL",
         dark=True,
         language="zh-CN",
         reload=False,

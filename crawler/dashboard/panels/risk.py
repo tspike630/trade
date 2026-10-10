@@ -26,6 +26,7 @@ def render_risk(store: DataStore) -> None:
     extra = "risk-live" if gates.live_effective else ""
     with panel_box("风险", "闸门只读。本看板不能修改环境变量或杀开关。", extra):
         _gates(gates)
+        _priors()
         _today(store)
         _week(store)
         _processes(store)
@@ -44,6 +45,18 @@ def _gates(status: GateStatus) -> None:
         kpi("实盘", live_value, _live_hint(status), live_tone)
     ui.label(
         "关是当前预期状态（模拟盘未开闸）。实盘若变为「开启」会标红。这里没有开关。"
+    ).classes("muted gate-note")
+
+
+def _priors() -> None:
+    """§10 observe baselines — display only; never touch weights/gates/env/execution."""
+    ui.label("先验对照（观察中·不调权）").classes("section-label")
+    with ui.element("div").classes("kpi-grid"):
+        kpi("见顶 P50", "1.0 min", "GMGN 完整 n=956 · 观察中·不调权")
+        kpi("4h 存活", "75.3%", "自库 self_survival，短窗 · 观察中·不调权")
+        kpi("当天死", "68.67%", "CoinGecko · 观察中·不调权")
+    ui.label(
+        "§10 观察基线，只读对照。不改策略权重、闸门、环境变量或执行。"
     ).classes("muted gate-note")
 
 

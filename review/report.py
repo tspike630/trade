@@ -104,10 +104,108 @@ def _render_dim_table(dim_name: str, dim: dict[str, Any]) -> list[str]:
     return lines
 
 
+
+_JOINT_TABLE_HEADER = (
+    "| token_age | n | up_1h | med_1h | up_4h | 全网存活率(先验) | 备注 |\n"
+    "|---|---:|---:|---:|---:|---:|---|"
+)
+
+
+def _joint_row(label: str, m: dict[str, Any]) -> str:
+    prior_disp = m.get("prior_display") or "N/A"
+    reason = m.get("prior_reason")
+    note = reason if reason else (m.get("prior_label") or "—")
+    # shorten long reasons for table
+    if isinstance(note, str) and len(note) > 80:
+        note = note[:77] + "…"
+    return (
+        f"| {label} | {m.get('n', 0)} | "
+        f"{_pct(m.get('up_1h') if m.get('up_1h') is not None else m.get('up_1h_rate'))} | "
+        f"{_ret(m.get('med_1h') if m.get('med_1h') is not None else m.get('median_1h'))} | "
+        f"{_pct(m.get('up_4h') if m.get('up_4h') is not None else m.get('up_4h_rate'))} | "
+        f"{prior_disp} | {note} |"
+    )
+
+
+def _render_joint_section(joint: Optional[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    lines.append("### JEV×币龄×先验（细桶联合表）")
+    lines.append("")
+    if not joint:
+        lines.append("_本期未计算联合表。_")
+        lines.append("")
+        return lines
+
+    caveat = joint.get("caveat") or (
+        "联合归因观察：n 仍小；不作为调参依据；不调权"
+    )
+    lines.append(f"> **Caveat：** {caveat}")
+    lines.append("")
+    src = joint.get("bucket_source") or "computed"
+    lines.append(f"分桶源=`{src}`")
+    if joint.get("prior_tags_period"):
+        lines.append(
+            f"prior_tags 本期覆盖：`{joint.get('prior_tags_period')}`"
+            + (f"（表总行={joint.get('prior_tags_n')}）" if joint.get("prior_tags_n") is not None else "")
+        )
+    lines.append(f"细桶：`{joint.get('edges')}`")
+    if joint.get("hypothesis"):
+        lines.append(f"假说：{joint.get('hypothesis')}")
+    if joint.get("note"):
+        lines.append(f"说明：{joint.get('note')}")
+    mismatches = joint.get("mismatch_notes") or []
+    if mismatches:
+        lines.append(f"交叉校验不一致：{len(mismatches)} 条（prior_tagger vs 现算 token_age）")
+        for m in mismatches[:5]:
+            lines.append(f"- {m}")
+        if len(mismatches) > 5:
+            lines.append(f"- …共 {len(mismatches)} 条")
+    pm = joint.get("prior_meta") or {}
+    if pm:
+        bits = []
+        if pm.get("report"):
+            bits.append(f"报告=`{pm.get('report')}`")
+        if pm.get("source"):
+            bits.append(f"源=`{pm.get('source')}`")
+        if pm.get("crawler_window_h") is not None:
+            bits.append(f"crawler窗≈{pm.get('crawler_window_h')}h")
+        if pm.get("n") is not None:
+            bits.append(f"self_db n={pm.get('n')}")
+        if bits:
+            lines.append("先验旁挂：" + " · ".join(bits))
+    lines.append("")
+
+    for key, title in (
+        ("jev_filtered", "过滤后 JEV 切片（周检同口径）"),
+        ("full_sample", "全样本"),
+    ):
+        block = joint.get(key) or {}
+        lines.append(f"#### {title}（n={block.get('n', 0)}）")
+        lines.append("")
+        buckets = block.get("buckets") or {}
+        if not buckets:
+            lines.append("_无分桶样本。_")
+            lines.append("")
+            continue
+        lines.append(_JOINT_TABLE_HEADER)
+        for lab in joint.get("labels") or buckets.keys():
+            if lab in buckets:
+                lines.append(_joint_row(lab, buckets[lab]))
+        lines.append("")
+
+    lines.append(
+        "口径提醒：全网存活率来自 self_db 观测跨度（`last_seen−first_seen > t`），"
+        "不是链上真实寿命；窗不足时写 N/A + 原因，勿把 0% 当真死亡。"
+    )
+    lines.append("")
+    return lines
+
+
 def _render_attribution_section(
     attribution: Optional[dict[str, Any]],
     fill_attr: Optional[dict[str, Any]],
     backtest_summary: Optional[dict[str, Any]],
+    joint: Optional[dict[str, Any]] = None,
 ) -> list[str]:
     lines: list[str] = []
     lines.append("## 8. 信号层归因")
@@ -128,18 +226,30 @@ def _render_attribution_section(
             f"全样本 n={attribution.get('n', 0)}。"
             "以下为观察性分桶（有 fwd 才计上涨率/中位），**不**改策略参数或闸门。"
         )
+        if attribution.get("bucket_source"):
+            lines.append(
+                f"token_age 分桶源=`{attribution.get('bucket_source')}`"
+                + (
+                    f"（prior_tags={attribution.get('prior_tags_period')}）"
+                    if attribution.get("prior_tags_period")
+                    else ""
+                )
+            )
         lines.append("")
         dims = attribution.get("dimensions") or {}
         dim_titles = [
             ("strength", "strength（jev_strength）"),
             ("coverage", "coverage（jev_coverage，0–100）"),
             ("liq", "liq（liquidity_at_signal，USD）"),
-            ("token_age", "token_age（raw_json 创建时间）"),
+            ("token_age", "token_age（pairs.pair_created_at）"),
             ("market_regime", "market_regime（同期 hot 基准）"),
         ]
         for key, title in dim_titles:
             if key in dims:
                 lines.extend(_render_dim_table(title, dims[key]))
+
+    # joint JEV × token_age_fine × prior
+    lines.extend(_render_joint_section(joint))
 
     # fills subsection
     lines.append("### 成交归因")
@@ -210,6 +320,7 @@ def render_weekly_md(
     attribution: Optional[dict[str, Any]] = None,
     fill_attr: Optional[dict[str, Any]] = None,
     backtest_summary: Optional[dict[str, Any]] = None,
+    joint: Optional[dict[str, Any]] = None,
     optimize_section: Optional[str] = None,
     evolution_suggestions: Optional[list[dict[str, Any]]] = None,
 ) -> str:
@@ -387,7 +498,7 @@ def render_weekly_md(
     lines.append("")
 
     # 8. 信号层归因（R2）
-    lines.extend(_render_attribution_section(attribution, fill_attr, backtest_summary))
+    lines.extend(_render_attribution_section(attribution, fill_attr, backtest_summary, joint=joint))
 
     # 9. R3 参数寻优（脚手架占位）
     lines.append("## 9. R3 参数寻优 — 待历史≥7天且周检跨门槛")

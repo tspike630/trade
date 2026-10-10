@@ -12,6 +12,8 @@ from dashboard.format_util import (
     short_addr,
 )
 from dashboard.panels.common import col, data_table, panel_box, show_unavailable, slow_hint
+from dashboard.chat.page import set_chat_context
+from nicegui import ui
 from dashboard.settings import refresh_seconds
 
 
@@ -26,6 +28,12 @@ def render_signals(store: DataStore) -> None:
         if result.data.exec_note:
             show_unavailable(f"执行结果无法关联：{result.data.exec_note}")
         rows = [_row(item) for item in result.data.rows]
+        def _click(row: dict) -> None:
+            token = str(row.get("token_raw") or row.get("token") or "").strip()
+            if token and token != "—":
+                set_chat_context(token)
+                ui.notify(f"已带入 AI 上下文 [Context: {token}]")
+
         data_table(
             [
                 col("ts", "时间"),
@@ -46,6 +54,7 @@ def render_signals(store: DataStore) -> None:
             rows,
             row_key="decision_id",
             color_fields=("check", "done"),
+            on_row_click=_click,
         )
 
 
@@ -65,6 +74,7 @@ def _row(item: SignalRow) -> dict[str, object]:
         "action": item.action or "—",
         "chain": item.chain_id or "—",
         "token": short_addr(item.token_address),
+        "token_raw": item.token_address or "",
         "strength": fmt_strength(item.jev_strength),
         "coverage": fmt_coverage(item.coverage),
         "liq": fmt_liq(item.liquidity_usd),
