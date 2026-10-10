@@ -34,6 +34,13 @@ TOKEN_INDICATOR_COLS = [
     "change_24h",
     "volatility_24h",
     "volume_strength",
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "boll_upper",
+    "boll_mid",
+    "boll_lower",
     "jev_score",
     "jev_funding_bias",
     "jev_updated_at",
@@ -60,6 +67,14 @@ TOKEN_INDICATOR_COLS = [
 
 # Columns added after Step 1 — ALTER on existing DBs
 _MIGRATE_TOKEN_INDICATORS = [
+    # pandas-ta ADD-ON
+    ("rsi_14", "REAL"),
+    ("macd", "REAL"),
+    ("macd_signal", "REAL"),
+    ("macd_hist", "REAL"),
+    ("boll_upper", "REAL"),
+    ("boll_mid", "REAL"),
+    ("boll_lower", "REAL"),
     ("jev_raw_score", "REAL"),
     ("jev_signal", "TEXT"),
     ("jev_confidence", "REAL"),
@@ -74,6 +89,13 @@ _MIGRATE_TOKEN_INDICATORS = [
     ("sentiment_polarity", "REAL"),
 ]
 _MIGRATE_INDICATOR_HISTORY = [
+    ("rsi_14", "REAL"),
+    ("macd", "REAL"),
+    ("macd_signal", "REAL"),
+    ("macd_hist", "REAL"),
+    ("boll_upper", "REAL"),
+    ("boll_mid", "REAL"),
+    ("boll_lower", "REAL"),
     ("jev_strength", "REAL"),
     ("sentiment_mentions_1h", "REAL"),
     ("sentiment_heat_score", "REAL"),
@@ -474,12 +496,14 @@ class IndicatorStore:
                 chain_id, token_address, recorded_at,
                 change_5m, change_15m, change_1h, change_4h, change_24h,
                 volatility_24h, volume_strength,
+                rsi_14, macd, macd_signal, macd_hist,
+                boll_upper, boll_mid, boll_lower,
                 jev_score, jev_strength,
                 sentiment_score, sentiment_mentions_1h,
                 sentiment_heat_score, sentiment_polarity,
                 composite_score,
                 tier, primary_pair_address
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chain_id,
@@ -492,6 +516,13 @@ class IndicatorStore:
                 row.get("change_24h"),
                 row.get("volatility_24h"),
                 row.get("volume_strength"),
+                row.get("rsi_14"),
+                row.get("macd"),
+                row.get("macd_signal"),
+                row.get("macd_hist"),
+                row.get("boll_upper"),
+                row.get("boll_mid"),
+                row.get("boll_lower"),
                 row.get("jev_score"),
                 row.get("jev_strength"),
                 row.get("sentiment_score"),

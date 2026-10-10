@@ -4,3 +4,5 @@ uvicorn[standard]>=0.32.0
 socksio>=1.0.0
 python-dotenv>=1.0.0
 websockets>=12.0
+pandas>=2.0.0
+pandas-ta-classic>=0.3.14

@@ -1,4 +1,8 @@
-"""Technical indicators from pair_history: interval returns, volatility, volume strength."""
+"""Technical indicators from pair_history: interval returns, volatility, volume strength.
+
+Also fills ADD-ON pandas-ta fields (rsi_14 / macd* / boll_*) via technical_lib.
+Existing change_*/volatility_24h/volume_strength logic is unchanged.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ from history import history_tier_for_token
 from logging_setup import get_logger
 
 from indicators.base import INTERVAL_SEC, IndicatorStore, parse_iso, to_epoch, utc_now_iso
+from indicators import technical_lib
 
 log = get_logger("indicators.technical")
 
@@ -48,6 +53,18 @@ TIER_FIELDS: dict[str, frozenset[str]] = {
         }
     ),
 }
+
+# ADD-ON library fields (weight 0 in composite; not part of TIER_FIELDS gating).
+# Filled whenever history is long enough; short history → None.
+PANDAS_TA_FIELDS: tuple[str, ...] = (
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "boll_upper",
+    "boll_mid",
+    "boll_lower",
+)
 
 
 def _num(v: Any) -> float | None:
@@ -297,6 +314,23 @@ class TechnicalIndicators:
                 else:
                     out[key] = change_pct(series, INTERVAL_SEC[key])
             elif prev is not None and prev.get(key) is not None:
+                out[key] = prev.get(key)
+            else:
+                out[key] = None
+
+        # --- ADD-ON: pandas-ta RSI / MACD / BOLL (does not touch fields above) ---
+        closes: list[float] = []
+        for row in series:
+            p = _num(row.get("price_usd"))
+            if p is not None and p > 0:
+                closes.append(p)
+        lib = technical_lib.compute_pandas_ta(closes) if closes else {}
+        for key in PANDAS_TA_FIELDS:
+            val = lib.get(key) if lib else None
+            if val is not None:
+                out[key] = val
+            elif prev is not None and prev.get(key) is not None:
+                # Preserve prior library value if this pass lacked enough bars
                 out[key] = prev.get(key)
             else:
                 out[key] = None
