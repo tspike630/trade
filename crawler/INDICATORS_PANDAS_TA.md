@@ -55,3 +55,19 @@ cd /workspace/dexscreener-crawler
 
 - MACD 列名按前缀映射（`MACD` / `MACDs` / `MACDh`），避免不同版本列顺序差异。
 - 旁路字段暂不参与 composite；权重保持 0。
+
+## 7. 样本与重启（2026-10-10 22:05 HKT）
+
+样本（`solana/2j5sas7xy776…`，151 根 history）：
+
+| 字段 | 值 |
+|------|-----|
+| change_1h（旧，保留） | -11.178 |
+| volatility_24h（旧，保留） | 7.211 |
+| volume_strength（旧，保留） | 0.608 |
+| rsi_14 | 48.777 |
+| macd / signal / hist | 1.01e-4 / 1.97e-4 / -9.56e-5 |
+| boll_upper / mid / lower | 0.004873 / 0.004405 / 0.003937 |
+
+重启：仅 `indicators.run` → PID 2299758（`main.py` / `sources.jev` 未动）。  
+推送：`tspike630/trade` commit `d2a2bd0`（`crawler/`，无 secrets）。
