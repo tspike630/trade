@@ -50,23 +50,41 @@ python main.py --health   # 应 OK
 python daily_check.py
 ```
 
-## 3. 其它层（各层跟进提交后）
+## 3. 指标层恢复（代码在 `crawler/indicators/`，与采集同仓同 venv）
+
+指标旁路只写 `token_indicators` / `indicator_history` / `jev_signals`，**不改**评分权重（`INDICATORS_WEIGHT_*=0`）。密钥可选：无 `JEV_API_KEY` 时走 `jevs.fun` 公开档。
+
+```bash
+cd crawler && source .venv/bin/activate
+# 表结构：首次跑 run 会 migrate；亦可
+# sqlite3 dexscreener.db < models/indicator_tables.sql
+python -m indicators.run --once          # 或 --full
+python demo_indicators_p0.py             # API 冒烟（需 api_server + API_SECRET）
+nohup python -m indicators.run --loop --interval 300 >> logs/indicators.log 2>&1 &
+nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
+# 可选 Top：./top.sh jev|change5m|volume
+```
+
+验收：`pgrep -af 'indicators.run|sources.jev'`；`token_indicators` 有新鲜 `updated_at`；权重仍为 0。
+
+细节：`crawler/INDICATORS_AUDIT.md`、`AUTH_JEV.md`、`INDICATORS_STEP*.md`。
+
+## 4. 其它层（各层跟进提交后）
 
 - 看板：`dashboard/` → 见其 README（通常 `8081` + `API_SECRET`）
-- 指标：`indicators/` → migrate + `indicators.run` / JEV
 - 决策：`decision_engine/` → dry-run 指只读 `DB_PATH`
 - 执行：`execution/` → `--once` 再 `--loop`（paper/PM 默认关）
 - 复盘：`review/` → `python -m review.run --period 7d --report`
 
-## 4. 验收
+## 5. 验收
 
 - [ ] `gh` 已登录且能 `git pull`
 - [ ] `crawler/.env` 有密钥但未进 Git（`git status` 干净）
 - [ ] 主爬虫心跳新鲜；`LIVE_TRADING_DISABLED` 存在
-- [ ] 看板 / 指标 / 决策 / 执行 / 复盘按各自清单冒烟通过
+- [ ] 指标 loop + JEV loop 冒烟；看板 / 决策 / 执行 / 复盘按各自清单冒烟通过
 - [ ] 实盘相关环境变量仍为关闭
 
-## 5. 回滚
+## 6. 回滚
 
 - 代码：`git revert` / 切旧 commit
 - 数据：`backups/` 或换机前拷贝的 `dexscreener-*.db`
