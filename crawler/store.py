@@ -22,6 +22,19 @@ def norm_address(address: str) -> str:
     return address.strip().lower()
 
 
+def _parse_pair_created_at(raw: dict[str, Any]) -> int | None:
+    """DexScreener pairCreatedAt as ms epoch int; missing/invalid -> None (never invent)."""
+    v = raw.get("pairCreatedAt")
+    if v is None or v == "":
+        return None
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return n
+
 class Store:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -123,6 +136,7 @@ class Store:
         self._migrate_x_social()
         self._migrate_pair_history()
         self._migrate_quality_score()
+        self._migrate_pair_created_at()
 
     def _migrate_add_pair_flags(self) -> None:
         cols = self._table_columns("tokens")
@@ -341,6 +355,7 @@ class Store:
         pair_address = norm_address(pair_address)
         now = _utc_now_iso()
         raw_json = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        pair_created_at = _parse_pair_created_at(raw)
         if token_address is None:
             base = raw.get("baseToken") or {}
             token_address = base.get("address")
@@ -354,15 +369,19 @@ class Store:
         exists = cur.fetchone() is not None
         cur.execute(
             """
-            INSERT INTO pairs (chain_id, pair_address, token_address, raw_json, source, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO pairs (
+                chain_id, pair_address, token_address, raw_json, source, updated_at,
+                pair_created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chain_id, pair_address) DO UPDATE SET
                 token_address = excluded.token_address,
                 raw_json = excluded.raw_json,
                 source = excluded.source,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                pair_created_at = excluded.pair_created_at
             """,
-            (chain_id, pair_address, token_address, raw_json, source, now),
+            (chain_id, pair_address, token_address, raw_json, source, now, pair_created_at),
         )
         self._conn.commit()
         return "updated" if exists else "inserted"
@@ -1107,6 +1126,72 @@ class Store:
         if "scored_at" not in cols:
             cur.execute("ALTER TABLE tokens ADD COLUMN scored_at TEXT")
         self._conn.commit()
+
+
+    def _migrate_pair_created_at(self) -> None:
+        """Add pairs.pair_created_at (ms epoch, nullable) for token_age attribution."""
+        cols = self._table_columns("pairs")
+        cur = self._conn.cursor()
+        if "pair_created_at" not in cols:
+            cur.execute("ALTER TABLE pairs ADD COLUMN pair_created_at INTEGER")
+        # Optional index for age / recency filters (cheap; nullable column).
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pairs_pair_created_at ON pairs (pair_created_at)"
+        )
+        self._conn.commit()
+
+    def backfill_pair_created_at(self, *, batch_size: int = 2000) -> dict[str, int]:
+        """One-shot: parse pairCreatedAt from raw_json into pair_created_at. No inventing."""
+        self._migrate_pair_created_at()
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            "SELECT chain_id, pair_address, raw_json FROM pairs WHERE pair_created_at IS NULL"
+        ).fetchall()
+        updated = 0
+        skipped = 0
+        bad_json = 0
+        pending: list[tuple[int | None, str, str]] = []
+        for row in rows:
+            try:
+                raw = json.loads(row["raw_json"])
+            except (json.JSONDecodeError, TypeError):
+                bad_json += 1
+                skipped += 1
+                continue
+            if not isinstance(raw, dict):
+                skipped += 1
+                continue
+            ms = _parse_pair_created_at(raw)
+            if ms is None:
+                skipped += 1
+                continue
+            pending.append((ms, row["chain_id"], row["pair_address"]))
+            if len(pending) >= batch_size:
+                cur.executemany(
+                    """
+                    UPDATE pairs SET pair_created_at = ?
+                    WHERE chain_id = ? AND pair_address = ?
+                    """,
+                    pending,
+                )
+                updated += len(pending)
+                pending.clear()
+        if pending:
+            cur.executemany(
+                """
+                UPDATE pairs SET pair_created_at = ?
+                WHERE chain_id = ? AND pair_address = ?
+                """,
+                pending,
+            )
+            updated += len(pending)
+        self._conn.commit()
+        return {
+            "scanned_null": len(rows),
+            "updated": updated,
+            "skipped_missing": skipped,
+            "bad_json": bad_json,
+        }
 
     def insert_pair_history(
         self,
