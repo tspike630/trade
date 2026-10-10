@@ -69,14 +69,35 @@ nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
 
 细节：`crawler/INDICATORS_AUDIT.md`、`AUTH_JEV.md`、`INDICATORS_STEP*.md`。
 
-## 4. 其它层（各层跟进提交后）
+## 4. 复盘层
+
+只读旁路，不改策略参数、不开实盘闸门。完整步骤与注意见 [RECOVERY_REVIEW.md](RECOVERY_REVIEW.md)。
+
+在仓库根（`review/` 的上一级；四库只读路径或符号链接放在该目录，默认 `--db-root` 即此处）：
+
+1. 装依赖（与主仓同一 venv / requirements；采集层为 `crawler/.venv`）
+2. 四库只读：`dexscreener.db` / `execution_ledger.db` / `paper_trading.db` / `backtest_ledger.db`
+3. `python -m review.run --period 7d --report`（报告写入 `exports/reports/`，该目录不进 Git）
+4. 可选：`python -m sources.news --once`（独立 `news_events.db`）；周一 routine（周一 09:30 周报+预回测；新闻 RSS 工作日半小时）
+
+```bash
+# 若上一步停在 crawler/，先回到仓库根
+cd "$(git rev-parse --show-toplevel)"
+source crawler/.venv/bin/activate
+python -m review.run --period 7d --report
+# 可选。news 依赖采集层 logging_setup / httpx
+PYTHONPATH=crawler python -m sources.news --once
+```
+
+规格与旁路说明：`docs/REVIEW_R1_SPEC.md`、`docs/REVIEW_R3_SCAFFOLD.md`、`docs/REVIEW_R4_LOOP.md`、`docs/EVOLUTION_SECTION10.md`、`docs/NEWS_SIDECHANNEL.md`。
+
+## 5. 其它层（各层跟进提交后）
 
 - 看板：`dashboard/` → 见其 README（通常 `8081` + `API_SECRET`）
 - 决策：`decision_engine/` → dry-run 指只读 `DB_PATH`
 - 执行：`execution/` → `--once` 再 `--loop`（paper/PM 默认关）
-- 复盘：`review/` → `python -m review.run --period 7d --report`
 
-## 5. 验收
+## 6. 验收
 
 - [ ] `gh` 已登录且能 `git pull`
 - [ ] `crawler/.env` 有密钥但未进 Git（`git status` 干净）
@@ -84,7 +105,7 @@ nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
 - [ ] 指标 loop + JEV loop 冒烟；看板 / 决策 / 执行 / 复盘按各自清单冒烟通过
 - [ ] 实盘相关环境变量仍为关闭
 
-## 6. 回滚
+## 7. 回滚
 
 - 代码：`git revert` / 切旧 commit
 - 数据：`backups/` 或换机前拷贝的 `dexscreener-*.db`

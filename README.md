@@ -7,7 +7,8 @@
 - `crawler/` — 消息采集层（DexScreener + Helius + X 等）
 - `config-backup/` — 启动脚本与 env 模板（**不含真实密钥**）
 - `docs/RECOVERY.md` — 换机恢复清单
-- 指标层代码在 `crawler/indicators/`（及 `sources/jev.py`）；其它层目录由各层后续提交（`dashboard/`、`decision_engine/`、`execution/`、`review/` …）
+- `review/` — 复盘层（只读信号周报、归因、寻优脚手架与进化建议；新闻旁路 `sources/news.py`）
+- 指标层代码在 `crawler/indicators/`（及 `sources/jev.py`）；其它层目录由各层后续提交（`dashboard/`、`decision_engine/`、`execution/` …）
 
 ## 安全
 
