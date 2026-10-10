@@ -24,8 +24,12 @@ from dashboard.settings import GateStatus, read_gates
 def render_risk(store: DataStore) -> None:
     gates = read_gates()
     extra = "risk-live" if gates.live_effective else ""
-    with panel_box("风险", "闸门只读。本看板不能修改环境变量或杀开关。", extra):
-        _gates(gates)
+    with panel_box(
+        "风险",
+        f"闸门只读。{_live_hint(gates)} 这里没有开关。",
+        extra,
+        tags=gate_header_tags(gates),
+    ):
         _today(store)
         _week(store)
         _processes(store)
@@ -34,17 +38,17 @@ def render_risk(store: DataStore) -> None:
         _news(store)
 
 
-def _gates(status: GateStatus) -> None:
-    paper_value, paper_tone = ("开", "tone-warn") if status.paper_enabled else ("关", "")
-    pm_value, pm_tone = ("开", "tone-warn") if status.pm_enabled else ("关", "")
+def live_face(status: GateStatus) -> tuple[str, str]:
+    """Short live-gate label and tone. Read-only."""
+    return _live_face(status)
+
+
+def gate_header_tags(status: GateStatus) -> tuple[tuple[str, str], ...]:
+    """Three compact labels for the risk panel header, not a second status bar."""
+    paper = ("模拟盘执行 开", "tone-warn") if status.paper_enabled else ("模拟盘执行 关", "")
+    pm = ("仓位管理 开", "tone-warn") if status.pm_enabled else ("仓位管理 关", "")
     live_value, live_tone = _live_face(status)
-    with ui.element("div").classes("kpi-grid"):
-        kpi("模拟盘执行", paper_value, "EXECUTION_PAPER_ENABLED", paper_tone)
-        kpi("仓位管理", pm_value, "PM_ENABLED", pm_tone)
-        kpi("实盘", live_value, _live_hint(status), live_tone)
-    ui.label(
-        "关是当前预期状态（模拟盘未开闸）。实盘若变为「开启」会标红。这里没有开关。"
-    ).classes("muted gate-note")
+    return (paper, pm, (f"实盘 {live_value}", live_tone))
 
 
 def _live_face(status: GateStatus) -> tuple[str, str]:

@@ -25,8 +25,8 @@ python -m dashboard.app
 
 - 顶栏：CRYPTO TERMINAL / 链上新币投研终端、实时点、进程心跳、UTC 时钟、刷新。
 - 模块标签：DASHBOARD / MARKETS / AI CHAT。`/chat` 是同一套鉴权下的 AI CHAT。
-- DASHBOARD 内子标签：OVERVIEW（风险 + 持仓）、SIGNALS、EXECUTION。注册表里新增的面板默认落在 OVERVIEW。
-- 底栏：会话时长、库文件就绪数、进程心跳、距上次刷新的秒数。
+- DASHBOARD 内子标签：OVERVIEW 首屏是四列状态卡，下面整行持仓表和信号流；风险面板排在后面，三闸门是标题行里的小标签。SIGNALS、EXECUTION 仍是子页。注册表里新增且未指定分组的面板排在风险面板之后。
+- 底栏只有一条：左侧版本、会话、库、进程，右侧刷新年龄和间隔。
 - MARKETS 读 `token_indicators`，流动性取 `primary_pair_address` 在 `pair_history` 的最新值，覆盖率沿用信号流的口径。列只有 change_*、流动性、JEV、覆盖、档。不展示 RSI、MACD、BOLL。
 - 本仓库没有 `dashboard.chat` 时，AI CHAT 只显示未挂载说明，不调用模型，不写 `dashboard_state.db`。挂上模块并提供 `render(store)` 后，同一页会调用它。
 

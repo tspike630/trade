@@ -709,6 +709,20 @@ class DashboardSmokeTest(unittest.TestCase):
             "/chat",
         ):
             self.assertIn(label, app_text)
+        for marker in (
+            "overview-grid",
+            "card full",
+            "status-group",
+            "margin-left: auto",
+            "statusbar",
+            "height: 32px",
+            "height: 22px",
+            "height: 26px",
+        ):
+            self.assertIn(marker, app_text)
+        risk_text = Path(__file__).resolve().parent.joinpath("panels", "risk.py").read_text(encoding="utf-8")
+        self.assertIn("gate_header_tags", risk_text)
+        self.assertNotIn('kpi("模拟盘执行"', risk_text)
         market_src = inspect.getsource(DataStore._market_rows)
         for banned in ("rsi", "macd", "boll"):
             self.assertNotIn(banned, market_src.lower())

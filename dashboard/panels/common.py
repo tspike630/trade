@@ -21,13 +21,24 @@ _CELL_SLOT = """
 
 
 @contextmanager
-def panel_box(title: str, subtitle: str = "", extra_class: str = "") -> Iterator[None]:
+def panel_box(
+    title: str,
+    subtitle: str = "",
+    extra_class: str = "",
+    tags: tuple[tuple[str, str], ...] = (),
+) -> Iterator[None]:
     classes = "panel"
     if extra_class:
         classes = f"{classes} {extra_class}"
     with ui.element("section").classes(classes):
         with ui.element("div").classes("panel-head"):
-            ui.label(title).classes("panel-title")
+            with ui.element("div").classes("panel-head-row"):
+                ui.label(title).classes("panel-title")
+                for text, tone in tags:
+                    tag_class = "gate-tag"
+                    if tone:
+                        tag_class = f"{tag_class} {tone}"
+                    ui.label(text).classes(tag_class)
             if subtitle:
                 ui.label(subtitle).classes("panel-sub")
         yield

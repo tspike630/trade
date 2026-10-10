@@ -18,13 +18,14 @@ from typing import Literal
 
 from fastapi import Request
 from nicegui import app, ui
+from nicegui.elements.mixins.text_element import TextElement
 
 from dashboard.auth import SecretFilter, verify_api_key
 from dashboard.data import DataStore
-from dashboard.format_util import fmt_rate, liveness_label
 from dashboard.panels.common import panel_box, panel_guard, show_unavailable
 from dashboard.panels.markets import render_markets
 from dashboard.panels.registry import PANELS
+from dashboard.panels.risk import live_face
 from dashboard.panels.shell import (
     db_status_line,
     heartbeat_summary,
@@ -86,95 +87,217 @@ body { margin: 0; }
   flex-direction: column;
   background: var(--bg);
 }
-.ft-top {
+.topbar {
   position: sticky;
   top: 0;
   z-index: 50;
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 10px 14px;
-  min-height: 44px;
+  gap: 24px;
+  height: 48px;
   padding: 0 16px;
   background: #111111;
   border-bottom: 1px solid #1a1a1a;
+  flex-wrap: nowrap;
 }
-.ft-brand { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-.ft-brand-crypto {
-  color: #d97706;
+.topbar .brand { display: flex; align-items: baseline; gap: 10px; white-space: nowrap; }
+.topbar .brand .name {
+  display: inline-flex;
+  align-items: baseline;
   font-weight: 700;
+  letter-spacing: 0.5px;
+  color: #e5e5e5;
   font-size: 13px;
-  letter-spacing: 0.04em;
 }
-.ft-brand-name { color: #e5e5e5; font-weight: 700; font-size: 13px; letter-spacing: 0.04em; }
-.ft-brand-sub { color: #808080; font-size: 11px; }
-.ft-live { color: #16a34a; font-size: 12px; font-family: var(--mono); }
-.ft-live-warn { color: #ca8a04; }
-.ft-live-muted { color: #525252; }
-.ft-proc, .ft-clock, .ft-status-item {
+.topbar .brand .name span { margin-right: 2px; }
+.topbar .brand .tag { font-size: 11px; color: #d97706; }
+.topbar .status-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+  min-width: 0;
+}
+.topbar .live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #16a34a;
+  box-shadow: 0 0 6px #16a34a;
+  flex: 0 0 auto;
+}
+.topbar .live-dot.tone-warn { background: #ca8a04; box-shadow: 0 0 6px #ca8a04; }
+.topbar .live-dot.tone-muted { background: #525252; box-shadow: none; }
+.topbar .live-caption,
+.topbar .status-group .proc,
+.topbar .status-group .clock {
+  font-size: 11px;
   color: #808080;
   font-family: var(--mono);
-  font-size: 11px;
+  white-space: nowrap;
 }
-.ft-grow { flex: 1 1 auto; }
-.ft-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-.ft-refresh {
-  color: #e5e5e5 !important;
+.topbar .actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.topbar .actions .q-btn {
+  height: 26px !important;
+  min-height: 26px !important;
+  padding: 0 12px !important;
+  font-size: 11px !important;
   background: #161616 !important;
-  border: 1px solid #222222 !important;
+  color: #e5e5e5 !important;
+  border: 1px solid #222 !important;
+  border-radius: 4px !important;
+  box-shadow: none !important;
 }
-.ft-body { width: 100%; max-width: 1440px; margin: 0 auto; padding: 0 12px 40px; }
-.ft-tabbar .q-tabs__content { background: #080808; border-bottom: 1px solid #1a1a1a; min-height: 32px; }
-.ft-tabbar .q-tab {
-  padding: 0 8px;
+.topbar .actions .q-btn:hover,
+.topbar .actions .q-btn:hover .q-btn__content {
+  border-color: #d97706 !important;
+  color: #d97706 !important;
+}
+.ft-body { width: 100%; max-width: 1440px; margin: 0 auto; padding: 0 12px 48px; box-sizing: border-box; }
+.ft-tabbar {
+  display: flex;
+  height: 32px;
   min-height: 32px;
+  border-bottom: 1px solid #1a1a1a;
+  background: #0a0a0a;
+}
+.ft-tabbar .q-tabs__content {
+  background: #0a0a0a;
+  border-bottom: 1px solid #1a1a1a;
+  min-height: 32px !important;
+  height: 32px !important;
+}
+.ft-tabbar .q-tab {
+  padding: 0 8px !important;
+  height: 32px !important;
+  min-height: 32px !important;
   text-transform: uppercase;
   letter-spacing: 0.5px;
-  color: #525252;
-  font-size: 12px;
+  color: #808080;
+  font-size: 12px !important;
+  font-weight: 600;
 }
-.ft-tabbar .q-tab:hover { color: #d97706; background: #111111; }
+.ft-tabbar .q-tab:hover { color: #d97706; background: #161616; }
 .ft-tabbar .q-tab.q-tab--active {
-  background: #111111;
+  background: #161616;
   color: #d97706;
   font-weight: 600;
-  border-bottom: 2px solid #78350f;
+  border-bottom: 2px solid #d97706;
 }
 .ft-tabbar .q-tab__indicator, .ft-subtab .q-tab__indicator { display: none; }
-.ft-subtab .q-tabs__content { background: #0a0a0a; border-bottom: 1px solid #1a1a1a; min-height: 26px; }
+.ft-tabbar .q-tab__content { min-height: 32px !important; padding: 0 !important; }
+.ft-subtab .q-tab__content { min-height: 22px !important; padding: 0 !important; }
+.topbar .actions .q-btn .q-btn__content { min-height: 26px !important; line-height: 26px; }
+.ft-subtab {
+  display: flex;
+  height: auto;
+  min-height: 0;
+  gap: 4px;
+  padding: 4px 8px;
+  background: transparent;
+}
+.ft-subtab .q-tabs__content {
+  background: transparent;
+  border-bottom: none;
+  min-height: 22px !important;
+  height: 22px !important;
+}
 .ft-subtab .q-tab {
-  padding: 0 10px;
-  min-height: 26px;
+  padding: 0 10px !important;
+  height: 22px !important;
+  min-height: 22px !important;
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: #525252;
-  font-size: 10px;
+  font-size: 10px !important;
+  font-weight: 400;
+  border-radius: 3px;
 }
-.ft-subtab .q-tab:hover { color: #d97706; background: #161616; }
+.ft-subtab .q-tab:hover { color: #808080; background: #161616; }
 .ft-subtab .q-tab.q-tab--active {
-  color: #e5e5e5;
+  color: #d97706;
   font-weight: 600;
-  border-bottom: 2px solid #d97706;
+  background: #1a1a1a;
+  border-bottom: none;
 }
 .ft-panels, .ft-panels .q-tab-panel, .ft-subpanels, .ft-subpanels .q-tab-panel {
   background: transparent !important;
   padding: 8px 0 0;
+  width: 100%;
 }
+.nicegui-tab-panel {
+  align-items: stretch !important;
+  width: 100%;
+}
+.nicegui-tab-panel > * { width: 100%; max-width: 100%; }
 .ft-chain { min-width: 140px; margin-bottom: 8px; }
-.ft-status {
+.statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 32px;
+  padding: 0 12px;
+  font-size: 10px;
+  color: #808080;
+  font-family: var(--mono);
+  border-top: 1px solid #1a1a1a;
+  background: #0a0a0a;
   position: sticky;
   bottom: 0;
   z-index: 40;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-  min-height: 24px;
-  padding: 2px 12px;
-  background: #111111;
-  border-top: 1px solid #1a1a1a;
+  margin-top: auto;
+  white-space: nowrap;
 }
-.ft-status-miss { color: #ca8a04; }
+.statusbar .left, .statusbar .right { display: flex; gap: 16px; align-items: center; min-width: 0; }
+.statusbar .miss { color: #ca8a04; }
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  width: 100%;
+}
+.overview-grid .card {
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  border-radius: 6px;
+  padding: 12px;
+  min-height: 110px;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.overview-grid .card.full {
+  grid-column: span 4;
+  min-height: 0;
+}
+.overview-grid .card-label { font-size: 10px; color: #808080; }
+.overview-grid .card-value {
+  font-size: 24px;
+  color: #e5e5e5;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  margin-top: 6px;
+  line-height: 1.2;
+}
+.overview-grid .card-source { font-size: 10px; color: #525252; margin-top: 6px; }
+.overview-grid .card.tone-warn .card-value { color: #ca8a04; }
+.overview-grid .card.tone-bad .card-value { color: #dc2626; }
+.overview-grid .card.full .panel,
+.overview-grid .card.full .table-scroll,
+.overview-grid .card.full .q-table { width: 100%; }
+.overview-grid .card.full .panel { margin-bottom: 0; }
+.panel-head-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.gate-tag {
+  font-size: 10px;
+  font-family: var(--mono);
+  color: #808080;
+  background: #111111;
+  border: 1px solid #222222;
+  border-radius: 3px;
+  padding: 1px 6px;
+}
+.gate-tag.tone-warn { color: #ca8a04; border-color: #6d5a2e; }
+.gate-tag.tone-bad { color: #dc2626; border-color: #7a3036; }
+.panel { width: 100%; box-sizing: border-box; }
 .kpi-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
@@ -216,14 +339,6 @@ body { margin: 0; }
 .kpi-tile.tone-bad .kpi-value { color: var(--bad); }
 .kpi-tile.tone-ok { border-left-color: var(--mint); }
 .kpi-tile.tone-ok .kpi-value { color: var(--mint); }
-.topbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 10px;
-}
 .brand-kicker {
   color: var(--accent);
   font-family: var(--mono);
@@ -402,6 +517,9 @@ body { margin: 0; }
   .brand-title { font-size: 18px; }
   .kpi-value { font-size: 18px; }
   .page { padding: 0 8px 28px; }
+  .overview-grid { grid-template-columns: repeat(2, 1fr); }
+  .overview-grid .card.full { grid-column: span 2; }
+  .topbar { gap: 12px; padding: 0 10px; }
 }
 """
 
@@ -558,8 +676,16 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
 
     @ui.refreshable
     def overview_tab() -> None:
-        _status_strip(store)
-        _render_panel_group(store, "overview", overview_tab.refresh)
+        with ui.element("div").classes("overview-grid"):
+            _overview_cards(store)
+            with ui.element("div").classes("card full"):
+                _render_panel(store, "positions", overview_tab.refresh)
+            with ui.element("div").classes("card full"):
+                _render_panel(store, "signals", overview_tab.refresh)
+        _render_panel(store, "risk", overview_tab.refresh)
+        for spec in PANELS:
+            if panel_group(spec.id) == "overview" and spec.id not in {"risk", "positions"}:
+                _render_panel(store, spec.id, overview_tab.refresh)
         ui.label("阶段一只读监控。手动交易确认不在本看板内。").classes("footer-note")
 
     @ui.refreshable
@@ -587,11 +713,22 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
     def chat_tab() -> None:
         panel_guard("AI 问答", lambda: _render_chat(store), on_retry=chat_tab.refresh)
 
+    status_bits = {"session": session_clock(0), "db": "库 —", "proc": "进程 —"}
+
+    def sync_status() -> None:
+        status_left.set_text(
+            f"v0.1.0 · {status_bits['session']} · {status_bits['db']} · {status_bits['proc']}"
+        )
+        status_left.classes(remove="miss")
+        if "缺失" in status_bits["db"]:
+            status_left.classes(add="miss")
+
     def paint_clock() -> None:
         clock_lbl.set_text(_clock_text())
         age = int(time.monotonic() - refreshed_at["mono"])
-        age_lbl.set_text(refresh_age_label(age))
-        up_lbl.set_text(session_clock(int(time.monotonic() - opened_at)))
+        age_lbl.set_text(f"{refresh_age_label(age)} · 每 {interval}s")
+        status_bits["session"] = session_clock(int(time.monotonic() - opened_at))
+        sync_status()
 
     def paint_status() -> None:
         try:
@@ -601,17 +738,15 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
             else:
                 text, tone = heartbeat_summary([item.state for item in live.data])
             proc_lbl.set_text(text)
-            foot_proc.set_text(text)
-            _paint_live(live_lbl, tone)
-            db_text = db_status_line(store.file_status())
-            db_lbl.set_text(db_text)
-            db_lbl.classes(remove="ft-status-miss")
-            if "缺失" in db_text:
-                db_lbl.classes(add="ft-status-miss")
+            status_bits["proc"] = text
+            _paint_live(live_dot, live_lbl, tone)
+            status_bits["db"] = db_status_line(store.file_status())
+            sync_status()
         except Exception:
             log.warning("status strip failed")
             proc_lbl.set_text("心跳：不可用")
-            foot_proc.set_text("心跳：不可用")
+            status_bits["proc"] = "心跳：不可用"
+            sync_status()
 
     def tick() -> None:
         if api_secret() and not _session_ok():
@@ -630,19 +765,21 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
             age_lbl.set_text("刷新失败")
 
     with ui.element("div").classes("shell"):
-        with ui.element("div").classes("ft-top"):
-            with ui.element("div").classes("ft-brand"):
-                ui.label("CRYPTO").classes("ft-brand-crypto")
-                ui.label("TERMINAL").classes("ft-brand-name")
-                ui.label("链上新币投研终端").classes("ft-brand-sub")
-            live_lbl = ui.label("● 实时").classes("ft-live")
-            proc_lbl = ui.label("进程 —").classes("ft-proc")
-            ui.element("div").classes("ft-grow")
-            clock_lbl = ui.label(_clock_text()).classes("ft-clock")
-            with ui.element("div").classes("ft-actions"):
-                ui.button("刷新", on_click=tick).props("flat dense size=sm").classes("ft-refresh")
+        with ui.element("div").classes("topbar"):
+            with ui.element("div").classes("brand"):
+                with ui.element("span").classes("name"):
+                    _Word("CRYPTO")
+                    _Word("TERMINAL")
+                ui.label("链上新币投研终端").classes("tag")
+            with ui.element("div").classes("status-group"):
+                live_dot = ui.element("span").classes("live-dot")
+                live_lbl = ui.label("实时").classes("live-caption")
+                proc_lbl = ui.label("进程 —").classes("proc")
+                clock_lbl = ui.label(_clock_text()).classes("clock")
+            with ui.element("div").classes("actions"):
+                ui.button("刷新", on_click=tick).props("unelevated dense no-caps")
                 if api_secret():
-                    ui.button("退出", on_click=_revoke_session).props("flat dense size=sm").classes("ghost-btn")
+                    ui.button("退出", on_click=_revoke_session).props("unelevated dense no-caps")
         with ui.element("div").classes("ft-body"):
             if insecure:
                 ui.label("本地未鉴权模式（ALLOW_INSECURE_API=1）。不要暴露到公网。").classes("banner")
@@ -654,14 +791,11 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                 markets_tab,
                 chat_tab,
             )
-        with ui.element("div").classes("ft-status"):
-            ui.label("v0.1.0").classes("ft-status-item")
-            up_lbl = ui.label(session_clock(0)).classes("ft-status-item")
-            db_lbl = ui.label("库 —").classes("ft-status-item")
-            foot_proc = ui.label("进程 —").classes("ft-status-item")
-            ui.element("div").classes("ft-grow")
-            age_lbl = ui.label(refresh_age_label(0)).classes("ft-status-item")
-            ui.label(f"每 {interval}s").classes("ft-status-item")
+        with ui.element("div").classes("statusbar"):
+            with ui.element("div").classes("left"):
+                status_left = ui.label("v0.1.0 · 会话 00:00:00 · 库 — · 进程 —")
+            with ui.element("div").classes("right"):
+                age_lbl = ui.label(f"{refresh_age_label(0)} · 每 {interval}s")
     paint_status()
     paint_clock()
     ui.timer(1.0, paint_clock)
@@ -677,13 +811,13 @@ def _module_tabs(
     chat_tab: ui.refreshable,
 ) -> None:
     initial = "AI CHAT" if section == "chat" else "DASHBOARD"
-    with ui.tabs(value=initial).classes("w-full ft-tabbar") as tabs:
+    with ui.tabs(value=initial).props("align=left").classes("w-full ft-tabbar") as tabs:
         dash = ui.tab("DASHBOARD")
         markets = ui.tab("MARKETS")
         chat = ui.tab("AI CHAT")
     with ui.tab_panels(tabs, value=initial).classes("w-full ft-panels"):
         with ui.tab_panel(dash):
-            with ui.tabs(value="OVERVIEW").classes("w-full ft-subtab").props("dense") as sub:
+            with ui.tabs(value="OVERVIEW").props("align=left").classes("w-full ft-subtab") as sub:
                 overview = ui.tab("OVERVIEW")
                 signals = ui.tab("SIGNALS")
                 execution = ui.tab("EXECUTION")
@@ -699,6 +833,14 @@ def _module_tabs(
         with ui.tab_panel(chat):
             chat_tab()
             ui.link("在 /chat 打开", "/chat").classes("news-link")
+
+
+def _render_panel(store: DataStore, panel_id: str, on_retry) -> None:
+    for spec in PANELS:
+        if spec.id != panel_id:
+            continue
+        panel_guard(spec.title, lambda bound=spec: bound.render(store), on_retry=on_retry)
+        return
 
 
 def _render_panel_group(store: DataStore, group: str, on_retry) -> None:
@@ -724,89 +866,54 @@ def _clock_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _paint_live(label: ui.label, tone: str) -> None:
+class _Word(TextElement):
+    def __init__(self, text: str) -> None:
+        super().__init__(tag="span", text=text)
+
+
+def _paint_live(dot: ui.element, label: ui.label, tone: str) -> None:
     if tone == "ok":
-        label.set_text(live_caption("ok"))
+        caption = live_caption("ok")
+        dot_tone = ""
     elif tone == "warn":
-        label.set_text(live_caption("warn"))
-        label.classes(remove="ft-live-muted")
-        label.classes(add="ft-live-warn")
-        return
+        caption = live_caption("warn")
+        dot_tone = "tone-warn"
     else:
-        label.set_text(live_caption("muted"))
-        label.classes(remove="ft-live-warn")
-        label.classes(add="ft-live-muted")
-        return
-    label.classes(remove="ft-live-warn ft-live-muted")
+        caption = live_caption("muted")
+        dot_tone = "tone-muted"
+    label.set_text(caption.removeprefix("● ").strip())
+    dot.classes(remove="tone-warn tone-muted")
+    if dot_tone:
+        dot.classes(add=dot_tone)
 
 
-def _status_strip(store: DataStore) -> None:
-    """Dense KPI strip on OVERVIEW. Read-only."""
+def _overview_cards(store: DataStore) -> None:
+    """Four OVERVIEW cards. Positions and the signal stream are full-width rows."""
     gates = read_gates()
     today = store.today_execution_stats()
-    pos = store.open_positions()
-    live = store.process_liveness()
-
-    paper = "ON" if gates.paper_enabled else "OFF"
-    pm = "ON" if gates.pm_enabled else "OFF"
-    live_lbl = "ON" if gates.live_effective else "OFF"
-    paper_tone = "tone-warn" if gates.paper_enabled else "tone-ok"
-    pm_tone = "tone-warn" if gates.pm_enabled else "tone-ok"
-    live_tone = "tone-bad" if gates.live_effective else "tone-ok"
-
+    paper = "开" if gates.paper_enabled else "关"
+    pm = "开" if gates.pm_enabled else "关"
+    live_value, live_tone = live_face(gates)
     if today.available:
-        n = str(today.data.n)
-        ok = fmt_rate(today.data.ok_rate, today.data.n_ok, today.data.n)
-        exe = fmt_rate(today.data.executed_rate, today.data.n_executed, today.data.n)
+        signal_value = str(today.data.n)
+        signal_source = "execution_log"
     else:
-        n, ok, exe = "—", "—", "—"
-
-    if pos.available:
-        n_pos = str(len(pos.data.rows))
-        cash = f"{pos.data.cash_usd:,.0f}" if getattr(pos.data, "cash_usd", None) is not None else "—"
-        equity = getattr(pos.data, "equity_usd", None)
-        eq = f"{equity:,.0f}" if equity is not None else cash
-    else:
-        n_pos, eq = "—", "—"
-
-    crawl = "—"
-    if live.available:
-        items = live.data if isinstance(live.data, list) else list(live.data)
-        try:
-            pick = None
-            for probe in items:
-                name = str(getattr(probe, "name", ""))
-                if any(k in name for k in ("爬虫", "采集", "main", "crawler")):
-                    pick = probe
-                    break
-            if pick is None and items:
-                pick = items[0]
-            if pick is not None:
-                crawl = liveness_label(getattr(pick, "state", "unknown"))
-        except Exception:
-            crawl = "见风险面板"
-
-    with ui.element("div").classes("kpi-strip"):
-        _tile("模拟盘", paper, "PAPER", paper_tone)
-        _tile("仓位闸", pm, "PM", pm_tone)
-        _tile("实盘", live_lbl, gates.live_block_reason or "LIVE", live_tone)
-        _tile("今日信号", n, "execution_log")
-        _tile("校验通过", ok, "validation_ok")
-        _tile("已执行", exe, "executed")
-        _tile("持仓数", n_pos, "paper positions")
-        _tile("权益$", eq, "cash+mtm")
-        _tile("主爬虫", str(crawl)[:18], "heartbeat")
+        signal_value = "—"
+        signal_source = today.reason or "execution_log"
+    _card("模拟盘闸", paper, "EXECUTION_PAPER_ENABLED", "tone-warn" if gates.paper_enabled else "")
+    _card("仓位闸", pm, "PM_ENABLED", "tone-warn" if gates.pm_enabled else "")
+    _card("实盘", live_value, gates.live_block_reason or "LIVE", live_tone)
+    _card("今日信号", signal_value, signal_source)
 
 
-def _tile(label: str, value: str, hint: str = "", tone: str = "") -> None:
-    classes = "kpi-tile"
+def _card(label: str, value: str, source: str, tone: str = "") -> None:
+    classes = "card"
     if tone:
         classes = f"{classes} {tone}"
     with ui.element("div").classes(classes):
-        ui.label(label).classes("kpi-label")
-        ui.label(value).classes("kpi-value")
-        if hint:
-            ui.label(hint).classes("kpi-hint")
+        ui.label(label).classes("card-label")
+        ui.label(value).classes("card-value")
+        ui.label(source).classes("card-source")
 
 
 
