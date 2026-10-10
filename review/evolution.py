@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -167,6 +169,396 @@ def _r3_skip_evidence(
         )
     return f"未跑 --optimize；按闸门预检将 skip：{reason}"
 
+def _pandas_ta_bypass_note(db_root: Path) -> Optional[str]:
+    """PRAGMA-probe rsi_14/macd/boll_mid on token_indicators / indicator_history.
+
+    Returns evidence string when any target column exists; None to skip the item.
+    Read-only; never mutates weights.
+    """
+    path = db_root / "dexscreener.db"
+    if not path.is_file():
+        return None
+    targets = ("rsi_14", "macd", "boll_mid")
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            bits: list[str] = []
+            any_col = False
+            for table in ("token_indicators", "indicator_history"):
+                try:
+                    cols = {
+                        str(r[1])
+                        for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                    }
+                except sqlite3.Error:
+                    continue
+                present = [c for c in targets if c in cols]
+                if not present:
+                    continue
+                any_col = True
+                try:
+                    tot = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                except sqlite3.Error:
+                    continue
+                parts: list[str] = []
+                for c in present:
+                    try:
+                        n = int(
+                            conn.execute(
+                                f"SELECT COUNT(*) FROM {table} WHERE {c} IS NOT NULL"
+                            ).fetchone()[0]
+                        )
+                    except sqlite3.Error:
+                        continue
+                    cov = f"{(n / tot * 100):.1f}%" if tot > 0 else "—"
+                    parts.append(f"{c}={n}/{tot}（{cov}）")
+                if parts:
+                    bits.append(f"{table}: " + "；".join(parts))
+            if not any_col:
+                return None
+            if not bits:
+                return "列已存在但无法统计有值行数"
+            return "；".join(bits)
+        finally:
+            conn.close()
+    except Exception as e:
+        return f"dexscreener.db 打开失败: {e}"
+
+
+
+def _prior_survival_bypass_note(db_root: Path) -> Optional[str]:
+    """Read-only prior baseline trio for §10 observation (PRIOR_STEP1).
+
+    Prefers data/prior/exports/baseline_params.json weekly_baseline_trio
+    (+ survival_*.md path). Never emits deprecated survive_*/lifespan curves
+    (RED-PUMP last_ts is 24h TIMEOUT window end, not death time).
+    Returns None only when nothing exists.
+    """
+    prior_root = db_root / "data" / "prior"
+    exports = prior_root / "exports"
+    db_path = prior_root / "db" / "prior.db"
+
+    report_rel: Optional[str] = None
+    trio_bits: list[str] = []
+    notes: list[str] = []
+
+    # survival report path (prefer dated 20261010, else newest survival_*.md)
+    md_text = ""
+    if exports.is_dir():
+        preferred = exports / "survival_20261010.md"
+        if preferred.is_file():
+            report_rel = "data/prior/exports/survival_20261010.md"
+            try:
+                md_text = preferred.read_text(encoding="utf-8")
+            except OSError:
+                md_text = ""
+        else:
+            cands = sorted(
+                (
+                    p
+                    for p in exports.glob("survival_*.md")
+                    if not p.name.endswith("_v2.md")
+                ),
+                reverse=True,
+            )
+            if cands:
+                report_rel = f"data/prior/exports/{cands[0].name}"
+                try:
+                    md_text = cands[0].read_text(encoding="utf-8")
+                except OSError:
+                    md_text = ""
+
+    # baseline_params.json — prefer weekly_baseline_trio (三件套)
+    bp = exports / "baseline_params.json"
+    data: Optional[dict[str, Any]] = None
+    if bp.is_file():
+        try:
+            data = json.loads(bp.read_text(encoding="utf-8"))
+        except Exception as e:
+            notes.append(f"baseline_params.json 读失败: {e}")
+
+    if isinstance(data, dict):
+        trio = data.get("weekly_baseline_trio") or {}
+        rp = data.get("redpump") or {}
+        cg = data.get("coingecko") or {}
+        sol = data.get("solrpds") or {}
+
+        grad = trio.get("graduation_rate")
+        if grad is None:
+            grad = rp.get("graduation_rate")
+        death = trio.get("same_day_death_rate")
+        if death is None:
+            death = cg.get("same_day_death_rate")
+        rug = trio.get("solrpds_remove_gt_add_rate")
+        if rug is None:
+            rug = sol.get("remove_gt_add_rate")
+
+        # Detect "三件套 ready" vs legacy survive_* only
+        has_trio = grad is not None and death is not None and rug is not None
+        if has_trio:
+            try:
+                trio_bits.append(f"毕业率 {float(grad) * 100:.1f}%")
+            except (TypeError, ValueError):
+                trio_bits.append(f"毕业率 {grad}")
+            try:
+                trio_bits.append(f"当天死 {float(death) * 100:.2f}%(CoinGecko)")
+            except (TypeError, ValueError):
+                trio_bits.append(f"当天死 {death}(CoinGecko)")
+            try:
+                trio_bits.append(f"SolRPDs 池移除>添加 {float(rug) * 100:.1f}%")
+            except (TypeError, ValueError):
+                trio_bits.append(f"SolRPDs 池移除>添加 {rug}")
+
+            ut = sol.get("unique_tokens")
+            if ut is not None:
+                notes.append(f"unique token 本库 {ut}（提示≈22195）")
+        else:
+            # Placeholder when metrics layer has not shipped the trio yet
+            trio_bits = [
+                "毕业率≈0.2%",
+                "当天死≈68.67%(CoinGecko)",
+                "SolRPDs 池移除>添加≈60.1%",
+            ]
+            notes.append("可用基线待三件套（当前 baseline 未齐）")
+
+        inv = (
+            (data.get("meta") or {}).get("invalidity_note_zh")
+            or (rp.get("deprecated") or {}).get("reason_zh")
+        )
+        if inv:
+            notes.append(
+                "旧存活曲线/寿命分位口径不可用（RED-PUMP 24h TIMEOUT 窗口）"
+            )
+        else:
+            notes.append(
+                "旧存活曲线/寿命分位口径不可用（RED-PUMP 24h TIMEOUT 窗口）"
+            )
+    elif report_rel or md_text:
+        # Parse trio from markdown §6 if JSON missing
+        m_grad = re.search(r"毕业率\s*[|：:]*\s*\*?\*?([0-9.]+)%", md_text)
+        m_death = re.search(r"当天死\s*[|：:]*\s*\*?\*?([0-9.]+)%", md_text)
+        m_rug = re.search(
+            r"(?:池移除>添加|移除>添加)[^\d]*\*?\*?([0-9.]+)%", md_text
+        )
+        if m_grad and m_death and m_rug:
+            trio_bits = [
+                f"毕业率 {m_grad.group(1)}%",
+                f"当天死 {m_death.group(1)}%(CoinGecko)",
+                f"SolRPDs 池移除>添加 {m_rug.group(1)}%",
+            ]
+        else:
+            trio_bits = [
+                "毕业率≈0.2%",
+                "当天死≈68.67%(CoinGecko)",
+                "SolRPDs 池移除>添加≈60.1%",
+            ]
+        notes.append(
+            "旧存活曲线/寿命分位口径不可用（RED-PUMP 24h TIMEOUT 窗口）"
+        )
+        m_ut = re.search(r"结果：\s*([0-9,]+)", md_text)
+        if m_ut:
+            notes.append(
+                f"unique token 本库 {m_ut.group(1).replace(',', '')}（提示≈22195）"
+            )
+    elif not db_path.is_file():
+        return None
+    else:
+        trio_bits = [
+            "毕业率≈0.2%",
+            "当天死≈68.67%(CoinGecko)",
+            "SolRPDs 池移除>添加≈60.1%",
+        ]
+        notes.append(
+            "旧存活曲线/寿命分位口径不可用（RED-PUMP 24h TIMEOUT 窗口）"
+        )
+
+    bits: list[str] = []
+    if trio_bits:
+        bits.append(" / ".join(trio_bits))
+    bits.extend(notes)
+    if report_rel:
+        bits.append(f"报告={report_rel}")
+    else:
+        bits.append("报告路径待旁路导出")
+    return "；".join(bits)
+
+
+
+def _prior_gmgn_v2_bypass_note(db_root: Path) -> Optional[str]:
+    """Read-only GMGN STEP2 side-note from survival_*_v2.md.
+
+    Official kagglehub pack is Tokens=956 (完整数据集 / full release);
+    unique>1000 gate cannot be met from this source. Peak/gain may seed a
+    prior prototype; 1h/4h/24h survival needs a longer OHLCV source. Does
+    not replace the PRIOR_STEP1 三件套 main entry.
+    """
+    exports = db_root / "data" / "prior" / "exports"
+    if not exports.is_dir():
+        return None
+    preferred = exports / "survival_20261010_v2.md"
+    if preferred.is_file():
+        v2 = preferred
+    else:
+        cands = sorted(exports.glob("survival_*_v2.md"), reverse=True)
+        if not cands:
+            return None
+        v2 = cands[0]
+    try:
+        md = v2.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    report_rel = f"data/prior/exports/{v2.name}"
+
+    # 见顶 P25/P50/P75（§3 table first data row）
+    peak_p25 = peak_p50 = peak_p75 = None
+    peak_n = None
+    in_peak = False
+    for line in md.splitlines():
+        if line.startswith("## 3."):
+            in_peak = True
+            continue
+        if in_peak and line.startswith("##"):
+            break
+        if in_peak and line.startswith("|") and "---" not in line and "P25" not in line:
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) >= 4:
+                peak_p25, peak_p50, peak_p75, peak_n = cells[0], cells[1], cells[2], cells[3]
+            break
+
+    m_span = re.search(r"监控跨度[^:\n]*:\s*([^\n]+)", md)
+    span = m_span.group(1).strip() if m_span else "—"
+
+    # death_reason shares
+    dr_parts: list[str] = []
+    n_total = None
+    for line in md.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        name, cnt, pct = cells[0], cells[1], cells[2]
+        if name in ("price_stable", "volume_low", "candle_gap", "timeout"):
+            dr_parts.append(f"{name} {pct}")
+        if name in ("合计", "total") and cnt.isdigit():
+            n_total = int(cnt)
+    if n_total is None:
+        m_n = re.search(r"n[=≈]\s*(\d+)", md)
+        if m_n:
+            n_total = int(m_n.group(1))
+
+    # §4 见顶涨幅 P50
+    gain_p50 = None
+    in_gain = False
+    for line in md.splitlines():
+        if line.startswith("## 4."):
+            in_gain = True
+            continue
+        if in_gain and line.startswith("##"):
+            break
+        if in_gain and line.startswith("|") and "---" not in line and "P25" not in line:
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) >= 2:
+                gain_p50 = cells[1]
+            break
+
+    peak_s = (
+        f"见顶 P25/P50/P75={peak_p25}/{peak_p50}/{peak_p75}"
+        if peak_p25 and peak_p50 and peak_p75
+        else "见顶分位待解析"
+    )
+    if peak_n:
+        peak_s += f"（见顶样本 {peak_n}）"
+    gain_s = f"涨幅 P50={gain_p50}" if gain_p50 else "涨幅分位待解析"
+    dr_s = "、".join(dr_parts) if dr_parts else "death_reason 占比待解析"
+    n_s = f"n={n_total}" if n_total is not None else "n=—"
+
+    return (
+        f"{peak_s} / {gain_s} 可作先验雏形；监控跨度 {span}；"
+        f"death_reason（监控终止≠归零）{dr_s}；{n_s}；"
+        "kagglehub `moussaouallaf/gmgn-solana-token-charts` 官方 Tokens=956 即完整数据集"
+        "（Kaggle v3 全量，无更大 pack），unique>1000 验收线本源无法满足；"
+        "1h/4h/24h 存活因监控跨度短全 0，需另找长 OHLCV 数据源才换挂真实存活曲线；"
+        f"报告={report_rel}"
+    )
+
+
+
+def _self_survival_bypass_note(db_root: Path) -> Optional[str]:
+    """Read-only self crawler observation-span survival for §10 (旁注).
+
+    Prefers data/prior/exports/self_survival_20261010.md, else newest
+    self_survival_*.md. Does not replace PRIOR_STEP1 三件套 or GMGN STEP2.
+    """
+    exports = db_root / "data" / "prior" / "exports"
+    if not exports.is_dir():
+        return None
+    preferred = exports / "self_survival_20261010.md"
+    if preferred.is_file():
+        md_path = preferred
+    else:
+        cands = sorted(exports.glob("self_survival_*.md"), reverse=True)
+        if not cands:
+            return None
+        md_path = cands[0]
+    try:
+        md = md_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    report_rel = f"data/prior/exports/{md_path.name}"
+
+    n_total = None
+    m_n = re.search(
+        r"unique tokens[^\n]*:\s*\*\*?([0-9,]+)\*\*?", md, re.I
+    )
+    if m_n:
+        n_total = int(m_n.group(1).replace(",", ""))
+
+    rates: dict[str, str] = {}
+    for label, key in (
+        ("1h", "1h"),
+        ("4h", "4h"),
+        ("24h", "24h"),
+        ("7d", "7d"),
+    ):
+        m = re.search(
+            rf"\|\s*{re.escape(label)}(?:\s*\([^)]*\))?\s*\|\s*([0-9.]+)%",
+            md,
+        )
+        if m:
+            rates[key] = m.group(1) + "%"
+
+    span_p50 = span_max = None
+    m_span = re.search(
+        r"跨度（小时）:\s*P25=[0-9.]+h\s*/\s*P50=([0-9.]+)h\s*/\s*P75=[0-9.]+h\s*/\s*max=([0-9.]+)h",
+        md,
+    )
+    if m_span:
+        span_p50, span_max = m_span.group(1), m_span.group(2)
+
+    fake = "PASS" if re.search(r"假象扫描[^\n]*:\s*PASS", md) else None
+    if fake is None and re.search(r"假象扫描[^\n]*:\s*FAIL", md):
+        fake = "FAIL"
+
+    n_s = f"n={n_total}" if n_total is not None else "n=—"
+    rate_s = (
+        f"1h/4h/24h/7d="
+        f"{rates.get('1h', '—')}/{rates.get('4h', '—')}/"
+        f"{rates.get('24h', '—')}/{rates.get('7d', '—')}"
+    )
+    if span_p50 and span_max:
+        span_s = f"跨度 P50≈{span_p50}h；max≈{span_max}h"
+    else:
+        span_s = "跨度分位待解析"
+    fake_s = f"假象扫描 {fake}" if fake else "假象扫描待解析"
+
+    return (
+        f"{n_s}；{rate_s}；{span_s} → 24h/7d=0% 是 crawler 短窗覆盖上限；"
+        f"只读 pair_history；{fake_s}；报告={report_rel}"
+    )
+
 
 def build_evolution_suggestions(
     *,
@@ -176,6 +568,7 @@ def build_evolution_suggestions(
     attribution: Optional[dict[str, Any]] = None,
     fill_attr: Optional[dict[str, Any]] = None,
     jev_slice_metrics: Optional[dict[str, Any]] = None,
+    joint: Optional[dict[str, Any]] = None,
     opt_result: Optional[OptimizeResult] = None,
     optimize_section: Optional[str] = None,
     period_start: Optional[str] = None,
@@ -196,22 +589,39 @@ def build_evolution_suggestions(
     # --- 采集 ---
     n_unk, n_tot = _token_age_unknown_ratio(attribution)
     if n_tot > 0:
-        age_ev = (
-            f"归因 token_age 桶 unknown={n_unk}/{n_tot}"
-            + ("（创建时间字段缺口，全样本 unknown）" if n_unk == n_tot else "")
-        )
+        unk_pct = 100.0 * n_unk / n_tot
+        if n_unk == n_tot:
+            age_ev = (
+                f"归因 token_age 桶 unknown={n_unk}/{n_tot}"
+                f"（创建时间仍缺，全样本 unknown；pairs.pair_created_at 回填后应下降）"
+            )
+            age_hint = (
+                "确认 pairs.pair_created_at 回填与信号 chain_id+pair_address 对齐；"
+                "复盘侧仅观察 unknown 占比下降，不改桶边界"
+            )
+        else:
+            age_ev = (
+                f"归因 token_age 已接 pairs.pair_created_at；"
+                f"unknown={n_unk}/{n_tot}（{unk_pct:.1f}%），"
+                f"相对此前全 unknown 已下降；仍观察中"
+            )
+            age_hint = (
+                "继续观察 unknown 占比与分桶稳定性；"
+                "不改桶边界，落地须走 R4"
+            )
     else:
-        age_ev = "归因未提供 token_age 分桶，等采集/信号层交来创建时间字段覆盖率"
+        age_ev = "归因未提供 token_age 分桶，等采集/信号层交来创建时间覆盖率"
+        age_hint = (
+            "确认 pairs.pair_created_at 回填与 annotate_token_age 接线；"
+            "复盘侧仅观察 unknown 占比下降，不改桶边界"
+        )
     suggestions.append(
         _suggestion(
             layer="采集",
-            item="token_age 字段缺口",
+            item="token_age 覆盖率观察",
             status=STATUS_WATCH,
             evidence=age_ev,
-            action_hint=(
-                "在 crawl/raw_json 补齐 pairCreatedAt（或等价创建时间）；"
-                "复盘侧仅观察 unknown 占比下降，不改桶边界"
-            ),
+            action_hint=age_hint,
         )
     )
 
@@ -263,6 +673,58 @@ def build_evolution_suggestions(
             ),
         )
     )
+
+    ta_ev = _pandas_ta_bypass_note(root)
+    if ta_ev is not None:
+        suggestions.append(
+            _suggestion(
+                layer="指标",
+                item="pandas-ta 旁路 RSI/MACD/BOLL",
+                status=STATUS_WATCH,
+                evidence=ta_ev,
+                action_hint=(
+                    "有分层区分度再建议上调权重；裁决前权重保持 0"
+                ),
+            )
+        )
+
+    prior_ev = _prior_survival_bypass_note(root)
+    if prior_ev is not None:
+        suggestions.append(
+            _suggestion(
+                layer="指标",
+                item="先验存活过滤（PRIOR_STEP1）",
+                status=STATUS_WATCH,
+                evidence=prior_ev,
+                action_hint=(
+                    "裁决前不调权、不进策略；与现网 JEV 过滤对照后再谈落地"
+                ),
+            )
+        )
+
+    gmgn_ev = _prior_gmgn_v2_bypass_note(root)
+    if gmgn_ev is not None:
+        suggestions.append(
+            _suggestion(
+                layer="指标",
+                item="GMGN 见顶分布（STEP2 完整 n=956）",
+                status=STATUS_WATCH,
+                evidence=gmgn_ev,
+                action_hint="另找长 OHLCV 数据源后再换挂真实存活曲线；裁决前不调权",
+            )
+        )
+
+    self_ev = _self_survival_bypass_note(root)
+    if self_ev is not None:
+        suggestions.append(
+            _suggestion(
+                layer="指标",
+                item="自库存活曲线（self_survival）",
+                status=STATUS_WATCH,
+                evidence=self_ev,
+                action_hint="与 JEV 周检并排对照；裁决前不调权",
+            )
+        )
 
     # --- 决策 ---
     suggestions.append(
@@ -333,6 +795,77 @@ def build_evolution_suggestions(
     )
 
     # --- 复盘 ---
+    # joint attribution observation (step 4)
+    try:
+        from review.joint import summarize_joint_for_evolution
+        joint_ev = summarize_joint_for_evolution(joint)
+    except Exception as e:  # noqa: BLE001
+        joint_ev = f"联合表摘要失败: {e}"
+    suggestions.append(
+        _suggestion(
+            layer="复盘",
+            item="JEV×币龄×先验联合归因",
+            status=STATUS_WATCH,
+            evidence=joint_ev,
+            action_hint=(
+                "联合归因已出，不调权；n 仍小；监控假说「1–24h 段质量最高」（过滤后 JEV n=7 up_1h=85.7%；过滤增益最大；>7d n=4 且 4h 差）；"
+                "落地须走 R4"
+            ),
+        )
+    )
+
+    # prior_tagger bypass feed for §8 joint / attribution
+    try:
+        from review.joint import load_decision_prior_tags, BUCKET_SOURCE_PRIOR
+        tags = load_decision_prior_tags(root)
+        n_tags = len(tags)
+        n_chain = len({str(r.decision_id) for r in chain}) if chain else 0
+        n_hit = sum(1 for r in chain if str(r.decision_id) in tags) if tags and chain else 0
+        src = (joint or {}).get("bucket_source") or (
+            BUCKET_SOURCE_PRIOR if n_tags else "computed"
+        )
+        if n_tags > 0:
+            pt_ev = (
+                f"prior_tagger 已回填 {n_tags}/{n_tags}（decision_prior_tags）；"
+                f"本期信号覆盖 {n_hit}/{n_chain}；§8 分桶源={src}，可自动吃标签"
+            )
+        else:
+            pt_ev = (
+                "prior.db.decision_prior_tags 空/缺失；§8 仍用现算 token_age；"
+                "复盘前可跑 scripts/prior_tagger.py"
+            )
+    except Exception as e:  # noqa: BLE001
+        pt_ev = f"prior_tagger 状态读取失败: {e}"
+    suggestions.append(
+        _suggestion(
+            layer="复盘",
+            item="prior_tagger 旁路标签",
+            status=STATUS_WATCH,
+            evidence=pt_ev,
+            action_hint=(
+                "只读 prior.db；§8/联合表优先吃 age_bucket；"
+                "不进决策/不调权；落地须走 R4"
+            ),
+        )
+    )
+
+    suggestions.append(
+        _suggestion(
+            layer="复盘",
+            item="候选分层过滤 token_age∈[1h,24h]",
+            status=STATUS_WATCH,
+            evidence=(
+                "过滤后 JEV 1–24h 段 n=7 up_1h=85.7%，过滤增益最大；"
+                ">7d n=4 且 4h 差；监控假说「1–24h 段质量最高」"
+            ),
+            action_hint=(
+                "status=观察中；等 unique≥10 再攒几周才谈建议落地；"
+                "裁决前不加币龄闸；落地须走 R4"
+            ),
+        )
+    )
+
+
     r3_ev = _r3_skip_evidence(
         opt_result=opt_result,
         chain=chain,
