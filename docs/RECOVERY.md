@@ -72,7 +72,7 @@ nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
 ## 4. 其它层（各层跟进提交后）
 
 - 看板：`dashboard/` → 见其 README（通常 `8081` + `API_SECRET`）
-- 决策：`decision_engine/` → dry-run 指只读 `DB_PATH`
+- 决策：仓库根 `decision_engine/` → [DECISION_ENGINE_RESTORE.md](../DECISION_ENGINE_RESTORE.md)
 - 执行：`execution/` → `--once` 再 `--loop`（paper/PM 默认关）
 - 复盘：`review/` → `python -m review.run --period 7d --report`
 
@@ -89,3 +89,9 @@ nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
 - 代码：`git revert` / 切旧 commit
 - 数据：`backups/` 或换机前拷贝的 `dexscreener-*.db`
 - 实盘：确保 `LIVE_TRADING_DISABLED` 在；勿设 `LIVE_TRADING_ENABLED=1`
+
+## 决策引擎
+
+Step1 dry-run 与 Step2 回测在仓库根 `decision_engine/`，JEV 周检为 `scripts/jev_validity.py`。换机步骤、烟雾命令和上线闸门见 [DECISION_ENGINE_RESTORE.md](../DECISION_ENGINE_RESTORE.md)。
+
+不提交 `.env`、API Key、`*.db`（含 `dexscreener.db` / `backtest_ledger.db`）、`logs/`。虚拟环境用 `crawler/.venv`；主库用本机 `crawler/dexscreener.db`（或 `DB_PATH` / `DECISION_DB_PATH`）。
