@@ -69,22 +69,55 @@ nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
 
 细节：`crawler/INDICATORS_AUDIT.md`、`AUTH_JEV.md`、`INDICATORS_STEP*.md`。
 
-## 4. 其它层（各层跟进提交后）
+## 4. 交易看板
 
-- 看板：`dashboard/` → 见其 README（通常 `8081` + `API_SECRET`）
+只读 NiceGUI 看板在仓库根 `dashboard/`（与 `crawler/` 同级）。只读本地 SQLite（主库、执行账本、模拟盘、回测、新闻），不写库，不提供开闸开关。`API_SECRET`、`.env`、`*.db`、日志不进 Git。
+
+依赖在仓库根 `requirements-dashboard.txt`（采集层用自己的 `crawler/requirements.txt`，两套 venv 分开）。`crawler/requirements-dashboard.txt` 内容相同，安装用根上这一份。
+
+库文件在 `crawler/`（`dexscreener.db`、`execution_ledger.db`、`paper_trading.db`、`backtest_ledger.db`、`news_events.db`）。看板默认把包的上一级当数据目录，所以必须设 `DASHBOARD_DB_ROOT`。杀开关 `LIVE_TRADING_DISABLED` 也按这个目录找。`crawler/dashboard/` 是采集层带入的同内容副本；换机启动用仓库根这份。
+
+```bash
+cd /path/to/trade
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dashboard.txt
+export API_SECRET='长随机密钥'          # 与登录框 / X-API-Key 相同；不要写入仓库
+export DASHBOARD_DB_ROOT="$PWD/crawler"  # 不设则去仓库根找库，会空
+python -m dashboard.app                  # http://127.0.0.1:8081 ，只绑 127.0.0.1
+```
+
+冒烟（不需要真实库）：
+
+```bash
+python -m dashboard.smoke_test
+```
+
+验收：
+
+- `GET http://127.0.0.1:8081/health` 返回 ok；未设 `API_SECRET` 且未开 `ALLOW_INSECURE_API=1` 时，数据页关闭
+- 浏览器打开 `http://127.0.0.1:8081`，密钥正确后能看到风险 / 持仓 / 信号流 / 执行记录
+- 四面板只读；跑一段时间后 `crawler/*.db` 的 mtime 不变
+
+细节：`dashboard/README.md`。
+
+## 5. 其它层（各层跟进提交后）
+
+- 看板：见上文「交易看板」
 - 决策：`decision_engine/` → dry-run 指只读 `DB_PATH`
 - 执行：`execution/` → `--once` 再 `--loop`（paper/PM 默认关）
 - 复盘：`review/` → `python -m review.run --period 7d --report`
 
-## 5. 验收
+## 6. 验收
 
 - [ ] `gh` 已登录且能 `git pull`
 - [ ] `crawler/.env` 有密钥但未进 Git（`git status` 干净）
 - [ ] 主爬虫心跳新鲜；`LIVE_TRADING_DISABLED` 存在
-- [ ] 指标 loop + JEV loop 冒烟；看板 / 决策 / 执行 / 复盘按各自清单冒烟通过
+- [ ] 指标 loop + JEV loop 冒烟
+- [ ] 看板：`/health` 为 ok，`python -m dashboard.smoke_test` 通过；`API_SECRET` 与 `*.db` 未进 Git
+- [ ] 决策 / 执行 / 复盘按各自清单冒烟通过
 - [ ] 实盘相关环境变量仍为关闭
 
-## 6. 回滚
+## 7. 回滚
 
 - 代码：`git revert` / 切旧 commit
 - 数据：`backups/` 或换机前拷贝的 `dexscreener-*.db`
