@@ -1,0 +1,47 @@
+{
+  "slot": 280001234,
+  "transaction": {
+    "message": {
+      "instructions": [
+        {
+          "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+          "parsed": {
+            "type": "initializeMint",
+            "info": {
+              "mint": "He1iusTxMintBBBB222222222222222222222222222",
+              "decimals": 6,
+              "mintAuthority": "Auth111111111111111111111111111111111111111"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "meta": {
+    "err": null,
+    "preTokenBalances": [],
+    "postTokenBalances": [
+      {
+        "accountIndex": 1,
+        "mint": "He1iusTxMintBBBB222222222222222222222222222",
+        "owner": "Owner1111111111111111111111111111111111111",
+        "uiTokenAmount": {
+          "uiAmount": 0,
+          "decimals": 6,
+          "amount": "0"
+        }
+      },
+      {
+        "accountIndex": 2,
+        "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "owner": "Owner1111111111111111111111111111111111111",
+        "uiTokenAmount": {
+          "uiAmount": 100.0,
+          "decimals": 6,
+          "amount": "100000000"
+        }
+      }
+    ],
+    "innerInstructions": []
+  }
+}

@@ -1,0 +1,12 @@
+[Unit]
+Description=DexScreener SQLite backup (oneshot)
+After=network.target
+
+[Service]
+Type=oneshot
+User=dexscreener
+Group=dexscreener
+WorkingDirectory=/opt/dexscreener-crawler
+EnvironmentFile=-/etc/dexscreener-crawler.env
+ExecStart=/opt/dexscreener-crawler/.venv/bin/python backup.py
+Nice=10

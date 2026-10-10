@@ -1,0 +1,923 @@
+{
+  "generated_at": "2026-10-09T18:30:25Z",
+  "source": "dexscreener-crawler",
+  "enabled_chains": [
+    "solana",
+    "ethereum",
+    "bsc",
+    "base"
+  ],
+  "alert_min_score": 25.0,
+  "health": {
+    "ok": false,
+    "message": "FAIL: heartbeat stale age=524s > 120s status=ok",
+    "heartbeat": {
+      "timestamp": "2026-10-09T18:21:41Z",
+      "cycle_id": "20261009T182125Z-2bf7997b",
+      "status": "ok",
+      "last_error": null,
+      "pid": 1534746,
+      "stats": {
+        "cycle_number": 18,
+        "tokens_total": 148,
+        "pairs_total": 118,
+        "enrich_batches": 6,
+        "validation_errors": 0,
+        "alerts_emitted": 29,
+        "enrich_pending_remaining": 0,
+        "interrupted": false
+      },
+      "counters": {
+        "cycles_ok": 10,
+        "cycles_fail": 0,
+        "alerts_emitted": 152,
+        "validation_errors": 0
+      }
+    }
+  },
+  "stats": {
+    "tokens": 156,
+    "pairs": 126,
+    "alerts": 152,
+    "pair_history_rows": 185,
+    "pending_enrich": 0,
+    "cycle_number": 18
+  },
+  "top_scores": [
+    {
+      "chain_id": "solana",
+      "token_address": "2j5sas7xy776qcbpypqbzjyqsatkifgrwjferthnw2zm",
+      "quality_score": 85.0,
+      "quality_tags": "[\"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:34Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "7k52ayqw9rwgjwzmq7o2d1p6e7bji6hsmsqaly5ecxlh",
+      "quality_score": 85.0,
+      "quality_tags": "[\"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:32Z"
+    },
+    {
+      "chain_id": "robinhood",
+      "token_address": "0xfeb1ab438e274b2a2ef0657be64aa7db073441a3",
+      "quality_score": 83.5,
+      "quality_tags": "[\"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:29Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "cbcyno7m1amfwqeqm2m4plv1unvpcl3c1ujm6akzpkou",
+      "quality_score": 82.0,
+      "quality_tags": "[\"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:34Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "8k4sbteek4pf26nokqapv8nbtnusjcbdwpkyknk5pbaa",
+      "quality_score": 82.0,
+      "quality_tags": "[\"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:40Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "7vertkgf9klhxxjxhx6uawuoyztp9ldgj2bwmvxvpump",
+      "quality_score": 82.0,
+      "quality_tags": "[\"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:40Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "4qv31uejjyuvwp2f1qgez8gupkf6wypzyamgdt8ud8ld",
+      "quality_score": 80.1,
+      "quality_tags": "[]",
+      "scored_at": "2026-10-09T18:21:34Z"
+    },
+    {
+      "chain_id": "robinhood",
+      "token_address": "0x413b3965fa4864f42122981192c12e4b4b0c7681",
+      "quality_score": 80.0,
+      "quality_tags": "[\"new\", \"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:29Z"
+    },
+    {
+      "chain_id": "bsc",
+      "token_address": "0xe39d1870e902a7c8f10bc511d403360a30928cca",
+      "quality_score": 80.0,
+      "quality_tags": "[\"new\", \"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:25Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "bsjtbwdokgtnzwbt3vqpvepxut4pdx8yevxlrtt6zpep",
+      "quality_score": 79.7,
+      "quality_tags": "[\"new\"]",
+      "scored_at": "2026-10-09T18:21:35Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "2x3kudsxqcwdweza1vsnr9ukkhubqg81m5mbgrappump",
+      "quality_score": 79.0,
+      "quality_tags": "[\"new\", \"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:34Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "cmvdererz8frt65jrjx5cp1cqtrvkzkuh3dzra5fpump",
+      "quality_score": 78.2,
+      "quality_tags": "[\"new\", \"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:34Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "cbytnf7upzvewhh4zp6umogm2rwahhmgrjwljnpwpump",
+      "quality_score": 78.0,
+      "quality_tags": "[\"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:34Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "pumpcmxqmfrsakq5r49wcjnrayyrqmxz6ae8h7h9dfn",
+      "quality_score": 78.0,
+      "quality_tags": "[\"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:35Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "himsszzwkzkrxj4pgvjrdtflaaneaztjjcgk5dxe7lwx",
+      "quality_score": 78.0,
+      "quality_tags": "[\"high_liq\"]",
+      "scored_at": "2026-10-09T18:21:35Z"
+    }
+  ],
+  "low_scores": [
+    {
+      "chain_id": "solana",
+      "token_address": "8lrmcsjaqqggrbqaayefc3x6ubx8sbms91quj1vzpump",
+      "quality_score": 12.9,
+      "quality_tags": "[\"new\", \"low_quality\"]"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "gtj5fqvm5jpsc7wyn9aqcwc5qgxpnveqnwd7yhhrxbmr",
+      "quality_score": 18.0,
+      "quality_tags": "[\"new\", \"low_quality\"]"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "fkyv9v7ahy6cdjzmxdtaybavspgmlcg76pocfjhlpump",
+      "quality_score": 20.4,
+      "quality_tags": "[\"new\", \"low_quality\"]"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "2tnhwbezhep7hdqaxz1ianpu1xtnn7mfkcrczfblpump",
+      "quality_score": 22.6,
+      "quality_tags": "[\"new\", \"low_quality\"]"
+    }
+  ],
+  "history_samples": [
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000011111111111111111111111111111111",
+      "points": 8,
+      "series": [
+        {
+          "t": "2026-10-09T12:00:00Z",
+          "price": 0.02967986814901928,
+          "liq": 20000.0,
+          "vol_h24": 10000.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:05:00Z",
+          "price": 0.028788449658590527,
+          "liq": 20000.0,
+          "vol_h24": 10100.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:10:00Z",
+          "price": 0.02766456039817669,
+          "liq": 20000.0,
+          "vol_h24": 10200.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:15:00Z",
+          "price": 0.029157640977159706,
+          "liq": 20000.0,
+          "vol_h24": 10300.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:20:00Z",
+          "price": 0.030402441337115886,
+          "liq": 20000.0,
+          "vol_h24": 10400.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:25:00Z",
+          "price": 0.032954085182289525,
+          "liq": 20000.0,
+          "vol_h24": 10500.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:30:00Z",
+          "price": 0.030900248452021408,
+          "liq": 20000.0,
+          "vol_h24": 10600.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:35:00Z",
+          "price": 0.03077523019363546,
+          "liq": 20000.0,
+          "vol_h24": 10700.0,
+          "tier": "hot"
+        }
+      ]
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000111111111111111111111111111111111",
+      "points": 8,
+      "series": [
+        {
+          "t": "2026-10-09T12:00:00Z",
+          "price": 0.010399541852516984,
+          "liq": 20000.0,
+          "vol_h24": 10000.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:05:00Z",
+          "price": 0.010589375837754383,
+          "liq": 20000.0,
+          "vol_h24": 10100.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:10:00Z",
+          "price": 0.010170898263726828,
+          "liq": 20000.0,
+          "vol_h24": 10200.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:15:00Z",
+          "price": 0.010439517387217387,
+          "liq": 20000.0,
+          "vol_h24": 10300.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:20:00Z",
+          "price": 0.011148398288257717,
+          "liq": 20000.0,
+          "vol_h24": 10400.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:25:00Z",
+          "price": 0.010303314226603423,
+          "liq": 20000.0,
+          "vol_h24": 10500.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:30:00Z",
+          "price": 0.010995796664715809,
+          "liq": 20000.0,
+          "vol_h24": 10600.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:35:00Z",
+          "price": 0.011509562015379952,
+          "liq": 20000.0,
+          "vol_h24": 10700.0,
+          "tier": "hot"
+        }
+      ]
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000211111111111111111111111111111111",
+      "points": 8,
+      "series": [
+        {
+          "t": "2026-10-09T12:00:00Z",
+          "price": 0.004441157084850193,
+          "liq": 20000.0,
+          "vol_h24": 10000.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:05:00Z",
+          "price": 0.004775334066858067,
+          "liq": 20000.0,
+          "vol_h24": 10100.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:10:00Z",
+          "price": 0.004914227743026038,
+          "liq": 20000.0,
+          "vol_h24": 10200.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:15:00Z",
+          "price": 0.005245747288020981,
+          "liq": 20000.0,
+          "vol_h24": 10300.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:20:00Z",
+          "price": 0.0055221618856756355,
+          "liq": 20000.0,
+          "vol_h24": 10400.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:25:00Z",
+          "price": 0.005614151625485196,
+          "liq": 20000.0,
+          "vol_h24": 10500.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:30:00Z",
+          "price": 0.00617464458362343,
+          "liq": 20000.0,
+          "vol_h24": 10600.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:35:00Z",
+          "price": 0.006101822587860505,
+          "liq": 20000.0,
+          "vol_h24": 10700.0,
+          "tier": "hot"
+        }
+      ]
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000311111111111111111111111111111111",
+      "points": 8,
+      "series": [
+        {
+          "t": "2026-10-09T12:00:00Z",
+          "price": 0.03029570825319876,
+          "liq": 20000.0,
+          "vol_h24": 10000.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:05:00Z",
+          "price": 0.028198095768731224,
+          "liq": 20000.0,
+          "vol_h24": 10100.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:10:00Z",
+          "price": 0.027120126820946562,
+          "liq": 20000.0,
+          "vol_h24": 10200.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:15:00Z",
+          "price": 0.026373664957717282,
+          "liq": 20000.0,
+          "vol_h24": 10300.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:20:00Z",
+          "price": 0.024698154608700684,
+          "liq": 20000.0,
+          "vol_h24": 10400.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:25:00Z",
+          "price": 0.023774911551411326,
+          "liq": 20000.0,
+          "vol_h24": 10500.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:30:00Z",
+          "price": 0.02234966082844197,
+          "liq": 20000.0,
+          "vol_h24": 10600.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:35:00Z",
+          "price": 0.02168989305130393,
+          "liq": 20000.0,
+          "vol_h24": 10700.0,
+          "tier": "hot"
+        }
+      ]
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000411111111111111111111111111111111",
+      "points": 8,
+      "series": [
+        {
+          "t": "2026-10-09T12:00:00Z",
+          "price": 0.014665640555209058,
+          "liq": 20000.0,
+          "vol_h24": 10000.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:05:00Z",
+          "price": 0.015213052097330898,
+          "liq": 20000.0,
+          "vol_h24": 10100.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:10:00Z",
+          "price": 0.01567077215285752,
+          "liq": 20000.0,
+          "vol_h24": 10200.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:15:00Z",
+          "price": 0.01491850349345762,
+          "liq": 20000.0,
+          "vol_h24": 10300.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:20:00Z",
+          "price": 0.015702895330843424,
+          "liq": 20000.0,
+          "vol_h24": 10400.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:25:00Z",
+          "price": 0.014928282382229097,
+          "liq": 20000.0,
+          "vol_h24": 10500.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:30:00Z",
+          "price": 0.0147546684784637,
+          "liq": 20000.0,
+          "vol_h24": 10600.0,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T12:35:00Z",
+          "price": 0.016275708868871253,
+          "liq": 20000.0,
+          "vol_h24": 10700.0,
+          "tier": "hot"
+        }
+      ]
+    }
+  ],
+  "recent_alerts": [
+    {
+      "id": 152,
+      "created_at": "2026-10-09T18:21:40Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "ripsrnkeflpkf7e8plycbxwcxddgtnbdqgqkkedcvng",
+      "pair_address": "arzhzeu1etsaart1ix9t5zxnwyqmrhayrvguqxumhcjh",
+      "severity": "medium",
+      "message": "priceUsd changed +24.9% (1.73 → 2.16) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 1.73,
+        "new_priceUsd": 2.16,
+        "change_pct": 24.8555,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 151,
+      "created_at": "2026-10-09T18:21:40Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "8k4sbteek4pf26nokqapv8nbtnusjcbdwpkyknk5pbaa",
+      "pair_address": "2i2iulr7uwk1sdrb17t5futimnfql7fyy7rh69brzihc",
+      "severity": "medium",
+      "message": "priceUsd changed -35.1% (0.001139 → 0.0007388) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 0.001139,
+        "new_priceUsd": 0.0007388,
+        "change_pct": -35.1361,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 150,
+      "created_at": "2026-10-09T18:21:39Z",
+      "type": "liquidity_drop",
+      "chain_id": "solana",
+      "token_address": "fth6xgiyf8gxlgkszgtvxnsbd5lfzdli5u2ddbtpump",
+      "pair_address": "ckfscxbwhnq9rvcseruffmmwtbguw4tkzxvv3gaqgsb3",
+      "severity": "high",
+      "message": "liquidity.usd dropped 31.5% (4267.2 → 2924.22) threshold=30.0%",
+      "delivered": 1,
+      "payload": {
+        "old_liquidity_usd": 4267.2,
+        "new_liquidity_usd": 2924.22,
+        "drop_pct": 31.4722,
+        "threshold_pct": 30.0
+      }
+    },
+    {
+      "id": 149,
+      "created_at": "2026-10-09T18:21:39Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "fth6xgiyf8gxlgkszgtvxnsbd5lfzdli5u2ddbtpump",
+      "pair_address": "ckfscxbwhnq9rvcseruffmmwtbguw4tkzxvv3gaqgsb3",
+      "severity": "medium",
+      "message": "priceUsd changed -38.7% (4.9e-06 → 3.005e-06) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 4.9e-06,
+        "new_priceUsd": 3.005e-06,
+        "change_pct": -38.6735,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 148,
+      "created_at": "2026-10-09T18:21:38Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "ad4pzrfztln5tbslpbf5yatnucfb76bcg4snhmgpump",
+      "pair_address": "5igh33z6dcgpdrd7gtjrdruuqw3dke86nrntftqdpbnr",
+      "severity": "medium",
+      "message": "priceUsd changed -28.6% (3.399e-06 → 2.426e-06) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 3.399e-06,
+        "new_priceUsd": 2.426e-06,
+        "change_pct": -28.6261,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 147,
+      "created_at": "2026-10-09T18:21:37Z",
+      "type": "liquidity_drop",
+      "chain_id": "solana",
+      "token_address": "avfhan2ec5doyape5wrkefhdtqqwpjqvafeeoattpump",
+      "pair_address": "3cioz3rxweur56hsf8gbvibx7gxvuragvqgj7n5mrdtq",
+      "severity": "high",
+      "message": "liquidity.usd dropped 94.9% (44107.05 → 2245.21) threshold=30.0%",
+      "delivered": 1,
+      "payload": {
+        "old_liquidity_usd": 44107.05,
+        "new_liquidity_usd": 2245.21,
+        "drop_pct": 94.9096,
+        "threshold_pct": 30.0
+      }
+    },
+    {
+      "id": 146,
+      "created_at": "2026-10-09T18:21:37Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "avfhan2ec5doyape5wrkefhdtqqwpjqvafeeoattpump",
+      "pair_address": "3cioz3rxweur56hsf8gbvibx7gxvuragvqgj7n5mrdtq",
+      "severity": "high",
+      "message": "priceUsd changed -99.2% (0.0002618 → 2.146e-06) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 0.0002618,
+        "new_priceUsd": 2.146e-06,
+        "change_pct": -99.1803,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 145,
+      "created_at": "2026-10-09T18:21:36Z",
+      "type": "liquidity_drop",
+      "chain_id": "solana",
+      "token_address": "93ek2mwh69ucsug9bcuqhjpbkuozrtfw6ezkfxsjfnxs",
+      "pair_address": "8icrgx8gshbnr6i45thhxfbcwdqtpespl3rso59bzkwj",
+      "severity": "high",
+      "message": "liquidity.usd dropped 58.0% (59676.9 → 25083.13) threshold=30.0%",
+      "delivered": 1,
+      "payload": {
+        "old_liquidity_usd": 59676.9,
+        "new_liquidity_usd": 25083.13,
+        "drop_pct": 57.9684,
+        "threshold_pct": 30.0
+      }
+    },
+    {
+      "id": 144,
+      "created_at": "2026-10-09T18:21:36Z",
+      "type": "volume_h24_jump",
+      "chain_id": "solana",
+      "token_address": "93ek2mwh69ucsug9bcuqhjpbkuozrtfw6ezkfxsjfnxs",
+      "pair_address": "8icrgx8gshbnr6i45thhxfbcwdqtpespl3rso59bzkwj",
+      "severity": "medium",
+      "message": "volume.h24 changed +193.6% (21208.89 → 62268.4) threshold=50.0%",
+      "delivered": 1,
+      "payload": {
+        "old_volume_h24": 21208.89,
+        "new_volume_h24": 62268.4,
+        "change_pct": 193.5958,
+        "threshold_pct": 50.0
+      }
+    },
+    {
+      "id": 143,
+      "created_at": "2026-10-09T18:21:35Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "93ek2mwh69ucsug9bcuqhjpbkuozrtfw6ezkfxsjfnxs",
+      "pair_address": "8icrgx8gshbnr6i45thhxfbcwdqtpespl3rso59bzkwj",
+      "severity": "high",
+      "message": "priceUsd changed -80.8% (0.0004907 → 9.407e-05) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 0.0004907,
+        "new_priceUsd": 9.407e-05,
+        "change_pct": -80.8294,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 142,
+      "created_at": "2026-10-09T18:21:35Z",
+      "type": "volume_h24_jump",
+      "chain_id": "solana",
+      "token_address": "7mxkjehyzuhhwptuiup7vud61hkt5fo91ruprh5xpump",
+      "pair_address": "9suqhhfdbltrujejatecfdyp1cwa8qt3x7b3qzt7oz82",
+      "severity": "medium",
+      "message": "volume.h24 changed +138.5% (5111.64 → 12189.94) threshold=50.0%",
+      "delivered": 1,
+      "payload": {
+        "old_volume_h24": 5111.64,
+        "new_volume_h24": 12189.94,
+        "change_pct": 138.4741,
+        "threshold_pct": 50.0
+      }
+    },
+    {
+      "id": 141,
+      "created_at": "2026-10-09T18:21:34Z",
+      "type": "liquidity_drop",
+      "chain_id": "solana",
+      "token_address": "rtmj3z4za85jw2zf8xelydnxxmmtyyaunmqe6cxwbox",
+      "pair_address": "2nzoemxdnrfteufjjbgwp6dyn5tzsgqz97zhjjox6svp",
+      "severity": "high",
+      "message": "liquidity.usd dropped 33.1% (4619.63 → 3091.75) threshold=30.0%",
+      "delivered": 1,
+      "payload": {
+        "old_liquidity_usd": 4619.63,
+        "new_liquidity_usd": 3091.75,
+        "drop_pct": 33.0736,
+        "threshold_pct": 30.0
+      }
+    },
+    {
+      "id": 140,
+      "created_at": "2026-10-09T18:21:34Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "rtmj3z4za85jw2zf8xelydnxxmmtyyaunmqe6cxwbox",
+      "pair_address": "2nzoemxdnrfteufjjbgwp6dyn5tzsgqz97zhjjox6svp",
+      "severity": "high",
+      "message": "priceUsd changed -41.2% (5.452e-06 → 3.208e-06) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 5.452e-06,
+        "new_priceUsd": 3.208e-06,
+        "change_pct": -41.1592,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 139,
+      "created_at": "2026-10-09T18:21:33Z",
+      "type": "volume_h24_jump",
+      "chain_id": "solana",
+      "token_address": "8yarfvzlwwhjy9xlraggmeizza2tnrqaxnfljtxipump",
+      "pair_address": "4thr6kuyosthwh67pnvuauzdjsflbrmj7wg9ubkrvcu5",
+      "severity": "medium",
+      "message": "volume.h24 changed +124.4% (6525.08 → 14643.14) threshold=50.0%",
+      "delivered": 1,
+      "payload": {
+        "old_volume_h24": 6525.08,
+        "new_volume_h24": 14643.14,
+        "change_pct": 124.4132,
+        "threshold_pct": 50.0
+      }
+    },
+    {
+      "id": 138,
+      "created_at": "2026-10-09T18:21:33Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "8yarfvzlwwhjy9xlraggmeizza2tnrqaxnfljtxipump",
+      "pair_address": "4thr6kuyosthwh67pnvuauzdjsflbrmj7wg9ubkrvcu5",
+      "severity": "high",
+      "message": "priceUsd changed -85.6% (2.142e-05 → 3.085e-06) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 2.142e-05,
+        "new_priceUsd": 3.085e-06,
+        "change_pct": -85.5976,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 137,
+      "created_at": "2026-10-09T18:21:32Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "2aybf8vdwtfva6fqqfkqfrsa17slpmng6zods2qzpump",
+      "pair_address": "59pjknmhyrjiagfy8huawfyxmd4j215tygpurjhr3gz9",
+      "severity": "medium",
+      "message": "priceUsd changed +22.1% (0.0004272 → 0.0005215) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 0.0004272,
+        "new_priceUsd": 0.0005215,
+        "change_pct": 22.074,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 136,
+      "created_at": "2026-10-09T18:21:32Z",
+      "type": "liquidity_drop",
+      "chain_id": "solana",
+      "token_address": "gryr9hcjmtpw1vcbzeoyqfw49vbtxj5pdiqdaesspump",
+      "pair_address": "hn6tvmjft5aszr4bs59usc143pghy3o61rfxwq84qq2k",
+      "severity": "high",
+      "message": "liquidity.usd dropped 97.0% (64664.29 → 1949.8) threshold=30.0%",
+      "delivered": 1,
+      "payload": {
+        "old_liquidity_usd": 64664.29,
+        "new_liquidity_usd": 1949.8,
+        "drop_pct": 96.9847,
+        "threshold_pct": 30.0
+      }
+    },
+    {
+      "id": 135,
+      "created_at": "2026-10-09T18:21:31Z",
+      "type": "volume_h24_jump",
+      "chain_id": "solana",
+      "token_address": "gryr9hcjmtpw1vcbzeoyqfw49vbtxj5pdiqdaesspump",
+      "pair_address": "hn6tvmjft5aszr4bs59usc143pghy3o61rfxwq84qq2k",
+      "severity": "medium",
+      "message": "volume.h24 changed +146.9% (22525.65 → 55616.42) threshold=50.0%",
+      "delivered": 1,
+      "payload": {
+        "old_volume_h24": 22525.65,
+        "new_volume_h24": 55616.42,
+        "change_pct": 146.9026,
+        "threshold_pct": 50.0
+      }
+    },
+    {
+      "id": 134,
+      "created_at": "2026-10-09T18:21:30Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "gryr9hcjmtpw1vcbzeoyqfw49vbtxj5pdiqdaesspump",
+      "pair_address": "hn6tvmjft5aszr4bs59usc143pghy3o61rfxwq84qq2k",
+      "severity": "high",
+      "message": "priceUsd changed -99.7% (0.0005733 → 1.936e-06) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 0.0005733,
+        "new_priceUsd": 1.936e-06,
+        "change_pct": -99.6623,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 133,
+      "created_at": "2026-10-09T18:21:30Z",
+      "type": "liquidity_drop",
+      "chain_id": "solana",
+      "token_address": "gf4bkif2ucsjjyt1ag8zqgdvhcszt8syuk3wqvakpump",
+      "pair_address": "9pnb8d2vkqvkeefepq9fyt9zpwinjymqfjuxp2pn63v3",
+      "severity": "high",
+      "message": "liquidity.usd dropped 73.4% (7427.9 → 1979.21) threshold=30.0%",
+      "delivered": 1,
+      "payload": {
+        "old_liquidity_usd": 7427.9,
+        "new_liquidity_usd": 1979.21,
+        "drop_pct": 73.3544,
+        "threshold_pct": 30.0
+      }
+    },
+    {
+      "id": 132,
+      "created_at": "2026-10-09T18:21:29Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "gf4bkif2ucsjjyt1ag8zqgdvhcszt8syuk3wqvakpump",
+      "pair_address": "9pnb8d2vkqvkeefepq9fyt9zpwinjymqfjuxp2pn63v3",
+      "severity": "high",
+      "message": "priceUsd changed -82.5% (1.119e-05 → 1.953e-06) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 1.119e-05,
+        "new_priceUsd": 1.953e-06,
+        "change_pct": -82.5469,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 131,
+      "created_at": "2026-10-09T18:21:28Z",
+      "type": "volume_h24_jump",
+      "chain_id": "robinhood",
+      "token_address": "0x413b3965fa4864f42122981192c12e4b4b0c7681",
+      "pair_address": "0xd1f60c657c2283a9cdda64441635d73909b399eb9445f34d3ba09257878c4ce9",
+      "severity": "medium",
+      "message": "volume.h24 changed +271.2% (770555.44 → 2859946.38) threshold=50.0%",
+      "delivered": 1,
+      "payload": {
+        "old_volume_h24": 770555.44,
+        "new_volume_h24": 2859946.38,
+        "change_pct": 271.1539,
+        "threshold_pct": 50.0
+      }
+    },
+    {
+      "id": 130,
+      "created_at": "2026-10-09T18:21:28Z",
+      "type": "price_change",
+      "chain_id": "robinhood",
+      "token_address": "0x413b3965fa4864f42122981192c12e4b4b0c7681",
+      "pair_address": "0xd1f60c657c2283a9cdda64441635d73909b399eb9445f34d3ba09257878c4ce9",
+      "severity": "high",
+      "message": "priceUsd changed +77.0% (8.053e-06 → 1.425e-05) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 8.053e-06,
+        "new_priceUsd": 1.425e-05,
+        "change_pct": 76.9527,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 129,
+      "created_at": "2026-10-09T18:21:27Z",
+      "type": "price_change",
+      "chain_id": "robinhood",
+      "token_address": "0x22ff1467c43b4d7a91401633b42b85a4cb03db9c",
+      "pair_address": "0x7c178a3f55e8a586203d7be976a348890767036a15cddaa46cfaf8d4a73e2afc",
+      "severity": "medium",
+      "message": "priceUsd changed -29.0% (0.0001008 → 7.156e-05) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 0.0001008,
+        "new_priceUsd": 7.156e-05,
+        "change_pct": -29.0079,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 128,
+      "created_at": "2026-10-09T18:21:27Z",
+      "type": "liquidity_drop",
+      "chain_id": "robinhood",
+      "token_address": "0x73482d5ca24fddfd5f194c20b766efc2fcc089a7",
+      "pair_address": "0x61a7574857d74a1a6a4ac51a846e69a2738eb265",
+      "severity": "high",
+      "message": "liquidity.usd dropped 100.0% (49349.34 → 20.81) threshold=30.0%",
+      "delivered": 1,
+      "payload": {
+        "old_liquidity_usd": 49349.34,
+        "new_liquidity_usd": 20.81,
+        "drop_pct": 99.9578,
+        "threshold_pct": 30.0
+      }
+    }
+  ]
+}

@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DexScreener Crawler — Admin</title>
+  <style>
+    :root { --bg:#0f1419; --card:#1a2332; --fg:#e7ecf3; --muted:#8b9bb4; --acc:#3d8bfd; --ok:#3dd68c; --bad:#f07178; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:14px/1.45 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+    header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between;
+      padding:16px 20px; border-bottom:1px solid #243044; background:#121a24; position:sticky; top:0; }
+    h1 { font-size:18px; margin:0; font-weight:600; }
+    .btn { background:var(--acc); color:#fff; border:0; border-radius:8px; padding:8px 14px; cursor:pointer; font-weight:600; }
+    .btn.secondary { background:#2a3648; }
+    .wrap { max-width:1200px; margin:0 auto; padding:20px; display:grid; gap:16px; }
+    .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); }
+    .card { background:var(--card); border-radius:12px; padding:14px 16px; border:1px solid #243044; }
+    .card h2 { margin:0 0 10px; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+    .stat { font-size:22px; font-weight:700; }
+    .muted { color:var(--muted); }
+    .ok { color:var(--ok); } .bad { color:var(--bad); }
+    table { width:100%; border-collapse:collapse; font-size:12px; }
+    th,td { text-align:left; padding:6px 8px; border-bottom:1px solid #243044; vertical-align:top; }
+    th { color:var(--muted); font-weight:600; }
+    code { font-size:11px; }
+    .err { background:#3a1d22; color:#ffb4b4; padding:12px; border-radius:8px; }
+    .row2 { display:grid; gap:16px; grid-template-columns:1fr; }
+    @media(min-width:900px){ .row2 { grid-template-columns:1fr 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>DexScreener Crawler <span class="muted">P2 admin</span></h1>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span id="authState" class="muted">API key: not set</span>
+      <button class="btn secondary" id="btnKey" type="button">Set API key</button>
+      <button class="btn" id="btnRefresh" type="button">Refresh</button>
+    </div>
+  </header>
+  <div class="wrap">
+    <div id="error" class="err" style="display:none"></div>
+    <div class="grid" id="stats"></div>
+    <div class="card">
+      <h2>Status / heartbeat</h2>
+      <div id="health" class="muted">Loading…</div>
+    </div>
+    <div class="row2">
+      <div class="card">
+        <h2>Top volume (h24)</h2>
+        <div id="topVol" class="muted">—</div>
+      </div>
+      <div class="card">
+        <h2>Top gainers (h24 %)</h2>
+        <div id="topGain" class="muted">—</div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Indicators Top <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">GET /indicators/top</span></h2>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px">
+        <label class="muted">sort
+          <select id="topSort" style="margin-left:4px;background:#121a24;color:var(--fg);border:1px solid #243044;border-radius:6px;padding:4px 8px">
+            <option value="jev_strength">jev_strength</option>
+            <option value="change_5m">change_5m</option>
+            <option value="volume_strength">volume_strength</option>
+          </select>
+        </label>
+        <label class="muted">chain
+          <input id="topChain" value="solana" size="10"
+            style="margin-left:4px;background:#121a24;color:var(--fg);border:1px solid #243044;border-radius:6px;padding:4px 8px" />
+        </label>
+        <label class="muted">limit
+          <input id="topLimit" type="number" min="1" max="100" value="20"
+            style="margin-left:4px;width:64px;background:#121a24;color:var(--fg);border:1px solid #243044;border-radius:6px;padding:4px 8px" />
+        </label>
+        <button class="btn secondary" id="btnTop" type="button">Load Top</button>
+      </div>
+      <div id="indTop" class="muted">—</div>
+    </div>
+    <div class="card">
+      <h2>Recent alerts</h2>
+      <div id="alerts" class="muted">—</div>
+    </div>
+  </div>
+  <script>
+    const KEY_STORE = "dex_crawler_api_key";
+
+    function getKey() {
+      return sessionStorage.getItem(KEY_STORE) || "";
+    }
+    function setKey(k) {
+      if (k) sessionStorage.setItem(KEY_STORE, k);
+      else sessionStorage.removeItem(KEY_STORE);
+      document.getElementById("authState").textContent = k ? "API key: set (session)" : "API key: not set";
+    }
+    async function api(path) {
+      const headers = {};
+      const k = getKey();
+      if (k) headers["X-API-Key"] = k;
+      const res = await fetch(path, { headers });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(res.status + " " + t.slice(0, 200));
+      }
+      return res.json();
+    }
+    function esc(s) {
+      return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+    }
+    function pairTable(items) {
+      if (!items || !items.length) return "<p class='muted'>No data</p>";
+      let h = "<table><tr><th>Chain</th><th>Symbol</th><th>Pair</th><th>Metric</th></tr>";
+      for (const it of items) {
+        const metric = it.volume_h24 != null && it.price_change_h24 != null
+          ? (arguments[1] === "gainer"
+              ? (Number(it.price_change_h24).toFixed(1) + "%")
+              : Number(it.volume_h24).toLocaleString())
+          : (arguments[1] === "gainer"
+              ? (Number(it.price_change_h24||0).toFixed(1) + "%")
+              : Number(it.volume_h24||0).toLocaleString());
+        h += `<tr><td>${esc(it.chain_id)}</td><td>${esc(it.symbol||"—")}</td>`
+          + `<td><code>${esc((it.pair_address||"").slice(0,10))}…</code></td>`
+          + `<td>${esc(metric)}</td></tr>`;
+      }
+      return h + "</table>";
+    }
+    function renderVol(items) {
+      if (!items||!items.length) return "<p class='muted'>No data</p>";
+      let h = "<table><tr><th>Chain</th><th>Symbol</th><th>Pair</th><th>Vol h24</th></tr>";
+      for (const it of items) {
+        h += `<tr><td>${esc(it.chain_id)}</td><td>${esc(it.symbol||"—")}</td>`
+          + `<td><code>${esc((it.pair_address||"").slice(0,10))}…</code></td>`
+          + `<td>${Number(it.volume_h24||0).toLocaleString()}</td></tr>`;
+      }
+      return h + "</table>";
+    }
+    function renderGain(items) {
+      if (!items||!items.length) return "<p class='muted'>No data</p>";
+      let h = "<table><tr><th>Chain</th><th>Symbol</th><th>Pair</th><th>Δ h24</th></tr>";
+      for (const it of items) {
+        h += `<tr><td>${esc(it.chain_id)}</td><td>${esc(it.symbol||"—")}</td>`
+          + `<td><code>${esc((it.pair_address||"").slice(0,10))}…</code></td>`
+          + `<td>${Number(it.price_change_h24||0).toFixed(1)}%</td></tr>`;
+      }
+      return h + "</table>";
+    }
+    function renderAlerts(items) {
+      if (!items||!items.length) return "<p class='muted'>No alerts</p>";
+      let h = "<table><tr><th>When</th><th>Type</th><th>Sev</th><th>Token</th><th>Message</th></tr>";
+      for (const a of items) {
+        h += `<tr><td>${esc((a.created_at||"").replace("T"," ").slice(0,19))}</td>`
+          + `<td>${esc(a.type)}</td><td>${esc(a.severity)}</td>`
+          + `<td><code>${esc((a.token_address||"").slice(0,10))}</code></td>`
+          + `<td>${esc((a.message||"").slice(0,80))}</td></tr>`;
+      }
+      return h + "</table>";
+    }
+    function fmtNum(v, digits) {
+      if (v == null || v === "") return "—";
+      const n = Number(v);
+      if (!Number.isFinite(n)) return esc(v);
+      return n.toFixed(digits);
+    }
+    function renderIndTop(payload) {
+      const items = (payload && payload.items) || [];
+      if (!items.length) return "<p class='muted'>No indicator rows</p>";
+      let h = "<table><tr><th>#</th><th>Chain</th><th>Token</th><th>Δ5m</th><th>Vol str</th><th>JEV str</th><th>JEV sig</th><th>Updated</th></tr>";
+      items.forEach((it, i) => {
+        const t = it.technical || {};
+        const f = it.funding || {};
+        h += `<tr><td>${i + 1}</td>`
+          + `<td>${esc(it.chain_id)}</td>`
+          + `<td><code>${esc((it.token_address||"").slice(0,10))}…</code></td>`
+          + `<td>${fmtNum(t.change_5m, 2)}</td>`
+          + `<td>${fmtNum(t.volume_strength, 3)}</td>`
+          + `<td>${fmtNum(f.jev_strength, 4)}</td>`
+          + `<td>${esc(f.jev_signal || "—")}</td>`
+          + `<td>${esc((it.updated_at||"").replace("T"," ").slice(0,19))}</td></tr>`;
+      });
+      return h + "</table>"
+        + `<p class="muted" style="margin:8px 0 0">count=${esc(payload.count)} sort=${esc(payload.sort)} chain=${esc(payload.chain)} limit=${esc(payload.limit)}</p>`;
+    }
+    async function loadIndTop() {
+      const err = document.getElementById("error");
+      const sort = document.getElementById("topSort").value;
+      const chain = (document.getElementById("topChain").value || "").trim();
+      let limit = parseInt(document.getElementById("topLimit").value, 10);
+      if (!Number.isFinite(limit) || limit < 1) limit = 20;
+      if (limit > 100) limit = 100;
+      const q = new URLSearchParams({ sort, limit: String(limit) });
+      if (chain) q.set("chain", chain);
+      try {
+        const d = await api("/indicators/top?" + q.toString());
+        document.getElementById("indTop").innerHTML = renderIndTop(d);
+      } catch (e) {
+        err.style.display = "block";
+        err.textContent = String(e.message || e);
+        document.getElementById("indTop").innerHTML = "<p class='muted'>Failed to load Top</p>";
+      }
+    }
+    async function refresh() {
+      const err = document.getElementById("error");
+      err.style.display = "none";
+      try {
+        const d = await api("/dashboard/summary");
+        const s = d.stats || {};
+        document.getElementById("stats").innerHTML = [
+          ["Tokens", s.tokens],
+          ["Pairs", s.pairs],
+          ["Alerts today", s.alerts_today],
+          ["Alerts total", s.alerts_total],
+          ["Pending enrich", s.pending_enrich],
+          ["History rows", s.pair_history_rows],
+          ["Cycle #", s.cycle_number],
+        ].map(([k,v]) => `<div class="card"><h2>${esc(k)}</h2><div class="stat">${esc(v)}</div></div>`).join("");
+
+        const hb = d.heartbeat || {};
+        const cls = d.health_ok ? "ok" : "bad";
+        document.getElementById("health").innerHTML =
+          `<div class="${cls}"><strong>${d.health_ok ? "OK" : "STALE/FAIL"}</strong> — ${esc(d.health_message)}</div>`
+          + `<div class="muted" style="margin-top:8px">status=${esc(hb.status)} pid=${esc(hb.pid)} `
+          + `cycle=${esc(hb.cycle_id)} ts=${esc(hb.timestamp)}</div>`
+          + `<div class="muted">chains: ${esc((d.enabled_chains||[]).join(", "))} · last_success=${esc(s.last_success_at)}</div>`;
+
+        document.getElementById("topVol").innerHTML = renderVol(d.top_volume);
+        document.getElementById("topGain").innerHTML = renderGain(d.top_gainers);
+        document.getElementById("alerts").innerHTML = renderAlerts(d.recent_alerts);
+      } catch (e) {
+        err.style.display = "block";
+        err.textContent = String(e.message || e);
+      }
+    }
+    document.getElementById("btnKey").onclick = () => {
+      const cur = getKey();
+      const v = prompt("Enter X-API-Key (stored in sessionStorage only; not in URL)", cur || "");
+      if (v === null) return;
+      setKey(v.trim());
+      refresh();
+    };
+    document.getElementById("btnRefresh").onclick = () => { refresh(); loadIndTop(); };
+    document.getElementById("btnTop").onclick = () => loadIndTop();
+    document.getElementById("topSort").onchange = () => loadIndTop();
+    setKey(getKey());
+    refresh();
+    loadIndTop();
+    setInterval(() => { refresh(); loadIndTop(); }, 30000);
+  </script>
+</body>
+</html>

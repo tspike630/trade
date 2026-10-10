@@ -1,0 +1,14 @@
+{
+  "description": "Sample mints that a logsSubscribe pipeline might emit",
+  "tokens": [
+    {
+      "chainId": "solana",
+      "tokenAddress": "So1anaStubMint1111111111111111111111111111112",
+      "description": "fixture mint A from solana_stub"
+    },
+    {
+      "mint": "So1anaStubMint2222222222222222222222222222223",
+      "description": "fixture mint B"
+    }
+  ]
+}

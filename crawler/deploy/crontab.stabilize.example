@@ -1,0 +1,18 @@
+# Local stabilize host crontab example (paths relative to repo checkout)
+SHELL=/bin/bash
+PATH=/usr/bin:/bin
+
+# From repo root, adjust CD
+# CD=/workspace/dexscreener-crawler
+
+# SQLite backup every 6h, retain 7
+# 10 */6 * * * cd $CD && .venv/bin/python backup.py --retain 7 >> logs/backup.cron.log 2>&1
+
+# Paper tick hourly (virtual only)
+# 20 * * * * cd $CD && .venv/bin/python paper_trade.py tick >> logs/paper_tick.cron.log 2>&1
+
+# Daily QA
+# 30 9 * * * cd $CD && .venv/bin/python daily_check.py >> logs/daily_check.cron.log 2>&1
+
+# Grok hourly incremental report (no telegram unless GROK_REPORT_TELEGRAM=1)
+# 5 * * * * cd $CD && .venv/bin/python scripts/grok_report.py --mode hourly --incremental >> logs/grok_report.cron.log 2>&1

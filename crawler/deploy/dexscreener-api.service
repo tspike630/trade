@@ -1,0 +1,24 @@
+[Unit]
+Description=DexScreener crawler read API (uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dexscreener
+Group=dexscreener
+WorkingDirectory=/opt/dexscreener-crawler
+EnvironmentFile=-/etc/dexscreener-crawler.env
+# Require API_SECRET in the env file for production
+ExecStart=/opt/dexscreener-crawler/.venv/bin/python -m api_server
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dexscreener-api
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

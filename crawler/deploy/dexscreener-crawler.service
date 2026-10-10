@@ -1,0 +1,26 @@
+[Unit]
+Description=DexScreener crawler (--loop)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dexscreener
+Group=dexscreener
+WorkingDirectory=/opt/dexscreener-crawler
+EnvironmentFile=-/etc/dexscreener-crawler.env
+# Prefer venv python
+ExecStart=/opt/dexscreener-crawler/.venv/bin/python main.py --loop --interval 60
+Restart=always
+RestartSec=5
+# File logs still written under logs/; also capture stdout/stderr in journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dexscreener-crawler
+
+# Hardening (optional; adjust if binds fail)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+{
+  "code": 1,
+  "message": "OK",
+  "result": {
+    "0xDemoToken000000000000000000000000000001": {
+      "is_honeypot": "0",
+      "buy_tax": "0.05",
+      "sell_tax": "0.12",
+      "owner_change_balance": "0",
+      "is_open_source": "1",
+      "holder_count": "1200",
+      "is_proxy": "0",
+      "can_take_back_ownership": "0"
+    }
+  }
+}

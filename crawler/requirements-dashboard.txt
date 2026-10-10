@@ -1,0 +1,4 @@
+# Read-only trading dashboard (NiceGUI).
+# Install from the project root:
+#   pip install -r requirements-dashboard.txt
+nicegui==2.24.2

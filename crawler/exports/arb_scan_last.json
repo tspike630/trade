@@ -1,0 +1,240 @@
+[
+  {
+    "key": "PAWS",
+    "spread_pct": 2908115.8817,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "gchrw8i173jaiyexwzhcc31dy51wunejm147obcuvdkg",
+      "price": 8.727e-07,
+      "liq_usd": 132527.45
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "8wkans6ik66a7yqzdgcw6badroqmsfgje9kg1yurz2fq",
+      "price": 0.02538,
+      "liq_usd": 440301.29
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "USDF",
+    "spread_pct": 238389.426,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "fguuyhr2rwmmcainpn9nvqw7zdahfhjmgohgirkwoeri",
+      "price": 0.0001655,
+      "liq_usd": 25482.05
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "bjfxsqftjj2h2ef5ljibphqh47jhply54y1qumngswz",
+      "price": 0.3947,
+      "liq_usd": 1742040.26
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "D\u200aO\u200aT\u200aF",
+    "spread_pct": 14447.2062,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "hvrp5zs9rxz7m93s3v41d8daqxhqtoteyjgxohpwtr2z",
+      "price": 0.01038,
+      "liq_usd": 282192.74
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "ck4bkweskjihfsn2fhpi1tvyqjwsduyuo3wmb9ua1opb",
+      "price": 1.51,
+      "liq_usd": 3411455.45
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "QI",
+    "spread_pct": 3880.3886,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "j2q1xdp1f3h6qktr2jz2twimqr3ws1qvle5nfde4oges",
+      "price": 5.507e-05,
+      "liq_usd": 50417.58
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "cb4gfrgeitfu5qtxfrmiqzsavpwgbd3heor4cs2jfpn",
+      "price": 0.002192,
+      "liq_usd": 148555.81
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "SARP",
+    "spread_pct": 1797.3794,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "buuxqogwmx8r7cgsjvuxn1ztfsfdmpwy2kmrzgisu7aa",
+      "price": 0.04083,
+      "liq_usd": 558793.48
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "8ttvynfyjtup8rng44vwst4uxjqfotam656cg9zzxthg",
+      "price": 0.7747,
+      "liq_usd": 2443113.25
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "PUMP",
+    "spread_pct": 1494.1724,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "hhmeckzs7vka1teo4jj2yvan9xul1blnpf8tdbztpzks",
+      "price": 0.0003329,
+      "liq_usd": 48689.35
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "bofa2viusudpbtums2krug6ahnemawjnfwqtjdgx5bkw",
+      "price": 0.005307,
+      "liq_usd": 2136449.34
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "SYNTHS",
+    "spread_pct": 1392.0803,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "c7hbflqyvbrdn8cggxkqqt7kwnbtpkbbql7a5xsatns3",
+      "price": 1.894e-05,
+      "liq_usd": 28392.76
+    },
+    "sell_venue": {
+      "chain_id": "robinhood",
+      "pair_address": "0xeac7a9ef9babd0ca9a579d30fe194c31dfbdca970e0531977308cc2429768b0e",
+      "price": 0.0002826,
+      "liq_usd": 49083.84
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "GOON",
+    "spread_pct": 607.292,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "hkb11z7tu3myggd89uewgriuwbknrdjtlqblkbtzj9g4",
+      "price": 2.921e-05,
+      "liq_usd": 33548.29
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "4gt6lfrujsvdhs7s6g1q7ik4dfh1npftkzrbujtmrhor",
+      "price": 0.0002066,
+      "liq_usd": 40243.06
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "DOTF",
+    "spread_pct": 313.1134,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "5iyzszd81uda1nb5fm9hyfuuhnxshpfyamtshwccdhtb",
+      "price": 0.007458,
+      "liq_usd": 240385.38
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "5gacckldzuagnuckgwjsat1wgnucuwthcyy8cc47lftv",
+      "price": 0.03081,
+      "liq_usd": 490196.67
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "TP",
+    "spread_pct": 138.4109,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "exfwwzy6rrwyja6cvjqvxq5hk2s7t9atfhnxcttc1eqz",
+      "price": 2.58e-05,
+      "liq_usd": 31792.53
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "9pygtjbvhkexgfkobj1qgfcqf1u7mnmr8dr1x67h9gug",
+      "price": 6.151e-05,
+      "liq_usd": 20693.15
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "SI",
+    "spread_pct": 53.4683,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "g3dgab2wmpi4mtnq8hbunpsm7wajcgcgzfuocqhgjwhw",
+      "price": 2.667e-05,
+      "liq_usd": 42192.02
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "3suplvqtnlnj4nyfmxojrduo81uq1tzs7yh1ht1fikv5",
+      "price": 4.093e-05,
+      "liq_usd": 18536.22
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "QC",
+    "spread_pct": 18.2195,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "gyxv9qx23wpopw3hggzgsw7pqvxep76tfa7v2tceuomv",
+      "price": 1.449e-05,
+      "liq_usd": 8683.91
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "4a9iugmmoe6f4hwkskju43amegyuzchac6kqnirubamj",
+      "price": 1.713e-05,
+      "liq_usd": 32476.7
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "WSOS",
+    "spread_pct": 9.7228,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "hv11wjyjsxfzvgsqdtgbc8fbzjzrydnwhfnvwuuhidmu",
+      "price": 0.2345,
+      "liq_usd": 1342100.27
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "hau9qhscz8rm1atxtutjzhahjuzqd4egvkz1y8hx1nny",
+      "price": 0.2573,
+      "liq_usd": 1406171.31
+    },
+    "note": "signal_only_not_executable_arb"
+  },
+  {
+    "key": "SPEED",
+    "spread_pct": 2.7404,
+    "buy_venue": {
+      "chain_id": "solana",
+      "pair_address": "9nv94ecqcdyesxagcwtspzpra1uqwk6mzaw4yzfjhvcy",
+      "price": 0.0006386,
+      "liq_usd": 68206.01
+    },
+    "sell_venue": {
+      "chain_id": "solana",
+      "pair_address": "cn8evyt4q7l3sdstaffgmxee9373v5n4fzcaqp2buum6",
+      "price": 0.0006561,
+      "liq_usd": 69160.13
+    },
+    "note": "signal_only_not_executable_arb"
+  }
+]

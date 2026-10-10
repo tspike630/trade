@@ -1,0 +1,197 @@
+{
+  "strategy": {
+    "name": "grid",
+    "buy_after_min": 5.0,
+    "hold_min": 60.0,
+    "tp_pct": null,
+    "sl_pct": null,
+    "grid_step_pct": 3.0,
+    "grid_levels": 3
+  },
+  "pairs_considered": 8,
+  "trades": 8,
+  "win_rate": 0.375,
+  "avg_return_pct": -94.2591,
+  "median_return_pct": -20.562,
+  "exit_reasons": {
+    "grid": 8
+  },
+  "pnl_distribution": {
+    "min": -471.9633,
+    "p25": -77.3032,
+    "p50": -20.562,
+    "p75": 9.0,
+    "max": 14.3927
+  },
+  "sample_trades": [
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000011111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T13:05:00Z",
+      "buy_price": 0.028788449658590527,
+      "sell_price": 0.025532161409435913,
+      "return_pct": 9.0,
+      "win": true,
+      "reason": "grid",
+      "grid_buys": [
+        1,
+        2,
+        3
+      ],
+      "grid_sells": [
+        1,
+        2,
+        3
+      ],
+      "grid_rounds": 3,
+      "inventory": 0
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000111111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T13:05:00Z",
+      "buy_price": 0.010589375837754383,
+      "sell_price": 0.03573720274935946,
+      "return_pct": -471.9633,
+      "win": false,
+      "reason": "grid",
+      "grid_buys": [
+        1
+      ],
+      "grid_sells": [
+        1,
+        2,
+        3
+      ],
+      "grid_rounds": 1,
+      "inventory": -2
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000211111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:55:00Z",
+      "buy_price": 0.004775334066858067,
+      "sell_price": 0.007416360677474646,
+      "return_pct": -165.9168,
+      "win": false,
+      "reason": "grid",
+      "grid_buys": [],
+      "grid_sells": [
+        1,
+        2,
+        3
+      ],
+      "grid_rounds": 0,
+      "inventory": -3
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000311111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:55:00Z",
+      "buy_price": 0.028198095768731224,
+      "sell_price": 0.02093208660287933,
+      "return_pct": -77.3032,
+      "win": false,
+      "reason": "grid",
+      "grid_buys": [
+        1,
+        2,
+        3
+      ],
+      "grid_sells": [],
+      "grid_rounds": 0,
+      "inventory": 3
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000411111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:55:00Z",
+      "buy_price": 0.015213052097330898,
+      "sell_price": 0.0192992949528401,
+      "return_pct": -50.7202,
+      "win": false,
+      "reason": "grid",
+      "grid_buys": [
+        1
+      ],
+      "grid_sells": [
+        1,
+        2,
+        3
+      ],
+      "grid_rounds": 1,
+      "inventory": -2
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000511111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:55:00Z",
+      "buy_price": 0.03467448045429591,
+      "sell_price": 0.04083225539257464,
+      "return_pct": 9.0,
+      "win": true,
+      "reason": "grid",
+      "grid_buys": [
+        1,
+        2,
+        3
+      ],
+      "grid_sells": [
+        1,
+        2,
+        3
+      ],
+      "grid_rounds": 3,
+      "inventory": 0
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000611111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:55:00Z",
+      "buy_price": 0.013125011704804967,
+      "sell_price": 0.012377367483192046,
+      "return_pct": 14.3927,
+      "win": true,
+      "reason": "grid",
+      "grid_buys": [
+        1
+      ],
+      "grid_sells": [
+        1,
+        2,
+        3
+      ],
+      "grid_rounds": 1,
+      "inventory": -2
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000711111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:55:00Z",
+      "buy_price": 0.03330392655451677,
+      "sell_price": 0.04215012649581185,
+      "return_pct": -20.562,
+      "win": false,
+      "reason": "grid",
+      "grid_buys": [
+        1,
+        2
+      ],
+      "grid_sells": [
+        1,
+        2,
+        3
+      ],
+      "grid_rounds": 2,
+      "inventory": -1
+    }
+  ]
+}

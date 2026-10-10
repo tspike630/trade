@@ -1,0 +1,117 @@
+{
+  "strategy": {
+    "name": "tpsl",
+    "buy_after_min": 5.0,
+    "hold_min": 60.0,
+    "tp_pct": 10.0,
+    "sl_pct": 5.0,
+    "grid_step_pct": null,
+    "grid_levels": null
+  },
+  "pairs_considered": 8,
+  "trades": 8,
+  "win_rate": 0.625,
+  "avg_return_pct": 28.6583,
+  "median_return_pct": 13.3209,
+  "exit_reasons": {
+    "take_profit": 5,
+    "stop_loss": 3
+  },
+  "pnl_distribution": {
+    "min": -6.6267,
+    "p25": -5.3539,
+    "p50": 13.3209,
+    "p75": 15.6393,
+    "max": 193.4689
+  },
+  "sample_trades": [
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000011111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:25:00Z",
+      "buy_price": 0.028788449658590527,
+      "sell_price": 0.032954085182289525,
+      "return_pct": 14.4698,
+      "win": true,
+      "reason": "take_profit"
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000111111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:10:00Z",
+      "buy_price": 0.010589375837754383,
+      "sell_price": 0.03107652443486336,
+      "return_pct": 193.4689,
+      "win": true,
+      "reason": "take_profit"
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000211111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:20:00Z",
+      "buy_price": 0.004775334066858067,
+      "sell_price": 0.0055221618856756355,
+      "return_pct": 15.6393,
+      "win": true,
+      "reason": "take_profit"
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000311111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:15:00Z",
+      "buy_price": 0.028198095768731224,
+      "sell_price": 0.026373664957717282,
+      "return_pct": -6.47,
+      "win": false,
+      "reason": "stop_loss"
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000411111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:40:00Z",
+      "buy_price": 0.015213052097330898,
+      "sell_price": 0.016858815576651507,
+      "return_pct": 10.8181,
+      "win": true,
+      "reason": "take_profit"
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000511111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:15:00Z",
+      "buy_price": 0.03467448045429591,
+      "sell_price": 0.032818057227040925,
+      "return_pct": -5.3539,
+      "win": false,
+      "reason": "stop_loss"
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000611111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:35:00Z",
+      "buy_price": 0.013125011704804967,
+      "sell_price": 0.014873385144697956,
+      "return_pct": 13.3209,
+      "win": true,
+      "reason": "take_profit"
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "btpair000711111111111111111111111111111111",
+      "buy_at": "2026-10-09T12:05:00Z",
+      "sell_at": "2026-10-09T12:10:00Z",
+      "buy_price": 0.03330392655451677,
+      "sell_price": 0.031096967042875952,
+      "return_pct": -6.6267,
+      "win": false,
+      "reason": "stop_loss"
+    }
+  ]
+}

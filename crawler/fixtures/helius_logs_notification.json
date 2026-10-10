@@ -1,0 +1,25 @@
+{
+  "jsonrpc": "2.0",
+  "method": "logsNotification",
+  "params": {
+    "result": {
+      "context": {
+        "slot": 280001234
+      },
+      "value": {
+        "signature": "5HeliusFixtureSig11111111111111111111111111111111111111111111111",
+        "err": null,
+        "logs": [
+          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]",
+          "Program log: initialize2: Initialize Instruction 2",
+          "Program log: ray_log: create pool baseMint=So11111111111111111111111111111111111111112 quoteMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+          "Program log: mint He1iusDemoMintAAAA1111111111111111111111111",
+          "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success",
+          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 consumed 12345 of 200000 compute units",
+          "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 success"
+        ]
+      }
+    },
+    "subscription": 42
+  }
+}

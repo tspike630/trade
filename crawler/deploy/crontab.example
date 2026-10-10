@@ -1,0 +1,10 @@
+# Install as the dexscreener user (crontab -e), after deploying to /opt/dexscreener-crawler
+SHELL=/bin/bash
+PATH=/usr/bin:/bin
+
+# Daily consistent SQLite backup at 03:15 (retain last 7 via backup.py)
+15 3 * * * cd /opt/dexscreener-crawler && .venv/bin/python backup.py >> logs/backup.cron.log 2>&1
+
+# P4 Grok reports (HK-oriented schedule — adjust TZ)
+# 5 * * * *  cd /opt/dexscreener-crawler && .venv/bin/python scripts/grok_report.py --mode hourly --incremental
+# 10 0 * * * cd /opt/dexscreener-crawler && .venv/bin/python scripts/grok_report.py --mode daily

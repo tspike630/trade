@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+logs/
+backups/
+exports/reports/
+proxies.txt
+LIVE_TRADING_DISABLED
+*.log
+.DS_Store
