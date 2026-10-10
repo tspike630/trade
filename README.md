@@ -4,10 +4,12 @@
 
 ## 目录
 
-- `crawler/` — 消息采集层（DexScreener + Helius + X 等）
+- `crawler/` — 消息采集层（DexScreener + Helius + X 等）。`crawler/execution` 链接到仓库根 `execution/`
+- `execution/` — 执行层（网关 / ledger / PaperExecutor / PositionManager）。Paper 与 PM 默认关（`EXECUTION_PAPER_ENABLED=0`、`PM_ENABLED=0`）
+- `deploy/dexscreener-execution.service` — 执行层 systemd 模板（只跑 `--loop`，不开 paper/PM）
 - `config-backup/` — 启动脚本与 env 模板（**不含真实密钥**）
 - `docs/RECOVERY.md` — 换机恢复清单
-- 指标层代码在 `crawler/indicators/`（及 `sources/jev.py`）；其它层目录由各层后续提交（`dashboard/`、`decision_engine/`、`execution/`、`review/` …）
+- 指标层代码在 `crawler/indicators/`（及 `sources/jev.py`）；看板 / 决策 / 复盘目录由各层后续提交（`dashboard/`、`decision_engine/`、`review/` …）
 
 ## 安全
 

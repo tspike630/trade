@@ -1,0 +1,24 @@
+[Unit]
+Description=DexScreener execution gateway Step A (--loop)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dexscreener
+Group=dexscreener
+WorkingDirectory=/opt/dexscreener-crawler
+EnvironmentFile=-/etc/dexscreener-crawler.env
+# Prefer venv python; default poll 5s (EXECUTION_POLL_SEC / --interval)
+ExecStart=/opt/dexscreener-crawler/.venv/bin/python -m execution.run --loop
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dexscreener-execution
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

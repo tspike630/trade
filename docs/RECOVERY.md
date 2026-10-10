@@ -69,22 +69,55 @@ nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
 
 细节：`crawler/INDICATORS_AUDIT.md`、`AUTH_JEV.md`、`INDICATORS_STEP*.md`。
 
-## 4. 其它层（各层跟进提交后）
+## 4. 执行层恢复
+
+代码：仓库根 `execution/`（网关 / ledger / PaperExecutor / position_manager / run）。`crawler/execution` 指向同一目录，这样采集目录里的 `python -m execution.run` 与 `daily_check.py` 仍能导入。
+
+systemd 模板：`deploy/dexscreener-execution.service`（可选；`ExecStart` 只有 `--loop`，不含 `--paper-enabled` / `--pm-enabled`）。`crawler/deploy/dexscreener-execution.service` 内容相同。
+
+不含：`.env`、密钥、`execution_ledger.db`、`paper_trading.db`、`logs/`。
+
+采集主码、依赖和 `crawler/.venv` 见第 2 节。在采集目录恢复执行层：
+
+1. 指主库只读：`DB_PATH` / `DECISION_DB_PATH` → 本机 `dexscreener.db`（WAL 推荐）。
+2. 验证（不下单）：
+
+```bash
+cd crawler
+python -m execution.run --once
+```
+
+预期：消费 `decision_log` 增量，写入同目录 `execution_ledger.db`（或 `EXECUTION_LEDGER_PATH`）。
+
+3. 挂常驻（默认关闸）：
+
+```bash
+cd crawler
+nohup .venv/bin/python -m execution.run --loop >> logs/execution_loop.log 2>&1 &
+echo $! > logs/execution_loop.pid
+```
+
+4. **不要**默认打开：`EXECUTION_PAPER_ENABLED`、`EXECUTION_PAPER_TICK`、`PM_ENABLED` / `PM_*`。开闸需单独裁决；实盘另需确认。
+5. 巡检：`python daily_check.py` 应含 execution 进程存活 + 今日台账 + 持仓概览。
+
+若有 `EXECUTION_*` / `PM_*` env，备份到私密配置包，与 `.env` 同级保管，不进仓。
+
+## 5. 其它层（各层跟进提交后）
 
 - 看板：`dashboard/` → 见其 README（通常 `8081` + `API_SECRET`）
 - 决策：`decision_engine/` → dry-run 指只读 `DB_PATH`
-- 执行：`execution/` → `--once` 再 `--loop`（paper/PM 默认关）
 - 复盘：`review/` → `python -m review.run --period 7d --report`
 
-## 5. 验收
+## 6. 验收
 
 - [ ] `gh` 已登录且能 `git pull`
 - [ ] `crawler/.env` 有密钥但未进 Git（`git status` 干净）
 - [ ] 主爬虫心跳新鲜；`LIVE_TRADING_DISABLED` 存在
-- [ ] 指标 loop + JEV loop 冒烟；看板 / 决策 / 执行 / 复盘按各自清单冒烟通过
+- [ ] 指标 loop + JEV loop 冒烟；看板 / 决策 / 复盘按各自清单冒烟通过
+- [ ] `cd crawler && python -m execution.run --once` 写入 ledger；常驻 loop 未加 `--paper-enabled` / `--pm-enabled`，`EXECUTION_PAPER_ENABLED` 与 `PM_ENABLED` 仍为关
 - [ ] 实盘相关环境变量仍为关闭
 
-## 6. 回滚
+## 7. 回滚
 
 - 代码：`git revert` / 切旧 commit
 - 数据：`backups/` 或换机前拷贝的 `dexscreener-*.db`
