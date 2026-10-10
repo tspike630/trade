@@ -8,6 +8,7 @@ missing databases degrade instead of raising. Run from the project root::
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -26,6 +27,13 @@ from dashboard.auth import SecretFilter, verify_api_key
 from dashboard.data import DataStore, DbPaths, _WRITE_RE, connect_ro
 from dashboard.format_util import fmt_hold, fmt_liq, fmt_pct, fmt_usd
 from dashboard.panels.registry import PANELS
+from dashboard.panels.shell import (
+    db_status_line,
+    heartbeat_summary,
+    live_caption,
+    panel_group,
+    refresh_age_label,
+)
 from dashboard.parsing import bucket_key, extract_jev_strength
 from dashboard.settings import bind_host, port, read_gates, refresh_seconds
 
@@ -674,6 +682,147 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(fmt_liq(12345.6), "$12.3K")
         self.assertEqual(fmt_hold(5400), "1小时30分")
         self.assertEqual([item.id for item in PANELS], ["risk", "positions", "signals", "execution"])
+        self.assertEqual(panel_group("risk"), "overview")
+        self.assertEqual(panel_group("positions"), "overview")
+        self.assertEqual(panel_group("signals"), "signals")
+        self.assertEqual(panel_group("execution"), "execution")
+        self.assertEqual(panel_group("later"), "overview")
+        self.assertEqual(heartbeat_summary(["alive", "stale", "unknown"]), ("进程 1/3 存活", "ok"))
+        self.assertEqual(heartbeat_summary(["stale"]), ("进程 0/1 存活", "warn"))
+        self.assertEqual(heartbeat_summary([]), ("进程 —", "muted"))
+        self.assertEqual(live_caption("ok"), "● 实时")
+        self.assertEqual(live_caption("warn"), "● 停滞")
+        self.assertEqual(db_status_line([("主库", "a.db", True), ("新闻", "b.db", False)]), "库 1/2 缺失:新闻")
+        self.assertEqual(refresh_age_label(None), "刷新 —")
+        self.assertEqual(refresh_age_label(3), "刷新 3s 前")
+        app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+        for label in (
+            "CRYPTO",
+            "TERMINAL",
+            "链上新币投研终端",
+            "DASHBOARD",
+            "MARKETS",
+            "AI CHAT",
+            "OVERVIEW",
+            "SIGNALS",
+            "EXECUTION",
+            "/chat",
+        ):
+            self.assertIn(label, app_text)
+        market_src = inspect.getsource(DataStore._market_rows)
+        for banned in ("rsi", "macd", "boll"):
+            self.assertNotIn(banned, market_src.lower())
+
+    def test_market_rows_keep_indicator_columns(self) -> None:
+        missing = DataStore(
+            DbPaths(
+                main=self.root / "no-market.db",
+                execution=self.root / "no-market-exec.db",
+                paper=self.root / "no-market-paper.db",
+                backtest=self.root / "no-market-bt.db",
+                news=self.root / "no-market-news.db",
+            )
+        )
+        absent = missing.market_rows()
+        self.assertFalse(absent.available)
+        self.assertIn("不存在", absent.reason)
+
+        main = self.root / "market.db"
+        with sqlite3.connect(main) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    change_5m REAL,
+                    change_1h REAL,
+                    jev_strength REAL,
+                    jev_confidence REAL,
+                    tier TEXT,
+                    primary_pair_address TEXT,
+                    updated_at TEXT
+                );
+                CREATE TABLE pair_history (
+                    id INTEGER PRIMARY KEY,
+                    chain_id TEXT,
+                    pair_address TEXT,
+                    recorded_at TEXT,
+                    price_usd REAL,
+                    liquidity_usd REAL
+                );
+                CREATE TABLE jev_signals (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    coverage_pct REAL,
+                    fetched_at TEXT
+                );
+                CREATE TABLE tokens (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    raw_json TEXT
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators
+                    (chain_id, token_address, change_5m, change_1h, jev_strength, jev_confidence,
+                     tier, primary_pair_address, updated_at)
+                VALUES ('solana', 'T1', 12.5, -1.25, 0.81, 0.2, 'hot', 'P1', '2026-10-10T00:00:00Z')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators
+                    (chain_id, token_address, change_5m, jev_confidence, tier, updated_at)
+                VALUES ('ethereum', 'T2', 1.0, 0.25, 'warm', '2026-10-10T00:00:00Z')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO pair_history (chain_id, pair_address, recorded_at, price_usd, liquidity_usd)
+                VALUES ('solana', 'P1', '2026-10-10T00:00:00Z', 1.25, 50000)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO jev_signals (chain_id, token_address, coverage_pct, fetched_at)
+                VALUES ('solana', 'T1', 88, '2026-10-10T00:00:00Z')
+                """
+            )
+            conn.execute(
+                "INSERT INTO tokens (chain_id, token_address, raw_json) VALUES ('solana', 'T1', ?)",
+                (json.dumps({"symbol": "BONK"}),),
+            )
+        before = main.stat().st_mtime_ns
+        store = DataStore(
+            DbPaths(
+                main=main,
+                execution=self.root / "market-exec-missing.db",
+                paper=self.root / "market-paper-missing.db",
+                backtest=self.root / "market-bt-missing.db",
+                news=self.root / "market-news-missing.db",
+            )
+        )
+        result = store.market_rows()
+        self.assertTrue(result.available, result.reason)
+        self.assertEqual([row.token_address for row in result.data], ["T1", "T2"])
+        first = result.data[0]
+        self.assertEqual(first.symbol, "BONK")
+        self.assertEqual(first.tier, "hot")
+        self.assertAlmostEqual(first.change_5m or 0, 12.5)
+        self.assertAlmostEqual(first.change_1h or 0, -1.25)
+        self.assertIsNone(first.change_15m)
+        self.assertAlmostEqual(first.liquidity_usd or 0, 50000)
+        self.assertAlmostEqual(first.jev_strength or 0, 0.81)
+        self.assertAlmostEqual(first.coverage or 0, 88)
+        second = result.data[1]
+        self.assertAlmostEqual(second.coverage or 0, 25)
+        self.assertIsNone(second.liquidity_usd)
+        sol = store.market_rows(chain="solana")
+        self.assertEqual([row.token_address for row in sol.data], ["T1"])
+        self.assertEqual(store.market_rows(chain="not-a-chain").data, ())
+        self.assertEqual(main.stat().st_mtime_ns, before)
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
