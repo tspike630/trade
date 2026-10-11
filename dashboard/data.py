@@ -10,13 +10,14 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import statistics
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import quote
 
 from dashboard.parsing import (
@@ -34,6 +35,11 @@ from dashboard.parsing import (
 )
 from dashboard.settings import db_root, resolve_db_file, stale_seconds
 from dashboard.format_util import Liveness
+
+try:
+    from scripts import jev_validity
+except ImportError:  # optional analysis module; overview shows an em dash without it
+    jev_validity = None  # type: ignore[assignment]
 
 log = logging.getLogger("dashboard.data")
 
@@ -279,6 +285,35 @@ class RejectionReport:
     buckets: tuple[RejectionBucket, ...]
 
 
+@dataclass(frozen=True)
+class HotBaseline:
+    """indicator_history tier=hot. change_* values are already percent units."""
+
+    n_1h: int
+    median_1h: float | None
+    median_4h: float | None
+    mean_1h_winsor: float | None
+
+
+@dataclass(frozen=True)
+class StrategyBucket:
+    strategy_id: str
+    n: int
+
+
+@dataclass(frozen=True)
+class JevThreshold:
+    """Filtered JEV gate from scripts.jev_validity. Rates are fractions, or None."""
+
+    n: int
+    unique_token: int
+    up_1h: float | None
+    up_4h: float | None
+    strategy_id: str
+    raw_n: int
+    raw_up_1h: float | None
+
+
 class MissingTable(LookupError):
     pass
 
@@ -424,6 +459,7 @@ def _liveness(age: float | None) -> Liveness:
 class DataStore:
     def __init__(self, paths: DbPaths | None = None) -> None:
         self.paths = paths if paths is not None else DbPaths.from_env()
+        self._read_cache: dict[str, tuple[float, float, DataResult]] = {}
 
     def file_status(self) -> list[tuple[str, str, bool]]:
         items = (
@@ -514,6 +550,39 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed rejection_buckets: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "rejection_buckets")
+
+    def hot_baseline(self) -> DataResult:
+        return self._cached("hot_baseline", self.paths.main, 45.0, self._hot_baseline)
+
+    def strategy_buckets(self) -> DataResult:
+        return self._cached("strategy_buckets", self.paths.main, 45.0, self._strategy_buckets)
+
+    def jev_threshold(self) -> DataResult:
+        return self._cached("jev_threshold", self.paths.main, 90.0, self._jev_threshold)
+
+    def _cached(
+        self,
+        key: str,
+        path: Path,
+        ttl: float,
+        build: Callable[[], DataResult],
+    ) -> DataResult:
+        now = time.monotonic()
+        started = time.perf_counter()
+        try:
+            stamp = path.stat().st_mtime if path.is_file() else 0.0
+        except OSError:
+            stamp = 0.0
+        hit = self._read_cache.get(key)
+        if hit is not None and now - hit[0] < ttl and hit[1] == stamp:
+            return hit[2]
+        try:
+            result = build()
+        except Exception as exc:
+            log.warning("read failed %s: %s", key, type(exc).__name__)
+            result = _unavail(f"查询失败：{_safe_exc(exc)}", started)
+        self._read_cache[key] = (now, stamp, result)
+        return result
 
     def _today_execution_stats(self, started: float) -> DataResult:
         path = self.paths.execution
@@ -1257,6 +1326,148 @@ class DataStore:
         except sqlite3.Error as exc:
             return {}, {}, f"查询失败：{_safe_exc(exc)}"
         return quotes, symbols, note
+
+    def _hot_baseline(self) -> DataResult:
+        started = time.perf_counter()
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "indicator_history", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "indicator_history")
+                absent = _require(cols, ("tier", "change_1h", "change_4h"))
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                rows = _exec(
+                    conn,
+                    "SELECT change_1h, change_4h FROM indicator_history WHERE LOWER(tier) = 'hot'",
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        change_1h: list[float] = []
+        change_4h: list[float] = []
+        for row in rows:
+            one = safe_float(row["change_1h"])
+            four = safe_float(row["change_4h"])
+            if one is not None:
+                change_1h.append(one)
+            if four is not None:
+                change_4h.append(four)
+        winsor = [value for value in change_1h if abs(value) <= 500]
+        return _ok(
+            HotBaseline(
+                n_1h=len(change_1h),
+                median_1h=_median(change_1h),
+                median_4h=_median(change_4h),
+                mean_1h_winsor=_mean(winsor),
+            ),
+            started,
+        )
+
+    def _strategy_buckets(self) -> DataResult:
+        started = time.perf_counter()
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "decision_log", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "decision_log")
+                absent = _require(cols, ("strategy_id",))
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                rows = _exec(
+                    conn,
+                    "SELECT strategy_id, COUNT(*) AS n FROM decision_log "
+                    "GROUP BY strategy_id ORDER BY n DESC, strategy_id ASC LIMIT 12",
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        buckets = tuple(
+            StrategyBucket(
+                strategy_id=clip(_cell(row, "strategy_id"), 40) or "—",
+                n=_as_int(row["n"]) or 0,
+            )
+            for row in rows
+        )
+        return _ok(buckets, started)
+
+    def _jev_threshold(self) -> DataResult:
+        """Read-only filtered gate. Does not append the trend CSV or write a report."""
+        started = time.perf_counter()
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        if jev_validity is None:
+            return _unavail("未挂载 scripts.jev_validity", started)
+        run_analysis = getattr(jev_validity, "run_analysis", None)
+        if not callable(run_analysis):
+            return _unavail("scripts.jev_validity 无 run_analysis", started)
+        strategy_id = str(getattr(jev_validity, "STRATEGY_ID", "jev_strength_v1"))
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "decision_log", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                count_row = _exec(conn, "SELECT COUNT(*) AS n FROM decision_log").fetchone()
+                total = _as_int(count_row["n"]) if count_row is not None else 0
+                if total is not None and total > 4000:
+                    return _unavail("decision_log 过大，看板刷新不重算前向收益", started)
+                result = run_analysis(
+                    conn,
+                    min_strength=0.15,
+                    min_liq=50000.0,
+                    min_coverage=10.0,
+                    min_price=1e-6,
+                    tol_sec=1800.0,
+                )
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        except Exception as exc:
+            log.warning("jev threshold read failed: %s", type(exc).__name__)
+            return _unavail(f"查询失败：{_safe_exc(exc)}", started)
+        if not isinstance(result, dict):
+            return _unavail("JEV 结果不可用", started)
+        n_filt = _as_int(result.get("n_filt"))
+        unique = _as_int(result.get("unique_token"))
+        raw_n = _as_int(result.get("n_raw"))
+        if n_filt is None or unique is None or raw_n is None:
+            return _unavail("JEV 结果缺字段", started)
+        return _ok(
+            JevThreshold(
+                n=n_filt,
+                unique_token=unique,
+                up_1h=_fraction(getattr(result.get("st1"), "up_rate", None)),
+                up_4h=_fraction(getattr(result.get("st4"), "up_rate", None)),
+                strategy_id=strategy_id,
+                raw_n=raw_n,
+                raw_up_1h=_fraction(getattr(result.get("st1_raw"), "up_rate", None)),
+            ),
+            started,
+        )
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(statistics.median(values))
+
+
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(statistics.fmean(values))
+
+
+def _fraction(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def _missing_table(conn: sqlite3.Connection, table: str, db_name: str) -> str:

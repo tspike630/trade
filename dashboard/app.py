@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import resource
 import secrets
 import time
 from collections.abc import Callable
@@ -24,15 +25,14 @@ from nicegui import app, ui
 
 from dashboard.auth import SecretFilter, verify_api_key
 from dashboard.data import DataStore
-from dashboard.format_util import fmt_rate
+from dashboard.format_util import liveness_label
 from dashboard.panels import risk as risk_panel
-from dashboard.panels.common import col, panel_box, panel_guard, show_unavailable
+from dashboard.panels.common import panel_box, panel_guard, show_unavailable
 from dashboard.panels.markets import render_markets
 from dashboard.panels.registry import PANELS
 from dashboard.panels.shell import (
     db_status_line,
     heartbeat_summary,
-    live_caption,
     panel_group,
     refresh_age_label,
     session_clock,
@@ -54,30 +54,38 @@ _logging_ready = False
 THEME_CSS = """
 :root {
   color-scheme: dark;
-  --bg: #080808;
-  --bg-2: #111111;
-  --panel: #0a0a0a;
-  --panel-2: #111111;
-  --line: #1a1a1a;
-  --text: #e5e5e5;
-  --muted: #808080;
-  --accent: #d97706;
-  --accent-dim: #3a2408;
-  --mint: #16a34a;
-  --mint-dim: #052e16;
-  --warn: #ca8a04;
-  --warn-dim: #3a2f0e;
-  --bad: #dc2626;
-  --bad-dim: #3a1518;
-  --ok: #16a34a;
-  --mono: "IBM Plex Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --sans: "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --bg: #0d1117;
+  --bg-2: #161b22;
+  --panel: #161b22;
+  --panel-2: #1f2630;
+  --line: #2d333b;
+  --border: #2d333b;
+  --border-strong: #3d444d;
+  --text: #e6edf3;
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --fg-dim: #8b949e;
+  --fg-mute: #565d66;
+  --accent: #2f81f7;
+  --accent-dim: #12243d;
+  --mint: #3fb950;
+  --up: #3fb950;
+  --mint-dim: #0d2416;
+  --warn: #d29922;
+  --warn-dim: #2a2410;
+  --bad: #f85149;
+  --down: #f85149;
+  --bad-dim: #2a1416;
+  --ok: #3fb950;
+  --mono: "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --sans: "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
-html, body {
-  background: var(--bg);
-  color: var(--text);
+html, body, body.body--dark {
+  background: var(--bg) !important;
+  color: var(--text) !important;
   font-family: var(--sans);
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 body { margin: 0; }
 .page {
@@ -99,15 +107,16 @@ body { margin: 0; }
   z-index: 50;
   display: flex;
   align-items: center;
-  gap: 24px;
-  height: 48px;
-  min-height: 48px;
-  padding: 0 16px;
-  background: #111111;
-  border-bottom: 1px solid #1a1a1a;
+  gap: 0;
+  height: 40px;
+  min-height: 40px;
+  padding: 0 4px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
   width: 100%;
   box-sizing: border-box;
   flex-wrap: nowrap;
+  overflow-x: auto;
 }
 .topbar .brand, .ft-brand {
   display: flex;
@@ -120,20 +129,22 @@ body { margin: 0; }
 .topbar .brand .name, .ft-brand-name {
   font-weight: 700;
   letter-spacing: 0.5px;
-  color: #e5e5e5;
+  color: var(--fg);
   font-size: 13px;
 }
 .topbar .brand .name span, .ft-brand .name-word { margin-right: 2px; }
 .ft-brand-crypto {
-  color: #d97706;
+  color: var(--fg);
   font-weight: 700;
   font-size: 13px;
   letter-spacing: 0.5px;
   margin-right: 2px;
 }
 .ft-brand-sub, .topbar .brand .tag {
-  font-size: 11px;
-  color: #d97706;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--fg-mute);
+  margin-left: 6px;
 }
 .topbar .status-group, .ft-status-group {
   display: flex;
@@ -142,18 +153,20 @@ body { margin: 0; }
   margin-left: auto;
   flex-shrink: 0;
 }
-.topbar .live-dot {
-  width: 8px;
-  height: 8px;
+.topbar .live-dot, .status-dot {
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
-  background: #16a34a;
-  box-shadow: 0 0 6px #16a34a;
+  background: var(--up);
+  box-shadow: 0 0 4px var(--up);
+  display: inline-block;
+  flex-shrink: 0;
 }
-.ft-live { color: #16a34a; font-size: 12px; font-family: var(--mono); }
-.ft-live-warn { color: #ca8a04; }
-.ft-live-muted { color: #525252; }
+.ft-live { color: var(--fg-dim); font-size: 11px; font-family: var(--mono); }
+.ft-live-warn { color: var(--warn); }
+.ft-live-muted { color: var(--fg-mute); }
 .ft-proc, .ft-clock, .ft-status-item, .statusbar .proc {
-  color: #808080;
+  color: var(--fg-dim);
   font-family: var(--mono);
   font-size: 11px;
 }
@@ -164,84 +177,89 @@ body { margin: 0; }
   flex-shrink: 0;
 }
 .topbar .actions button, .ft-actions .q-btn, .ft-refresh, .ghost-btn.q-btn {
-  height: 26px !important;
-  min-height: 26px !important;
-  padding: 0 12px !important;
-  font-size: 11px !important;
-  background: #161616 !important;
-  color: #e5e5e5 !important;
-  border: 1px solid #222222 !important;
-  border-radius: 4px !important;
+  height: 22px !important;
+  min-height: 22px !important;
+  padding: 0 8px !important;
+  font-size: 10px !important;
+  background: transparent !important;
+  color: var(--fg-dim) !important;
+  border: 1px solid var(--border-strong) !important;
+  border-radius: 3px !important;
 }
 .topbar .actions button:hover, .ft-actions .q-btn:hover, .ft-refresh:hover, .ghost-btn.q-btn:hover {
-  border-color: #d97706 !important;
-  color: #d97706 !important;
+  border-color: var(--accent) !important;
+  color: var(--fg) !important;
 }
 .ft-body {
   width: 100%;
-  max-width: 1440px;
-  margin: 0 auto;
-  padding: 0 12px 40px;
+  max-width: none;
+  margin: 0;
+  padding: 0 0 8px;
   flex: 1 1 auto;
   box-sizing: border-box;
 }
-/* Main tabs: 32px uppercase amber active */
+/* Main tabs sit in the top bar: 40px, accent underline */
+.ft-tabbar { height: 40px; background: transparent; flex-shrink: 0; }
 .ft-tabbar .q-tabs__content {
-  background: #0a0a0a;
-  border-bottom: 1px solid #1a1a1a;
-  min-height: 32px;
-  height: 32px;
+  background: transparent;
+  border-bottom: none;
+  min-height: 40px;
+  height: 40px;
 }
 .ft-tabbar .q-tab {
-  padding: 0 8px;
-  min-height: 32px;
-  height: 32px;
+  padding: 0 12px;
+  min-height: 40px;
+  height: 40px;
   display: flex;
   align-items: center;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: #808080;
-  font-size: 12px;
-  font-weight: 600;
+  letter-spacing: 0.8px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-weight: 500;
   border-bottom: 2px solid transparent;
   cursor: pointer;
 }
-.ft-tabbar .q-tab:hover { color: #d97706; background: #161616; }
+.ft-tabbar .q-tab .q-tab__label { color: inherit; font-size: 11px; letter-spacing: 0.8px; }
+.ft-tabbar .q-tab:hover { color: var(--fg); background: rgba(255,255,255,.03); }
 .ft-tabbar .q-tab.q-tab--active {
-  background: #161616;
-  color: #d97706;
+  background: transparent;
+  color: var(--fg);
   font-weight: 600;
-  border-bottom-color: #d97706;
+  border-bottom-color: var(--accent);
 }
 .ft-tabbar .q-tab__indicator, .ft-subtab .q-tab__indicator { display: none; }
-/* Nested subtabs under DASHBOARD: 22px muted */
+/* Nested subtabs under DASHBOARD */
 .ft-subtab .q-tabs__content {
-  background: #0a0a0a;
-  border-bottom: 1px solid #1a1a1a;
-  min-height: 22px;
-  height: 22px;
-  padding: 4px 8px;
-  gap: 4px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  min-height: 30px;
+  height: 30px;
+  padding: 0 8px;
+  gap: 2px;
 }
 .ft-subtab .q-tab {
-  padding: 0 10px;
-  min-height: 22px;
-  height: 22px;
+  padding: 0 12px;
+  min-height: 26px;
+  height: 26px;
   display: flex;
   align-items: center;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: #525252;
-  font-size: 10px;
-  border-radius: 3px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--fg-dim);
+  font-size: 11px;
+  border-radius: 4px 4px 0 0;
+  border: 1px solid transparent;
   border-bottom: none;
   cursor: pointer;
 }
-.ft-subtab .q-tab:hover { color: #808080; background: #161616; }
+.ft-subtab .q-tab .q-tab__label { color: inherit; font-size: 11px; }
+.ft-subtab .q-tab:hover { color: var(--fg); background: rgba(255,255,255,.03); }
 .ft-subtab .q-tab.q-tab--active {
-  color: #d97706;
-  font-weight: 600;
-  background: #1a1a1a;
+  color: var(--fg);
+  font-weight: 500;
+  background: var(--panel);
+  border-color: var(--border);
   border-bottom: none;
 }
 .ft-panels, .ft-panels .q-tab-panel, .ft-subpanels, .ft-subpanels .q-tab-panel {
@@ -267,18 +285,20 @@ body { margin: 0; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 32px;
-  min-height: 32px;
+  height: 26px;
+  min-height: 26px;
   padding: 0 12px;
   font-size: 10px;
-  color: #808080;
+  color: var(--fg-dim);
   font-family: var(--mono);
-  border-top: 1px solid #1a1a1a;
-  background: #0a0a0a;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
   width: 100%;
   box-sizing: border-box;
   flex-wrap: nowrap;
 }
+.ft-status-ok { color: var(--up); }
+.ft-status-sep { color: var(--border-strong); }
 .statusbar .left, .statusbar .right {
   display: flex;
   gap: 16px;
@@ -519,7 +539,7 @@ body { margin: 0; }
   box-shadow: none !important;
 }
 .q-table thead tr, .q-table tbody td { border-color: var(--line) !important; }
-.q-table thead tr { background: #151a22; }
+.q-table thead tr { background: var(--panel-2); }
 .q-td, .q-th {
   font-size: 12px;
   font-family: var(--mono);
@@ -545,7 +565,7 @@ body { margin: 0; }
   align-items: center;
   justify-content: center;
   padding: 24px 16px;
-  background: radial-gradient(ellipse at top, #111111 0%, var(--bg) 55%);
+  background: radial-gradient(ellipse at top, #161b22 0%, var(--bg) 55%);
 }
 .gate-card {
   width: min(420px, 100%);
@@ -557,7 +577,7 @@ body { margin: 0; }
 }
 .gate-title { font-size: 20px; font-weight: 700; }
 .gate-copy { color: var(--muted); font-size: 13px; margin: 8px 0 14px; line-height: 1.5; }
-.enter-btn { background: var(--accent) !important; color: #111 !important; font-weight: 700; }
+.enter-btn { background: var(--accent) !important; color: #fff !important; font-weight: 700; }
 .q-field__native, .q-field__label { color: var(--text) !important; }
 @media (max-width: 720px) {
   .brand-title { font-size: 18px; }
@@ -566,7 +586,7 @@ body { margin: 0; }
   .page { padding: 0 8px 28px; }
   .topbar, .ft-top { gap: 12px; height: auto; min-height: 48px; flex-wrap: wrap; padding: 8px 12px; }
 }
-/* ============ V2 网格组件体系（基准：dashboard_grid_skeleton_v2.html） ============ */
+/* ============ 网格组件（对齐 dashboard_grid_skeleton_v2） ============ */
 .gv2-grid {
   display: grid;
   grid-template-columns: repeat(12, 1fr);
@@ -574,27 +594,10 @@ body { margin: 0; }
   width: 100%;
   box-sizing: border-box;
 }
-.gv2-kpi {
-  background: #0a0a0a;
-  border: 1px solid #1a1a1a;
-  border-radius: 4px;
-  padding: 8px 10px;
-  min-height: 72px;
-  grid-column: span 3;
-  min-width: 0;
-  box-sizing: border-box;
-}
-.gv2-kpi .kpi-label { color: #808080; font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
-.gv2-kpi .kpi-value { font-family: var(--mono); font-size: 18px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; }
-.gv2-kpi .kpi-hint  { color: #525252; font-size: 9px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.gv2-kpi.tone-warn .kpi-value { color: var(--warn); }
-.gv2-kpi.tone-bad  .kpi-value { color: var(--bad); }
-.gv2-kpi.tone-ok   .kpi-value { color: var(--mint); }
-
 .gv2-component {
-  background: #0a0a0a;
-  border: 1px solid #1a1a1a;
-  border-radius: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 3px;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -604,45 +607,69 @@ body { margin: 0; }
 .gv2-component.span-3 { grid-column: span 3; }
 .gv2-component.span-4 { grid-column: span 4; }
 .gv2-component.span-6 { grid-column: span 6; }
+.gv2-component.span-8 { grid-column: span 8; }
 .gv2-head {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 5px 10px;
-  background: #111111;
-  border-bottom: 1px solid #1a1a1a;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
 }
-.gv2-title { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #808080; font-family: var(--mono); }
-.gv2-title b { color: #e5e5e5; font-weight: 650; }
+.gv2-title {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+}
+.gv2-title .em { color: var(--fg); font-weight: 600; letter-spacing: 1px; }
+.gv2-title .suffix { color: var(--fg-dim); letter-spacing: 0; text-transform: none; }
 .gv2-tools { margin-left: auto; display: flex; gap: 4px; align-items: center; }
 .gv2-tool {
-  background: transparent; border: 1px solid #2a2a2a; color: #808080;
-  font-size: 10px; padding: 1px 7px; border-radius: 3px; cursor: pointer; line-height: 1.5;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--fg-dim);
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  line-height: 1.4;
 }
-.gv2-tool:hover { color: #e5e5e5; border-color: var(--accent); }
-.gv2-body { padding: 8px 10px; flex: 1; display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.gv2-tool-note { font-size: 10px; color: var(--fg-mute); }
+.gv2-body { padding: 8px 10px; flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .gv2-foot {
-  padding: 3px 10px; border-top: 1px solid #1a1a1a;
-  font-size: 10px; color: #525252; display: flex; gap: 10px;
+  padding: 4px 10px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+  color: var(--fg-mute);
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 .gv2-kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; }
-.gv2-kv .k { color: #808080; font-size: 10px; white-space: nowrap; }
-.gv2-kv .v { font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
-.gv2-kv .v.up { color: var(--mint); }
-.gv2-kv .v.down { color: var(--bad); }
-.gv2-kv .v.mute { color: #525252; }
+.gv2-kv .k { color: var(--fg-dim); font-size: 11px; white-space: nowrap; }
+.gv2-kv .v { font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; color: var(--fg); }
+.gv2-kv .v.up { color: var(--up); }
+.gv2-kv .v.down { color: var(--down); }
+.gv2-kv .v.mute { color: var(--fg-mute); }
 .gv2-table { width: 100%; border-collapse: collapse; font-size: 11px; }
-.gv2-table th { text-align: left; color: #525252; font-weight: 500; padding: 2px 6px; border-bottom: 1px solid #1a1a1a; white-space: nowrap; }
+.gv2-table th { text-align: left; color: var(--fg-mute); font-weight: 500; padding: 3px 6px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 .gv2-table th.num, .gv2-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
-.gv2-table td { padding: 2px 6px; border-bottom: 1px solid rgba(26,26,26,.6); white-space: nowrap; }
-.gv2-table tr:hover td { background: rgba(217,119,6,.05); }
+.gv2-table td { padding: 3px 6px; border-bottom: 1px solid rgba(45,51,59,.5); white-space: nowrap; color: var(--fg); }
+.gv2-table tr:hover td { background: rgba(47,129,247,.06); }
+.gv2-table .nicegui-label { font-size: inherit; line-height: inherit; }
 .gv2-pulse { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-.gv2-pulse-item { border: 1px solid #1a1a1a; border-radius: 3px; padding: 5px 8px; }
-.gv2-pulse-item .lbl { font-size: 9px; color: #525252; }
-.gv2-pulse-item .val { font-size: 15px; font-variant-numeric: tabular-nums; margin-top: 1px; }
+.gv2-pulse-item { border: 1px solid var(--border); border-radius: 3px; padding: 6px 8px; }
+.gv2-pulse-item .lbl { font-size: 10px; color: var(--fg-mute); }
+.gv2-pulse-item .val { font-size: 15px; font-variant-numeric: tabular-nums; margin-top: 2px; color: var(--fg); }
+.gv2-note { color: var(--fg-mute); font-size: 10px; font-style: italic; }
 @media (max-width: 720px) {
   .gv2-grid { grid-template-columns: repeat(2, 1fr); }
-  .gv2-component, .gv2-kpi { grid-column: span 2 !important; }
+  .gv2-component { grid-column: span 2 !important; }
+  .gv2-pulse { grid-template-columns: repeat(2, 1fr); }
 }
 """
 
@@ -678,7 +705,7 @@ def register_health() -> None:
 
 def apply_theme() -> None:
     ui.dark_mode(True)
-    ui.colors(primary="#d97706")
+    ui.colors(primary="#2f81f7")
     ui.add_css(THEME_CSS)
     ui.add_head_html('<meta name="robots" content="noindex, nofollow">')
 
@@ -784,7 +811,6 @@ def _render_login(next_path: str) -> None:
 
 def _render_dashboard(*, insecure: bool, section: Section) -> None:
     store = DataStore()
-    interval = int(refresh_seconds())
     chain_filter = {"value": "all"}
     refreshed_at = {"mono": time.monotonic()}
     opened_at = time.monotonic()
@@ -799,26 +825,77 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
 
     @ui.refreshable
     def overview_tab() -> None:
+        prior_values, prior_foot = _gv2_prior_pack()
+        proc_foot: list[str] = ["心跳不可用"]
+        jev_foot: list[str] = ["门槛 n≥15 / unique≥10", "过滤后样本未读到"]
         with ui.element("div").classes("gv2-grid"):
-            try:
-                _gv2_kpi_strip(store)
-            except Exception:
-                log.warning("overview kpi strip failed")
-                ui.label("—").classes("muted")
-            _gv2_component("进程 · 心跳", "span-3", lambda: _gv2_procs(store))
-            _gv2_component("风险 · 闸门", "span-3", lambda: _gv2_gates(), foot="闸门只读·环境变量不可改")
             _gv2_component(
-                "先验 · 对照",
-                "span-6",
-                lambda: _gv2_priors(),
-                foot="GMGN n=956 · self n=9317 · CoinGecko · RED-PUMP",
+                "进程",
+                "心跳",
+                "span-3",
+                lambda: _gv2_procs(store, proc_foot),
+                tool="⟳",
+                foot=proc_foot,
             )
-            _gv2_component("今日 · EXECUTION_LOG", "span-4", lambda: _gv2_today(store))
-            _gv2_component("近 7 日 · 决策", "span-4", lambda: _gv2_week(store))
-            _gv2_component("信号 · 流", "span-4", lambda: _gv2_signals(store))
-            _gv2_component("持仓 · 总览", "span-6", lambda: _gv2_positions(store))
-            _gv2_component("回测 · 新闻", "span-6", lambda: _gv2_btnews(store))
-            ui.label("阶段一只读监控。手动交易确认不在本看板内。").classes("footer-note")
+            _gv2_component(
+                "风险",
+                "闸门",
+                "span-3",
+                _gv2_gates,
+                tool="只读",
+                foot=["闸门只读，不调权"],
+            )
+            _gv2_component(
+                "先验",
+                "对照",
+                "span-6",
+                lambda: _gv2_pulse(prior_values),
+                tool="观察中·不调权",
+                tool_plain=True,
+                foot=prior_foot,
+            )
+            _gv2_component(
+                "今日",
+                "EXECUTION_LOG",
+                "span-4",
+                lambda: _gv2_today(store),
+                tool="UTC 日",
+                foot=["execution_log 当日行"],
+            )
+            _gv2_component(
+                "近 7 日",
+                "决策",
+                "span-4",
+                lambda: _gv2_week(store),
+                tool="168h",
+                foot=["decision_log 滚动 168h"],
+            )
+            _gv2_component(
+                "JEV",
+                "门槛",
+                "span-4",
+                lambda: _gv2_jev(store, jev_foot),
+                tool="过滤后",
+                tool_plain=True,
+                foot=jev_foot,
+            )
+            _gv2_component(
+                "市场",
+                "基准",
+                "span-8",
+                lambda: _gv2_hot(store),
+                suffix="（hot）",
+                tool="winsor",
+                foot=["indicator_history tier=hot", "winsor |x|≤500"],
+            )
+            _gv2_component(
+                "策略",
+                "速览",
+                "span-4",
+                lambda: _gv2_strategies(store),
+                tool="⟳",
+                foot=["decision_log 按 strategy_id"],
+            )
 
     @ui.refreshable
     def signals_tab() -> None:
@@ -850,6 +927,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
         age = int(time.monotonic() - refreshed_at["mono"])
         age_lbl.set_text(refresh_age_label(age))
         up_lbl.set_text(session_clock(int(time.monotonic() - opened_at)))
+        mem_lbl.set_text(_rss_label())
 
     def paint_status() -> None:
         try:
@@ -859,17 +937,29 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
             else:
                 text, tone = heartbeat_summary([item.state for item in live.data])
             proc_lbl.set_text(text)
-            foot_proc.set_text(text)
             _paint_live(live_lbl, tone)
-            db_text = db_status_line(store.file_status())
+            files = store.file_status()
+            db_text = db_status_line(files)
             db_lbl.set_text(db_text)
-            db_lbl.classes(remove="ft-status-miss")
+            db_lbl.classes(remove="ft-status-ok ft-status-miss")
             if "缺失" in db_text:
                 db_lbl.classes(add="ft-status-miss")
+                ready_lbl.set_text("● 降级")
+                ready_lbl.classes(remove="ft-status-ok")
+                ready_lbl.classes(add="ft-live-warn")
+            else:
+                db_lbl.classes(add="ft-status-ok")
+                ready_lbl.set_text("● 就绪")
+                ready_lbl.classes(remove="ft-live-warn")
+                ready_lbl.classes(add="ft-status-ok")
+            main_ok = any(label == "主库" and present for label, _name, present in files)
+            src_lbl.set_text("数据源 已连接" if main_ok else "数据源 未连接")
+            src_lbl.classes(remove="ft-status-ok ft-status-miss")
+            src_lbl.classes(add="ft-status-ok" if main_ok else "ft-status-miss")
         except Exception:
             log.warning("status strip failed")
             proc_lbl.set_text("心跳：不可用")
-            foot_proc.set_text("心跳：不可用")
+            ready_lbl.set_text("● 降级")
 
     def tick() -> None:
         if api_secret() and not _session_ok():
@@ -888,15 +978,20 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
             age_lbl.set_text("刷新失败")
 
     with ui.element("div").classes("shell"):
+        initial = "AI CHAT" if section == "chat" else "DASHBOARD"
         with ui.element("div").classes("topbar"):
             with ui.element("div").classes("brand"):
-                ui.label("SPIKE'S").classes("ft-brand-crypto")
-                ui.label("CRYPTO TERMINER").classes("ft-brand-name")
+                ui.label("SPIKE'S CRYPTO TERMINER").classes("ft-brand-name")
                 ui.label("链上新币投研终端").classes("ft-brand-sub")
+            with ui.tabs(value=initial).classes("ft-tabbar") as tabs:
+                dash = ui.tab("DASHBOARD")
+                markets = ui.tab("MARKETS")
+                chat = ui.tab("AI CHAT")
             with ui.element("div").classes("status-group"):
-                live_lbl = ui.label("● 实时").classes("ft-live")
                 proc_lbl = ui.label("进程 —").classes("ft-proc")
                 clock_lbl = ui.label(_clock_text()).classes("ft-clock")
+                ui.element("span").classes("status-dot")
+                live_lbl = ui.label("实时").classes("ft-live")
             with ui.element("div").classes("actions"):
                 ui.button("刷新", on_click=tick).props("flat dense size=sm").classes("ft-refresh")
                 if api_secret():
@@ -904,8 +999,12 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
         with ui.element("div").classes("ft-body"):
             if insecure:
                 ui.label("本地未鉴权模式（ALLOW_INSECURE_API=1）。不要暴露到公网。").classes("banner")
-            _module_tabs(
-                section,
+            _module_panels(
+                initial,
+                tabs,
+                dash,
+                markets,
+                chat,
                 overview_tab,
                 signals_tab,
                 execution_tab,
@@ -915,31 +1014,36 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
         with ui.element("div").classes("statusbar"):
             with ui.element("div").classes("left"):
                 ui.label("v0.1.0").classes("ft-status-item")
+                ui.label("·").classes("ft-status-sep")
                 up_lbl = ui.label(session_clock(0)).classes("ft-status-item")
+                ui.label("·").classes("ft-status-sep")
                 db_lbl = ui.label("库 —").classes("ft-status-item")
-                foot_proc = ui.label("进程 —").classes("ft-status-item")
-            with ui.element("div").classes("right"):
+                ui.label("·").classes("ft-status-sep")
+                src_lbl = ui.label("数据源 —").classes("ft-status-item")
+                ui.label("·").classes("ft-status-sep")
                 age_lbl = ui.label(refresh_age_label(0)).classes("ft-status-item")
-                ui.label(f"每 {interval}s").classes("ft-status-item")
+                ui.label("·").classes("ft-status-sep")
+                mem_lbl = ui.label(_rss_label()).classes("ft-status-item")
+            with ui.element("div").classes("right"):
+                ready_lbl = ui.label("● 就绪").classes("ft-status-ok")
     paint_status()
     paint_clock()
     ui.timer(1.0, paint_clock)
     ui.timer(refresh_seconds(), tick, immediate=False)
 
 
-def _module_tabs(
-    section: Section,
+def _module_panels(
+    initial: str,
+    tabs: ui.tabs,
+    dash: ui.tab,
+    markets: ui.tab,
+    chat: ui.tab,
     overview_tab: ui.refreshable,
     signals_tab: ui.refreshable,
     execution_tab: ui.refreshable,
     markets_tab: ui.refreshable,
     chat_tab: ui.refreshable,
 ) -> None:
-    initial = "AI CHAT" if section == "chat" else "DASHBOARD"
-    with ui.tabs(value=initial).classes("w-full ft-tabbar") as tabs:
-        dash = ui.tab("DASHBOARD")
-        markets = ui.tab("MARKETS")
-        chat = ui.tab("AI CHAT")
     with ui.tab_panels(tabs, value=initial).classes("w-full ft-panels"):
         with ui.tab_panel(dash):
             with ui.tabs(value="OVERVIEW").classes("w-full ft-subtab").props("dense") as sub:
@@ -985,64 +1089,51 @@ def _clock_text() -> str:
 
 def _paint_live(label: ui.label, tone: str) -> None:
     if tone == "ok":
-        label.set_text(live_caption("ok"))
-    elif tone == "warn":
-        label.set_text(live_caption("warn"))
+        label.set_text("实时")
+        label.classes(remove="ft-live-warn ft-live-muted")
+        return
+    if tone == "warn":
+        label.set_text("停滞")
         label.classes(remove="ft-live-muted")
         label.classes(add="ft-live-warn")
         return
-    else:
-        label.set_text(live_caption("muted"))
-        label.classes(remove="ft-live-warn")
-        label.classes(add="ft-live-muted")
-        return
-    label.classes(remove="ft-live-warn ft-live-muted")
+    label.set_text("未知")
+    label.classes(remove="ft-live-warn")
+    label.classes(add="ft-live-muted")
 
 
-def _gv2_kpi(label_: str, value: str, hint: str = "", tone: str = "") -> None:
-    classes = "gv2-kpi"
-    if tone:
-        classes = f"{classes} {tone}"
-    with ui.element("div").classes(classes):
-        ui.label(label_).classes("kpi-label")
-        ui.label(value).classes("kpi-value")
-        if hint:
-            ui.label(hint).classes("kpi-hint")
-
-
-def _gv2_kpi_strip(store: DataStore) -> None:
-    gates = read_gates()
-    today = store.today_execution_stats()
-    paper_on = bool(getattr(gates, "paper_enabled", False))
-    pm_on = bool(getattr(gates, "pm_enabled", False))
-    live_on = bool(getattr(gates, "live_effective", False))
-    count = "—"
-    if today.available and today.data is not None:
-        raw = getattr(today.data, "n", None)
-        if raw is not None:
-            count = str(raw)
-    reason = getattr(gates, "live_block_reason", None) or "LIVE"
-    _gv2_kpi("模拟盘", "ON" if paper_on else "OFF", "PAPER", "tone-warn" if paper_on else "tone-ok")
-    _gv2_kpi("仓位闸", "ON" if pm_on else "OFF", "PM", "tone-warn" if pm_on else "tone-ok")
-    _gv2_kpi("实盘", "ON" if live_on else "OFF", str(reason), "tone-bad" if live_on else "tone-ok")
-    _gv2_kpi("今日信号", count, "execution_log")
-
-
-def _gv2_component(title: str, span: str, body_fn: Callable[[], None], foot: str = "") -> None:
+def _gv2_component(
+    prefix: str,
+    emphasis: str,
+    span: str,
+    body_fn: Callable[[], None],
+    *,
+    suffix: str = "",
+    tool: str = "",
+    tool_plain: bool = False,
+    foot: list[str] | None = None,
+) -> None:
     with ui.element("div").classes(f"gv2-component {span}"):
         with ui.element("div").classes("gv2-head"):
-            ui.label(title).classes("gv2-title")
-            with ui.element("div").classes("gv2-tools"):
-                ui.button("⟳", on_click=lambda: None).props("flat dense size=xs").classes("gv2-tool")
+            with ui.element("div").classes("gv2-title"):
+                ui.label(prefix)
+                ui.label(emphasis).classes("em")
+                if suffix:
+                    ui.label(suffix).classes("suffix")
+            if tool:
+                with ui.element("div").classes("gv2-tools"):
+                    ui.label(tool).classes("gv2-tool-note" if tool_plain else "gv2-tool")
         with ui.element("div").classes("gv2-body"):
             try:
                 body_fn()
             except Exception:
-                log.warning("overview component failed: %s", title)
+                log.warning("overview component failed: %s %s", prefix, emphasis)
                 ui.label("—").classes("muted")
-        if foot:
+        parts = [part for part in (foot or []) if part]
+        if parts:
             with ui.element("div").classes("gv2-foot"):
-                ui.label(foot).classes("gv2-foot-text")
+                for part in parts:
+                    ui.label(part)
 
 
 def _gv2_kv(pairs: list[tuple[str, str, str]]) -> None:
@@ -1063,22 +1154,6 @@ def _gv2_text(value: object, limit: int | None = None) -> str:
     return text
 
 
-def _as_int(value: object) -> int:
-    if isinstance(value, bool) or value is None:
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    return 0
-
-
-def _gv2_money(value: object) -> str:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return "—"
-    return f"${value:,.0f}"
-
-
 def _result_rows(result: object) -> list[object]:
     if not getattr(result, "available", False):
         return []
@@ -1095,21 +1170,37 @@ def _result_rows(result: object) -> list[object]:
         return []
 
 
-def _gv2_procs(store: DataStore) -> None:
+def _gv2_procs(store: DataStore, foot: list[str]) -> None:
+    slots = ("主爬虫", "指标", "JEV", "决策引擎", "执行网关")
     live = store.process_liveness()
-    if not live.available:
-        ui.label("心跳：不可用").classes("muted")
-        return
-    probes = _result_rows(live)
-    if not probes:
-        ui.label("心跳：不可用").classes("muted")
-        return
+    probes = _result_rows(live) if live.available else []
+    by_name = {str(getattr(probe, "name", "")): probe for probe in probes}
     pairs: list[tuple[str, str, str]] = []
-    for probe in probes:
-        name = _gv2_text(getattr(probe, "name", None))
-        state = _gv2_text(getattr(probe, "state", None))
-        pairs.append((name, state, "up" if state == "alive" else "mute"))
+    for name in slots:
+        probe = by_name.get(name)
+        if probe is None:
+            pairs.append((name, "—", "mute"))
+            continue
+        state = getattr(probe, "state", None)
+        if state == "alive":
+            pairs.append((name, liveness_label("alive"), "up"))
+        elif state == "stale":
+            pairs.append((name, liveness_label("stale"), "down"))
+        else:
+            pairs.append((name, "—", "mute"))
     _gv2_kv(pairs)
+    known = [probe for probe in probes if getattr(probe, "name", None) in slots[:3]]
+    if not known:
+        foot[:] = ["心跳不可用"]
+        return
+    alive = sum(1 for probe in known if getattr(probe, "state", None) == "alive")
+    ages = [
+        float(age)
+        for probe in known
+        if isinstance((age := getattr(probe, "age_seconds", None)), (int, float)) and not isinstance(age, bool)
+    ]
+    age_text = f"{int(min(ages))}s 前" if ages else "--s 前"
+    foot[:] = [f"进程 {alive}/{len(known)} 存活", f"上次心跳 {age_text}"]
 
 
 def _gv2_gates() -> None:
@@ -1117,10 +1208,12 @@ def _gv2_gates() -> None:
     paper_on = bool(getattr(gates, "paper_enabled", False))
     pm_on = bool(getattr(gates, "pm_enabled", False))
     live_on = bool(getattr(gates, "live_effective", False))
+    switch_on = bool(getattr(gates, "kill_switch_present", False))
     _gv2_kv([
-        ("模拟盘执行", "ON" if paper_on else "关", "up" if paper_on else "mute"),
-        ("仓位管理", "ON" if pm_on else "关", "up" if pm_on else "mute"),
-        ("实盘", "ON" if live_on else "关", "down" if live_on else "mute"),
+        ("模拟盘", "开" if paper_on else "关", "up" if paper_on else "mute"),
+        ("仓位管理", "开" if pm_on else "关", "up" if pm_on else "mute"),
+        ("实盘", "开" if live_on else "关", "down" if live_on else "mute"),
+        ("杀开关", "存在" if switch_on else "不存在", "mute"),
     ])
 
 
@@ -1214,236 +1307,207 @@ def _prior_from_baseline(payload: dict[str, object]) -> list[tuple[str, str]]:
     ]
 
 
-def _gv2_prior_values() -> list[tuple[str, str]]:
+def _gv2_prior_pack() -> tuple[list[tuple[str, str]], list[str]]:
+    payload = _read_prior_baseline()
     loaded = _prior_from_risk()
     if loaded is not None:
-        return loaded
-    payload = _read_prior_baseline()
-    if payload:
-        return _prior_from_baseline(payload)
-    # Same three literals risk._priors already paints when the pack is absent.
-    return [
-        ("见顶 P50", "1.0 min"),
-        ("4H 存活", "75.3%"),
-        ("当天死", "68.67%"),
-        ("毕业率", "—"),
-    ]
+        values = loaded
+    elif payload:
+        values = _prior_from_baseline(payload)
+    else:
+        # Same three literals risk._priors already paints when the pack is absent.
+        values = [
+            ("见顶 P50", "1.0 min"),
+            ("4H 存活", "75.3%"),
+            ("当天死", "68.67%"),
+            ("毕业率", "—"),
+        ]
+    return values, _prior_foot(payload)
 
 
-def _gv2_priors() -> None:
+def _prior_foot(payload: dict[str, object]) -> list[str]:
+    meta = _mapping(payload.get("meta"))
+    gmgn = _mapping(payload.get("gmgn"))
+    self_db = _mapping(payload.get("self_db"))
+    gmgn_n = meta.get("gmgn_n", gmgn.get("n"))
+    self_n = self_db.get("n")
+    gmgn_text = f"GMGN n={gmgn_n}" if isinstance(gmgn_n, int) and not isinstance(gmgn_n, bool) else "GMGN"
+    self_text = (
+        f"self_survival n={self_n}" if isinstance(self_n, int) and not isinstance(self_n, bool) else "self_survival"
+    )
+    return [gmgn_text, self_text, "CoinGecko", "RED-PUMP"]
+
+
+def _gv2_pulse(values: list[tuple[str, str]]) -> None:
     with ui.element("div").classes("gv2-pulse"):
-        for label_, value in _gv2_prior_values():
+        for label_, value in values:
             with ui.element("div").classes("gv2-pulse-item"):
                 ui.label(label_).classes("lbl")
                 ui.label(value).classes("val")
 
 
+def _gv2_table(headers: list[tuple[str, bool]], rows: list[list[str]]) -> None:
+    with ui.element("table").classes("gv2-table"):
+        with ui.element("tr"):
+            for text, numeric in headers:
+                with ui.element("th").classes("num" if numeric else ""):
+                    ui.label(text)
+        for row in rows:
+            with ui.element("tr"):
+                for index, text in enumerate(row):
+                    numeric = headers[index][1] if index < len(headers) else False
+                    with ui.element("td").classes("num" if numeric else ""):
+                        ui.label(text)
+
+
 def _gv2_today(store: DataStore) -> None:
     result = store.today_execution_stats()
     if not result.available or result.data is None:
-        ui.label("暂无数据").classes("muted")
+        _gv2_table(
+            [("信号数", True), ("校验通过", True), ("已执行", True)],
+            [["—", "—", "—"]],
+        )
         return
     block = result.data
-    total = _as_int(getattr(block, "n", None))
-    _gv2_kv([
-        ("信号数", str(getattr(block, "n", "—")), ""),
-        (
-            "校验通过",
-            fmt_rate(getattr(block, "ok_rate", None), _as_int(getattr(block, "n_ok", None)), total),
-            "up",
-        ),
-        (
-            "已执行",
-            fmt_rate(
-                getattr(block, "executed_rate", None),
-                _as_int(getattr(block, "n_executed", None)),
-                total,
-            ),
-            "mute",
-        ),
-    ])
+    _gv2_table(
+        [("信号数", True), ("校验通过", True), ("已执行", True)],
+        [[
+            _count_text(getattr(block, "n", None)),
+            _count_text(getattr(block, "n_ok", None)),
+            _count_text(getattr(block, "n_executed", None)),
+        ]],
+    )
 
 
 def _gv2_week(store: DataStore) -> None:
     result = store.week_decision_stats()
+    headers = [("决策数", True), ("有执行", True), ("通过率", True), ("执行率", True)]
     if not result.available or result.data is None:
-        ui.label("暂无数据").classes("muted")
+        _gv2_table(headers, [["—", "—", "—", "—"]])
         return
     block = result.data
-    # DecisionWindowStats rates use n_with_exec. There is no `n` field.
-    denominator = _as_int(getattr(block, "n_with_exec", None))
+    _gv2_table(
+        headers,
+        [[
+            _count_text(getattr(block, "n_decisions", None)),
+            _count_text(getattr(block, "n_with_exec", None)),
+            _plain_rate(getattr(block, "ok_rate", None)),
+            _plain_rate(getattr(block, "executed_rate", None)),
+        ]],
+    )
+
+
+def _gv2_jev(store: DataStore, foot: list[str]) -> None:
+    result = store.jev_threshold()
+    block = result.data if result.available else None
+    n = getattr(block, "n", None)
+    unique = getattr(block, "unique_token", None)
+    up_1h = getattr(block, "up_1h", None)
+    up_4h = getattr(block, "up_4h", None)
     _gv2_kv([
-        ("决策数", str(getattr(block, "n_decisions", "—")), ""),
-        ("有执行", str(getattr(block, "n_with_exec", "—")), ""),
-        (
-            "通过率",
-            fmt_rate(getattr(block, "ok_rate", None), _as_int(getattr(block, "n_ok", None)), denominator),
-            "up",
-        ),
-        (
-            "执行率",
-            fmt_rate(
-                getattr(block, "executed_rate", None),
-                _as_int(getattr(block, "n_executed", None)),
-                denominator,
-            ),
-            "mute",
-        ),
+        ("n", _count_text(n), ""),
+        ("unique_token", _count_text(unique), ""),
+        ("1h 上涨率", _plain_rate(up_1h), _jev_tone(up_1h)),
+        ("4h 上涨率", _plain_rate(up_4h), _jev_tone(up_4h)),
     ])
+    gap = _jev_gap(n, unique)
+    foot[:] = ["门槛 n≥15 / unique≥10", gap]
 
 
-def _gv2_signals(store: DataStore) -> None:
-    result = store.recent_signals(limit=5)
-    rows = _result_rows(result)
-    if not rows:
-        ui.label("暂无信号").classes("muted")
+def _jev_gap(n: object, unique: object) -> str:
+    if not isinstance(n, int) or not isinstance(unique, int) or isinstance(n, bool) or isinstance(unique, bool):
+        return "过滤后样本未读到"
+    short_n = 15 - n
+    short_unique = 10 - unique
+    if short_n <= 0 and short_unique <= 0:
+        return "已达门槛"
+    if short_n == short_unique and short_n > 0:
+        return f"各差 {short_n}"
+    parts: list[str] = []
+    if short_n > 0:
+        parts.append(f"n 差 {short_n}")
+    if short_unique > 0:
+        parts.append(f"unique 差 {short_unique}")
+    return " · ".join(parts)
+
+
+def _jev_tone(rate: object) -> str:
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+        return "mute"
+    if rate >= 0.55:
+        return "up"
+    if rate < 0.50:
+        return "down"
+    return ""
+
+
+def _gv2_hot(store: DataStore) -> None:
+    headers = [("指标", False), ("n_1h", True), ("中位 1h", True), ("中位 4h", True), ("均值 1h(w)", True)]
+    result = store.hot_baseline()
+    block = result.data if result.available else None
+    if block is None:
+        _gv2_table(headers, [["hot 全量", "—", "—", "—", "—"]])
+        ui.label("hot 截面未读到").classes("gv2-note")
         return
-    table_rows: list[dict[str, str]] = []
-    for index, item in enumerate(rows):
-        size = getattr(item, "size_pct", None)
-        if isinstance(size, (int, float)) and not isinstance(size, bool):
-            size_text = f"{size:.2f}"
-        else:
-            size_text = "—"
-        # decision_id is unique. ts collides when two signals share a timestamp.
-        key = getattr(item, "decision_id", None)
-        table_rows.append(
-            {
-                "key": str(key) if key is not None else str(index),
-                "ts": _gv2_text(getattr(item, "ts", None)),
-                "strategy_id": _gv2_text(getattr(item, "strategy_id", None)),
-                "action": _gv2_text(getattr(item, "action", None)),
-                "size_pct": size_text,
-            }
-        )
-    with ui.element("div").classes("table-scroll"):
-        table = ui.table(
-            columns=[
-                col("ts", "时间", "right"),
-                col("strategy_id", "策略"),
-                col("action", "动作"),
-                col("size_pct", "仓位", "right"),
-            ],
-            rows=table_rows,
-            row_key="key",
-            pagination=5,
-        )
-        table.classes("w-full gv2-table")
+    _gv2_table(
+        headers,
+        [[
+            "hot 全量",
+            _count_text(getattr(block, "n_1h", None)),
+            _signed_pct(getattr(block, "median_1h", None)),
+            _signed_pct(getattr(block, "median_4h", None)),
+            _signed_pct(getattr(block, "mean_1h_winsor", None)),
+        ]],
+    )
 
 
-def _gv2_positions(store: DataStore) -> None:
-    result = store.open_positions()
-    if not result.available or result.data is None:
-        ui.label("暂无数据").classes("muted")
-        return
-    payload = result.data
-    cash_raw = getattr(payload, "cash_usd", None)
-    equity_raw = getattr(payload, "equity_usd", None)
-    cash = _gv2_money(cash_raw)
-    equity = _gv2_money(equity_raw) if equity_raw is not None else cash
-    held_rows = getattr(payload, "rows", None)
-    if held_rows is None:
-        count = getattr(payload, "open_count", None)
-        held = str(count) if count is not None else "—"
-    else:
-        held = str(len(tuple(held_rows)))
-    pct = getattr(payload, "position_pct", None)
-    if isinstance(pct, (int, float)) and not isinstance(pct, bool):
-        share = f"{float(pct):.2f}%"
-    else:
-        ratio = getattr(payload, "position_ratio", None)
-        if isinstance(ratio, (int, float)) and not isinstance(ratio, bool):
-            share = f"{float(ratio) * 100:.2f}%"
-        else:
-            share = "—"
-    _gv2_kv([
-        ("总权益", equity, ""),
-        ("现金", cash, ""),
-        ("持仓数", held, ""),
-        ("仓位占比", share, ""),
-    ])
+def _gv2_strategies(store: DataStore) -> None:
+    headers = [("strategy", False), ("n", True), ("win", True)]
+    result = store.strategy_buckets()
+    rows = _result_rows(result) if result.available else []
+    jev = store.jev_threshold()
+    jev_block = jev.data if jev.available else None
+    strategy_id = str(getattr(jev_block, "strategy_id", "") or "")
+    raw_win = getattr(jev_block, "raw_up_1h", None)
+    painted: list[list[str]] = []
+    for item in rows:
+        name = _gv2_text(getattr(item, "strategy_id", None))
+        win = "—"
+        if strategy_id and name == strategy_id:
+            win = _plain_rate(raw_win)
+        painted.append([name, _count_text(getattr(item, "n", None)), win])
+    if not painted:
+        painted = [["—", "—", "—"]]
+    _gv2_table(headers, painted)
+    ui.label("B/C 策略出信号后自动分桶").classes("gv2-note")
 
 
-def _gv2_btnews(store: DataStore) -> None:
-    result = store.latest_backtest()
-    if result.available and result.data is not None:
-        run = result.data
-        end = getattr(run, "end_equity", None)
-        if isinstance(end, (int, float)) and not isinstance(end, bool):
-            equity = f"${end:,.0f}"
-            tone = "up" if end >= 10000 else "down"
-        else:
-            equity = "—"
-            tone = "mute"
-        done = getattr(run, "done_at", None)
-        if done in (None, ""):
-            done = getattr(run, "finished_at", None)
-        _gv2_kv([
-            ("最近回测", _gv2_text(getattr(run, "run_id", None), 16), "mute"),
-            ("权益", equity, tone),
-            ("完成", _gv2_text(done), "mute"),
-        ])
-    else:
-        _gv2_kv([("最近回测", "暂无", "mute")])
-    items = _result_rows(store.latest_news(limit=3))
-    if not items:
-        return
-    with ui.element("div").classes("gv2-body"):
-        for item in items[:3]:
-            with ui.element("div").classes("news-item"):
-                ui.label(_gv2_text(getattr(item, "title", None))).classes("news-link")
+def _count_text(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "—"
+    return f"{value:,}"
 
 
-def _status_strip(store: DataStore) -> None:
-    """Dense KPI strip on OVERVIEW. Read-only."""
-    gates = read_gates()
-    today = store.today_execution_stats()
-    pos = store.open_positions()
-
-    paper = "ON" if gates.paper_enabled else "OFF"
-    pm = "ON" if gates.pm_enabled else "OFF"
-    live_lbl = "ON" if gates.live_effective else "OFF"
-    paper_tone = "tone-warn" if gates.paper_enabled else "tone-ok"
-    pm_tone = "tone-warn" if gates.pm_enabled else "tone-ok"
-    live_tone = "tone-bad" if gates.live_effective else "tone-ok"
-
-    if today.available:
-        n = str(today.data.n)
-        ok = fmt_rate(today.data.ok_rate, today.data.n_ok, today.data.n)
-        exe = fmt_rate(today.data.executed_rate, today.data.n_executed, today.data.n)
-    else:
-        n, ok, exe = "—", "—", "—"
-
-    if pos.available:
-        n_pos = str(len(pos.data.rows))
-        cash = f"{pos.data.cash_usd:,.0f}" if getattr(pos.data, "cash_usd", None) is not None else "—"
-        equity = getattr(pos.data, "equity_usd", None)
-        eq = f"{equity:,.0f}" if equity is not None else cash
-    else:
-        n_pos, eq = "—", "—"
-
-    # Four primary KPI cards fill the first overview-grid row.
-    _tile("模拟盘", paper, "PAPER", paper_tone)
-    _tile("仓位闸", pm, "PM", pm_tone)
-    _tile("实盘", live_lbl, gates.live_block_reason or "LIVE", live_tone)
-    _tile("今日信号", n, "execution_log")
-    # Remaining stats continue on subsequent grid rows (still 4-col).
-    _tile("校验通过", ok, "validation_ok")
-    _tile("已执行", exe, "executed")
-    _tile("持仓数", n_pos, "paper positions")
-    _tile("权益$", eq, "cash+mtm")
+def _plain_rate(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    return f"{float(value) * 100:.1f}%"
 
 
-def _tile(label: str, value: str, hint: str = "", tone: str = "") -> None:
-    classes = "card"
-    if tone:
-        classes = f"{classes} {tone}"
-    with ui.element("div").classes(classes):
-        ui.label(label).classes("kpi-label")
-        ui.label(value).classes("kpi-value")
-        if hint:
-            ui.label(hint).classes("kpi-hint")
+def _signed_pct(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    return f"{float(value):+.2f}%"
 
+
+def _rss_label() -> str:
+    try:
+        kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        return "内存 —"
+    if not isinstance(kib, (int, float)) or isinstance(kib, bool) or kib < 0:
+        return "内存 —"
+    return f"内存 {kib / 1024:.0f} MB"
 
 
 def main() -> None:
