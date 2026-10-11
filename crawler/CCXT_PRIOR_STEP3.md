@@ -86,3 +86,7 @@ cd crawler
 ```
 
 主爬虫、决策引擎、评分、告警都不会拉起这个脚本。
+
+## Step 4
+
+Step 4 已落地，见 `CCXT_PRIOR_STEP4.md`：`scripts/cex_scope_compare.py`（周报 §6e；快照不足 2 行则「数据积累中」）与 `scripts/ccxt_listing_watch.py`（`prior.db.cex_listing_events`，周报 §6f）。分支 A per-token 深挖仍不启，要等 `cex_listing_events` 与链上按 symbol 归一 join 之后。

@@ -16,7 +16,9 @@ from review.data import (
     SignalChainRow,
     annotate_forward_returns,
     connect_ro,
+    load_cex_listing_events,
     load_cex_scope,
+    load_cex_scope_compare,
     load_jev_coverage,
     load_market_baseline,
     load_signal_chain,
@@ -313,10 +315,30 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         print(f"evolution: {len(evo)} suggestions")
         prior_db = str(db_root / "data" / "prior" / "db" / "prior.db")
+        reports_dir = str(db_root / "exports" / "reports")
         try:
             cex_scope = load_cex_scope(prior_db)
         except Exception as exc:  # noqa: BLE001 —— 缺库不阻断周报
             cex_scope = {"available": False, "reason": str(exc), "rows": []}
+        try:
+            cex_scope_compare = load_cex_scope_compare(reports_dir)
+        except Exception as exc:  # noqa: BLE001 —— 缺报告不阻断周报
+            cex_scope_compare = {
+                "available": False,
+                "reason": str(exc),
+                "rows": [],
+            }
+        try:
+            cex_listing_events = load_cex_listing_events(prior_db)
+        except Exception as exc:  # noqa: BLE001 —— 缺事件不阻断周报
+            cex_listing_events = {
+                "available": False,
+                "reason": str(exc),
+                "n_7d": 0,
+                "exchanges": [],
+                "matched": "N/A",
+                "med_ret_1h": "N/A",
+            }
         md = render_weekly_md(
             period_start=period_start,
             period_end=period_end,
@@ -336,6 +358,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             optimize_section=optimize_section,
             evolution_suggestions=evo,
             cex_scope=cex_scope,
+            cex_scope_compare=cex_scope_compare,
+            cex_listing_events=cex_listing_events,
         )
         written = write_report(md, str(out_path))
         print(f"report: {written}")
