@@ -10,10 +10,13 @@ Binds 127.0.0.1 only. Default port is 8081 (``DASHBOARD_PORT``).
 
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 from fastapi import Request
@@ -22,7 +25,8 @@ from nicegui import app, ui
 from dashboard.auth import SecretFilter, verify_api_key
 from dashboard.data import DataStore
 from dashboard.format_util import fmt_rate
-from dashboard.panels.common import panel_box, panel_guard, show_unavailable
+from dashboard.panels import risk as risk_panel
+from dashboard.panels.common import col, panel_box, panel_guard, show_unavailable
 from dashboard.panels.markets import render_markets
 from dashboard.panels.registry import PANELS
 from dashboard.panels.shell import (
@@ -562,6 +566,84 @@ body { margin: 0; }
   .page { padding: 0 8px 28px; }
   .topbar, .ft-top { gap: 12px; height: auto; min-height: 48px; flex-wrap: wrap; padding: 8px 12px; }
 }
+/* ============ V2 网格组件体系（基准：dashboard_grid_skeleton_v2.html） ============ */
+.gv2-grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.gv2-kpi {
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  border-radius: 4px;
+  padding: 8px 10px;
+  min-height: 72px;
+  grid-column: span 3;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.gv2-kpi .kpi-label { color: #808080; font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
+.gv2-kpi .kpi-value { font-family: var(--mono); font-size: 18px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.gv2-kpi .kpi-hint  { color: #525252; font-size: 9px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gv2-kpi.tone-warn .kpi-value { color: var(--warn); }
+.gv2-kpi.tone-bad  .kpi-value { color: var(--bad); }
+.gv2-kpi.tone-ok   .kpi-value { color: var(--mint); }
+
+.gv2-component {
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.gv2-component.span-3 { grid-column: span 3; }
+.gv2-component.span-4 { grid-column: span 4; }
+.gv2-component.span-6 { grid-column: span 6; }
+.gv2-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  background: #111111;
+  border-bottom: 1px solid #1a1a1a;
+}
+.gv2-title { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #808080; font-family: var(--mono); }
+.gv2-title b { color: #e5e5e5; font-weight: 650; }
+.gv2-tools { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+.gv2-tool {
+  background: transparent; border: 1px solid #2a2a2a; color: #808080;
+  font-size: 10px; padding: 1px 7px; border-radius: 3px; cursor: pointer; line-height: 1.5;
+}
+.gv2-tool:hover { color: #e5e5e5; border-color: var(--accent); }
+.gv2-body { padding: 8px 10px; flex: 1; display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.gv2-foot {
+  padding: 3px 10px; border-top: 1px solid #1a1a1a;
+  font-size: 10px; color: #525252; display: flex; gap: 10px;
+}
+.gv2-kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; }
+.gv2-kv .k { color: #808080; font-size: 10px; white-space: nowrap; }
+.gv2-kv .v { font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.gv2-kv .v.up { color: var(--mint); }
+.gv2-kv .v.down { color: var(--bad); }
+.gv2-kv .v.mute { color: #525252; }
+.gv2-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.gv2-table th { text-align: left; color: #525252; font-weight: 500; padding: 2px 6px; border-bottom: 1px solid #1a1a1a; white-space: nowrap; }
+.gv2-table th.num, .gv2-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.gv2-table td { padding: 2px 6px; border-bottom: 1px solid rgba(26,26,26,.6); white-space: nowrap; }
+.gv2-table tr:hover td { background: rgba(217,119,6,.05); }
+.gv2-pulse { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.gv2-pulse-item { border: 1px solid #1a1a1a; border-radius: 3px; padding: 5px 8px; }
+.gv2-pulse-item .lbl { font-size: 9px; color: #525252; }
+.gv2-pulse-item .val { font-size: 15px; font-variant-numeric: tabular-nums; margin-top: 1px; }
+@media (max-width: 720px) {
+  .gv2-grid { grid-template-columns: repeat(2, 1fr); }
+  .gv2-component, .gv2-kpi { grid-column: span 2 !important; }
+}
 """
 
 
@@ -657,7 +739,7 @@ def _open(request: Request, section: Section) -> None:
 def _render_locked() -> None:
     with ui.element("div").classes("gate-wrap"):
         with ui.element("div").classes("gate-card"):
-            ui.label("CRYPTO TERMINAL").classes("brand-kicker")
+            ui.label("SPIKE'S CRYPTO TERMINER").classes("brand-kicker")
             ui.label("链上新币投研终端").classes("gate-title")
             ui.label(
                 "未配置 API_SECRET，数据视图已关闭。在环境中设置 API_SECRET 后重启看板，"
@@ -670,7 +752,7 @@ def _render_login(next_path: str) -> None:
     target = "/chat" if next_path == "/chat" else "/"
     with ui.element("div").classes("gate-wrap"):
         with ui.element("div").classes("gate-card"):
-            ui.label("CRYPTO TERMINAL").classes("brand-kicker")
+            ui.label("SPIKE'S CRYPTO TERMINER").classes("brand-kicker")
             ui.label("链上新币投研终端").classes("gate-title")
             ui.label(
                 "数据视图需要 API Key。输入与环境变量 API_SECRET 相同的值，"
@@ -717,9 +799,25 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
 
     @ui.refreshable
     def overview_tab() -> None:
-        with ui.element("div").classes("overview-grid"):
-            _status_strip(store)
-            _render_panel_group(store, "overview", overview_tab.refresh)
+        with ui.element("div").classes("gv2-grid"):
+            try:
+                _gv2_kpi_strip(store)
+            except Exception:
+                log.warning("overview kpi strip failed")
+                ui.label("—").classes("muted")
+            _gv2_component("进程 · 心跳", "span-3", lambda: _gv2_procs(store))
+            _gv2_component("风险 · 闸门", "span-3", lambda: _gv2_gates(), foot="闸门只读·环境变量不可改")
+            _gv2_component(
+                "先验 · 对照",
+                "span-6",
+                lambda: _gv2_priors(),
+                foot="GMGN n=956 · self n=9317 · CoinGecko · RED-PUMP",
+            )
+            _gv2_component("今日 · EXECUTION_LOG", "span-4", lambda: _gv2_today(store))
+            _gv2_component("近 7 日 · 决策", "span-4", lambda: _gv2_week(store))
+            _gv2_component("信号 · 流", "span-4", lambda: _gv2_signals(store))
+            _gv2_component("持仓 · 总览", "span-6", lambda: _gv2_positions(store))
+            _gv2_component("回测 · 新闻", "span-6", lambda: _gv2_btnews(store))
             ui.label("阶段一只读监控。手动交易确认不在本看板内。").classes("footer-note")
 
     @ui.refreshable
@@ -792,8 +890,8 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
     with ui.element("div").classes("shell"):
         with ui.element("div").classes("topbar"):
             with ui.element("div").classes("brand"):
-                ui.label("CRYPTO").classes("ft-brand-crypto")
-                ui.label("TERMINAL").classes("ft-brand-name")
+                ui.label("SPIKE'S").classes("ft-brand-crypto")
+                ui.label("CRYPTO TERMINER").classes("ft-brand-name")
                 ui.label("链上新币投研终端").classes("ft-brand-sub")
             with ui.element("div").classes("status-group"):
                 live_lbl = ui.label("● 实时").classes("ft-live")
@@ -901,6 +999,401 @@ def _paint_live(label: ui.label, tone: str) -> None:
     label.classes(remove="ft-live-warn ft-live-muted")
 
 
+def _gv2_kpi(label_: str, value: str, hint: str = "", tone: str = "") -> None:
+    classes = "gv2-kpi"
+    if tone:
+        classes = f"{classes} {tone}"
+    with ui.element("div").classes(classes):
+        ui.label(label_).classes("kpi-label")
+        ui.label(value).classes("kpi-value")
+        if hint:
+            ui.label(hint).classes("kpi-hint")
+
+
+def _gv2_kpi_strip(store: DataStore) -> None:
+    gates = read_gates()
+    today = store.today_execution_stats()
+    paper_on = bool(getattr(gates, "paper_enabled", False))
+    pm_on = bool(getattr(gates, "pm_enabled", False))
+    live_on = bool(getattr(gates, "live_effective", False))
+    count = "—"
+    if today.available and today.data is not None:
+        raw = getattr(today.data, "n", None)
+        if raw is not None:
+            count = str(raw)
+    reason = getattr(gates, "live_block_reason", None) or "LIVE"
+    _gv2_kpi("模拟盘", "ON" if paper_on else "OFF", "PAPER", "tone-warn" if paper_on else "tone-ok")
+    _gv2_kpi("仓位闸", "ON" if pm_on else "OFF", "PM", "tone-warn" if pm_on else "tone-ok")
+    _gv2_kpi("实盘", "ON" if live_on else "OFF", str(reason), "tone-bad" if live_on else "tone-ok")
+    _gv2_kpi("今日信号", count, "execution_log")
+
+
+def _gv2_component(title: str, span: str, body_fn: Callable[[], None], foot: str = "") -> None:
+    with ui.element("div").classes(f"gv2-component {span}"):
+        with ui.element("div").classes("gv2-head"):
+            ui.label(title).classes("gv2-title")
+            with ui.element("div").classes("gv2-tools"):
+                ui.button("⟳", on_click=lambda: None).props("flat dense size=xs").classes("gv2-tool")
+        with ui.element("div").classes("gv2-body"):
+            try:
+                body_fn()
+            except Exception:
+                log.warning("overview component failed: %s", title)
+                ui.label("—").classes("muted")
+        if foot:
+            with ui.element("div").classes("gv2-foot"):
+                ui.label(foot).classes("gv2-foot-text")
+
+
+def _gv2_kv(pairs: list[tuple[str, str, str]]) -> None:
+    with ui.element("div").classes("gv2-kv"):
+        for key, value, tone in pairs:
+            ui.label(key).classes("k")
+            ui.label(value).classes(f"v {tone}".rstrip())
+
+
+def _gv2_text(value: object, limit: int | None = None) -> str:
+    if value is None:
+        return "—"
+    text = str(value).strip()
+    if not text:
+        return "—"
+    if limit is not None:
+        return text[:limit]
+    return text
+
+
+def _as_int(value: object) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return 0
+
+
+def _gv2_money(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    return f"${value:,.0f}"
+
+
+def _result_rows(result: object) -> list[object]:
+    if not getattr(result, "available", False):
+        return []
+    data = getattr(result, "data", None)
+    if data is None:
+        return []
+    rows = getattr(data, "rows", None)
+    source = rows if rows is not None else data
+    if isinstance(source, (str, bytes)):
+        return []
+    try:
+        return list(source)
+    except TypeError:
+        return []
+
+
+def _gv2_procs(store: DataStore) -> None:
+    live = store.process_liveness()
+    if not live.available:
+        ui.label("心跳：不可用").classes("muted")
+        return
+    probes = _result_rows(live)
+    if not probes:
+        ui.label("心跳：不可用").classes("muted")
+        return
+    pairs: list[tuple[str, str, str]] = []
+    for probe in probes:
+        name = _gv2_text(getattr(probe, "name", None))
+        state = _gv2_text(getattr(probe, "state", None))
+        pairs.append((name, state, "up" if state == "alive" else "mute"))
+    _gv2_kv(pairs)
+
+
+def _gv2_gates() -> None:
+    gates = read_gates()
+    paper_on = bool(getattr(gates, "paper_enabled", False))
+    pm_on = bool(getattr(gates, "pm_enabled", False))
+    live_on = bool(getattr(gates, "live_effective", False))
+    _gv2_kv([
+        ("模拟盘执行", "ON" if paper_on else "关", "up" if paper_on else "mute"),
+        ("仓位管理", "ON" if pm_on else "关", "up" if pm_on else "mute"),
+        ("实盘", "ON" if live_on else "关", "down" if live_on else "mute"),
+    ])
+
+
+def _ratio_text(value: object, digits: int) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    number = float(value)
+    if abs(number) <= 1:
+        number *= 100
+    return f"{number:.{digits}f}%"
+
+
+def _read_prior_baseline() -> dict[str, object]:
+    """baseline_params.json is the published prior pack. risk.py has no loader yet."""
+    relative = (
+        Path("data") / "prior" / "exports" / "baseline_params.json",
+        Path("crawler") / "data" / "prior" / "exports" / "baseline_params.json",
+    )
+    roots: list[Path] = []
+    try:
+        roots.append(db_root())
+    except Exception:
+        log.warning("prior baseline root unavailable")
+    roots.append(Path(__file__).resolve().parent.parent)
+    seen: set[Path] = set()
+    for root in roots:
+        for name in relative:
+            path = (root / name).resolve()
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                if not path.is_file():
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                log.warning("prior baseline unreadable: %s", path.name)
+                continue
+            if isinstance(payload, dict):
+                return payload
+    return {}
+
+
+def _mapping(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _prior_from_risk() -> list[tuple[str, str]] | None:
+    load = getattr(risk_panel, "_load_prior_kpis", None)
+    fmt_peak = getattr(risk_panel, "_fmt_peak_min", None)
+    fmt_pct1 = getattr(risk_panel, "_fmt_pct1", None)
+    fmt_pct2 = getattr(risk_panel, "_fmt_pct2", None)
+    if not all(callable(fn) for fn in (load, fmt_peak, fmt_pct1, fmt_pct2)):
+        return None
+    try:
+        loaded = load()
+    except Exception:
+        log.warning("prior kpi load failed")
+        return None
+    if loaded is None:
+        return None
+    return [
+        ("见顶 P50", str(fmt_peak(getattr(loaded, "peak_p50_min", None)))),
+        ("4H 存活", str(fmt_pct1(getattr(loaded, "survive_4h", None)))),
+        ("当天死", str(fmt_pct2(getattr(loaded, "same_day_death", None)))),
+        ("毕业率", str(fmt_pct1(getattr(loaded, "graduation_rate", None)))),
+    ]
+
+
+def _prior_from_baseline(payload: dict[str, object]) -> list[tuple[str, str]]:
+    gmgn = _mapping(payload.get("gmgn"))
+    self_db = _mapping(payload.get("self_db"))
+    survive = _mapping(self_db.get("survive"))
+    coingecko = _mapping(payload.get("coingecko"))
+    redpump = _mapping(payload.get("redpump"))
+    trio = _mapping(payload.get("weekly_baseline_trio"))
+    peak = gmgn.get("median_peak_min")
+    if isinstance(peak, (int, float)) and not isinstance(peak, bool):
+        peak_text = f"{float(peak):.1f} min"
+    else:
+        peak_text = "—"
+    death = trio.get("same_day_death_rate", coingecko.get("same_day_death_rate"))
+    grad = trio.get("graduation_rate", redpump.get("graduation_rate"))
+    return [
+        ("见顶 P50", peak_text),
+        ("4H 存活", _ratio_text(survive.get("4h"), 1)),
+        ("当天死", _ratio_text(death, 2)),
+        ("毕业率", _ratio_text(grad, 1)),
+    ]
+
+
+def _gv2_prior_values() -> list[tuple[str, str]]:
+    loaded = _prior_from_risk()
+    if loaded is not None:
+        return loaded
+    payload = _read_prior_baseline()
+    if payload:
+        return _prior_from_baseline(payload)
+    # Same three literals risk._priors already paints when the pack is absent.
+    return [
+        ("见顶 P50", "1.0 min"),
+        ("4H 存活", "75.3%"),
+        ("当天死", "68.67%"),
+        ("毕业率", "—"),
+    ]
+
+
+def _gv2_priors() -> None:
+    with ui.element("div").classes("gv2-pulse"):
+        for label_, value in _gv2_prior_values():
+            with ui.element("div").classes("gv2-pulse-item"):
+                ui.label(label_).classes("lbl")
+                ui.label(value).classes("val")
+
+
+def _gv2_today(store: DataStore) -> None:
+    result = store.today_execution_stats()
+    if not result.available or result.data is None:
+        ui.label("暂无数据").classes("muted")
+        return
+    block = result.data
+    total = _as_int(getattr(block, "n", None))
+    _gv2_kv([
+        ("信号数", str(getattr(block, "n", "—")), ""),
+        (
+            "校验通过",
+            fmt_rate(getattr(block, "ok_rate", None), _as_int(getattr(block, "n_ok", None)), total),
+            "up",
+        ),
+        (
+            "已执行",
+            fmt_rate(
+                getattr(block, "executed_rate", None),
+                _as_int(getattr(block, "n_executed", None)),
+                total,
+            ),
+            "mute",
+        ),
+    ])
+
+
+def _gv2_week(store: DataStore) -> None:
+    result = store.week_decision_stats()
+    if not result.available or result.data is None:
+        ui.label("暂无数据").classes("muted")
+        return
+    block = result.data
+    # DecisionWindowStats rates use n_with_exec. There is no `n` field.
+    denominator = _as_int(getattr(block, "n_with_exec", None))
+    _gv2_kv([
+        ("决策数", str(getattr(block, "n_decisions", "—")), ""),
+        ("有执行", str(getattr(block, "n_with_exec", "—")), ""),
+        (
+            "通过率",
+            fmt_rate(getattr(block, "ok_rate", None), _as_int(getattr(block, "n_ok", None)), denominator),
+            "up",
+        ),
+        (
+            "执行率",
+            fmt_rate(
+                getattr(block, "executed_rate", None),
+                _as_int(getattr(block, "n_executed", None)),
+                denominator,
+            ),
+            "mute",
+        ),
+    ])
+
+
+def _gv2_signals(store: DataStore) -> None:
+    result = store.recent_signals(limit=5)
+    rows = _result_rows(result)
+    if not rows:
+        ui.label("暂无信号").classes("muted")
+        return
+    table_rows: list[dict[str, str]] = []
+    for index, item in enumerate(rows):
+        size = getattr(item, "size_pct", None)
+        if isinstance(size, (int, float)) and not isinstance(size, bool):
+            size_text = f"{size:.2f}"
+        else:
+            size_text = "—"
+        # decision_id is unique. ts collides when two signals share a timestamp.
+        key = getattr(item, "decision_id", None)
+        table_rows.append(
+            {
+                "key": str(key) if key is not None else str(index),
+                "ts": _gv2_text(getattr(item, "ts", None)),
+                "strategy_id": _gv2_text(getattr(item, "strategy_id", None)),
+                "action": _gv2_text(getattr(item, "action", None)),
+                "size_pct": size_text,
+            }
+        )
+    with ui.element("div").classes("table-scroll"):
+        table = ui.table(
+            columns=[
+                col("ts", "时间", "right"),
+                col("strategy_id", "策略"),
+                col("action", "动作"),
+                col("size_pct", "仓位", "right"),
+            ],
+            rows=table_rows,
+            row_key="key",
+            pagination=5,
+        )
+        table.classes("w-full gv2-table")
+
+
+def _gv2_positions(store: DataStore) -> None:
+    result = store.open_positions()
+    if not result.available or result.data is None:
+        ui.label("暂无数据").classes("muted")
+        return
+    payload = result.data
+    cash_raw = getattr(payload, "cash_usd", None)
+    equity_raw = getattr(payload, "equity_usd", None)
+    cash = _gv2_money(cash_raw)
+    equity = _gv2_money(equity_raw) if equity_raw is not None else cash
+    held_rows = getattr(payload, "rows", None)
+    if held_rows is None:
+        count = getattr(payload, "open_count", None)
+        held = str(count) if count is not None else "—"
+    else:
+        held = str(len(tuple(held_rows)))
+    pct = getattr(payload, "position_pct", None)
+    if isinstance(pct, (int, float)) and not isinstance(pct, bool):
+        share = f"{float(pct):.2f}%"
+    else:
+        ratio = getattr(payload, "position_ratio", None)
+        if isinstance(ratio, (int, float)) and not isinstance(ratio, bool):
+            share = f"{float(ratio) * 100:.2f}%"
+        else:
+            share = "—"
+    _gv2_kv([
+        ("总权益", equity, ""),
+        ("现金", cash, ""),
+        ("持仓数", held, ""),
+        ("仓位占比", share, ""),
+    ])
+
+
+def _gv2_btnews(store: DataStore) -> None:
+    result = store.latest_backtest()
+    if result.available and result.data is not None:
+        run = result.data
+        end = getattr(run, "end_equity", None)
+        if isinstance(end, (int, float)) and not isinstance(end, bool):
+            equity = f"${end:,.0f}"
+            tone = "up" if end >= 10000 else "down"
+        else:
+            equity = "—"
+            tone = "mute"
+        done = getattr(run, "done_at", None)
+        if done in (None, ""):
+            done = getattr(run, "finished_at", None)
+        _gv2_kv([
+            ("最近回测", _gv2_text(getattr(run, "run_id", None), 16), "mute"),
+            ("权益", equity, tone),
+            ("完成", _gv2_text(done), "mute"),
+        ])
+    else:
+        _gv2_kv([("最近回测", "暂无", "mute")])
+    items = _result_rows(store.latest_news(limit=3))
+    if not items:
+        return
+    with ui.element("div").classes("gv2-body"):
+        for item in items[:3]:
+            with ui.element("div").classes("news-item"):
+                ui.label(_gv2_text(getattr(item, "title", None))).classes("news-link")
+
+
 def _status_strip(store: DataStore) -> None:
     """Dense KPI strip on OVERVIEW. Read-only."""
     gates = read_gates()
@@ -974,7 +1467,7 @@ def main() -> None:
     ui.run(
         host=bind_host(),
         port=listen_port,
-        title="CRYPTO TERMINAL",
+        title="SPIKE'S CRYPTO TERMINER",
         dark=True,
         language="zh-CN",
         reload=False,

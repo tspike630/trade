@@ -698,7 +698,7 @@ class DashboardSmokeTest(unittest.TestCase):
         app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
         for label in (
             "CRYPTO",
-            "TERMINAL",
+            "TERMINER",
             "链上新币投研终端",
             "DASHBOARD",
             "MARKETS",
