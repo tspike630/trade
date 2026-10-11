@@ -5,6 +5,7 @@ from review.data import (
     DbPaths,
     SignalChainRow,
     annotate_forward_returns,
+    annotate_token_age,
     load_market_baseline,
     load_signal_chain,
     summarize_execution,
@@ -20,12 +21,14 @@ from review.optimizer import (
 )
 from review.report import render_weekly_md, write_report
 from review.evolution import build_evolution_suggestions, format_evolution_section
+from review.joint import joint_jev_age_prior
 
 __all__ = [
     "DbPaths",
     "OptimizeResult",
     "SignalChainRow",
     "annotate_forward_returns",
+    "annotate_token_age",
     "build_evolution_suggestions",
     "build_param_grid",
     "format_evolution_section",
@@ -41,5 +44,6 @@ __all__ = [
     "slice_jev_filtered",
     "summarize_execution",
     "time_split",
+    "joint_jev_age_prior",
     "write_report",
 ]
