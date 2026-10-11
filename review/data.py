@@ -575,3 +575,271 @@ def summarize_execution(rows: list[SignalChainRow]) -> dict[str, Any]:
         ),
         "exec_dup_count": exec_dup_count,
     }
+
+def load_sentiment_spike_linkage(
+    db_root: str | Path,
+    *,
+    period_start: str,
+    period_end: str,
+    main_db_name: str = "dexscreener.db",
+) -> dict[str, Any]:
+    """Read-only: social spike × on-chain linkage for weekly review §B.
+
+    Probes ``token_indicators`` (preferred) or tables named like
+    ``sentiment`` / ``token_sentiment`` / ``social_*`` for a ``spike`` column.
+    Missing db / table / column / rows → ``ok=False`` + ``note`` (never raises).
+    Observation only — no weights, alerts, or writes.
+    """
+    root = Path(db_root)
+    db_path = root / main_db_name
+    empty: dict[str, Any] = {
+        "ok": False,
+        "empty": True,
+        "note": "",
+        "path": str(db_path),
+        "table": None,
+        "n_spike": 0,
+        "n_spike_with_jev": 0,
+        "n_1h": 0,
+        "n_4h": 0,
+        "up_1h_rate": None,
+        "up_4h_rate": None,
+        "up_1h_n": 0,
+        "up_4h_n": 0,
+        "change_source": None,
+        "period_start": period_start,
+        "period_end": period_end,
+        "hit_gate_55": False,
+    }
+
+    def _fail(note: str) -> dict[str, Any]:
+        out = dict(empty)
+        out["note"] = note
+        return out
+
+    if not db_path.is_file():
+        return _fail(f"{main_db_name} 不存在；暂无数据（等 sentiment.spike 入库）")
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except Exception as e:
+        return _fail(f"打开 {main_db_name} 失败: {e}")
+
+    try:
+        tables = {
+            str(r[0])
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        def _cols(table: str) -> set[str]:
+            return {
+                str(r[1])
+                for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+
+        # Prefer token_indicators when spike is present (SENTIMENT_SPIKE.md).
+        candidates: list[str] = []
+        if "token_indicators" in tables:
+            candidates.append("token_indicators")
+        for t in sorted(tables):
+            tl = t.lower()
+            if t in candidates:
+                continue
+            if (
+                "sentiment" in tl
+                or tl.startswith("social_")
+                or tl in ("token_sentiment", "sentiment")
+            ):
+                candidates.append(t)
+
+        chosen: Optional[str] = None
+        cols: set[str] = set()
+        for t in candidates:
+            try:
+                c = _cols(t)
+            except Exception:
+                continue
+            if "spike" in c:
+                chosen, cols = t, c
+                break
+
+        if chosen is None:
+            if not candidates:
+                return _fail("暂无数据（等 sentiment.spike 入库）：未找到 sentiment 相关表")
+            return _fail(
+                "暂无数据（等 sentiment.spike 入库）："
+                f"已见表 {candidates} 但无 spike 列"
+            )
+
+        # Time column for period filter
+        ts_col = None
+        for cand in (
+            "sentiment_updated_at",
+            "spike_at",
+            "recorded_at",
+            "updated_at",
+            "ts",
+        ):
+            if cand in cols:
+                ts_col = cand
+                break
+
+        where = "spike = 1"
+        params: list[Any] = []
+        if ts_col:
+            where += f" AND {ts_col} >= ? AND {ts_col} < ?"
+            params.extend([period_start, period_end])
+
+        # Identity columns
+        has_chain = "chain_id" in cols
+        has_token = "token_address" in cols
+        if has_chain and has_token:
+            id_sql = "chain_id, token_address"
+        elif has_token:
+            id_sql = "token_address AS token_address, '' AS chain_id"
+        else:
+            return _fail(
+                f"表 `{chosen}` 有 spike 但缺 token_address；无法汇总联动"
+            )
+
+        change_1h_expr = "change_1h" if "change_1h" in cols else "NULL AS change_1h"
+        change_4h_expr = "change_4h" if "change_4h" in cols else "NULL AS change_4h"
+        jev_col = None
+        for jc in ("jev_signal", "jev_score", "jev_strength"):
+            if jc in cols:
+                jev_col = jc
+                break
+        jev_sel = f"{jev_col}" if jev_col else "NULL AS jev_signal"
+
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT {id_sql}, {change_1h_expr}, {change_4h_expr}, {jev_sel}
+                FROM {chosen}
+                WHERE {where}
+                """,
+                params,
+            ).fetchall()
+        except Exception as e:
+            return _fail(f"查询 `{chosen}.spike` 失败: {e}")
+
+        if not rows:
+            note = (
+                f"`{chosen}.spike` 列存在，但期间 "
+                f"[{period_start}, {period_end}) 无 spike=1 行"
+            )
+            if not ts_col:
+                note += "（无时间列，已扫全表）"
+            return _fail(note)
+
+        # Unique spike tokens
+        keys: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for r in rows:
+            k = (str(r["chain_id"] or ""), str(r["token_address"] or ""))
+            if k[1] and k not in seen:
+                seen.add(k)
+                keys.append(k)
+        n_spike = len(keys)
+
+        # JEV overlap: jev_signals table and/or non-null jev_* on row
+        has_jev_table = "jev_signals" in tables
+        jev_keys: set[tuple[str, str]] = set()
+        if has_jev_table and keys:
+            try:
+                # Chunk IN queries to stay safe
+                chunk = 200
+                for i in range(0, len(keys), chunk):
+                    part = keys[i : i + chunk]
+                    placeholders = ",".join(["(?,?)"] * len(part))
+                    flat: list[Any] = []
+                    for ch, tok in part:
+                        flat.extend([ch, tok])
+                    hit = conn.execute(
+                        f"""
+                        SELECT DISTINCT chain_id, token_address
+                        FROM jev_signals
+                        WHERE (chain_id, token_address) IN ({placeholders})
+                        """,
+                        flat,
+                    ).fetchall()
+                    for h in hit:
+                        jev_keys.add(
+                            (str(h["chain_id"] or ""), str(h["token_address"] or ""))
+                        )
+            except Exception:
+                jev_keys = set()
+
+        if jev_col:
+            for r in rows:
+                k = (str(r["chain_id"] or ""), str(r["token_address"] or ""))
+                if not k[1]:
+                    continue
+                v = r[jev_col] if jev_col in r.keys() else None
+                if v is None or v == "":
+                    continue
+                # treat numeric 0 as no-signal only for score/strength; keep string labels
+                if jev_col in ("jev_score", "jev_strength"):
+                    fv = safe_float(v)
+                    if fv is None or fv == 0:
+                        continue
+                jev_keys.add(k)
+
+        n_spike_with_jev = len(jev_keys)
+
+        # Up rates from snapshot change_1h / change_4h (percent units)
+        c1 = [safe_float(r["change_1h"]) for r in rows]
+        c4 = [safe_float(r["change_4h"]) for r in rows]
+        c1v = [x for x in c1 if x is not None]
+        c4v = [x for x in c4 if x is not None]
+        up1 = sum(1 for x in c1v if x > 0)
+        up4 = sum(1 for x in c4v if x > 0)
+        n_1h = len(c1v)
+        n_4h = len(c4v)
+        up_1h_rate = (up1 / n_1h) if n_1h else None
+        up_4h_rate = (up4 / n_4h) if n_4h else None
+
+        change_source = None
+        if "change_1h" in cols or "change_4h" in cols:
+            change_source = (
+                f"`{chosen}`.change_1h/4h（突热快照并存涨跌幅，非 spike 后严格前向）"
+            )
+        else:
+            change_source = "缺 change_1h/4h 列；上涨率暂缺"
+
+        hit = bool(
+            (up_1h_rate is not None and up_1h_rate > 0.55)
+            or (up_4h_rate is not None and up_4h_rate > 0.55)
+        )
+
+        return {
+            "ok": True,
+            "empty": False,
+            "note": "",
+            "path": str(db_path),
+            "table": chosen,
+            "ts_col": ts_col,
+            "n_spike": n_spike,
+            "n_spike_rows": len(rows),
+            "n_spike_with_jev": n_spike_with_jev,
+            "n_1h": n_1h,
+            "n_4h": n_4h,
+            "up_1h_rate": up_1h_rate,
+            "up_4h_rate": up_4h_rate,
+            "up_1h_n": up1,
+            "up_4h_n": up4,
+            "change_source": change_source,
+            "period_start": period_start,
+            "period_end": period_end,
+            "hit_gate_55": hit,
+        }
+    except Exception as e:
+        return _fail(f"sentiment spike 联动汇总异常: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass

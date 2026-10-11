@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from review.data import SignalChainRow
+from review.data import SignalChainRow, load_sentiment_spike_linkage
 from review.evolution import format_evolution_section
 
 HK_TZ = timezone(timedelta(hours=8))
@@ -197,6 +197,90 @@ def _render_attribution_section(
     return lines
 
 
+def _render_sentiment_spike_section(
+    db_root: Optional[str | Path],
+    *,
+    period_start: str,
+    period_end: str,
+) -> list[str]:
+    """§8b: social spike × on-chain linkage (observe only; never weights)."""
+    lines: list[str] = []
+    lines.append("### 社媒突热 × 链上联动（只观察）")
+    lines.append("")
+    lines.append(
+        "> **纪律（钉死）：** 突热 = **滞后确认**，**非买入信号**；"
+        "RISK/权重默认关（`INDICATORS_WEIGHT_SENTIMENT=0`）；"
+        "不告警、不进决策、不调权。详见 `SENTIMENT_SPIKE.md`。"
+    )
+    lines.append("")
+
+    if db_root is None:
+        lines.append("_未提供 db_root；暂无数据（等 sentiment.spike 入库）。_")
+        lines.append("")
+        return lines
+
+    info = load_sentiment_spike_linkage(
+        db_root, period_start=period_start, period_end=period_end
+    )
+    if not info.get("ok") or info.get("empty"):
+        note = info.get("note") or "暂无数据（等 sentiment.spike 入库）"
+        lines.append(f"**暂无数据（等 sentiment.spike 入库）** — {note}")
+        lines.append("")
+        lines.append("> 继续观察；缺数据不失败、不调权。")
+        lines.append("")
+        return lines
+
+    n_spike = int(info.get("n_spike") or 0)
+    n_jev = int(info.get("n_spike_with_jev") or 0)
+    up1 = info.get("up_1h_rate")
+    up4 = info.get("up_4h_rate")
+    n1 = int(info.get("n_1h") or 0)
+    n4 = int(info.get("n_4h") or 0)
+    up1n = int(info.get("up_1h_n") or 0)
+    up4n = int(info.get("up_4h_n") or 0)
+    table = info.get("table") or "?"
+    ts_col = info.get("ts_col") or "—"
+    change_source = info.get("change_source") or "—"
+
+    lines.append(
+        f"期间 `{period_start}` ≤ `{ts_col}` < `{period_end}` · "
+        f"表=`{table}` · spike=1 去重 token。"
+    )
+    lines.append("")
+    lines.append("| 项 | 值 |")
+    lines.append("|---|---|")
+    lines.append(f"| n_spike（突热 token） | **{n_spike}** |")
+    lines.append(f"| 其中有 JEV 信号 | **{n_jev}** |")
+    lines.append(
+        f"| 1h 上涨率 | **{_pct(up1)}** "
+        f"（{up1n}/{n1}，change_1h>0） |"
+    )
+    lines.append(
+        f"| 4h 上涨率 | **{_pct(up4)}** "
+        f"（{up4n}/{n4}，change_4h>0） |"
+    )
+    lines.append(f"| 涨跌口径 | {change_source} |")
+    lines.append("")
+
+    hit = bool(info.get("hit_gate_55"))
+    if hit:
+        lines.append(
+            "**结论：** 命中率已有 >55% 时段 —— 仍只观察；"
+            "谈后续加权须另走 R4 人工确认（本小节不调权）。"
+        )
+    else:
+        lines.append(
+            "**结论：** 命中率未稳超 55%（1h/4h）—— **继续观察**，"
+            "不谈加权；突热仅作滞后确认素材。"
+        )
+    lines.append("")
+    lines.append(
+        "> 只观察不调权、不告警、不进决策；样本随 A 层 `spike` 入库滚动。"
+    )
+    lines.append("")
+    return lines
+
+
 def render_weekly_md(
     *,
     period_start: str,
@@ -212,8 +296,9 @@ def render_weekly_md(
     backtest_summary: Optional[dict[str, Any]] = None,
     optimize_section: Optional[str] = None,
     evolution_suggestions: Optional[list[dict[str, Any]]] = None,
+    db_root: Optional[str | Path] = None,
 ) -> str:
-    """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议）。"""
+    """返回 markdown 字符串（§1–8 + §8b 突热联动 + 可选§9 R3 + §10 进化建议）。"""
     n = len(chain)
     n_exec = sum(1 for r in chain if r.exec_id is not None)
     n_pos = sum(1 for r in chain if r.position_id is not None)
@@ -388,6 +473,13 @@ def render_weekly_md(
 
     # 8. 信号层归因（R2）
     lines.extend(_render_attribution_section(attribution, fill_attr, backtest_summary))
+
+    # 8b. 社媒突热 × 链上联动（只观察；不调权）
+    lines.extend(
+        _render_sentiment_spike_section(
+            db_root, period_start=period_start, period_end=period_end
+        )
+    )
 
     # 9. R3 参数寻优（脚手架占位）
     lines.append("## 9. R3 参数寻优 — 待历史≥7天且周检跨门槛")

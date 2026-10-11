@@ -18,3 +18,7 @@
 .venv/bin/python -m review.run --period 7d --report
 # 可选：--optimize 以便 §10 引用真实 R3 skip reason
 ```
+
+## §8b：社媒突热 × 链上联动（B，只观察）
+
+周报 §8 归因后追加 **「社媒突热 × 链上联动（只观察）」**：只读 `token_indicators.spike` / `spike_ratio`（A 层入库），汇总近窗 n_spike、有 JEV 数、change_1h/4h 上涨率。突热=滞后确认，非买入；**不调权、不告警、不进决策**。缺表/缺列/无行 → 显示「暂无数据」且 exit 0。详见 `SENTIMENT_SPIKE.md` · loader=`review.data.load_sentiment_spike_linkage`。

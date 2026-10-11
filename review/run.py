@@ -329,6 +329,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             backtest_summary=bt_summary,
             optimize_section=optimize_section,
             evolution_suggestions=evo,
+            db_root=db_root,
         )
         written = write_report(md, str(out_path))
         print(f"report: {written}")

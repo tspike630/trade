@@ -6,6 +6,7 @@ from review.data import (
     SignalChainRow,
     annotate_forward_returns,
     load_market_baseline,
+    load_sentiment_spike_linkage,
     load_signal_chain,
     summarize_execution,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "fill_attribution",
     "format_optimize_summary",
     "load_market_baseline",
+    "load_sentiment_spike_linkage",
     "load_signal_chain",
     "optimize",
     "render_weekly_md",
