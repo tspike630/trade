@@ -23,6 +23,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from dashboard.app import _jev_gap
 from dashboard.auth import SecretFilter, verify_api_key
 from dashboard.data import DataStore, DbPaths, _WRITE_RE, connect_ro
 from dashboard.format_util import fmt_hold, fmt_liq, fmt_pct, fmt_usd
@@ -708,9 +709,21 @@ class DashboardSmokeTest(unittest.TestCase):
             "SIGNALS",
             "EXECUTION",
             "/chat",
+            "EXECUTION_LOG",
+            "门槛",
+            "策略",
+            "速览",
+            "基准",
+            "span-8",
+            "#0d1117",
+            "#2f81f7",
+            "#3fb950",
+            "#f85149",
         ):
             self.assertIn(label, app_text)
         self.assertNotIn("TERMINAL", app_text)
+        self.assertNotIn("#d97706", app_text)
+        self.assertNotIn("_gv2_kpi_strip", app_text)
         market_src = inspect.getsource(DataStore._market_rows)
         for banned in ("rsi", "macd", "boll"):
             self.assertNotIn(banned, market_src.lower())
@@ -825,6 +838,91 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual([row.token_address for row in sol.data], ["T1"])
         self.assertEqual(list(store.market_rows(chain="not-a-chain").data or ()), [])
         self.assertEqual(main.stat().st_mtime_ns, before)
+
+    def test_overview_skeleton_reads_are_real_or_blank(self) -> None:
+        missing = DataStore(
+            DbPaths(
+                main=self.root / "no-overview.db",
+                execution=self.root / "no-overview-exec.db",
+                paper=self.root / "no-overview-paper.db",
+                backtest=self.root / "no-overview-bt.db",
+                news=self.root / "no-overview-news.db",
+            )
+        )
+        for result in (missing.hot_baseline(), missing.strategy_buckets(), missing.jev_threshold()):
+            self.assertFalse(result.available)
+            self.assertIsNone(result.data)
+
+        main = self.root / "overview.db"
+        with sqlite3.connect(main) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE indicator_history (
+                    tier TEXT,
+                    change_1h REAL,
+                    change_4h REAL,
+                    recorded_at TEXT
+                );
+                CREATE TABLE decision_log (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT,
+                    strategy_id TEXT,
+                    action TEXT,
+                    chain_id TEXT,
+                    token_address TEXT,
+                    reason TEXT,
+                    mode TEXT,
+                    raw_json TEXT
+                );
+                """
+            )
+            conn.executemany(
+                "INSERT INTO indicator_history (tier, change_1h, change_4h, recorded_at) VALUES (?, ?, ?, ?)",
+                [
+                    ("hot", 1.0, 0.66, "2026-10-10T00:00:00Z"),
+                    ("hot", 3.0, None, "2026-10-10T00:00:01Z"),
+                    ("hot", 1000.0, 2.0, "2026-10-10T00:00:02Z"),
+                    ("warm", 50.0, 50.0, "2026-10-10T00:00:03Z"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO decision_log (ts, strategy_id, action, mode) VALUES (?, ?, 'buy', 'dry_run')",
+                [
+                    ("2026-10-10T00:00:00Z", "alpha"),
+                    ("2026-10-10T00:00:01Z", "alpha"),
+                    ("2026-10-10T00:00:02Z", "jev_strength_v1"),
+                ],
+            )
+        before = main.stat().st_mtime_ns
+        store = DataStore(
+            DbPaths(
+                main=main,
+                execution=self.root / "overview-exec-missing.db",
+                paper=self.root / "overview-paper-missing.db",
+                backtest=self.root / "overview-bt-missing.db",
+                news=self.root / "overview-news-missing.db",
+            )
+        )
+        hot = store.hot_baseline()
+        self.assertTrue(hot.available, hot.reason)
+        self.assertEqual(hot.data.n_1h, 3)
+        self.assertAlmostEqual(hot.data.median_1h or 0, 3.0)
+        self.assertAlmostEqual(hot.data.median_4h or 0, 1.33, places=2)
+        # |1000| is outside the winsor cap, so the mean is (1+3)/2.
+        self.assertAlmostEqual(hot.data.mean_1h_winsor or 0, 2.0)
+        buckets = store.strategy_buckets()
+        self.assertTrue(buckets.available, buckets.reason)
+        self.assertEqual([(row.strategy_id, row.n) for row in buckets.data], [("alpha", 2), ("jev_strength_v1", 1)])
+        gate = store.jev_threshold()
+        self.assertTrue(gate.available, gate.reason)
+        self.assertEqual(gate.data.n, 0)
+        self.assertEqual(gate.data.unique_token, 0)
+        self.assertEqual(gate.data.strategy_id, "jev_strength_v1")
+        self.assertIsNone(gate.data.up_1h)
+        self.assertEqual(main.stat().st_mtime_ns, before)
+        self.assertEqual(_jev_gap(14, 9), "各差 1")
+        self.assertEqual(_jev_gap(None, 9), "过滤后样本未读到")
+        self.assertEqual(_jev_gap(20, 12), "已达门槛")
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
