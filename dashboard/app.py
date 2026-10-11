@@ -630,16 +630,16 @@ body { margin: 0; }
 /* ---- 组件网格（12 列） ---- */
 .v2-grid {
   display: grid; grid-template-columns: repeat(12, 1fr); gap: var(--v2-gap);
-  grid-auto-rows: minmax(0, auto); align-items: stretch; width: 100%;
+  grid-auto-rows: minmax(84px, auto); align-items: stretch; width: 100%;
   box-sizing: border-box; font-family: var(--v2-mono); font-size: var(--v2-base);
   line-height: var(--v2-lh); color: var(--v2-fg);
 }
-.v2-wrap { flex: 1; overflow-y: auto; padding: var(--v2-gap); }
+.v2-wrap { flex: 1; overflow-y: auto; padding: var(--v2-gap); width: 100%; align-self: stretch; }
 
 /* ---- 组件卡（#161b22 + #2d333b 边框 + 表头 #1f2630） ---- */
 .v2-comp {
   background: var(--v2-panel); border: 1px solid var(--v2-border); border-radius: 3px;
-  display: flex; flex-direction: column; min-width: 0; box-sizing: border-box; overflow: hidden;
+  display: flex; flex-direction: column; min-width: 0; min-height: 84px; box-sizing: border-box; overflow: hidden;
   font-family: var(--v2-mono);
 }
 .v2-comp.span-3 { grid-column: span 3; }
@@ -673,13 +673,19 @@ body { margin: 0; }
 .v2-table th { text-align: left; color: var(--v2-mute); font-weight: 500; padding: 3px 6px; border-bottom: 1px solid var(--v2-border); white-space: nowrap; }
 .v2-table th.num, .v2-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .v2-table td { padding: 3px 6px; border-bottom: 1px solid rgba(45,51,59,.5); white-space: nowrap; }
+.v2-table td.up, .v2-table .v.up { color: var(--v2-up); }
+.v2-table td.down, .v2-table .v.down { color: var(--v2-down); }
+.v2-table td.mute, .v2-table .v.mute { color: var(--v2-mute); }
 .v2-table tr:hover td { background: rgba(47,129,247,.06); }
 
 /* ---- 脉冲块 ---- */
 .v2-pulse { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-.v2-pulse-item { border: 1px solid var(--v2-border); border-radius: 3px; padding: 6px 8px; }
+.v2-pulse-item { border: 1px solid var(--v2-border); border-radius: 3px; padding: 4px 8px; }
 .v2-pulse-item .lbl { font-size: 10px; color: var(--v2-mute); font-family: var(--v2-mono); }
-.v2-pulse-item .val { font-size: 15px; font-variant-numeric: tabular-nums; margin-top: 2px; font-family: var(--v2-mono); }
+.v2-pulse-item .val { font-size: 14px; font-variant-numeric: tabular-nums; margin-top: 1px; font-family: var(--v2-mono); }
+.v2-pulse-item .val.up { color: var(--v2-up); }
+.v2-pulse-item .val.down { color: var(--v2-down); }
+.v2-pulse-item .val.mute { color: var(--v2-mute); }
 
 /* ---- KPI 顶行（4 卡） ---- */
 .v2-kpi {
@@ -721,14 +727,21 @@ body { margin: 0; }
 
 /* NiceGUI button chrome reset so v2-tab / v2-subtab / v2-tool match the skeleton. */
 html, body, .shell { background: var(--v2-bg); color: var(--v2-fg); }
-.nicegui-content { padding: 0 !important; }
-.shell { height: 100vh; max-height: 100vh; overflow: hidden; }
+.nicegui-content {
+  padding: 0 !important; gap: 0 !important; align-items: stretch !important;
+  height: 100vh; overflow: hidden;
+}
+.shell {
+  height: 100vh; max-height: 100vh; width: 100%; overflow: hidden;
+  display: flex !important; flex-direction: column !important; align-items: stretch !important;
+  gap: 0 !important;
+}
 .ft-body.v2-stage {
   max-width: none; margin: 0; padding: 0; min-height: 0;
   display: flex; flex-direction: column; overflow: hidden;
 }
-.v2-subslot { flex: 0 0 auto; }
-.v2-subslot > * { display: flex; flex-direction: column; }
+.v2-subslot { flex: 0 0 auto; width: 100%; align-self: stretch; display: block; }
+.v2-subslot > * { display: block; width: 100%; }
 .v2-mainslot { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .v2-mainslot > * {
   flex: 1; min-height: 0; display: flex !important; flex-direction: column; overflow: hidden;
@@ -740,7 +753,21 @@ html, body, .shell { background: var(--v2-bg); color: var(--v2-fg); }
 .v2-title { gap: 4px; }
 .v2-title .em { color: var(--v2-fg); font-weight: 600; }
 .v2-topbar { height: 40px !important; min-height: 40px !important; max-height: 40px !important; overflow: hidden; }
-.v2-subbar { height: 30px !important; min-height: 30px !important; max-height: 30px !important; }
+.v2-subbar {
+  height: 30px !important; min-height: 30px !important; max-height: 30px !important;
+  width: 100%; display: flex !important; flex-direction: row !important; flex-wrap: nowrap !important;
+  align-items: center !important; overflow: hidden; position: relative; z-index: 4;
+}
+.v2-warnbar {
+  display: flex; align-items: center; justify-content: center; height: 20px;
+  min-height: 20px; max-height: 20px; flex: 0 0 20px; width: 100%;
+  background: #3a2d10; color: #d29922; font-size: 10px; font-family: var(--v2-mono);
+  margin: 0; padding: 0; border: none; border-radius: 0; overflow: hidden; white-space: nowrap;
+}
+.v2-warnbar > * { margin: 0; padding: 0; font-size: 10px; line-height: 20px; color: inherit; font-family: inherit; }
+.v2-ready { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.v2-statusdot.warn { background: var(--v2-warn); box-shadow: 0 0 4px var(--v2-warn); }
+.v2-statusdot.mute { background: var(--v2-mute); box-shadow: none; }
 .v2-statusbar { height: 26px !important; min-height: 26px !important; max-height: 26px !important; }
 .v2-tab.q-btn, .v2-subtab.q-btn, .v2-tool.q-btn {
   box-shadow: none !important; text-transform: none !important; min-height: 0 !important;
@@ -774,6 +801,10 @@ html, body, .shell { background: var(--v2-bg); color: var(--v2-fg); }
   background: transparent !important; color: var(--v2-dim) !important;
   border: 1px solid var(--v2-border-strong) !important; border-radius: 3px !important;
   font-size: 10px !important; line-height: 1.4 !important;
+  flex: 0 0 auto !important; width: auto !important; white-space: nowrap !important;
+}
+.v2-subbar .v2-subtab.q-btn, .v2-subbar .v2-tool.q-btn {
+  flex: 0 0 auto !important; width: auto !important; white-space: nowrap !important;
 }
 .v2-tool.q-btn .q-btn__content { color: inherit !important; padding: 0 !important; min-height: 0 !important; }
 .v2-tool.q-btn.on, .v2-tool.q-btn.on .q-btn__content, .v2-tool.on {
@@ -1025,7 +1056,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     ("市场", "基准（hot）"),
                     "span-8",
                     lambda: _v2_market_base(store),
-                    foot="indicator_history tier=hot · winsor |x|≤500",
+                    foot="indicator_history tier=hot · winsor |x|<=500",
                     tools=("winsor",),
                 )
                 _v2_comp(
@@ -1092,19 +1123,15 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
             proc_lbl.set_text(text)
             _set_tone(proc_lbl, "ok" if tone == "ok" else ("warn" if tone == "warn" else ""))
             if tone == "ok" and "缺失" not in db_text:
-                ready_lbl.set_text("● 就绪")
-                _set_tone(ready_lbl, "ok")
+                _paint_ready(ready_lbl, ready_dot, "就绪", "ok")
             elif tone == "warn":
-                ready_lbl.set_text("● 停滞")
-                _set_tone(ready_lbl, "warn")
+                _paint_ready(ready_lbl, ready_dot, "停滞", "warn")
             else:
-                ready_lbl.set_text("● 未知")
-                _set_tone(ready_lbl, "")
+                _paint_ready(ready_lbl, ready_dot, "未知", "mute")
         except Exception:
             log.warning("status strip failed")
             proc_lbl.set_text("心跳：不可用")
-            ready_lbl.set_text("● 未知")
-            _set_tone(ready_lbl, "")
+            _paint_ready(ready_lbl, ready_dot, "未知", "mute")
 
     def tick() -> None:
         if api_secret() and not _session_ok():
@@ -1119,8 +1146,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
             paint_clock()
         except Exception:
             log.warning("refresh failed")
-            ready_lbl.set_text("● 刷新失败")
-            _set_tone(ready_lbl, "warn")
+            _paint_ready(ready_lbl, ready_dot, "刷新失败", "warn")
 
     def apply_nav() -> None:
         hosts = nav.get("hosts")
@@ -1186,23 +1212,23 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     ui.button("退出", on_click=_revoke_session).props(
                         "flat dense unelevated no-caps"
                     ).classes("v2-tool")
-        with ui.element("div").classes("ft-body v2-stage"):
-            if insecure:
-                ui.label("本地未鉴权模式（ALLOW_INSECURE_API=1）。不要暴露到公网。").classes("banner")
-            _module_tabs(
-                section,
-                overview_tab,
-                signals_tab,
-                execution_tab,
-                markets_tab,
-                chat_tab,
-                nav=nav,
-                on_sub=switch_sub,
-                on_compact=toggle_compact,
-                on_refresh=tick,
-                host_on=host_on,
-            )
-        session_lbl, db_lbl, proc_lbl, ready_lbl = _status_strip(store)
+        if insecure:
+            with ui.element("div").classes("v2-warnbar"):
+                ui.label("本地未鉴权模式（ALLOW_INSECURE_API=1）。不要暴露到公网。")
+        _module_tabs(
+            section,
+            overview_tab,
+            signals_tab,
+            execution_tab,
+            markets_tab,
+            chat_tab,
+            nav=nav,
+            on_sub=switch_sub,
+            on_compact=toggle_compact,
+            on_refresh=tick,
+            host_on=host_on,
+        )
+        session_lbl, db_lbl, proc_lbl, ready_lbl, ready_dot = _status_strip(store)
     paint_status()
     paint_clock()
     ui.timer(1.0, paint_clock)
@@ -1301,7 +1327,14 @@ def _set_tone(label: ui.label, tone: str) -> None:
         label.classes(add=tone)
 
 
-def _status_strip(store: DataStore) -> tuple[ui.label, ui.label, ui.label, ui.label]:
+def _paint_ready(ready_lbl: ui.label, ready_dot: ui.element, text: str, tone: str) -> None:
+    """Green status dot plus a word. The bullet character does not render in this font."""
+    ready_lbl.set_text(text)
+    ready_dot.classes(remove="ok warn mute")
+    ready_dot.classes(add=tone if tone in ("ok", "warn", "mute") else "mute")
+
+
+def _status_strip(store: DataStore) -> tuple[ui.label, ui.label, ui.label, ui.label, ui.element]:
     """Bottom status bar. Clock and heartbeat paints update the returned labels."""
     db_text = "库 —"
     try:
@@ -1317,9 +1350,10 @@ def _status_strip(store: DataStore) -> tuple[ui.label, ui.label, ui.label, ui.la
         ui.label("·").classes("sep")
         proc_lbl = ui.label("进程 —")
         ui.label("·").classes("sep")
-        ui.label("延迟 —")
-        ready_lbl = ui.label("● 就绪").classes("right")
-    return session_lbl, db_lbl, proc_lbl, ready_lbl
+        ui.label("延迟 --ms")
+        ready_dot = ui.element("div").classes("v2-statusdot ok right")
+        ready_lbl = ui.label("就绪")
+    return session_lbl, db_lbl, proc_lbl, ready_lbl, ready_dot
 
 
 def _v2_kpi(label_: str, value: str, hint: str = "", tone: str = "") -> None:
@@ -1395,17 +1429,24 @@ def _v2_kv(pairs: list[tuple[str, str, str]]) -> None:
             ui.label(value).classes(f"v {tone}".rstrip())
 
 
-def _v2_table(headers: list[tuple[str, str]], rows: list[list[str]]) -> None:
+def _v2_table(
+    headers: list[tuple[str, str]],
+    rows: list[list[str]],
+    tones: list[list[str]] | None = None,
+) -> None:
     with ui.element("table").classes("v2-table"):
         with ui.element("tr"):
             for text, align in headers:
                 with ui.element("th").classes(align):
                     ui.label(text)
-        for row in rows:
+        for row_index, row in enumerate(rows):
             with ui.element("tr"):
                 for index, text in enumerate(row):
                     align = headers[index][1] if index < len(headers) else ""
-                    with ui.element("td").classes(align):
+                    tone = ""
+                    if tones is not None and row_index < len(tones) and index < len(tones[row_index]):
+                        tone = tones[row_index][index]
+                    with ui.element("td").classes(f"{align} {tone}".strip()):
                         ui.label(text)
 
 
@@ -1434,6 +1475,16 @@ def _v2_money(value: object) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "—"
     return f"${value:,.0f}"
+
+
+def _signed_usd(value: object) -> tuple[str, str]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—", "mute"
+    if value > 0:
+        return f"+${value:,.0f}", "up"
+    if value < 0:
+        return f"-${abs(value):,.0f}", "down"
+    return "$0", "mute"
 
 
 def _result_rows(result: object) -> list[object]:
@@ -1474,35 +1525,31 @@ def _proc_foot(store: DataStore) -> str:
     return f"进程 {alive}/{len(probes)} 存活 · 上次心跳 —"
 
 
+_PROCESS_ROWS = ("主爬虫", "指标", "JEV", "决策引擎", "执行网关")
+
+
 def _v2_procs(store: DataStore) -> None:
-    live = store.process_liveness()
-    if not live.available:
-        ui.label("心跳：不可用").classes("v2-note")
-        return
-    probes = _result_rows(live)
-    if not probes:
-        ui.label("心跳：不可用").classes("v2-note")
-        return
-    pairs: list[tuple[str, str, str]] = []
-    ages: list[str] = []
-    for probe in probes:
-        name = _v2_text(getattr(probe, "name", None))
-        state = str(getattr(probe, "state", "") or "")
-        if state == "alive":
-            label, tone = liveness_label("alive"), "up"
-        elif state == "stale":
-            label, tone = liveness_label("stale"), "mute"
-        elif state == "unknown":
-            label, tone = liveness_label("unknown"), "down"
-        else:
-            label, tone = (state or "—"), "down"
-        pairs.append((name, label, tone))
-        age = getattr(probe, "age_seconds", None)
-        if isinstance(age, (int, float)) and not isinstance(age, bool):
-            ages.append(f"{name}·{fmt_age(float(age))}")
-    _v2_kv(pairs)
-    if ages:
-        ui.label(" · ".join(ages[:3])).classes("v2-note")
+    """Five heartbeat rows. A missing process is an em dash, not an error."""
+    by_name: dict[str, tuple[str, str]] = {}
+    try:
+        live = store.process_liveness()
+    except Exception:
+        log.warning("process rows failed")
+        live = None
+    if live is not None and getattr(live, "available", False):
+        for probe in _result_rows(live):
+            name = str(getattr(probe, "name", "") or "")
+            state = str(getattr(probe, "state", "") or "")
+            if state == "alive":
+                by_name[name] = (liveness_label("alive"), "up")
+            elif state == "stale":
+                by_name[name] = (liveness_label("stale"), "mute")
+            else:
+                by_name[name] = ("—", "mute")
+    _v2_kv([
+        (name, *by_name.get(name, ("—", "mute")))
+        for name in _PROCESS_ROWS
+    ])
 
 
 def _v2_gates() -> None:
@@ -1626,12 +1673,38 @@ def _v2_prior_values() -> list[tuple[str, str]]:
     ]
 
 
+def _percent_points(value: str) -> float | None:
+    text = value.strip().rstrip("%").strip()
+    if not text or text == "—":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def prior_pulse_tone(label: str, value: str) -> str:
+    """4H 存活 greens at >=60%. 当天死 reds at >=50%. Peak and graduation stay gray."""
+    if label == "4H 存活":
+        number = _percent_points(value)
+        if number is not None and number >= 60:
+            return "up"
+        return ""
+    if label == "当天死":
+        number = _percent_points(value)
+        if number is not None and number >= 50:
+            return "down"
+        return ""
+    return "mute"
+
+
 def _v2_priors() -> None:
     with ui.element("div").classes("v2-pulse"):
         for label_, value in _v2_prior_values():
+            tone = prior_pulse_tone(label_, value)
             with ui.element("div").classes("v2-pulse-item"):
                 ui.label(label_).classes("lbl")
-                ui.label(value).classes("val")
+                ui.label(value).classes(f"val {tone}".strip())
 
 
 def _v2_today(store: DataStore) -> None:
@@ -1678,6 +1751,39 @@ def _v2_week(store: DataStore) -> None:
     )
 
 
+def _jev_percent(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return "—"
+    if text.endswith("%"):
+        return text
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    if abs(number) <= 1.5:
+        number *= 100.0
+    return f"{number:.1f}%"
+
+
+def jev_gate_view(row: dict[str, str] | None) -> list[tuple[str, str, str]] | None:
+    """Map a trend CSV row onto n / unique_token / up_1h / up_4h. Empty row is None."""
+    if not row:
+        return None
+    count = (row.get("n") or row.get("filtered_n") or row.get("raw_n") or "").strip()
+    unique = (row.get("unique_token") or "").strip()
+    up_1h = (row.get("up_1h") or row.get("up_1h_rate") or "").strip()
+    up_4h = (row.get("up_4h") or row.get("up_4h_rate") or "").strip()
+    if not any((count, unique, up_1h, up_4h)):
+        return None
+    return [
+        ("n", count or "—", ""),
+        ("unique_token", unique or "—", ""),
+        ("1h 上涨率", _jev_percent(up_1h), "up" if up_1h else "mute"),
+        ("4h 上涨率", _jev_percent(up_4h), ""),
+    ]
+
+
 def _jev_trend_row() -> dict[str, str] | None:
     candidates: list[Path] = []
     raw = os.environ.get("JEV_TREND_CSV", "").strip()
@@ -1685,7 +1791,9 @@ def _jev_trend_row() -> dict[str, str] | None:
         candidates.append(Path(raw))
     relative = (
         Path("data") / "prior" / "exports" / "jev_validity_trend.csv",
+        Path("exports") / "reports" / "jev_validity_trend.csv",
         Path("crawler") / "data" / "prior" / "exports" / "jev_validity_trend.csv",
+        Path("crawler") / "exports" / "reports" / "jev_validity_trend.csv",
     )
     roots: list[Path] = []
     try:
@@ -1721,16 +1829,15 @@ def _jev_trend_row() -> dict[str, str] | None:
 
 
 def _v2_jev_gate() -> None:
-    row = _jev_trend_row()
-    if not row:
+    try:
+        view = jev_gate_view(_jev_trend_row())
+    except Exception:
+        log.warning("jev gate read failed")
+        view = None
+    if not view:
         ui.label("暂无数据（周检后自动填充）").classes("v2-note")
         return
-    _v2_kv([
-        ("n", row.get("n") or "—", ""),
-        ("unique_token", row.get("unique_token") or "—", ""),
-        ("1h 上涨率", row.get("up_1h") or "—", "up"),
-        ("4h 上涨率", row.get("up_4h") or "—", "mute"),
-    ])
+    _v2_kv(view)
 
 
 def _v2_market_base(store: DataStore) -> None:
@@ -1806,6 +1913,20 @@ def _v2_positions(store: DataStore) -> None:
         ("持仓数", held, ""),
         ("仓位占比", share, ""),
     ])
+    detail = tuple(held_rows)[:3] if held_rows is not None else ()
+    if detail:
+        table_rows: list[list[str]] = []
+        tones: list[list[str]] = []
+        for row in detail:
+            symbol = str(getattr(row, "symbol", "") or "").strip() or "—"
+            pnl, pnl_tone = _signed_usd(getattr(row, "pnl_usd", None))
+            table_rows.append([symbol, _v2_money(getattr(row, "mtm_usd", None)), pnl])
+            tones.append(["", "", pnl_tone])
+        _v2_table(
+            [("symbol", ""), ("市值", "num"), ("盈亏", "num")],
+            table_rows,
+            tones,
+        )
     ui.label("现价取 pair_history 最新；无价为「—」").classes("v2-note")
 
 
