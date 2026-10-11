@@ -697,8 +697,9 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(refresh_age_label(3), "刷新 3s 前")
         app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
         for label in (
+            "SPIKE'S",
             "CRYPTO",
-            "TERMINAL",
+            "TERMINER",
             "链上新币投研终端",
             "DASHBOARD",
             "MARKETS",
@@ -709,6 +710,7 @@ class DashboardSmokeTest(unittest.TestCase):
             "/chat",
         ):
             self.assertIn(label, app_text)
+        self.assertNotIn("TERMINAL", app_text)
         market_src = inspect.getsource(DataStore._market_rows)
         for banned in ("rsi", "macd", "boll"):
             self.assertNotIn(banned, market_src.lower())
