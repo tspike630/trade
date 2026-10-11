@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS token_indicators (
     sentiment_heat_score REAL,
     sentiment_polarity REAL,
     sentiment_updated_at TEXT,
+    -- social 突热 (observe-only; weight 0)
+    spike_ratio REAL,
+    spike INTEGER,
     -- composite (future)
     composite_score REAL,
     composite_updated_at TEXT,
@@ -84,6 +87,8 @@ CREATE TABLE IF NOT EXISTS indicator_history (
     sentiment_mentions_1h REAL,
     sentiment_heat_score REAL,
     sentiment_polarity REAL,
+    spike_ratio REAL,
+    spike INTEGER,
     composite_score REAL,
     tier TEXT,
     primary_pair_address TEXT

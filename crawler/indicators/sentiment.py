@@ -1,9 +1,10 @@
 """
-Sentiment indicators (Step 3).
+Sentiment indicators (Step 3 + 突热 observe-only).
 
 READ ONLY from x_watch / alerts (social_spike, sentiment_anomaly) /
 optional indicator_history snapshots — never calls X HTTP.
-Writes only token_indicators sentiment_* fields (+ hot indicator_history).
+Writes only token_indicators sentiment_* / spike_ratio / spike
+(+ hot indicator_history). No alerts, telegram, decision, or weights.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from logging_setup import get_logger
 from config import (
     SENTIMENT_ALERT_LOOKBACK_SEC,
     SENTIMENT_ENABLED,
+    SENTIMENT_SPIKE_MIN,
     SENTIMENT_WRITE_HISTORY,
 )
 from indicators.base import IndicatorStore, to_epoch, utc_now_iso
@@ -128,6 +130,33 @@ def growth_vs_baseline(current: float, baseline: float | None) -> float | None:
     return (float(current) - float(baseline)) / base
 
 
+def compute_spike_marking(
+    mentions_1h: float,
+    mentions_24h: float,
+    *,
+    threshold: float | None = None,
+) -> tuple[float, int]:
+    """
+    Social 突热 (observe-only).
+
+    Formula (documented in SENTIMENT_SPIKE.md):
+      mentions_24h_hourly_avg = mentions_24h / 24.0
+      spike_ratio = mentions_1h / max(mentions_24h_hourly_avg, 1.0)
+      spike = 1 iff spike_ratio >= SENTIMENT_SPIKE_MIN (default 3.0)
+
+    Baseline floors at 1.0 so zero/near-zero 24h activity does not explode
+    the ratio via division by tiny averages; ratio then equals mentions_1h.
+    """
+    thr = float(SENTIMENT_SPIKE_MIN if threshold is None else threshold)
+    m1 = max(0.0, float(mentions_1h))
+    m24 = max(0.0, float(mentions_24h))
+    hourly_avg = m24 / 24.0
+    denom = max(hourly_avg, 1.0)
+    ratio = m1 / denom
+    spike = 1 if ratio >= thr else 0
+    return round(ratio, 6), spike
+
+
 def compute_heat_score(
     mentions_1h: float,
     growth_1h: float | None,
@@ -202,6 +231,7 @@ def compute_sentiment_fields(
       heat_score          — compute_heat_score
       polarity            — blend_polarity(keyword + alerts + growth)
       sentiment_score     — (heat/100) * polarity   ∈ approx [-1, 1]
+      spike_ratio / spike — compute_spike_marking(m1, m24); observe-only
     """
     last = int(watch.get("mention_count_last") or 0)
     prev = int(watch.get("mention_count_prev") or 0)
@@ -239,6 +269,7 @@ def compute_sentiment_fields(
         m1, g1, recent_spike=recent_spike, recent_anomaly=recent_anomaly
     )
     score = round((heat / 100.0) * polarity, 6)
+    spike_ratio, spike = compute_spike_marking(m1, m24)
     updated = watch.get("last_searched_at") or watch.get("updated_at") or utc_now_iso()
 
     return {
@@ -252,6 +283,8 @@ def compute_sentiment_fields(
         "sentiment_polarity": polarity,
         "sentiment_score": score,
         "sentiment_updated_at": updated,
+        "spike_ratio": spike_ratio,
+        "spike": spike,
     }
 
 
@@ -371,6 +404,8 @@ class SentimentIndicators:
                             "sentiment_mentions_1h": row.get("sentiment_mentions_1h"),
                             "sentiment_heat_score": row.get("sentiment_heat_score"),
                             "sentiment_polarity": row.get("sentiment_polarity"),
+                            "spike_ratio": row.get("spike_ratio"),
+                            "spike": row.get("spike"),
                             "composite_score": prev.get("composite_score"),
                             "tier": tier,
                             "primary_pair_address": prev.get("primary_pair_address"),

@@ -148,3 +148,8 @@ fixture `fixtures/x_search_recent.json` 关键词单测 polarity = **1.0**（ape
 ## Grok DD 报告接入（只读输出）
 
 `scripts/grok_dd_report.py` 从 `token_indicators` 读取 `sentiment_*`（mention / growth / heat / polarity / score），写入 markdown 的 **舆情面 Sentiment** 段；缺字段时显示「暂无数据」，不导致报告失败。`prompts/dd_report.md` 已增加对应章节。不改评分 / 告警 / 循环。
+
+## 突热 spike 标记（observe-only）
+
+见 **[SENTIMENT_SPIKE.md](SENTIMENT_SPIKE.md)**：`spike_ratio = mentions_1h / max(mentions_24h/24, 1)`；`spike=1` iff `>= SENTIMENT_SPIKE_MIN`（默认 3）。只写指标表；突热=滞后确认，非买入信号；先验 `peak_window` 见顶极快。
+
