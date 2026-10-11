@@ -296,3 +296,5 @@ SENTIMENT_WRITE_HISTORY = os.environ.get(
 ).strip().lower() in ("1", "true", "yes", "on")
 # Optional lookback for social_spike / sentiment_anomaly flags (seconds)
 SENTIMENT_ALERT_LOOKBACK_SEC = int(os.environ.get("SENTIMENT_ALERT_LOOKBACK_SEC", str(6 * 3600)))
+# Social 突热 threshold: spike=1 iff spike_ratio >= this (observe-only; no alerts)
+SENTIMENT_SPIKE_MIN = float(os.environ.get("SENTIMENT_SPIKE_MIN", "3"))

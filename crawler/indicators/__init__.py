@@ -9,4 +9,4 @@ Sentiment reads x_watch / social alerts only (no HTTP).
 from __future__ import annotations
 
 __all__ = ["__version__"]
-__version__ = "0.3.1-audit"
+__version__ = "0.3.2-spike"
