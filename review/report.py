@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from review.data import SignalChainRow
+from review.data import SignalChainRow, load_ccxt_market_baseline
 from review.evolution import format_evolution_section
 
 HK_TZ = timezone(timedelta(hours=8))
@@ -104,10 +104,158 @@ def _render_dim_table(dim_name: str, dim: dict[str, Any]) -> list[str]:
     return lines
 
 
+
+_JOINT_TABLE_HEADER = (
+    "| token_age | n | up_1h | med_1h | up_4h | 全网存活率(先验) | 备注 |\n"
+    "|---|---:|---:|---:|---:|---:|---|"
+)
+
+
+def _joint_row(label: str, m: dict[str, Any]) -> str:
+    prior_disp = m.get("prior_display") or "N/A"
+    reason = m.get("prior_reason")
+    note = reason if reason else (m.get("prior_label") or "—")
+    # shorten long reasons for table
+    if isinstance(note, str) and len(note) > 80:
+        note = note[:77] + "…"
+    return (
+        f"| {label} | {m.get('n', 0)} | "
+        f"{_pct(m.get('up_1h') if m.get('up_1h') is not None else m.get('up_1h_rate'))} | "
+        f"{_ret(m.get('med_1h') if m.get('med_1h') is not None else m.get('median_1h'))} | "
+        f"{_pct(m.get('up_4h') if m.get('up_4h') is not None else m.get('up_4h_rate'))} | "
+        f"{prior_disp} | {note} |"
+    )
+
+
+def _render_joint_section(joint: Optional[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    lines.append("### JEV×币龄×先验（细桶联合表）")
+    lines.append("")
+    if not joint:
+        lines.append("_本期未计算联合表。_")
+        lines.append("")
+        return lines
+
+    caveat = joint.get("caveat") or (
+        "联合归因观察：n 仍小；不作为调参依据；不调权"
+    )
+    lines.append(f"> **Caveat：** {caveat}")
+    lines.append("")
+    src = joint.get("bucket_source") or "computed"
+    lines.append(f"分桶源=`{src}`")
+    if joint.get("prior_tags_period"):
+        lines.append(
+            f"prior_tags 本期覆盖：`{joint.get('prior_tags_period')}`"
+            + (f"（表总行={joint.get('prior_tags_n')}）" if joint.get("prior_tags_n") is not None else "")
+        )
+    lines.append(f"细桶：`{joint.get('edges')}`")
+    if joint.get("hypothesis"):
+        lines.append(f"假说：{joint.get('hypothesis')}")
+    if joint.get("note"):
+        lines.append(f"说明：{joint.get('note')}")
+    mismatches = joint.get("mismatch_notes") or []
+    if mismatches:
+        lines.append(f"交叉校验不一致：{len(mismatches)} 条（prior_tagger vs 现算 token_age）")
+        for m in mismatches[:5]:
+            lines.append(f"- {m}")
+        if len(mismatches) > 5:
+            lines.append(f"- …共 {len(mismatches)} 条")
+    pm = joint.get("prior_meta") or {}
+    if pm:
+        bits = []
+        if pm.get("report"):
+            bits.append(f"报告=`{pm.get('report')}`")
+        if pm.get("source"):
+            bits.append(f"源=`{pm.get('source')}`")
+        if pm.get("crawler_window_h") is not None:
+            bits.append(f"crawler窗≈{pm.get('crawler_window_h')}h")
+        if pm.get("n") is not None:
+            bits.append(f"self_db n={pm.get('n')}")
+        if bits:
+            lines.append("先验旁挂：" + " · ".join(bits))
+    lines.append("")
+
+    for key, title in (
+        ("jev_filtered", "过滤后 JEV 切片（周检同口径）"),
+        ("full_sample", "全样本"),
+    ):
+        block = joint.get(key) or {}
+        lines.append(f"#### {title}（n={block.get('n', 0)}）")
+        lines.append("")
+        buckets = block.get("buckets") or {}
+        if not buckets:
+            lines.append("_无分桶样本。_")
+            lines.append("")
+            continue
+        lines.append(_JOINT_TABLE_HEADER)
+        for lab in joint.get("labels") or buckets.keys():
+            if lab in buckets:
+                lines.append(_joint_row(lab, buckets[lab]))
+        lines.append("")
+
+    lines.append(
+        "口径提醒：全网存活率来自 self_db 观测跨度（`last_seen−first_seen > t`），"
+        "不是链上真实寿命；窗不足时写 N/A + 原因，勿把 0% 当真死亡。"
+    )
+    lines.append("")
+
+    # 先验标签自动分桶（get_prior_tag_buckets / prior_tagger 产物）
+    ptb = joint.get("prior_tag_buckets") or []
+    lines.append("### 先验标签自动分桶（prior_tagger 产物）")
+    lines.append("")
+    lines.append(
+        "> 数据：`decision_prior_tags`（prior.db，只读）；"
+        "`peak_window`=信号落在创建后 3 分钟内；"
+        "分桶结果与上一小节全样本联合表对账。"
+    )
+    lines.append("")
+    if not ptb:
+        lines.append("_prior.db.decision_prior_tags 不可用/空；未生成自动分桶。_")
+        lines.append("")
+    else:
+        lines.append(
+            "| age_bucket | n | unique_token | 在见顶窗口内 | 有 1h 参考 | 有 4h 参考 |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|")
+        order = ["<1h", "1-24h", "1-7d", ">7d", "unknown"]
+        by = {str(r.get("age_bucket")): r for r in ptb}
+        for lab in order:
+            r = by.get(lab)
+            if not r:
+                continue
+            lines.append(
+                f"| {lab} | {r.get('n', 0)} | {r.get('unique_token', 0)} | "
+                f"{r.get('in_peak', 0)} | {r.get('has_ref_1h', 0)} | "
+                f"{r.get('has_ref_4h', 0)} |"
+            )
+        # any unexpected buckets
+        for lab, r in by.items():
+            if lab not in order:
+                lines.append(
+                    f"| {lab} | {r.get('n', 0)} | {r.get('unique_token', 0)} | "
+                    f"{r.get('in_peak', 0)} | {r.get('has_ref_1h', 0)} | "
+                    f"{r.get('has_ref_4h', 0)} |"
+                )
+        lines.append("")
+        rec = joint.get("reconcile_notes") or []
+        if rec:
+            lines.append(f"对账不一致：{len(rec)} 项（联合表全样本 n vs prior_tag_buckets）")
+            for m in rec[:8]:
+                lines.append(f"- {m}")
+            if len(rec) > 8:
+                lines.append(f"- …共 {len(rec)} 条")
+        else:
+            lines.append("对账：与全样本联合表分桶 n **一致**。")
+        lines.append("")
+
+    return lines
+
+
 def _render_attribution_section(
     attribution: Optional[dict[str, Any]],
     fill_attr: Optional[dict[str, Any]],
     backtest_summary: Optional[dict[str, Any]],
+    joint: Optional[dict[str, Any]] = None,
 ) -> list[str]:
     lines: list[str] = []
     lines.append("## 8. 信号层归因")
@@ -128,18 +276,30 @@ def _render_attribution_section(
             f"全样本 n={attribution.get('n', 0)}。"
             "以下为观察性分桶（有 fwd 才计上涨率/中位），**不**改策略参数或闸门。"
         )
+        if attribution.get("bucket_source"):
+            lines.append(
+                f"token_age 分桶源=`{attribution.get('bucket_source')}`"
+                + (
+                    f"（prior_tags={attribution.get('prior_tags_period')}）"
+                    if attribution.get("prior_tags_period")
+                    else ""
+                )
+            )
         lines.append("")
         dims = attribution.get("dimensions") or {}
         dim_titles = [
             ("strength", "strength（jev_strength）"),
             ("coverage", "coverage（jev_coverage，0–100）"),
             ("liq", "liq（liquidity_at_signal，USD）"),
-            ("token_age", "token_age（raw_json 创建时间）"),
+            ("token_age", "token_age（pairs.pair_created_at）"),
             ("market_regime", "market_regime（同期 hot 基准）"),
         ]
         for key, title in dim_titles:
             if key in dims:
                 lines.extend(_render_dim_table(title, dims[key]))
+
+    # joint JEV × token_age_fine × prior
+    lines.extend(_render_joint_section(joint))
 
     # fills subsection
     lines.append("### 成交归因")
@@ -197,6 +357,105 @@ def _render_attribution_section(
     return lines
 
 
+def _fmt_quote_vol(v: Optional[float]) -> str:
+    if v is None:
+        return "—"
+    if v >= 1e9:
+        return f"{v / 1e9:.2f}B"
+    if v >= 1e6:
+        return f"{v / 1e6:.2f}M"
+    if v >= 1e3:
+        return f"{v / 1e3:.1f}K"
+    return f"{v:.0f}"
+
+
+def _render_ccxt_baseline_section(db_root: Optional[str | Path]) -> list[str]:
+    """§6b: read-only CCXT sidechannel second market benchmark."""
+    lines: list[str] = []
+    lines.append("### 6b. CEX 市场基准第二参照（ccxt.db，只观察）")
+    lines.append("")
+    if db_root is None:
+        lines.append("_未提供 db_root；跳过 ccxt.db 第二参照。_")
+        lines.append("")
+        return lines
+
+    info = load_ccxt_market_baseline(db_root)
+    if not info.get("ok"):
+        lines.append(f"_{info.get('note') or 'ccxt.db 不可用；已跳过'}_")
+        lines.append("")
+        lines.append(
+            "> 纪律：只观察不调权、不进决策/告警；缺库优雅跳过。"
+        )
+        lines.append("")
+        return lines
+
+    ex_list = info.get("exchanges") or []
+    ex_s = ", ".join(f"`{e}`" for e in ex_list) or "—"
+    tag = info.get("status_tag") or "SHORT"
+    winsor = info.get("winsor_abs", 50)
+    lines.append(
+        f"**状态:** `{tag}` / 旁路 · **交易所:** {ex_s} · "
+        f"**样本量:** 最近一轮/所 n={info.get('latest_round_n', 0)} "
+        f"（change_24h n={info.get('n_change_24h', 0)}）· "
+        f"全库 ticks={info.get('ticks_total', 0)} / "
+        f"listings={info.get('listings_total', 0)} / "
+        f"ohlcv={info.get('ohlcv_total', 0)}"
+    )
+    lines.append("")
+    lines.append(
+        f"`ccxt_ticks.change_24h_pct`（最近一轮/所）与 §6 hot 并列对照；"
+        f"winsor(|x|≤{winsor:g})。**不**调权、不进决策/告警。"
+    )
+    lines.append("")
+
+    # per-exchange counts
+    by_ex = info.get("by_exchange") or {}
+    if by_ex:
+        lines.append("| exchange | ticks | listings | ohlcv |")
+        lines.append("|---|---:|---:|---:|")
+        for ex in sorted(by_ex.keys()):
+            d = by_ex[ex]
+            lines.append(
+                f"| `{ex}` | {d.get('ticks', 0)} | "
+                f"{d.get('listings', 0)} | {d.get('ohlcv', 0)} |"
+            )
+        lines.append("")
+
+    lines.append("| 指标 | 原始 | winsor |")
+    lines.append("|---|---:|---:|")
+    lines.append(
+        f"| n (change_24h) | {info.get('n_change_24h', 0)} | "
+        f"{info.get('n_change_24h_winsor', 0)} |"
+    )
+    lines.append(
+        f"| median change_24h | {_chg_pct(info.get('median_change_24h'))} | "
+        f"{_chg_pct(info.get('median_change_24h_winsor'))} |"
+    )
+    lines.append(
+        f"| avg change_24h | {_chg_pct(info.get('avg_change_24h'))} | "
+        f"{_chg_pct(info.get('avg_change_24h_winsor'))} |"
+    )
+    lines.append("")
+
+    top = info.get("top_by_quote") or []
+    if top:
+        bits = []
+        for t in top:
+            bits.append(
+                f"`{t.get('exchange')}:{t.get('symbol')}` "
+                f"qv={_fmt_quote_vol(t.get('quote_volume_24h'))} "
+                f"Δ24h={_chg_pct(t.get('change_24h_pct'))}"
+            )
+        lines.append("**Top quote_volume（最近一轮）:** " + " · ".join(bits))
+        lines.append("")
+
+    lines.append(
+        "> 纪律：SHORT/旁路第二参照；只观察不调权、不进决策/告警。"
+    )
+    lines.append("")
+    return lines
+
+
 def render_weekly_md(
     *,
     period_start: str,
@@ -210,10 +469,12 @@ def render_weekly_md(
     attribution: Optional[dict[str, Any]] = None,
     fill_attr: Optional[dict[str, Any]] = None,
     backtest_summary: Optional[dict[str, Any]] = None,
+    joint: Optional[dict[str, Any]] = None,
     optimize_section: Optional[str] = None,
     evolution_suggestions: Optional[list[dict[str, Any]]] = None,
+    db_root: Optional[str | Path] = None,
 ) -> str:
-    """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议）。"""
+    """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议 + baseline_history）。"""
     n = len(chain)
     n_exec = sum(1 for r in chain if r.exec_id is not None)
     n_pos = sum(1 for r in chain if r.position_id is not None)
@@ -361,6 +622,9 @@ def render_weekly_md(
     )
     lines.append("")
 
+    # 6b. CEX 市场基准第二参照（ccxt.db，只观察）
+    lines.extend(_render_ccxt_baseline_section(db_root))
+
     # 7. 缺口
     lines.append("## 7. 缺口与下一步")
     lines.append("")
@@ -387,7 +651,7 @@ def render_weekly_md(
     lines.append("")
 
     # 8. 信号层归因（R2）
-    lines.extend(_render_attribution_section(attribution, fill_attr, backtest_summary))
+    lines.extend(_render_attribution_section(attribution, fill_attr, backtest_summary, joint=joint))
 
     # 9. R3 参数寻优（脚手架占位）
     lines.append("## 9. R3 参数寻优 — 待历史≥7天且周检跨门槛")
@@ -405,7 +669,12 @@ def render_weekly_md(
     # 10. 进化建议（只建议，不自动改参/开闸）
     lines.append("## 10. 进化建议")
     lines.append("")
-    lines.append(format_evolution_section(evolution_suggestions or []))
+    lines.append(
+        format_evolution_section(
+            evolution_suggestions or [],
+            db_root=db_root,
+        )
+    )
 
     lines.append("---")
     lines.append("")

@@ -61,6 +61,9 @@ class SignalChainRow:
     # 信号特征补充（周检过滤口径用；缺则 None）
     liquidity_at_signal: Optional[float] = None
     jev_coverage: Optional[float] = None
+    # token_age：pairs.pair_created_at（ms）→ 相对信号时刻的小时数
+    pair_created_at: Optional[int] = None  # ms epoch from pairs
+    token_age_hours: Optional[float] = None
     # 内部：同一 decision 多条 execution 时标记
     exec_dup: bool = False
 
@@ -530,6 +533,315 @@ def load_market_baseline(
     }
 
 
+def load_ccxt_market_baseline(
+    db_root: str | Path,
+    *,
+    winsor_abs: float = 50.0,
+    top_n: int = 5,
+) -> dict[str, Any]:
+    """Read-only CCXT sidechannel baseline from ``ccxt.db`` (second market ref).
+
+    Missing db / tables → ``ok=False`` with ``note`` (caller renders skip).
+    Uses latest tick round per exchange for change_24h stats; full-DB counts
+    for ticks / listings / ohlcv. Observation only — never weights or alerts.
+    """
+    root = Path(db_root)
+    db_path = root / "ccxt.db"
+    out: dict[str, Any] = {
+        "ok": False,
+        "note": "",
+        "path": str(db_path),
+        "exchanges": [],
+        "by_exchange": {},
+        "ticks_total": 0,
+        "listings_total": 0,
+        "ohlcv_total": 0,
+        "latest_round_n": 0,
+        "median_change_24h": None,
+        "avg_change_24h": None,
+        "median_change_24h_winsor": None,
+        "avg_change_24h_winsor": None,
+        "n_change_24h": 0,
+        "n_change_24h_winsor": 0,
+        "winsor_abs": winsor_abs,
+        "top_by_quote": [],
+        "scope": "latest_round_per_exchange",
+        "status_tag": "SHORT",
+    }
+    if not db_path.is_file():
+        out["note"] = "ccxt.db 不存在（旁路未建或未拉取）；跳过 CEX 第二参照"
+        return out
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except Exception as e:
+        out["note"] = f"ccxt.db 打开失败: {e}"
+        return out
+
+    try:
+        tables = {
+            str(r[0])
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        needed = {"ccxt_ticks", "ccxt_listings", "ccxt_ohlcv"}
+        missing = sorted(needed - tables)
+        if missing:
+            out["note"] = (
+                f"ccxt.db 缺表 {missing}；跳过 CEX 第二参照"
+            )
+            return out
+
+        # Full-DB counts by exchange
+        by_ex: dict[str, dict[str, int]] = {}
+
+        def _ensure(ex: str) -> dict[str, int]:
+            if ex not in by_ex:
+                by_ex[ex] = {"ticks": 0, "listings": 0, "ohlcv": 0}
+            return by_ex[ex]
+
+        for row in conn.execute(
+            "SELECT exchange, COUNT(*) AS n FROM ccxt_ticks GROUP BY exchange"
+        ):
+            _ensure(str(row["exchange"]))["ticks"] = int(row["n"])
+        for row in conn.execute(
+            "SELECT exchange, COUNT(*) AS n FROM ccxt_listings GROUP BY exchange"
+        ):
+            _ensure(str(row["exchange"]))["listings"] = int(row["n"])
+        for row in conn.execute(
+            "SELECT exchange, COUNT(*) AS n FROM ccxt_ohlcv GROUP BY exchange"
+        ):
+            _ensure(str(row["exchange"]))["ohlcv"] = int(row["n"])
+
+        exchanges = sorted(by_ex.keys())
+        ticks_total = sum(v["ticks"] for v in by_ex.values())
+        listings_total = sum(v["listings"] for v in by_ex.values())
+        ohlcv_total = sum(v["ohlcv"] for v in by_ex.values())
+
+        # Latest round per exchange (max ts)
+        latest_rows: list[sqlite3.Row] = []
+        for ex in exchanges:
+            mx = conn.execute(
+                "SELECT MAX(ts) FROM ccxt_ticks WHERE exchange = ?",
+                (ex,),
+            ).fetchone()[0]
+            if mx is None:
+                continue
+            part = conn.execute(
+                """
+                SELECT exchange, symbol, ts, last_price, quote_volume_24h,
+                       change_24h_pct
+                FROM ccxt_ticks
+                WHERE exchange = ? AND ts = ?
+                """,
+                (ex, mx),
+            ).fetchall()
+            latest_rows.extend(part)
+
+        changes = [
+            float(r["change_24h_pct"])
+            for r in latest_rows
+            if r["change_24h_pct"] is not None
+        ]
+        changes_w = [x for x in changes if abs(x) <= winsor_abs]
+
+        # Top by quote_volume within latest round
+        ranked = sorted(
+            latest_rows,
+            key=lambda r: float(r["quote_volume_24h"] or 0),
+            reverse=True,
+        )
+        top: list[dict[str, Any]] = []
+        for r in ranked[: max(0, top_n)]:
+            top.append(
+                {
+                    "exchange": str(r["exchange"]),
+                    "symbol": str(r["symbol"]),
+                    "quote_volume_24h": (
+                        float(r["quote_volume_24h"])
+                        if r["quote_volume_24h"] is not None
+                        else None
+                    ),
+                    "change_24h_pct": (
+                        float(r["change_24h_pct"])
+                        if r["change_24h_pct"] is not None
+                        else None
+                    ),
+                    "last_price": (
+                        float(r["last_price"])
+                        if r["last_price"] is not None
+                        else None
+                    ),
+                }
+            )
+
+        # SHORT if few rounds overall
+        distinct_rounds = conn.execute(
+            "SELECT COUNT(DISTINCT ts) FROM ccxt_ticks"
+        ).fetchone()[0]
+        status_tag = "SHORT" if int(distinct_rounds or 0) < 10 else "OK"
+
+        out.update(
+            {
+                "ok": True,
+                "note": (
+                    f"ccxt.db 可读 · 全库 ticks={ticks_total} "
+                    f"listings={listings_total} ohlcv={ohlcv_total} · "
+                    f"最近一轮/所 n={len(latest_rows)}"
+                ),
+                "exchanges": exchanges,
+                "by_exchange": by_ex,
+                "ticks_total": ticks_total,
+                "listings_total": listings_total,
+                "ohlcv_total": ohlcv_total,
+                "latest_round_n": len(latest_rows),
+                "median_change_24h": _median(changes),
+                "avg_change_24h": _mean(changes),
+                "median_change_24h_winsor": _median(changes_w),
+                "avg_change_24h_winsor": _mean(changes_w),
+                "n_change_24h": len(changes),
+                "n_change_24h_winsor": len(changes_w),
+                "top_by_quote": top,
+                "distinct_ts": int(distinct_rounds or 0),
+                "status_tag": status_tag,
+            }
+        )
+        return out
+    except Exception as e:
+        out["note"] = f"ccxt.db 读取失败: {e}"
+        return out
+    finally:
+        conn.close()
+
+
+def annotate_token_age(
+    rows: list[SignalChainRow],
+    paths: DbPaths,
+) -> list[SignalChainRow]:
+    """Join pairs.pair_created_at and set token_age_hours.
+
+    Prefer (chain_id, pair_address); fallback (chain_id, token_address).
+    age_hours = (signal_ts_ms - pair_created_at) / 3600000; missing → None.
+    """
+    if not rows:
+        return rows
+
+    pair_keys: set[tuple[str, str]] = set()
+    tok_keys: set[tuple[str, str]] = set()
+    for r in rows:
+        chain = (r.chain_id or "").strip()
+        if not chain:
+            continue
+        if r.pair_address:
+            pair_keys.add((chain, r.pair_address.strip()))
+        if r.token_address:
+            tok_keys.add((chain, r.token_address.strip()))
+
+    created_by_pair: dict[tuple[str, str], int] = {}
+    created_by_tok: dict[tuple[str, str], int] = {}
+
+    conn = connect_ro(paths.main)
+    try:
+        cols = _table_columns(conn, "pairs")
+        if "pair_created_at" not in cols:
+            return rows
+
+        # batch by pair_address
+        pair_list = sorted(pair_keys)
+        chunk = 400
+        for i in range(0, len(pair_list), chunk):
+            part = pair_list[i : i + chunk]
+            if not part:
+                continue
+            # OR of (chain_id=? AND pair_address=?) — safer than IN of tuples
+            clauses = " OR ".join(
+                "(chain_id = ? AND pair_address = ?)" for _ in part
+            )
+            params: list[Any] = []
+            for c, p in part:
+                params.extend([c, p])
+            for row in conn.execute(
+                f"""
+                SELECT chain_id, pair_address, pair_created_at
+                FROM pairs
+                WHERE pair_created_at IS NOT NULL
+                  AND ({clauses})
+                """,
+                params,
+            ).fetchall():
+                key = (str(row["chain_id"]), str(row["pair_address"]))
+                ms = row["pair_created_at"]
+                if ms is None:
+                    continue
+                try:
+                    created_by_pair[key] = int(ms)
+                except (TypeError, ValueError):
+                    continue
+
+        # token_address fallback (used only when pair join misses)
+        tok_list = sorted(tok_keys)
+        for i in range(0, len(tok_list), chunk):
+            part = tok_list[i : i + chunk]
+            if not part:
+                continue
+            clauses = " OR ".join(
+                "(chain_id = ? AND token_address = ?)" for _ in part
+            )
+            params = []
+            for c, t in part:
+                params.extend([c, t])
+            for row in conn.execute(
+                f"""
+                SELECT chain_id, token_address, pair_created_at
+                FROM pairs
+                WHERE pair_created_at IS NOT NULL
+                  AND ({clauses})
+                """,
+                params,
+            ).fetchall():
+                key = (str(row["chain_id"]), str(row["token_address"]))
+                if key in created_by_tok:
+                    continue  # keep first
+                ms = row["pair_created_at"]
+                if ms is None:
+                    continue
+                try:
+                    created_by_tok[key] = int(ms)
+                except (TypeError, ValueError):
+                    continue
+    finally:
+        conn.close()
+
+    out: list[SignalChainRow] = []
+    for r in rows:
+        chain = (r.chain_id or "").strip()
+        created: Optional[int] = None
+        if chain and r.pair_address:
+            created = created_by_pair.get((chain, r.pair_address.strip()))
+        if created is None and chain and r.token_address:
+            created = created_by_tok.get((chain, r.token_address.strip()))
+
+        age_hours: Optional[float] = None
+        if created is not None:
+            try:
+                signal_dt = parse_ts(r.ts)
+                signal_ms = signal_dt.timestamp() * 1000.0
+                age_hours = (signal_ms - float(created)) / 3600000.0
+            except (TypeError, ValueError):
+                age_hours = None
+
+        out.append(
+            replace(
+                r,
+                pair_created_at=created,
+                token_age_hours=age_hours,
+            )
+        )
+    return out
+
+
 def summarize_execution(rows: list[SignalChainRow]) -> dict[str, Any]:
     """校验通过率、executed 率、executor 分布、validation_errors 分桶。"""
     n = len(rows)
@@ -575,3 +887,92 @@ def summarize_execution(rows: list[SignalChainRow]) -> dict[str, Any]:
         ),
         "exec_dup_count": exec_dup_count,
     }
+
+
+def get_prior_tag_buckets(
+    prior_db: str,
+    min_ts: str | None = None,
+    *,
+    main_db: str | None = None,
+) -> list[dict]:
+    """读 decision_prior_tags，按 age_bucket 分桶（供周报 §8 联合表）。只读。
+
+    decision_id = str(decision_log.id)。若提供 main_db，ATTACH 后用
+    CAST(d.id AS TEXT) = t.decision_id 关联（勿直接 id=decision_id 依赖隐式亲和）。
+    未提供 main_db 时仅查 prior.db：unique_token 用 tags.token_address，
+    min_ts 过滤 t.signal_ts（= decision_log.ts 拷贝）。
+    复盘 owns 周报接线；本函数只保证可读表。
+    """
+    p = Path(prior_db)
+    if not p.is_file():
+        return []
+    # 主连接挂 prior（只读）；需要 decision_log 时 ATTACH 主库
+    conn = sqlite3.connect(f"file:{p.resolve()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        names = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "decision_prior_tags" not in names:
+            return []
+
+        params: list[Any] = []
+        if main_db and Path(main_db).is_file():
+            # ATTACH 主库只读；JOIN 用 CAST 对齐 TEXT decision_id
+            conn.execute(
+                "ATTACH DATABASE ? AS main_ro",
+                (f"file:{Path(main_db).resolve()}?mode=ro",),
+            )
+            where = ""
+            if min_ts:
+                where = "WHERE d.ts >= ?"
+                params.append(min_ts)
+            sql = f"""
+                SELECT t.age_bucket,
+                       COUNT(*) AS n,
+                       COUNT(DISTINCT COALESCE(d.token_address, t.token_address))
+                           AS unique_token,
+                       SUM(CASE WHEN t.peak_window = 1 THEN 1 ELSE 0 END) AS in_peak,
+                       SUM(CASE WHEN t.survival_ref_1h IS NOT NULL THEN 1 ELSE 0 END)
+                           AS has_ref_1h,
+                       SUM(CASE WHEN t.survival_ref_4h IS NOT NULL THEN 1 ELSE 0 END)
+                           AS has_ref_4h
+                FROM decision_prior_tags t
+                LEFT JOIN main_ro.decision_log d
+                  ON CAST(d.id AS TEXT) = t.decision_id
+                {where}
+                GROUP BY t.age_bucket
+                ORDER BY CASE t.age_bucket
+                    WHEN '<1h' THEN 1 WHEN '1-24h' THEN 2
+                    WHEN '1-7d' THEN 3 WHEN '>7d' THEN 4 ELSE 5 END
+            """
+        else:
+            where = ""
+            if min_ts:
+                where = "WHERE t.signal_ts >= ?"
+                params.append(min_ts)
+            sql = f"""
+                SELECT t.age_bucket,
+                       COUNT(*) AS n,
+                       COUNT(DISTINCT t.token_address) AS unique_token,
+                       SUM(CASE WHEN t.peak_window = 1 THEN 1 ELSE 0 END) AS in_peak,
+                       SUM(CASE WHEN t.survival_ref_1h IS NOT NULL THEN 1 ELSE 0 END)
+                           AS has_ref_1h,
+                       SUM(CASE WHEN t.survival_ref_4h IS NOT NULL THEN 1 ELSE 0 END)
+                           AS has_ref_4h
+                FROM decision_prior_tags t
+                {where}
+                GROUP BY t.age_bucket
+                ORDER BY CASE t.age_bucket
+                    WHEN '<1h' THEN 1 WHEN '1-24h' THEN 2
+                    WHEN '1-7d' THEN 3 WHEN '>7d' THEN 4 ELSE 5 END
+            """
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
