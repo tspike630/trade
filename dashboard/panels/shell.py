@@ -2,9 +2,67 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal, assert_never
 
 Tone = Literal["ok", "warn", "muted"]
+HostName = Literal["OVERVIEW", "SIGNALS", "EXECUTION", "MARKETS", "AI CHAT"]
+TopKind = Literal["live", "placeholder"]
+
+
+@dataclass(frozen=True)
+class TopTab:
+    """One skeleton top-bar slot. Placeholders are visible and do not navigate."""
+
+    label: str
+    kind: TopKind
+
+
+# Order matches dashboard_grid_skeleton_v2.html. Live slots are panels that
+# already exist. The rest stay in the row as muted placeholders.
+TOP_TABS: tuple[TopTab, ...] = (
+    TopTab("DASHBOARD", "live"),
+    TopTab("MARKETS", "live"),
+    TopTab("CRYPTO", "placeholder"),
+    TopTab("PORTFOLIO", "placeholder"),
+    TopTab("SIGNALS", "live"),
+    TopTab("EXECUTION", "live"),
+    TopTab("NEWS", "placeholder"),
+    TopTab("AI CHAT", "live"),
+    TopTab("BACKTEST", "placeholder"),
+    TopTab("ALGO", "placeholder"),
+    TopTab("NODES", "placeholder"),
+    TopTab("QUANT LAB", "placeholder"),
+    TopTab("SETTINGS", "placeholder"),
+)
+
+
+def is_live_top_tab(label: str) -> bool:
+    return any(tab.label == label and tab.kind == "live" for tab in TOP_TABS)
+
+
+def select_top_tab(current: str, key: str) -> str:
+    """Switch only among wired tabs. Placeholders and unknown labels stay put."""
+    if key == current or not is_live_top_tab(key):
+        return current
+    return key
+
+
+def host_visible(tab: str, sub: str, host: HostName) -> bool:
+    """Content host for the current top tab. Placeholder labels never map here."""
+    match host:
+        case "OVERVIEW":
+            return tab == "DASHBOARD" and sub == "OVERVIEW"
+        case "SIGNALS":
+            return tab == "SIGNALS" or (tab == "DASHBOARD" and sub == "SIGNALS")
+        case "EXECUTION":
+            return tab == "EXECUTION" or (tab == "DASHBOARD" and sub == "EXECUTION")
+        case "MARKETS":
+            return tab == "MARKETS"
+        case "AI CHAT":
+            return tab == "AI CHAT"
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def panel_group(panel_id: str) -> Literal["overview", "signals", "execution"]:
