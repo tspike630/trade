@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import statistics
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -223,6 +224,28 @@ class PositionsPayload:
     missing_price: int
     price_note: str
     rows: tuple[PositionRow, ...]
+
+
+@dataclass(frozen=True)
+class MarketBaseStats:
+    """Hot-tier indicator_history snapshot. Percents are already in percent units."""
+
+    n_1h: int
+    med_1h: str
+    med_4h: str
+    mean_1h_w: str
+
+
+@dataclass(frozen=True)
+class StrategyBucketRow:
+    strategy_id: str
+    n: int
+    ok_rate: str
+
+
+@dataclass(frozen=True)
+class StrategyBuckets:
+    rows: tuple[StrategyBucketRow, ...]
 
 
 @dataclass(frozen=True)
@@ -1143,6 +1166,24 @@ class DataStore:
         return latest, dups, ""
 
 
+    def market_base_stats(self) -> DataResult:
+        """Hot tier, last 24h: n / median 1h / median 4h / winsor mean 1h."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._market_base_stats(started), "market_base_stats")
+        except Exception as exc:
+            log.warning("read failed market_base_stats: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "market_base_stats")
+
+    def strategy_buckets(self) -> DataResult:
+        """decision_log grouped by strategy_id over 168h, with execution pass rate."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._strategy_buckets(started), "strategy_buckets")
+        except Exception as exc:
+            log.warning("read failed strategy_buckets: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "strategy_buckets")
+
     def market_rows(self, chain: str | None = None, limit: int = 100) -> DataResult:
         started = time.perf_counter()
         try:
@@ -1237,6 +1278,116 @@ class DataStore:
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
 
+    def _market_base_stats(self, started: float) -> DataResult:
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=24)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "indicator_history", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "indicator_history")
+                absent = _require(cols, ("change_1h", "change_4h", "tier"))
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                if "recorded_at" in cols:
+                    ts_col = _ident("recorded_at")
+                elif "ts" in cols:
+                    ts_col = _ident("ts")
+                else:
+                    return _unavail(f"缺少字段：recorded_at（{path.name}）", started)
+                lower = (start - timedelta(days=1)).strftime("%Y-%m-%d")
+                rows = _exec(
+                    conn,
+                    f"SELECT {ts_col} AS ts, change_1h, change_4h FROM indicator_history "
+                    f"WHERE tier = 'hot' AND {ts_col} >= ?",
+                    (lower,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        change_1h: list[float] = []
+        change_4h: list[float] = []
+        kept = 0
+        for row in rows:
+            if not _in_range(row["ts"], start, end, end_inclusive=True):
+                continue
+            kept += 1
+            value_1h = safe_float(row["change_1h"])
+            value_4h = safe_float(row["change_4h"])
+            if value_1h is not None:
+                change_1h.append(value_1h)
+            if value_4h is not None:
+                change_4h.append(value_4h)
+        if kept == 0:
+            return _unavail("indicator_history tier=hot 近 24h 无行", started)
+        winsor = [value for value in change_1h if abs(value) <= 500]
+        return _ok(
+            MarketBaseStats(
+                n_1h=len(change_1h),
+                med_1h=_fmt_signed_pct(_median(change_1h)),
+                med_4h=_fmt_signed_pct(_median(change_4h)),
+                mean_1h_w=_fmt_signed_pct(_mean(winsor)),
+            ),
+            started,
+        )
+
+    def _strategy_buckets(self, started: float) -> DataResult:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=7)
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "decision_log", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "decision_log")
+                absent = _require(cols, ("id", "ts", "strategy_id"))
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                lower = (start - timedelta(days=1)).strftime("%Y-%m-%d")
+                rows = _exec(
+                    conn,
+                    "SELECT id, ts, strategy_id FROM decision_log WHERE ts >= ?",
+                    (lower,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        kept = [
+            (int(row["id"]), str(row["strategy_id"] or "").strip() or "—")
+            for row in rows
+            if _in_range(row["ts"], start, end, end_inclusive=True)
+        ]
+        if not kept:
+            return _ok(StrategyBuckets(rows=()), started)
+        latest, _dups, note = self._latest_execs([item[0] for item in kept])
+        counts: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
+        for decision_id, strategy_id in kept:
+            cell = counts[strategy_id]
+            cell[0] += 1
+            if note:
+                continue
+            exec_row = latest.get(decision_id)
+            if exec_row is None:
+                continue
+            cell[1] += 1
+            if _as_int(_cell(exec_row, "validation_ok")) == 1:
+                cell[2] += 1
+        ordered = sorted(counts.items(), key=lambda item: (-item[1][0], item[0]))[:12]
+        payload = tuple(
+            StrategyBucketRow(
+                strategy_id=strategy_id,
+                n=n,
+                ok_rate=(f"{(n_ok / n_with) * 100:.1f}%" if n_with else "—"),
+            )
+            for strategy_id, (n, n_with, n_ok) in ordered
+        )
+        return _ok(StrategyBuckets(rows=payload), started)
+
     def _market_lookups(
         self,
         pair_keys: list[tuple[str, str]],
@@ -1263,6 +1414,24 @@ def _missing_table(conn: sqlite3.Connection, table: str, db_name: str) -> str:
     if _table_exists(conn, table):
         return ""
     return f"缺少数据表：{table}（{db_name}）"
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(statistics.median(values))
+
+
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(statistics.fmean(values))
+
+
+def _fmt_signed_pct(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:+.2f}%"
 
 
 def _clamp(value: int, low: int, high: int) -> int:

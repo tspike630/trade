@@ -10,31 +10,31 @@ Binds 127.0.0.1 only. Default port is 8081 (``DASHBOARD_PORT``).
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
+import os
 import secrets
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, assert_never
 
 from fastapi import Request
 from nicegui import app, ui
 
 from dashboard.auth import SecretFilter, verify_api_key
 from dashboard.data import DataStore
-from dashboard.format_util import fmt_rate
+from dashboard.format_util import fmt_age, fmt_rate, liveness_label
 from dashboard.panels import risk as risk_panel
-from dashboard.panels.common import col, panel_box, panel_guard, show_unavailable
+from dashboard.panels.common import panel_box, panel_guard, show_unavailable
 from dashboard.panels.markets import render_markets
 from dashboard.panels.registry import PANELS
 from dashboard.panels.shell import (
     db_status_line,
     heartbeat_summary,
-    live_caption,
     panel_group,
-    refresh_age_label,
     session_clock,
 )
 from dashboard.settings import allow_insecure, api_secret, bind_host, db_root, port, read_gates, refresh_seconds
@@ -48,6 +48,7 @@ except ImportError:
 log = logging.getLogger("dashboard")
 Access = Literal["ok", "open", "needed", "unconfigured"]
 Section = Literal["home", "chat"]
+HostKey = Literal["OVERVIEW", "SIGNALS", "EXECUTION", "MARKETS", "AI CHAT"]
 _health_ready = False
 _logging_ready = False
 
@@ -566,83 +567,232 @@ body { margin: 0; }
   .page { padding: 0 8px 28px; }
   .topbar, .ft-top { gap: 12px; height: auto; min-height: 48px; flex-wrap: wrap; padding: 8px 12px; }
 }
-/* ============ V2 网格组件体系（基准：dashboard_grid_skeleton_v2.html） ============ */
-.gv2-grid {
-  display: grid;
-  grid-template-columns: repeat(12, 1fr);
-  gap: 8px;
-  width: 100%;
-  box-sizing: border-box;
+/* ============================================================
+   V2 FULL ALIGN —— token 与 dashboard_grid_skeleton_v2.html 逐项一致
+   ============================================================ */
+:root {
+  --v2-bg: #0d1117; --v2-panel: #161b22; --v2-header: #1f2630;
+  --v2-border: #2d333b; --v2-border-strong: #3d444d;
+  --v2-fg: #e6edf3; --v2-dim: #8b949e; --v2-mute: #565d66;
+  --v2-up: #3fb950; --v2-down: #f85149; --v2-warn: #d29922; --v2-accent: #2f81f7;
+  --v2-mono: "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, "Segoe UI", Roboto, sans-serif;
+  --v2-base: 12px; --v2-num: 13px; --v2-title: 11px; --v2-lg: 22px;
+  --v2-gap: 8px; --v2-pad: 8px 10px; --v2-lh: 1.5;
 }
-.gv2-kpi {
-  background: #0a0a0a;
-  border: 1px solid #1a1a1a;
-  border-radius: 4px;
-  padding: 8px 10px;
-  min-height: 72px;
-  grid-column: span 3;
-  min-width: 0;
-  box-sizing: border-box;
-}
-.gv2-kpi .kpi-label { color: #808080; font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
-.gv2-kpi .kpi-value { font-family: var(--mono); font-size: 18px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; }
-.gv2-kpi .kpi-hint  { color: #525252; font-size: 9px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.gv2-kpi.tone-warn .kpi-value { color: var(--warn); }
-.gv2-kpi.tone-bad  .kpi-value { color: var(--bad); }
-.gv2-kpi.tone-ok   .kpi-value { color: var(--mint); }
 
-.gv2-component {
-  background: #0a0a0a;
-  border: 1px solid #1a1a1a;
-  border-radius: 4px;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
+/* ---- 顶栏（40px） ---- */
+.v2-topbar {
+  height: 40px; display: flex; align-items: center; gap: 0;
+  background: var(--v2-panel); border-bottom: 1px solid var(--v2-border);
+  padding: 0 4px; flex-shrink: 0; font-family: var(--v2-mono); font-size: var(--v2-base);
   box-sizing: border-box;
-  overflow: hidden;
 }
-.gv2-component.span-3 { grid-column: span 3; }
-.gv2-component.span-4 { grid-column: span 4; }
-.gv2-component.span-6 { grid-column: span 6; }
-.gv2-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 10px;
-  background: #111111;
-  border-bottom: 1px solid #1a1a1a;
+.v2-brand { padding: 0 14px; font-weight: 700; font-size: 13px; letter-spacing: .5px; color: var(--v2-fg); white-space: nowrap; }
+.v2-brand .sub { color: var(--v2-mute); font-weight: 400; font-size: 10px; margin-left: 6px; }
+.v2-tab {
+  height: 100%; padding: 0 12px; display: flex; align-items: center; gap: 6px;
+  color: var(--v2-dim); font-size: 11px; letter-spacing: .8px; text-transform: uppercase;
+  border-bottom: 2px solid transparent; cursor: pointer; white-space: nowrap;
+  background: transparent; border-top: none; border-left: none; border-right: none;
+  font-family: var(--v2-mono);
 }
-.gv2-title { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #808080; font-family: var(--mono); }
-.gv2-title b { color: #e5e5e5; font-weight: 650; }
-.gv2-tools { margin-left: auto; display: flex; gap: 4px; align-items: center; }
-.gv2-tool {
-  background: transparent; border: 1px solid #2a2a2a; color: #808080;
-  font-size: 10px; padding: 1px 7px; border-radius: 3px; cursor: pointer; line-height: 1.5;
+.v2-tab:hover { color: var(--v2-fg); background: rgba(255,255,255,.03); }
+.v2-tab.active { color: var(--v2-fg); border-bottom-color: var(--v2-accent); }
+.v2-topright { margin-left: auto; display: flex; align-items: center; gap: 8px; padding: 0 10px; }
+.v2-clock { font-size: 11px; color: var(--v2-dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.v2-statusdot { width: 7px; height: 7px; border-radius: 50%; background: var(--v2-up); box-shadow: 0 0 4px var(--v2-up); display: inline-block; }
+.v2-realtime { font-size: 11px; color: var(--v2-dim); }
+
+/* ---- 子标签行（30px） ---- */
+.v2-subbar {
+  height: 30px; display: flex; align-items: center; gap: 2px;
+  background: var(--v2-bg); border-bottom: 1px solid var(--v2-border);
+  padding: 0 8px; flex-shrink: 0; font-family: var(--v2-mono); font-size: var(--v2-base);
+  box-sizing: border-box;
 }
-.gv2-tool:hover { color: #e5e5e5; border-color: var(--accent); }
-.gv2-body { padding: 8px 10px; flex: 1; display: flex; flex-direction: column; gap: 5px; min-width: 0; }
-.gv2-foot {
-  padding: 3px 10px; border-top: 1px solid #1a1a1a;
-  font-size: 10px; color: #525252; display: flex; gap: 10px;
+.v2-subtab {
+  padding: 5px 12px; color: var(--v2-dim); font-size: 11px; border-radius: 4px 4px 0 0;
+  cursor: pointer; border: 1px solid transparent; border-bottom: none;
+  background: transparent; font-family: var(--v2-mono);
 }
-.gv2-kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; }
-.gv2-kv .k { color: #808080; font-size: 10px; white-space: nowrap; }
-.gv2-kv .v { font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
-.gv2-kv .v.up { color: var(--mint); }
-.gv2-kv .v.down { color: var(--bad); }
-.gv2-kv .v.mute { color: #525252; }
-.gv2-table { width: 100%; border-collapse: collapse; font-size: 11px; }
-.gv2-table th { text-align: left; color: #525252; font-weight: 500; padding: 2px 6px; border-bottom: 1px solid #1a1a1a; white-space: nowrap; }
-.gv2-table th.num, .gv2-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
-.gv2-table td { padding: 2px 6px; border-bottom: 1px solid rgba(26,26,26,.6); white-space: nowrap; }
-.gv2-table tr:hover td { background: rgba(217,119,6,.05); }
-.gv2-pulse { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-.gv2-pulse-item { border: 1px solid #1a1a1a; border-radius: 3px; padding: 5px 8px; }
-.gv2-pulse-item .lbl { font-size: 9px; color: #525252; }
-.gv2-pulse-item .val { font-size: 15px; font-variant-numeric: tabular-nums; margin-top: 1px; }
+.v2-subtab.active { color: var(--v2-fg); background: var(--v2-panel); border-color: var(--v2-border); }
+.v2-subbar .spacer { flex: 1; }
+
+/* ---- 通用工具按钮 ---- */
+.v2-tool {
+  background: transparent; border: 1px solid var(--v2-border-strong); color: var(--v2-dim);
+  font-size: 10px; padding: 2px 8px; border-radius: 3px; cursor: pointer; line-height: 1.4;
+  font-family: var(--v2-mono);
+}
+.v2-tool:hover { color: var(--v2-fg); border-color: var(--v2-accent); }
+.v2-tool.on { background: var(--v2-accent); color: #fff; border-color: var(--v2-accent); }
+
+/* ---- 组件网格（12 列） ---- */
+.v2-grid {
+  display: grid; grid-template-columns: repeat(12, 1fr); gap: var(--v2-gap);
+  grid-auto-rows: minmax(0, auto); align-items: stretch; width: 100%;
+  box-sizing: border-box; font-family: var(--v2-mono); font-size: var(--v2-base);
+  line-height: var(--v2-lh); color: var(--v2-fg);
+}
+.v2-wrap { flex: 1; overflow-y: auto; padding: var(--v2-gap); }
+
+/* ---- 组件卡（#161b22 + #2d333b 边框 + 表头 #1f2630） ---- */
+.v2-comp {
+  background: var(--v2-panel); border: 1px solid var(--v2-border); border-radius: 3px;
+  display: flex; flex-direction: column; min-width: 0; box-sizing: border-box; overflow: hidden;
+  font-family: var(--v2-mono);
+}
+.v2-comp.span-3 { grid-column: span 3; }
+.v2-comp.span-4 { grid-column: span 4; }
+.v2-comp.span-6 { grid-column: span 6; }
+.v2-comp.span-8 { grid-column: span 8; }
+.v2-head {
+  display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+  background: var(--v2-header); border-bottom: 1px solid var(--v2-border); flex-shrink: 0;
+}
+.v2-title { font-size: var(--v2-title); letter-spacing: 1px; text-transform: uppercase; color: var(--v2-dim); font-family: var(--v2-mono); }
+.v2-title b { color: var(--v2-fg); font-weight: 600; }
+.v2-tools { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+.v2-body { padding: var(--v2-pad); flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.v2-foot {
+  padding: 4px 10px; border-top: 1px solid var(--v2-border); font-size: 10px;
+  color: var(--v2-mute); display: flex; gap: 10px; flex-shrink: 0; font-family: var(--v2-mono);
+  white-space: nowrap; overflow: hidden;
+}
+
+/* ---- kv 行 ---- */
+.v2-kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; }
+.v2-kv .k { color: var(--v2-dim); font-size: 11px; white-space: nowrap; font-family: var(--v2-mono); }
+.v2-kv .v { font-size: var(--v2-num); color: var(--v2-fg); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; font-family: var(--v2-mono); }
+.v2-kv .v.up { color: var(--v2-up); }
+.v2-kv .v.down { color: var(--v2-down); }
+.v2-kv .v.mute { color: var(--v2-mute); }
+
+/* ---- 组件内表格（模板同款，无分页） ---- */
+.v2-table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: var(--v2-mono); }
+.v2-table th { text-align: left; color: var(--v2-mute); font-weight: 500; padding: 3px 6px; border-bottom: 1px solid var(--v2-border); white-space: nowrap; }
+.v2-table th.num, .v2-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.v2-table td { padding: 3px 6px; border-bottom: 1px solid rgba(45,51,59,.5); white-space: nowrap; }
+.v2-table tr:hover td { background: rgba(47,129,247,.06); }
+
+/* ---- 脉冲块 ---- */
+.v2-pulse { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.v2-pulse-item { border: 1px solid var(--v2-border); border-radius: 3px; padding: 6px 8px; }
+.v2-pulse-item .lbl { font-size: 10px; color: var(--v2-mute); font-family: var(--v2-mono); }
+.v2-pulse-item .val { font-size: 15px; font-variant-numeric: tabular-nums; margin-top: 2px; font-family: var(--v2-mono); }
+
+/* ---- KPI 顶行（4 卡） ---- */
+.v2-kpi {
+  background: var(--v2-panel); border: 1px solid var(--v2-border); border-radius: 3px;
+  padding: 8px 10px; min-height: 70px; grid-column: span 3; min-width: 0; box-sizing: border-box;
+  display: flex; flex-direction: column; justify-content: center; gap: 2px; font-family: var(--v2-mono);
+}
+.v2-kpi .lbl { color: var(--v2-dim); font-size: 9px; letter-spacing: .1em; text-transform: uppercase; }
+.v2-kpi .val { font-family: var(--v2-mono); font-size: var(--v2-lg); font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.v2-kpi .hint { color: var(--v2-mute); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.v2-kpi.tone-warn .val { color: var(--v2-warn); }
+.v2-kpi.tone-bad .val { color: var(--v2-down); }
+.v2-kpi.tone-ok .val { color: var(--v2-up); }
+
+/* ---- 底栏状态条（26px） ---- */
+.v2-statusbar {
+  height: 26px; display: flex; align-items: center; gap: 14px;
+  background: var(--v2-panel); border-top: 1px solid var(--v2-border);
+  padding: 0 12px; font-size: 10px; color: var(--v2-dim); flex-shrink: 0;
+  font-family: var(--v2-mono); white-space: nowrap; overflow: hidden; box-sizing: border-box;
+}
+.v2-statusbar .sep { color: var(--v2-border-strong); }
+.v2-statusbar .ok { color: var(--v2-up); }
+.v2-statusbar .warn { color: var(--v2-warn); }
+.v2-statusbar .right { margin-left: auto; }
+
+/* ---- 滚动条（暗色） ---- */
+.v2-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
+.v2-wrap::-webkit-scrollbar-track { background: var(--v2-bg); }
+.v2-wrap::-webkit-scrollbar-thumb { background: var(--v2-border); border-radius: 4px; }
+.v2-wrap::-webkit-scrollbar-thumb:hover { background: var(--v2-border-strong); }
+
+.v2-note { color: var(--v2-mute); font-size: 10px; font-style: italic; }
+
 @media (max-width: 720px) {
-  .gv2-grid { grid-template-columns: repeat(2, 1fr); }
-  .gv2-component, .gv2-kpi { grid-column: span 2 !important; }
+  .v2-grid { grid-template-columns: repeat(2, 1fr); }
+  .v2-comp, .v2-kpi { grid-column: span 2 !important; }
+}
+
+/* NiceGUI button chrome reset so v2-tab / v2-subtab / v2-tool match the skeleton. */
+html, body, .shell { background: var(--v2-bg); color: var(--v2-fg); }
+.nicegui-content { padding: 0 !important; }
+.shell { height: 100vh; max-height: 100vh; overflow: hidden; }
+.ft-body.v2-stage {
+  max-width: none; margin: 0; padding: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.v2-subslot { flex: 0 0 auto; }
+.v2-subslot > * { display: flex; flex-direction: column; }
+.v2-mainslot { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.v2-mainslot > * {
+  flex: 1; min-height: 0; display: flex !important; flex-direction: column; overflow: hidden;
+}
+.v2-host { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.v2-host.v2-off { display: none !important; }
+.v2-wrap { min-height: 0; }
+.v2-brand, .v2-title { display: flex; align-items: baseline; }
+.v2-title { gap: 4px; }
+.v2-title .em { color: var(--v2-fg); font-weight: 600; }
+.v2-topbar { height: 40px !important; min-height: 40px !important; max-height: 40px !important; overflow: hidden; }
+.v2-subbar { height: 30px !important; min-height: 30px !important; max-height: 30px !important; }
+.v2-statusbar { height: 26px !important; min-height: 26px !important; max-height: 26px !important; }
+.v2-tab.q-btn, .v2-subtab.q-btn, .v2-tool.q-btn {
+  box-shadow: none !important; text-transform: none !important; min-height: 0 !important;
+  font-family: var(--v2-mono) !important; font-weight: 400 !important;
+}
+.v2-tab.q-btn, .v2-tab.q-btn .q-btn__content {
+  height: 40px !important; padding: 0 12px !important; border-radius: 0 !important;
+  background: transparent !important; color: var(--v2-dim) !important;
+  font-size: 11px !important; letter-spacing: .8px !important;
+  border: none !important; border-bottom: 2px solid transparent !important;
+}
+.v2-tab.q-btn:hover, .v2-tab.q-btn:hover .q-btn__content {
+  color: var(--v2-fg) !important; background: rgba(255,255,255,.03) !important;
+}
+.v2-tab.q-btn.active, .v2-tab.q-btn.active .q-btn__content {
+  color: var(--v2-fg) !important; border-bottom-color: var(--v2-accent) !important;
+}
+.v2-subtab.q-btn, .v2-subtab.q-btn .q-btn__content {
+  height: auto !important; padding: 5px 12px !important;
+  background: transparent !important; color: var(--v2-dim) !important;
+  border: 1px solid transparent !important; border-bottom: none !important;
+  border-radius: 4px 4px 0 0 !important; font-size: 11px !important; letter-spacing: 0 !important;
+}
+.v2-subtab.q-btn.active, .v2-subtab.q-btn.active .q-btn__content {
+  color: var(--v2-fg) !important; background: var(--v2-panel) !important;
+  border-color: var(--v2-border) !important;
+}
+.v2-tool.q-btn, .v2-head .v2-tool, .v2-subbar .v2-tool.q-btn {
+  display: inline-flex; align-items: center;
+  height: auto !important; padding: 2px 8px !important;
+  background: transparent !important; color: var(--v2-dim) !important;
+  border: 1px solid var(--v2-border-strong) !important; border-radius: 3px !important;
+  font-size: 10px !important; line-height: 1.4 !important;
+}
+.v2-tool.q-btn .q-btn__content { color: inherit !important; padding: 0 !important; min-height: 0 !important; }
+.v2-tool.q-btn.on, .v2-tool.q-btn.on .q-btn__content, .v2-tool.on {
+  background: var(--v2-accent) !important; color: #fff !important; border-color: var(--v2-accent) !important;
+}
+.v2-table th > *, .v2-table td > *, .v2-brand > *, .v2-title > *, .v2-foot > *, .v2-kpi > *, .v2-pulse-item > * {
+  margin: 0; font: inherit; color: inherit; line-height: inherit;
+}
+.v2-news {
+  font-size: 11px; color: var(--v2-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.footer-note { color: var(--v2-mute); }
+.banner { margin: 8px 8px 0; }
+.v2-body { overflow-x: auto; }
+.v2-grid.v2-compact .v2-comp, .v2-grid.v2-compact .v2-kpi { grid-column: span 6 !important; }
+@media (max-width: 720px) {
+  .v2-grid.v2-compact .v2-comp, .v2-grid.v2-compact .v2-kpi { grid-column: span 2 !important; }
+  .v2-topbar { overflow-x: auto; }
 }
 """
 
@@ -678,7 +828,7 @@ def register_health() -> None:
 
 def apply_theme() -> None:
     ui.dark_mode(True)
-    ui.colors(primary="#d97706")
+    ui.colors(primary="#2f81f7")
     ui.add_css(THEME_CSS)
     ui.add_head_html('<meta name="robots" content="noindex, nofollow">')
 
@@ -784,10 +934,31 @@ def _render_login(next_path: str) -> None:
 
 def _render_dashboard(*, insecure: bool, section: Section) -> None:
     store = DataStore()
-    interval = int(refresh_seconds())
     chain_filter = {"value": "all"}
-    refreshed_at = {"mono": time.monotonic()}
     opened_at = time.monotonic()
+    nav: dict[str, object] = {
+        "tab": "AI CHAT" if section == "chat" else "DASHBOARD",
+        "sub": "OVERVIEW",
+        "compact": False,
+    }
+    host_keys: tuple[HostKey, ...] = ("OVERVIEW", "SIGNALS", "EXECUTION", "MARKETS", "AI CHAT")
+
+    def host_on(key: HostKey) -> bool:
+        tab = nav["tab"]
+        sub = nav["sub"]
+        match key:
+            case "OVERVIEW":
+                return tab == "DASHBOARD" and sub == "OVERVIEW"
+            case "SIGNALS":
+                return tab == "DASHBOARD" and sub == "SIGNALS"
+            case "EXECUTION":
+                return tab == "DASHBOARD" and sub == "EXECUTION"
+            case "MARKETS":
+                return tab == "MARKETS"
+            case "AI CHAT":
+                return tab == "AI CHAT"
+            case _ as unreachable:
+                assert_never(unreachable)
 
     def on_chain(event: object) -> None:
         value = getattr(event, "value", None) or "all"
@@ -799,26 +970,85 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
 
     @ui.refreshable
     def overview_tab() -> None:
-        with ui.element("div").classes("gv2-grid"):
-            try:
-                _gv2_kpi_strip(store)
-            except Exception:
-                log.warning("overview kpi strip failed")
-                ui.label("—").classes("muted")
-            _gv2_component("进程 · 心跳", "span-3", lambda: _gv2_procs(store))
-            _gv2_component("风险 · 闸门", "span-3", lambda: _gv2_gates(), foot="闸门只读·环境变量不可改")
-            _gv2_component(
-                "先验 · 对照",
-                "span-6",
-                lambda: _gv2_priors(),
-                foot="GMGN n=956 · self n=9317 · CoinGecko · RED-PUMP",
-            )
-            _gv2_component("今日 · EXECUTION_LOG", "span-4", lambda: _gv2_today(store))
-            _gv2_component("近 7 日 · 决策", "span-4", lambda: _gv2_week(store))
-            _gv2_component("信号 · 流", "span-4", lambda: _gv2_signals(store))
-            _gv2_component("持仓 · 总览", "span-6", lambda: _gv2_positions(store))
-            _gv2_component("回测 · 新闻", "span-6", lambda: _gv2_btnews(store))
-            ui.label("阶段一只读监控。手动交易确认不在本看板内。").classes("footer-note")
+        grid = "v2-grid v2-compact" if nav["compact"] else "v2-grid"
+        with ui.element("div").classes("v2-wrap"):
+            with ui.element("div").classes(grid):
+                try:
+                    _v2_kpi_strip(store)
+                except Exception:
+                    log.warning("overview kpi strip failed")
+                    ui.label("—").classes("v2-note")
+                _v2_comp(
+                    ("进程", "心跳"),
+                    "span-3",
+                    lambda: _v2_procs(store),
+                    foot=_proc_foot(store),
+                    tools=("⟳",),
+                    on_tool=lambda _name: tick(),
+                )
+                _v2_comp(
+                    ("风险", "闸门"),
+                    "span-3",
+                    _v2_gates,
+                    foot="闸门只读 · 不调权",
+                    tools=("只读",),
+                )
+                _v2_comp(
+                    ("先验", "对照"),
+                    "span-6",
+                    _v2_priors,
+                    foot="GMGN n=956 · self n=9317 · CoinGecko · RED-PUMP",
+                    tools=("观察中·不调权",),
+                )
+                _v2_comp(
+                    ("今日", "EXECUTION_LOG"),
+                    "span-4",
+                    lambda: _v2_today(store),
+                    foot="execution_log 当日行",
+                    tools=("UTC 日",),
+                )
+                _v2_comp(
+                    ("近 7 日", "决策"),
+                    "span-4",
+                    lambda: _v2_week(store),
+                    foot="decision_log 滚动 168h",
+                    tools=("168h",),
+                )
+                _v2_comp(
+                    ("JEV", "门槛"),
+                    "span-4",
+                    _v2_jev_gate,
+                    foot="门槛 n≥15 / unique≥10",
+                    tools=("过滤后",),
+                )
+                _v2_comp(
+                    ("市场", "基准（hot）"),
+                    "span-8",
+                    lambda: _v2_market_base(store),
+                    foot="indicator_history tier=hot · winsor |x|≤500",
+                    tools=("winsor",),
+                )
+                _v2_comp(
+                    ("策略", "速览"),
+                    "span-4",
+                    lambda: _v2_strategy(store),
+                    foot="decision_log 按 strategy_id",
+                    tools=("⟳",),
+                    on_tool=lambda _name: tick(),
+                )
+                _v2_comp(
+                    ("持仓", "总览"),
+                    "span-6",
+                    lambda: _v2_positions(store),
+                    foot="模拟盘当前持仓 · 现价取 pair_history",
+                )
+                _v2_comp(
+                    ("回测", "新闻"),
+                    "span-6",
+                    lambda: _v2_btnews(store),
+                    foot="latest_backtest · news_events",
+                )
+                ui.label("阶段一只读监控。手动交易确认不在本看板内。").classes("footer-note")
 
     @ui.refreshable
     def signals_tab() -> None:
@@ -847,29 +1077,34 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
 
     def paint_clock() -> None:
         clock_lbl.set_text(_clock_text())
-        age = int(time.monotonic() - refreshed_at["mono"])
-        age_lbl.set_text(refresh_age_label(age))
-        up_lbl.set_text(session_clock(int(time.monotonic() - opened_at)))
+        session_lbl.set_text(session_clock(int(time.monotonic() - opened_at)))
 
     def paint_status() -> None:
         try:
+            db_text = db_status_line(store.file_status())
+            db_lbl.set_text(db_text)
+            _set_tone(db_lbl, "ok" if "缺失" not in db_text else "warn")
             live = store.process_liveness()
             if not live.available:
                 text, tone = "心跳：不可用", "muted"
             else:
                 text, tone = heartbeat_summary([item.state for item in live.data])
             proc_lbl.set_text(text)
-            foot_proc.set_text(text)
-            _paint_live(live_lbl, tone)
-            db_text = db_status_line(store.file_status())
-            db_lbl.set_text(db_text)
-            db_lbl.classes(remove="ft-status-miss")
-            if "缺失" in db_text:
-                db_lbl.classes(add="ft-status-miss")
+            _set_tone(proc_lbl, "ok" if tone == "ok" else ("warn" if tone == "warn" else ""))
+            if tone == "ok" and "缺失" not in db_text:
+                ready_lbl.set_text("● 就绪")
+                _set_tone(ready_lbl, "ok")
+            elif tone == "warn":
+                ready_lbl.set_text("● 停滞")
+                _set_tone(ready_lbl, "warn")
+            else:
+                ready_lbl.set_text("● 未知")
+                _set_tone(ready_lbl, "")
         except Exception:
             log.warning("status strip failed")
             proc_lbl.set_text("心跳：不可用")
-            foot_proc.set_text("心跳：不可用")
+            ready_lbl.set_text("● 未知")
+            _set_tone(ready_lbl, "")
 
     def tick() -> None:
         if api_secret() and not _session_ok():
@@ -881,27 +1116,77 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
             execution_tab.refresh()
             markets_tab.refresh()
             paint_status()
-            refreshed_at["mono"] = time.monotonic()
             paint_clock()
         except Exception:
             log.warning("refresh failed")
-            age_lbl.set_text("刷新失败")
+            ready_lbl.set_text("● 刷新失败")
+            _set_tone(ready_lbl, "warn")
+
+    def apply_nav() -> None:
+        hosts = nav.get("hosts")
+        if isinstance(hosts, dict):
+            for key in host_keys:
+                host = hosts.get(key)
+                if host is None:
+                    continue
+                if host_on(key):
+                    host.classes(remove="v2-off")
+                else:
+                    host.classes(add="v2-off")
+        refresh_tabs = nav.get("refresh_tabs")
+        refresh_sub = nav.get("refresh_sub")
+        if callable(refresh_tabs):
+            refresh_tabs()
+        if callable(refresh_sub):
+            refresh_sub()
+
+    def switch_tab(key: str) -> None:
+        if key not in ("DASHBOARD", "MARKETS", "AI CHAT") or nav["tab"] == key:
+            return
+        nav["tab"] = key
+        apply_nav()
+
+    def switch_sub(key: str) -> None:
+        if key not in ("OVERVIEW", "SIGNALS", "EXECUTION"):
+            return
+        if nav["tab"] == "DASHBOARD" and nav["sub"] == key:
+            return
+        nav["tab"] = "DASHBOARD"
+        nav["sub"] = key
+        apply_nav()
+
+    def toggle_compact() -> None:
+        nav["compact"] = not bool(nav["compact"])
+        overview_tab.refresh()
+        refresh_sub = nav.get("refresh_sub")
+        if callable(refresh_sub):
+            refresh_sub()
+
+    @ui.refreshable
+    def tab_bar() -> None:
+        for name in ("DASHBOARD", "MARKETS", "AI CHAT"):
+            active = "active" if nav["tab"] == name else ""
+            ui.button(name, on_click=lambda k=name: switch_tab(k)).props(
+                "flat dense unelevated no-caps"
+            ).classes(f"v2-tab {active}".rstrip())
+
+    nav["refresh_tabs"] = tab_bar.refresh
 
     with ui.element("div").classes("shell"):
-        with ui.element("div").classes("topbar"):
-            with ui.element("div").classes("brand"):
-                ui.label("SPIKE'S").classes("ft-brand-crypto")
-                ui.label("CRYPTO TERMINER").classes("ft-brand-name")
-                ui.label("链上新币投研终端").classes("ft-brand-sub")
-            with ui.element("div").classes("status-group"):
-                live_lbl = ui.label("● 实时").classes("ft-live")
-                proc_lbl = ui.label("进程 —").classes("ft-proc")
-                clock_lbl = ui.label(_clock_text()).classes("ft-clock")
-            with ui.element("div").classes("actions"):
-                ui.button("刷新", on_click=tick).props("flat dense size=sm").classes("ft-refresh")
+        with ui.element("div").classes("v2-topbar"):
+            with ui.element("div").classes("v2-brand"):
+                ui.label("SPIKE'S CRYPTO TERMINER")
+                ui.label("链上新币投研终端").classes("sub")
+            tab_bar()
+            with ui.element("div").classes("v2-topright"):
+                clock_lbl = ui.label(_clock_text()).classes("v2-clock")
+                ui.element("div").classes("v2-statusdot")
+                ui.label("实时").classes("v2-realtime")
                 if api_secret():
-                    ui.button("退出", on_click=_revoke_session).props("flat dense size=sm").classes("ghost-btn")
-        with ui.element("div").classes("ft-body"):
+                    ui.button("退出", on_click=_revoke_session).props(
+                        "flat dense unelevated no-caps"
+                    ).classes("v2-tool")
+        with ui.element("div").classes("ft-body v2-stage"):
             if insecure:
                 ui.label("本地未鉴权模式（ALLOW_INSECURE_API=1）。不要暴露到公网。").classes("banner")
             _module_tabs(
@@ -911,16 +1196,13 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                 execution_tab,
                 markets_tab,
                 chat_tab,
+                nav=nav,
+                on_sub=switch_sub,
+                on_compact=toggle_compact,
+                on_refresh=tick,
+                host_on=host_on,
             )
-        with ui.element("div").classes("statusbar"):
-            with ui.element("div").classes("left"):
-                ui.label("v0.1.0").classes("ft-status-item")
-                up_lbl = ui.label(session_clock(0)).classes("ft-status-item")
-                db_lbl = ui.label("库 —").classes("ft-status-item")
-                foot_proc = ui.label("进程 —").classes("ft-status-item")
-            with ui.element("div").classes("right"):
-                age_lbl = ui.label(refresh_age_label(0)).classes("ft-status-item")
-                ui.label(f"每 {interval}s").classes("ft-status-item")
+        session_lbl, db_lbl, proc_lbl, ready_lbl = _status_strip(store)
     paint_status()
     paint_clock()
     ui.timer(1.0, paint_clock)
@@ -934,30 +1216,60 @@ def _module_tabs(
     execution_tab: ui.refreshable,
     markets_tab: ui.refreshable,
     chat_tab: ui.refreshable,
+    *,
+    nav: dict[str, object],
+    on_sub: Callable[[str], None],
+    on_compact: Callable[[], None],
+    on_refresh: Callable[[], None],
+    host_on: Callable[[HostKey], bool],
 ) -> None:
-    initial = "AI CHAT" if section == "chat" else "DASHBOARD"
-    with ui.tabs(value=initial).classes("w-full ft-tabbar") as tabs:
-        dash = ui.tab("DASHBOARD")
-        markets = ui.tab("MARKETS")
-        chat = ui.tab("AI CHAT")
-    with ui.tab_panels(tabs, value=initial).classes("w-full ft-panels"):
-        with ui.tab_panel(dash):
-            with ui.tabs(value="OVERVIEW").classes("w-full ft-subtab").props("dense") as sub:
-                overview = ui.tab("OVERVIEW")
-                signals = ui.tab("SIGNALS")
-                execution = ui.tab("EXECUTION")
-            with ui.tab_panels(sub, value="OVERVIEW").classes("w-full ft-subpanels"):
-                with ui.tab_panel(overview):
-                    overview_tab()
-                with ui.tab_panel(signals):
-                    signals_tab()
-                with ui.tab_panel(execution):
-                    execution_tab()
-        with ui.tab_panel(markets):
-            markets_tab()
-        with ui.tab_panel(chat):
+    """Sub-tab row plus the five hosts. Top-level tabs stay in the top bar."""
+    if section == "chat":
+        nav["tab"] = "AI CHAT"
+
+    @ui.refreshable
+    def subbar() -> None:
+        if nav["tab"] != "DASHBOARD":
+            return
+        with ui.element("div").classes("v2-subbar"):
+            for name in ("OVERVIEW", "SIGNALS", "EXECUTION"):
+                active = "active" if nav["sub"] == name else ""
+                ui.button(name, on_click=lambda k=name: on_sub(k)).props(
+                    "flat dense unelevated no-caps"
+                ).classes(f"v2-subtab {active}".rstrip())
+            ui.element("div").classes("spacer")
+            compact = "v2-tool on" if nav["compact"] else "v2-tool"
+            ui.button("紧凑", on_click=on_compact).props("flat dense unelevated no-caps").classes(compact)
+            ui.button("刷新", on_click=on_refresh).props("flat dense unelevated no-caps").classes("v2-tool")
+
+    nav["refresh_sub"] = subbar.refresh
+
+    def panel_wrap(render: Callable[[], None]) -> None:
+        with ui.element("div").classes("v2-wrap"):
+            render()
+
+    def chat_wrap() -> None:
+        with ui.element("div").classes("v2-wrap"):
             chat_tab()
             ui.link("在 /chat 打开", "/chat").classes("news-link")
+
+    panels: tuple[tuple[HostKey, Callable[[], None]], ...] = (
+        ("OVERVIEW", overview_tab),
+        ("SIGNALS", lambda: panel_wrap(signals_tab)),
+        ("EXECUTION", lambda: panel_wrap(execution_tab)),
+        ("MARKETS", lambda: panel_wrap(markets_tab)),
+        ("AI CHAT", chat_wrap),
+    )
+    hosts: dict[str, ui.element] = {}
+    with ui.element("div").classes("v2-subslot"):
+        subbar()
+    with ui.element("div").classes("v2-mainslot"):
+        for key, render in panels:
+            host = ui.element("div").classes("v2-host" if host_on(key) else "v2-host v2-off")
+            hosts[key] = host
+            with host:
+                render()
+    nav["hosts"] = hosts
 
 
 def _render_panel_group(store: DataStore, group: str, on_retry) -> None:
@@ -983,34 +1295,45 @@ def _clock_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _paint_live(label: ui.label, tone: str) -> None:
-    if tone == "ok":
-        label.set_text(live_caption("ok"))
-    elif tone == "warn":
-        label.set_text(live_caption("warn"))
-        label.classes(remove="ft-live-muted")
-        label.classes(add="ft-live-warn")
-        return
-    else:
-        label.set_text(live_caption("muted"))
-        label.classes(remove="ft-live-warn")
-        label.classes(add="ft-live-muted")
-        return
-    label.classes(remove="ft-live-warn ft-live-muted")
+def _set_tone(label: ui.label, tone: str) -> None:
+    label.classes(remove="ok warn")
+    if tone:
+        label.classes(add=tone)
 
 
-def _gv2_kpi(label_: str, value: str, hint: str = "", tone: str = "") -> None:
-    classes = "gv2-kpi"
+def _status_strip(store: DataStore) -> tuple[ui.label, ui.label, ui.label, ui.label]:
+    """Bottom status bar. Clock and heartbeat paints update the returned labels."""
+    db_text = "库 —"
+    try:
+        db_text = db_status_line(store.file_status())
+    except Exception:
+        log.warning("status strip failed")
+    with ui.element("div").classes("v2-statusbar"):
+        ui.label("v0.1.0")
+        ui.label("·").classes("sep")
+        session_lbl = ui.label(session_clock(0))
+        ui.label("·").classes("sep")
+        db_lbl = ui.label(db_text)
+        ui.label("·").classes("sep")
+        proc_lbl = ui.label("进程 —")
+        ui.label("·").classes("sep")
+        ui.label("延迟 —")
+        ready_lbl = ui.label("● 就绪").classes("right")
+    return session_lbl, db_lbl, proc_lbl, ready_lbl
+
+
+def _v2_kpi(label_: str, value: str, hint: str = "", tone: str = "") -> None:
+    classes = "v2-kpi"
     if tone:
         classes = f"{classes} {tone}"
     with ui.element("div").classes(classes):
-        ui.label(label_).classes("kpi-label")
-        ui.label(value).classes("kpi-value")
+        ui.label(label_).classes("lbl")
+        ui.label(value).classes("val")
         if hint:
-            ui.label(hint).classes("kpi-hint")
+            ui.label(hint).classes("hint")
 
 
-def _gv2_kpi_strip(store: DataStore) -> None:
+def _v2_kpi_strip(store: DataStore) -> None:
     gates = read_gates()
     today = store.today_execution_stats()
     paper_on = bool(getattr(gates, "paper_enabled", False))
@@ -1022,37 +1345,71 @@ def _gv2_kpi_strip(store: DataStore) -> None:
         if raw is not None:
             count = str(raw)
     reason = getattr(gates, "live_block_reason", None) or "LIVE"
-    _gv2_kpi("模拟盘", "ON" if paper_on else "OFF", "PAPER", "tone-warn" if paper_on else "tone-ok")
-    _gv2_kpi("仓位闸", "ON" if pm_on else "OFF", "PM", "tone-warn" if pm_on else "tone-ok")
-    _gv2_kpi("实盘", "ON" if live_on else "OFF", str(reason), "tone-bad" if live_on else "tone-ok")
-    _gv2_kpi("今日信号", count, "execution_log")
+    _v2_kpi("模拟盘", "ON" if paper_on else "OFF", "PAPER · 默认关", "tone-warn" if paper_on else "tone-ok")
+    _v2_kpi("仓位闸", "ON" if pm_on else "OFF", "PM · 默认关", "tone-warn" if pm_on else "tone-ok")
+    _v2_kpi("实盘", "ON" if live_on else "OFF", str(reason), "tone-bad" if live_on else "tone-ok")
+    _v2_kpi("今日信号", count, "execution_log", "tone-ok" if today.available else "")
 
 
-def _gv2_component(title: str, span: str, body_fn: Callable[[], None], foot: str = "") -> None:
-    with ui.element("div").classes(f"gv2-component {span}"):
-        with ui.element("div").classes("gv2-head"):
-            ui.label(title).classes("gv2-title")
-            with ui.element("div").classes("gv2-tools"):
-                ui.button("⟳", on_click=lambda: None).props("flat dense size=xs").classes("gv2-tool")
-        with ui.element("div").classes("gv2-body"):
+def _v2_title(plain: str, strong: str) -> None:
+    with ui.element("div").classes("v2-title"):
+        ui.label(plain)
+        ui.label(strong).classes("em")
+
+
+def _v2_comp(
+    title: tuple[str, str],
+    span: str,
+    body_fn: Callable[[], None],
+    foot: str = "",
+    tools: tuple[str, ...] = (),
+    on_tool: Callable[[str], None] | None = None,
+) -> None:
+    with ui.element("div").classes(f"v2-comp {span}"):
+        with ui.element("div").classes("v2-head"):
+            _v2_title(title[0], title[1])
+            if tools:
+                with ui.element("div").classes("v2-tools"):
+                    for tool in tools:
+                        if tool == "⟳" and on_tool is not None:
+                            ui.button("⟳", on_click=lambda name=tool: on_tool(name)).props(
+                                "flat dense unelevated no-caps"
+                            ).classes("v2-tool")
+                        else:
+                            ui.label(tool).classes("v2-tool")
+        with ui.element("div").classes("v2-body"):
             try:
                 body_fn()
             except Exception:
-                log.warning("overview component failed: %s", title)
-                ui.label("—").classes("muted")
+                log.warning("overview component failed: %s %s", title[0], title[1])
+                ui.label("—").classes("v2-note")
         if foot:
-            with ui.element("div").classes("gv2-foot"):
-                ui.label(foot).classes("gv2-foot-text")
+            with ui.element("div").classes("v2-foot"):
+                ui.label(foot)
 
 
-def _gv2_kv(pairs: list[tuple[str, str, str]]) -> None:
-    with ui.element("div").classes("gv2-kv"):
+def _v2_kv(pairs: list[tuple[str, str, str]]) -> None:
+    with ui.element("div").classes("v2-kv"):
         for key, value, tone in pairs:
             ui.label(key).classes("k")
             ui.label(value).classes(f"v {tone}".rstrip())
 
 
-def _gv2_text(value: object, limit: int | None = None) -> str:
+def _v2_table(headers: list[tuple[str, str]], rows: list[list[str]]) -> None:
+    with ui.element("table").classes("v2-table"):
+        with ui.element("tr"):
+            for text, align in headers:
+                with ui.element("th").classes(align):
+                    ui.label(text)
+        for row in rows:
+            with ui.element("tr"):
+                for index, text in enumerate(row):
+                    align = headers[index][1] if index < len(headers) else ""
+                    with ui.element("td").classes(align):
+                        ui.label(text)
+
+
+def _v2_text(value: object, limit: int | None = None) -> str:
     if value is None:
         return "—"
     text = str(value).strip()
@@ -1073,7 +1430,7 @@ def _as_int(value: object) -> int:
     return 0
 
 
-def _gv2_money(value: object) -> str:
+def _v2_money(value: object) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "—"
     return f"${value:,.0f}"
@@ -1095,33 +1452,72 @@ def _result_rows(result: object) -> list[object]:
         return []
 
 
-def _gv2_procs(store: DataStore) -> None:
+def _proc_foot(store: DataStore) -> str:
+    try:
+        live = store.process_liveness()
+    except Exception:
+        log.warning("process foot failed")
+        return "心跳不可用"
+    if not live.available:
+        return "心跳不可用"
+    probes = _result_rows(live)
+    if not probes:
+        return "心跳不可用"
+    alive = sum(1 for probe in probes if getattr(probe, "state", "") == "alive")
+    ages: list[float] = []
+    for probe in probes:
+        age = getattr(probe, "age_seconds", None)
+        if isinstance(age, (int, float)) and not isinstance(age, bool):
+            ages.append(float(age))
+    if ages:
+        return f"进程 {alive}/{len(probes)} 存活 · 上次心跳 {fmt_age(min(ages))}"
+    return f"进程 {alive}/{len(probes)} 存活 · 上次心跳 —"
+
+
+def _v2_procs(store: DataStore) -> None:
     live = store.process_liveness()
     if not live.available:
-        ui.label("心跳：不可用").classes("muted")
+        ui.label("心跳：不可用").classes("v2-note")
         return
     probes = _result_rows(live)
     if not probes:
-        ui.label("心跳：不可用").classes("muted")
+        ui.label("心跳：不可用").classes("v2-note")
         return
     pairs: list[tuple[str, str, str]] = []
+    ages: list[str] = []
     for probe in probes:
-        name = _gv2_text(getattr(probe, "name", None))
-        state = _gv2_text(getattr(probe, "state", None))
-        pairs.append((name, state, "up" if state == "alive" else "mute"))
-    _gv2_kv(pairs)
+        name = _v2_text(getattr(probe, "name", None))
+        state = str(getattr(probe, "state", "") or "")
+        if state == "alive":
+            label, tone = liveness_label("alive"), "up"
+        elif state == "stale":
+            label, tone = liveness_label("stale"), "mute"
+        elif state == "unknown":
+            label, tone = liveness_label("unknown"), "down"
+        else:
+            label, tone = (state or "—"), "down"
+        pairs.append((name, label, tone))
+        age = getattr(probe, "age_seconds", None)
+        if isinstance(age, (int, float)) and not isinstance(age, bool):
+            ages.append(f"{name}·{fmt_age(float(age))}")
+    _v2_kv(pairs)
+    if ages:
+        ui.label(" · ".join(ages[:3])).classes("v2-note")
 
 
-def _gv2_gates() -> None:
+def _v2_gates() -> None:
     gates = read_gates()
     paper_on = bool(getattr(gates, "paper_enabled", False))
     pm_on = bool(getattr(gates, "pm_enabled", False))
     live_on = bool(getattr(gates, "live_effective", False))
-    _gv2_kv([
-        ("模拟盘执行", "ON" if paper_on else "关", "up" if paper_on else "mute"),
+    kill = bool(getattr(gates, "kill_switch_present", False))
+    _v2_kv([
+        ("模拟盘", "ON" if paper_on else "关", "up" if paper_on else "mute"),
         ("仓位管理", "ON" if pm_on else "关", "up" if pm_on else "mute"),
         ("实盘", "ON" if live_on else "关", "down" if live_on else "mute"),
+        ("杀开关", "存在" if kill else "—", "mute"),
     ])
+    ui.label("关是当前预期状态；实盘若变「开启」会标红。").classes("v2-note")
 
 
 def _ratio_text(value: object, digits: int) -> str:
@@ -1214,7 +1610,7 @@ def _prior_from_baseline(payload: dict[str, object]) -> list[tuple[str, str]]:
     ]
 
 
-def _gv2_prior_values() -> list[tuple[str, str]]:
+def _v2_prior_values() -> list[tuple[str, str]]:
     loaded = _prior_from_risk()
     if loaded is not None:
         return loaded
@@ -1230,117 +1626,165 @@ def _gv2_prior_values() -> list[tuple[str, str]]:
     ]
 
 
-def _gv2_priors() -> None:
-    with ui.element("div").classes("gv2-pulse"):
-        for label_, value in _gv2_prior_values():
-            with ui.element("div").classes("gv2-pulse-item"):
+def _v2_priors() -> None:
+    with ui.element("div").classes("v2-pulse"):
+        for label_, value in _v2_prior_values():
+            with ui.element("div").classes("v2-pulse-item"):
                 ui.label(label_).classes("lbl")
                 ui.label(value).classes("val")
 
 
-def _gv2_today(store: DataStore) -> None:
+def _v2_today(store: DataStore) -> None:
     result = store.today_execution_stats()
     if not result.available or result.data is None:
-        ui.label("暂无数据").classes("muted")
+        ui.label("暂无数据").classes("v2-note")
         return
     block = result.data
     total = _as_int(getattr(block, "n", None))
-    _gv2_kv([
-        ("信号数", str(getattr(block, "n", "—")), ""),
-        (
-            "校验通过",
+    _v2_table(
+        [("信号数", "num"), ("校验通过", "num"), ("已执行", "num")],
+        [[
+            str(getattr(block, "n", "—")),
             fmt_rate(getattr(block, "ok_rate", None), _as_int(getattr(block, "n_ok", None)), total),
-            "up",
-        ),
-        (
-            "已执行",
             fmt_rate(
                 getattr(block, "executed_rate", None),
                 _as_int(getattr(block, "n_executed", None)),
                 total,
             ),
-            "mute",
-        ),
-    ])
+        ]],
+    )
 
 
-def _gv2_week(store: DataStore) -> None:
+def _v2_week(store: DataStore) -> None:
     result = store.week_decision_stats()
     if not result.available or result.data is None:
-        ui.label("暂无数据").classes("muted")
+        ui.label("暂无数据").classes("v2-note")
         return
     block = result.data
     # DecisionWindowStats rates use n_with_exec. There is no `n` field.
     denominator = _as_int(getattr(block, "n_with_exec", None))
-    _gv2_kv([
-        ("决策数", str(getattr(block, "n_decisions", "—")), ""),
-        ("有执行", str(getattr(block, "n_with_exec", "—")), ""),
-        (
-            "通过率",
+    _v2_table(
+        [("决策数", "num"), ("有执行", "num"), ("通过率", "num"), ("执行率", "num")],
+        [[
+            str(getattr(block, "n_decisions", "—")),
+            str(getattr(block, "n_with_exec", "—")),
             fmt_rate(getattr(block, "ok_rate", None), _as_int(getattr(block, "n_ok", None)), denominator),
-            "up",
-        ),
-        (
-            "执行率",
             fmt_rate(
                 getattr(block, "executed_rate", None),
                 _as_int(getattr(block, "n_executed", None)),
                 denominator,
             ),
-            "mute",
-        ),
+        ]],
+    )
+
+
+def _jev_trend_row() -> dict[str, str] | None:
+    candidates: list[Path] = []
+    raw = os.environ.get("JEV_TREND_CSV", "").strip()
+    if raw:
+        candidates.append(Path(raw))
+    relative = (
+        Path("data") / "prior" / "exports" / "jev_validity_trend.csv",
+        Path("crawler") / "data" / "prior" / "exports" / "jev_validity_trend.csv",
+    )
+    roots: list[Path] = []
+    try:
+        roots.append(db_root())
+    except Exception:
+        log.warning("jev trend root unavailable")
+    roots.append(Path(__file__).resolve().parent.parent)
+    seen: set[Path] = set()
+    for root in roots:
+        for name in relative:
+            candidates.append(root / name)
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            if not resolved.is_file():
+                continue
+            with resolved.open("r", newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+        except OSError:
+            log.warning("jev trend unreadable")
+            continue
+        if not rows:
+            continue
+        last = rows[-1]
+        return {str(key): str(value) for key, value in last.items() if key}
+    return None
+
+
+def _v2_jev_gate() -> None:
+    row = _jev_trend_row()
+    if not row:
+        ui.label("暂无数据（周检后自动填充）").classes("v2-note")
+        return
+    _v2_kv([
+        ("n", row.get("n") or "—", ""),
+        ("unique_token", row.get("unique_token") or "—", ""),
+        ("1h 上涨率", row.get("up_1h") or "—", "up"),
+        ("4h 上涨率", row.get("up_4h") or "—", "mute"),
     ])
 
 
-def _gv2_signals(store: DataStore) -> None:
-    result = store.recent_signals(limit=5)
-    rows = _result_rows(result)
-    if not rows:
-        ui.label("暂无信号").classes("muted")
+def _v2_market_base(store: DataStore) -> None:
+    reader = getattr(store, "market_base_stats", None)
+    result = reader() if callable(reader) else None
+    if not result or not getattr(result, "available", False) or getattr(result, "data", None) is None:
+        ui.label("暂无数据（indicator_history tier=hot）").classes("v2-note")
         return
-    table_rows: list[dict[str, str]] = []
-    for index, item in enumerate(rows):
-        size = getattr(item, "size_pct", None)
-        if isinstance(size, (int, float)) and not isinstance(size, bool):
-            size_text = f"{size:.2f}"
-        else:
-            size_text = "—"
-        # decision_id is unique. ts collides when two signals share a timestamp.
-        key = getattr(item, "decision_id", None)
-        table_rows.append(
-            {
-                "key": str(key) if key is not None else str(index),
-                "ts": _gv2_text(getattr(item, "ts", None)),
-                "strategy_id": _gv2_text(getattr(item, "strategy_id", None)),
-                "action": _gv2_text(getattr(item, "action", None)),
-                "size_pct": size_text,
-            }
-        )
-    with ui.element("div").classes("table-scroll"):
-        table = ui.table(
-            columns=[
-                col("ts", "时间", "right"),
-                col("strategy_id", "策略"),
-                col("action", "动作"),
-                col("size_pct", "仓位", "right"),
-            ],
-            rows=table_rows,
-            row_key="key",
-            pagination=5,
-        )
-        table.classes("w-full gv2-table")
+    data = result.data
+    n_1h = getattr(data, "n_1h", None)
+    count = f"{n_1h:,}" if isinstance(n_1h, int) else "—"
+    _v2_table(
+        [("指标", ""), ("n_1h", "num"), ("中位 1h", "num"), ("中位 4h", "num"), ("均值 1h(w)", "num")],
+        [[
+            "hot 全量",
+            count,
+            _v2_text(getattr(data, "med_1h", None)),
+            _v2_text(getattr(data, "med_4h", None)),
+            _v2_text(getattr(data, "mean_1h_w", None)),
+        ]],
+    )
 
 
-def _gv2_positions(store: DataStore) -> None:
+def _v2_strategy(store: DataStore) -> None:
+    reader = getattr(store, "strategy_buckets", None)
+    result = reader() if callable(reader) else None
+    rows = getattr(getattr(result, "data", None), "rows", None)
+    if not result or not getattr(result, "available", False) or not rows:
+        ui.label("暂无数据（decision_log 按 strategy_id）").classes("v2-note")
+        return
+    table_rows: list[list[str]] = []
+    for bucket in rows:
+        table_rows.append([
+            _v2_text(getattr(bucket, "strategy_id", None)),
+            _v2_text(getattr(bucket, "n", None)),
+            _v2_text(getattr(bucket, "ok_rate", None)),
+        ])
+    _v2_table(
+        [("strategy", ""), ("n", "num"), ("通过率", "num")],
+        table_rows,
+    )
+    ui.label("B/C 策略出信号后自动分桶").classes("v2-note")
+
+
+def _v2_positions(store: DataStore) -> None:
     result = store.open_positions()
     if not result.available or result.data is None:
-        ui.label("暂无数据").classes("muted")
+        ui.label("暂无数据").classes("v2-note")
         return
     payload = result.data
     cash_raw = getattr(payload, "cash_usd", None)
     equity_raw = getattr(payload, "equity_usd", None)
-    cash = _gv2_money(cash_raw)
-    equity = _gv2_money(equity_raw) if equity_raw is not None else cash
+    cash = _v2_money(cash_raw)
+    equity = _v2_money(equity_raw) if equity_raw is not None else cash
     held_rows = getattr(payload, "rows", None)
     if held_rows is None:
         count = getattr(payload, "open_count", None)
@@ -1356,15 +1800,16 @@ def _gv2_positions(store: DataStore) -> None:
             share = f"{float(ratio) * 100:.2f}%"
         else:
             share = "—"
-    _gv2_kv([
+    _v2_kv([
         ("总权益", equity, ""),
         ("现金", cash, ""),
         ("持仓数", held, ""),
         ("仓位占比", share, ""),
     ])
+    ui.label("现价取 pair_history 最新；无价为「—」").classes("v2-note")
 
 
-def _gv2_btnews(store: DataStore) -> None:
+def _v2_btnews(store: DataStore) -> None:
     result = store.latest_backtest()
     if result.available and result.data is not None:
         run = result.data
@@ -1378,71 +1823,19 @@ def _gv2_btnews(store: DataStore) -> None:
         done = getattr(run, "done_at", None)
         if done in (None, ""):
             done = getattr(run, "finished_at", None)
-        _gv2_kv([
-            ("最近回测", _gv2_text(getattr(run, "run_id", None), 16), "mute"),
+        _v2_kv([
+            ("最近回测", _v2_text(getattr(run, "run_id", None), 16), "mute"),
             ("权益", equity, tone),
-            ("完成", _gv2_text(done), "mute"),
+            ("完成", _v2_text(done), "mute"),
         ])
     else:
-        _gv2_kv([("最近回测", "暂无", "mute")])
+        _v2_kv([("最近回测", "暂无", "mute")])
     items = _result_rows(store.latest_news(limit=3))
     if not items:
+        ui.label("暂无新闻").classes("v2-note")
         return
-    with ui.element("div").classes("gv2-body"):
-        for item in items[:3]:
-            with ui.element("div").classes("news-item"):
-                ui.label(_gv2_text(getattr(item, "title", None))).classes("news-link")
-
-
-def _status_strip(store: DataStore) -> None:
-    """Dense KPI strip on OVERVIEW. Read-only."""
-    gates = read_gates()
-    today = store.today_execution_stats()
-    pos = store.open_positions()
-
-    paper = "ON" if gates.paper_enabled else "OFF"
-    pm = "ON" if gates.pm_enabled else "OFF"
-    live_lbl = "ON" if gates.live_effective else "OFF"
-    paper_tone = "tone-warn" if gates.paper_enabled else "tone-ok"
-    pm_tone = "tone-warn" if gates.pm_enabled else "tone-ok"
-    live_tone = "tone-bad" if gates.live_effective else "tone-ok"
-
-    if today.available:
-        n = str(today.data.n)
-        ok = fmt_rate(today.data.ok_rate, today.data.n_ok, today.data.n)
-        exe = fmt_rate(today.data.executed_rate, today.data.n_executed, today.data.n)
-    else:
-        n, ok, exe = "—", "—", "—"
-
-    if pos.available:
-        n_pos = str(len(pos.data.rows))
-        cash = f"{pos.data.cash_usd:,.0f}" if getattr(pos.data, "cash_usd", None) is not None else "—"
-        equity = getattr(pos.data, "equity_usd", None)
-        eq = f"{equity:,.0f}" if equity is not None else cash
-    else:
-        n_pos, eq = "—", "—"
-
-    # Four primary KPI cards fill the first overview-grid row.
-    _tile("模拟盘", paper, "PAPER", paper_tone)
-    _tile("仓位闸", pm, "PM", pm_tone)
-    _tile("实盘", live_lbl, gates.live_block_reason or "LIVE", live_tone)
-    _tile("今日信号", n, "execution_log")
-    # Remaining stats continue on subsequent grid rows (still 4-col).
-    _tile("校验通过", ok, "validation_ok")
-    _tile("已执行", exe, "executed")
-    _tile("持仓数", n_pos, "paper positions")
-    _tile("权益$", eq, "cash+mtm")
-
-
-def _tile(label: str, value: str, hint: str = "", tone: str = "") -> None:
-    classes = "card"
-    if tone:
-        classes = f"{classes} {tone}"
-    with ui.element("div").classes(classes):
-        ui.label(label).classes("kpi-label")
-        ui.label(value).classes("kpi-value")
-        if hint:
-            ui.label(hint).classes("kpi-hint")
+    for item in items[:3]:
+        ui.label(f"· {_v2_text(getattr(item, 'title', None))}").classes("v2-news")
 
 
 

@@ -711,6 +711,9 @@ class DashboardSmokeTest(unittest.TestCase):
         ):
             self.assertIn(label, app_text)
         self.assertNotIn("TERMINAL", app_text)
+        for marker in ("v2-topbar", "v2-subbar", "v2-statusbar", "v2-grid", "v2-kpi", "span-8"):
+            self.assertIn(marker, app_text)
+        self.assertNotIn("gv2-", app_text)
         market_src = inspect.getsource(DataStore._market_rows)
         for banned in ("rsi", "macd", "boll"):
             self.assertNotIn(banned, market_src.lower())
@@ -825,6 +828,51 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual([row.token_address for row in sol.data], ["T1"])
         self.assertEqual(list(store.market_rows(chain="not-a-chain").data or ()), [])
         self.assertEqual(main.stat().st_mtime_ns, before)
+
+    def test_market_base_and_strategy_buckets_are_read_only(self) -> None:
+        paths = build_fixture(self.root)
+        store = DataStore(paths)
+        missing = store.market_base_stats()
+        self.assertFalse(missing.available)
+        self.assertIn("change_1h", missing.reason)
+        buckets = store.strategy_buckets()
+        self.assertTrue(buckets.available, buckets.reason)
+        self.assertEqual([(row.strategy_id, row.n, row.ok_rate) for row in buckets.data.rows], [("alpha", 2, "50.0%")])
+
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=3)
+        fresh = now - timedelta(hours=1)
+        with sqlite3.connect(paths.main) as conn:
+            conn.execute("DROP TABLE indicator_history")
+            conn.execute(
+                """
+                CREATE TABLE indicator_history (
+                    id INTEGER PRIMARY KEY,
+                    tier TEXT,
+                    recorded_at TEXT,
+                    change_1h REAL,
+                    change_4h REAL
+                )
+                """
+            )
+            conn.executemany(
+                "INSERT INTO indicator_history (tier, recorded_at, change_1h, change_4h) VALUES (?, ?, ?, ?)",
+                [
+                    ("hot", _iso(fresh), 1.0, 2.0),
+                    ("hot", _iso(fresh), 3.0, 6.0),
+                    ("hot", _iso(fresh), 600.0, None),
+                    ("warm", _iso(fresh), 50.0, 50.0),
+                    ("hot", _iso(old), 9.0, 9.0),
+                ],
+            )
+        before = paths.main.stat().st_mtime_ns
+        stats = store.market_base_stats()
+        self.assertTrue(stats.available, stats.reason)
+        self.assertEqual(stats.data.n_1h, 3)
+        self.assertEqual(stats.data.med_1h, "+3.00%")
+        self.assertEqual(stats.data.med_4h, "+4.00%")
+        self.assertEqual(stats.data.mean_1h_w, "+2.00%")
+        self.assertEqual(paths.main.stat().st_mtime_ns, before)
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
