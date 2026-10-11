@@ -595,3 +595,183 @@ def load_cex_scope(prior_db: str) -> dict[str, Any]:
     except sqlite3.Error as exc:
         return {"available": False, "reason": str(exc), "rows": []}
     return {"available": True, "rows": [dict(r) for r in rows]}
+
+
+_LISTING_WINDOW_SEC = 7 * 24 * 3600
+_NA_TOKENS = {"", "none", "null", "n/a", "—", "-"}
+
+
+def _md_tables(text: str) -> list[list[list[str]]]:
+    """Split a markdown blob into tables of cell rows (header included)."""
+    tables: list[list[list[str]]] = []
+    current: list[list[str]] = []
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            tables.append(current)
+        current = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            flush()
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if cells and all(re.fullmatch(r":?-{1,}:?", cell) for cell in cells):
+            continue
+        current.append(cells)
+    flush()
+    return tables
+
+
+def _table_dicts(table: list[list[str]]) -> list[dict[str, str]]:
+    if len(table) < 2:
+        return []
+    header = table[0]
+    out: list[dict[str, str]] = []
+    for row in table[1:]:
+        padded = row + [""] * max(0, len(header) - len(row))
+        out.append({header[i]: padded[i] for i in range(len(header))})
+    return out
+
+
+def _clean_na(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = value.strip()
+    if text.lower() in _NA_TOKENS:
+        return None
+    return text
+
+
+def load_cex_scope_compare(reports_dir: str) -> dict[str, Any]:
+    """最新 CEX 视野对照 md（只读 exports/reports/cex_scope_compare_*.md 首表）。
+
+    没有报告（快照不足 2 行，脚本不落盘）返回 available=False、reason=data accruing。
+    文件在但首表读不出来返回 available=False，供周报写「暂无数据」。不抛错、不写库。
+    """
+    empty: dict[str, Any] = {
+        "available": False,
+        "reason": "data accruing",
+        "path": None,
+        "rows": [],
+        "window": None,
+        "med_delta24h": None,
+        "still_rate": None,
+        "survive_1h": None,
+        "survive_4h": None,
+    }
+    try:
+        directory = Path(reports_dir)
+        if not directory.is_dir():
+            return empty
+        files = sorted(
+            p for p in directory.glob("cex_scope_compare_*.md") if p.is_file()
+        )
+    except OSError as exc:
+        empty["reason"] = str(exc)
+        return empty
+    if not files:
+        return empty
+    latest = files[-1]
+    try:
+        text = latest.read_text(encoding="utf-8")
+    except OSError as exc:
+        empty["reason"] = str(exc)
+        empty["path"] = str(latest)
+        return empty
+
+    tables = _md_tables(text)
+    rows = _table_dicts(tables[0]) if tables else []
+    if not rows:
+        empty["reason"] = "empty table"
+        empty["path"] = str(latest)
+        return empty
+
+    window_match = re.search(r"快照行数:\s*\d+（([^）]+)）", text)
+    window = window_match.group(1).strip() if window_match else None
+    if not window and rows:
+        start = rows[0].get("日期") or ""
+        end = rows[-1].get("日期") or ""
+        window = f"{start} → {end}".strip()
+
+    still_rate = None
+    survive_1h = None
+    survive_4h = None
+    if len(tables) >= 2:
+        for item in _table_dicts(tables[1]):
+            dim = item.get("维度") or ""
+            cex_cell = item.get("CEX 视野") or ""
+            prior_cell = item.get("链上先验(self_survival)") or ""
+            if "留存" in dim or "视野留存" in cex_cell:
+                rate_match = re.search(r"视野留存\s*≈\s*(\S+)", cex_cell)
+                if rate_match:
+                    still_rate = _clean_na(rate_match.group(1))
+            if "1h" in dim:
+                survive_1h = _clean_na(prior_cell)
+            if "4h" in dim:
+                survive_4h = _clean_na(prior_cell)
+
+    latest_row = rows[-1]
+    return {
+        "available": True,
+        "reason": "",
+        "path": str(latest),
+        "rows": rows,
+        "window": window,
+        "med_delta24h": _clean_na(latest_row.get("新进者 Δ24h 中位")),
+        "still_rate": still_rate,
+        "survive_1h": survive_1h,
+        "survive_4h": survive_4h,
+    }
+
+
+def load_cex_listing_events(
+    prior_db: str,
+    *,
+    now_ts: Optional[int] = None,
+) -> dict[str, Any]:
+    """近 7 天精确上线事件计数（只读 prior.db.cex_listing_events）。
+
+    缺库、缺表或窗口内 0 行返回 available=False，供周报写「暂无数据」。
+    matched 与上线后 1h 表现本步固定 N/A：不重做 Step 2 的脏 join。
+    """
+    empty: dict[str, Any] = {
+        "available": False,
+        "reason": "no events",
+        "n_7d": 0,
+        "exchanges": [],
+        "exchange_counts": {},
+        "matched": "N/A",
+        "med_ret_1h": "N/A",
+    }
+    now = int(datetime.now(timezone.utc).timestamp()) if now_ts is None else int(now_ts)
+    cutoff = now - _LISTING_WINDOW_SEC
+    try:
+        conn = sqlite3.connect(f"file:{prior_db}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT exchange, COUNT(*) AS n FROM cex_listing_events "
+                "WHERE listing_ts >= ? GROUP BY exchange ORDER BY exchange",
+                (cutoff,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        empty["reason"] = str(exc)
+        return empty
+    counts = {str(row["exchange"]): int(row["n"]) for row in rows if int(row["n"]) > 0}
+    n_7d = sum(counts.values())
+    if n_7d <= 0:
+        return empty
+    return {
+        "available": True,
+        "reason": "",
+        "n_7d": n_7d,
+        "exchanges": list(counts.keys()),
+        "exchange_counts": counts,
+        "matched": "N/A",
+        "med_ret_1h": "N/A",
+    }

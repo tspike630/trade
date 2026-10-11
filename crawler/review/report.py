@@ -155,6 +155,96 @@ def _render_cex_scope_section(cex_scope: Optional[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _fmt_compare_cell(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    text = str(value).strip()
+    if text.lower() in {"", "none", "null", "n/a"}:
+        return "N/A"
+    return text
+
+
+def _fmt_listing_exchanges(payload: dict[str, Any]) -> str:
+    counts = payload.get("exchange_counts") or {}
+    if counts:
+        return ", ".join(f"{name}:{counts[name]}" for name in sorted(counts))
+    names = payload.get("exchanges") or []
+    if names:
+        return ", ".join(str(name) for name in names)
+    return "—"
+
+
+def _render_cex_scope_compare_section(
+    cex_scope_compare: Optional[dict[str, Any]],
+) -> list[str]:
+    """§6e CEX 视野对照：有 compare md 出表；快照不足「数据积累中」；读坏「暂无数据」。"""
+    lines: list[str] = []
+    lines.append("### 6e. CEX 视野对照（只观察）")
+    lines.append("")
+    lines.append(
+        "> 数据：`exports/reports/cex_scope_compare_*.md`（脚本产物）；"
+        "快照 <2 行时显示「数据积累中」。"
+    )
+    lines.append("")
+    payload = cex_scope_compare or {}
+    if not payload.get("available"):
+        reason = str(payload.get("reason") or "")
+        if payload.get("path") or "empty" in reason or "parse" in reason:
+            lines.append("暂无数据")
+        else:
+            lines.append("数据积累中")
+        lines.append("")
+    else:
+        survive = (
+            f"{_fmt_compare_cell(payload.get('survive_1h'))} / "
+            f"{_fmt_compare_cell(payload.get('survive_4h'))}"
+        )
+        lines.append("| 快照窗 | 新进者 Δ24h 中位 | 视野留存 | 链上 1h/4h 存活 |")
+        lines.append("|---|---|---|---|")
+        lines.append(
+            f"| {payload.get('window') or '—'} | "
+            f"{_fmt_compare_cell(payload.get('med_delta24h'))} | "
+            f"{_fmt_compare_cell(payload.get('still_rate'))} | {survive} |"
+        )
+        lines.append("")
+    lines.append("> 只观察不调权；CEX 视野 ≠ memecoin 总体，对照不跨总体推断。")
+    lines.append("")
+    return lines
+
+
+def _render_cex_listing_events_section(
+    cex_listing_events: Optional[dict[str, Any]],
+) -> list[str]:
+    """§6f 精确上线事件：近 7 天有行出表，无事件「暂无数据」。matched / 1h 本步 N/A。"""
+    lines: list[str] = []
+    lines.append("### 6f. CEX 精确上线事件（只观察）")
+    lines.append("")
+    lines.append(
+        "> 数据：`prior.db.cex_listing_events`（load_markets 全量 diff；比 top50 视野近似精确）。"
+    )
+    lines.append("")
+    payload = cex_listing_events or {}
+    n_7d = payload.get("n_7d") or 0
+    if not payload.get("available") or not n_7d:
+        lines.append("暂无数据")
+        lines.append("")
+    else:
+        lines.append("| 近 7 天新上线 | 交易所 | 与链上 matched | 上线后 1h 表现 |")
+        lines.append("|---|---:|---|---:|")
+        lines.append(
+            f"| {int(n_7d)} | {_fmt_listing_exchanges(payload)} | "
+            f"{payload.get('matched') or 'N/A'} | {payload.get('med_ret_1h') or 'N/A'} |"
+        )
+        lines.append("")
+    lines.append(
+        "> 数据 ≥1 条才输出；无事件「暂无数据」不失败。"
+        "与链上 matched、上线后 1h 表现本步为 N/A（不把 Step 2 脏 join 当因果）。"
+        "真 join 留给分支 A：`cex_listing_events` 与链上同 symbol 归一后再启 per-token 深挖。"
+    )
+    lines.append("")
+    return lines
+
+
 def _render_attribution_section(
     attribution: Optional[dict[str, Any]],
     fill_attr: Optional[dict[str, Any]],
@@ -264,8 +354,10 @@ def render_weekly_md(
     optimize_section: Optional[str] = None,
     evolution_suggestions: Optional[list[dict[str, Any]]] = None,
     cex_scope: Optional[dict[str, Any]] = None,
+    cex_scope_compare: Optional[dict[str, Any]] = None,
+    cex_listing_events: Optional[dict[str, Any]] = None,
 ) -> str:
-    """返回 markdown 字符串（§1–8 + §6d 只观察 + 可选§9 R3 + §10 进化建议）。"""
+    """返回 markdown 字符串（§1–8 + §6d/§6e/§6f 只观察 + 可选§9 R3 + §10 进化建议）。"""
     n = len(chain)
     n_exec = sum(1 for r in chain if r.exec_id is not None)
     n_pos = sum(1 for r in chain if r.position_id is not None)
@@ -413,6 +505,8 @@ def render_weekly_md(
     )
     lines.append("")
     lines.extend(_render_cex_scope_section(cex_scope))
+    lines.extend(_render_cex_scope_compare_section(cex_scope_compare))
+    lines.extend(_render_cex_listing_events_section(cex_listing_events))
 
     # 7. 缺口
     lines.append("## 7. 缺口与下一步")

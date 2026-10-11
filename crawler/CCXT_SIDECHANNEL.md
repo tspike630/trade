@@ -95,12 +95,14 @@ sqlite3 ccxt.db "SELECT * FROM ccxt_listings ORDER BY first_seen_ts DESC LIMIT 1
 
 `review/data.load_cex_scope` → **§6d**「CEX 新币视野」：只读 `prior.db.cex_scope_snapshots`（Step 3 分支 B）；无快照写「暂无数据」，不失败、不调权。
 
+Step 4 已落地（见 `CCXT_PRIOR_STEP4.md`）：`load_cex_scope_compare` → **§6e**「CEX 视野对照」（无 compare md 写「数据积累中」）；`load_cex_listing_events` → **§6f**「CEX 精确上线事件」（`prior.db.cex_listing_events`，无事件写「暂无数据」）。只观察不调权。
+
 ## 7. 后续（非本步）
 
 
 CEX 上线事件（`ccxt_listings`）× 链上先验（`prior.db`）联合归因，仍默认关；验证「链上新币 → CEX 上线 → 拉升」后再谈接评分/决策。
 
-Step 3 **分支 B**（CEX 新币视野，`scripts/cex_scope_watch.py` → `prior.db.cex_scope_snapshots`，周报 §6d）已落地，只观察、默认关。**分支 A**（传导链深挖 / `cex_chain_deepdive` / `cex_prior_linkage`）因 Step 2 匹配率脏（撞车）、传导链暂无法验证而挂起，未实现、不跑。见 `CCXT_PRIOR_STEP3.md`。仓库内无 `CCXT_PRIOR_STEP2.md`。
+Step 3 **分支 B**（CEX 新币视野，`scripts/cex_scope_watch.py` → `prior.db.cex_scope_snapshots`，周报 §6d）已落地，只观察、默认关。Step 4（视野对照 §6e + `cex_listing_events` §6f）已落地，见 `CCXT_PRIOR_STEP4.md`。**分支 A**（传导链深挖 / `cex_chain_deepdive` / `cex_prior_linkage`）仍挂起：要等 `cex_listing_events` 与链上按 symbol 归一 join 之后再启 per-token 深挖，不把 Step 2 脏 join 当因果。见 `CCXT_PRIOR_STEP3.md`。仓库内无 `CCXT_PRIOR_STEP2.md`。
 
 ---
 
