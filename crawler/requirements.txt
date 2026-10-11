@@ -6,3 +6,4 @@ python-dotenv>=1.0.0
 websockets>=12.0
 pandas>=2.0.0
 pandas-ta-classic>=0.3.14
+ccxt>=4.0

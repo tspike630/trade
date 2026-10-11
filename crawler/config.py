@@ -41,7 +41,7 @@ ASYNC_MAX_CONCURRENCY = 3
 ALERT_PRICE_CHANGE_PCT = 20.0
 ALERT_VOLUME_H24_CHANGE_PCT = 50.0
 ALERT_LIQUIDITY_DROP_PCT = 30.0
-ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
+ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "600"))  # raised 300→600 (TG push throttle)
 ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip() or None
 ALERT_WEBHOOK_TIMEOUT_SEC = 10.0
 
@@ -122,6 +122,23 @@ TG_RATE_PER_MIN = int(os.environ.get("TG_RATE_PER_MIN", "20"))  # ~20/min per ch
 TG_QUEUE_MAX = int(os.environ.get("TG_QUEUE_MAX", "80"))
 TG_QUEUE_DROP_LOW = os.environ.get("TG_QUEUE_DROP_LOW", "1").strip().lower() in (
     "1", "true", "yes", "on",
+)
+
+# Telegram push throttle (delivery only — detect/store keep ALERT_* / should_push_alert)
+# Defaults are conservative to avoid long Telegram flood-wait bans.
+_TELEGRAM_PUSH_EXCLUDE_RAW = os.environ.get(
+    "TELEGRAM_PUSH_EXCLUDE_TYPES", "new_listing"
+).strip()
+TELEGRAM_PUSH_EXCLUDE_TYPES = frozenset(
+    t.strip().lower() for t in _TELEGRAM_PUSH_EXCLUDE_RAW.split(",") if t.strip()
+)
+TELEGRAM_PUSH_MIN_SEVERITY = (
+    os.environ.get("TELEGRAM_PUSH_MIN_SEVERITY", "high").strip().lower() or "high"
+)
+TELEGRAM_PUSH_MIN_SCORE = float(os.environ.get("TELEGRAM_PUSH_MIN_SCORE", "35"))
+# Push-only cooldown (same key fields as store cooldown; does not change has_recent_alert)
+TELEGRAM_PUSH_COOLDOWN_SEC = int(
+    os.environ.get("TELEGRAM_PUSH_COOLDOWN_SEC", "600")
 )
 
 

@@ -5,6 +5,7 @@ Detection/cooldown stay in alerts.py. This module:
 - Per-chat rate limits (~1 msg/s, ~20/min) + ban_until from long retry_after
 - Priority queue: high (new_listing/cto/admin system) preferred; drop/merge low when full
 - First failure WARN; escalate ERROR only on repeated fail for same alert key
+- Push policy: TELEGRAM_PUSH_EXCLUDE_TYPES / MIN_SEVERITY (see TG_PUSH_THROTTLE.md)
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ from config import (
     TELEGRAM_CHAT_ID_ADMIN,
     TELEGRAM_CHAT_ID_ALERT,
     TELEGRAM_CHAT_ID_MAIN,
+    TELEGRAM_PUSH_EXCLUDE_TYPES,
+    TELEGRAM_PUSH_MIN_SEVERITY,
     TELEGRAM_TIMEOUT_SEC,
     TG_429_SLEEP_CAP_SEC,
     TG_MAX_RETRIES,
@@ -48,6 +51,29 @@ _ALERT_TYPES = frozenset({
 })
 _ADMIN_TYPES = frozenset({"proxy_pool_low", "system_error", "pipeline_error", "heartbeat_fail"})
 _HIGH_PRIORITY_TYPES = _MAIN_TYPES | _ADMIN_TYPES
+
+# Delivery-only filters (emit_alert also gates; this covers direct send_alert callers)
+_SEVERITY_RANK = {
+    "info": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
+
+
+def telegram_policy_allows(alert: dict[str, Any]) -> tuple[bool, str]:
+    """Type/severity policy for Telegram delivery. Admin/system always allowed."""
+    atype = str(alert.get("type") or "")
+    if atype in _ADMIN_TYPES:
+        return True, ""
+    if atype.lower() in TELEGRAM_PUSH_EXCLUDE_TYPES:
+        return False, f"exclude_type={atype}"
+    sev = str(alert.get("severity") or "info").lower()
+    min_sev = TELEGRAM_PUSH_MIN_SEVERITY
+    if _SEVERITY_RANK.get(sev, 0) < _SEVERITY_RANK.get(min_sev, 3):
+        return False, f"severity={sev}<min={min_sev}"
+    return True, ""
 
 
 def telegram_enabled() -> bool:
@@ -455,6 +481,15 @@ class TelegramAlerter:
         if not self.enabled:
             return False
         atype = str(alert.get("type") or "")
+        ok, reason = telegram_policy_allows(alert)
+        if not ok:
+            log.info(
+                "telegram drop policy (%s) type=%s severity=%s",
+                reason,
+                atype,
+                alert.get("severity"),
+            )
+            return None  # expected skip — alert already stored by emit_alert
         chat_id = resolve_chat_id(atype)
         if not chat_id:
             log.error(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 import httpx
@@ -15,11 +17,92 @@ from config import (
     ALERT_VOLUME_H24_CHANGE_PCT,
     ALERT_WEBHOOK_TIMEOUT_SEC,
     ALERT_WEBHOOK_URL,
+    TELEGRAM_PUSH_COOLDOWN_SEC,
+    TELEGRAM_PUSH_EXCLUDE_TYPES,
+    TELEGRAM_PUSH_MIN_SCORE,
+    TELEGRAM_PUSH_MIN_SEVERITY,
 )
 from scoring import should_push_alert
 from logging_setup import get_logger
 
 log = get_logger("alerts")
+
+# Severity order for TELEGRAM_PUSH_MIN_SEVERITY (delivery-only gate)
+_SEVERITY_RANK = {
+    "info": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
+# Always deliver admin/system to Telegram (bypass type/severity/score push filters)
+_TG_ALWAYS_PUSH_TYPES = frozenset({
+    "system_error",
+    "pipeline_error",
+    "heartbeat_fail",
+    "proxy_pool_low",
+})
+
+# In-memory last Telegram push times — does NOT touch store cooldown keys
+_tg_push_last: dict[tuple[str, str, str, str], float] = {}
+_tg_push_lock = threading.Lock()
+
+
+def _tg_push_key(alert: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(alert.get("type") or ""),
+        str(alert.get("chain_id") or ""),
+        str(alert.get("token_address") or ""),
+        str(alert.get("pair_address") or ""),
+    )
+
+
+def telegram_push_allowed(store: Any, alert: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Telegram-only delivery gate (after store + should_push_alert).
+    Returns (allowed, skip_reason). Detect/store unchanged.
+    """
+    atype = str(alert.get("type") or "")
+    if atype in _TG_ALWAYS_PUSH_TYPES:
+        return True, ""
+
+    if atype.lower() in TELEGRAM_PUSH_EXCLUDE_TYPES:
+        return False, f"exclude_type={atype}"
+
+    sev = str(alert.get("severity") or "info").lower()
+    min_sev = TELEGRAM_PUSH_MIN_SEVERITY
+    if _SEVERITY_RANK.get(sev, 0) < _SEVERITY_RANK.get(min_sev, 3):
+        return False, f"severity={sev}<min={min_sev}"
+
+    # Push score: stricter of ALERT_MIN_SCORE and TELEGRAM_PUSH_MIN_SCORE
+    eff_min = max(float(ALERT_MIN_SCORE), float(TELEGRAM_PUSH_MIN_SCORE))
+    chain = str(alert.get("chain_id") or "")
+    token = str(alert.get("token_address") or "")
+    if chain and token:
+        q = store.get_token_quality(chain, token)
+        if q and q.get("quality_score") is not None:
+            score = float(q["quality_score"])
+            if score < eff_min:
+                return False, f"score={score:.1f}<min={eff_min:.1f}"
+
+    if TELEGRAM_PUSH_COOLDOWN_SEC > 0:
+        key = _tg_push_key(alert)
+        now = time.time()
+        with _tg_push_lock:
+            last = _tg_push_last.get(key, 0.0)
+            if last > 0 and (now - last) < TELEGRAM_PUSH_COOLDOWN_SEC:
+                return False, (
+                    f"push_cooldown remaining={TELEGRAM_PUSH_COOLDOWN_SEC - (now - last):.0f}s"
+                )
+    return True, ""
+
+
+def _mark_telegram_push(alert: dict[str, Any]) -> None:
+    if TELEGRAM_PUSH_COOLDOWN_SEC <= 0:
+        return
+    key = _tg_push_key(alert)
+    with _tg_push_lock:
+        _tg_push_last[key] = time.time()
 
 
 def _num(value: Any) -> float | None:
@@ -249,32 +332,43 @@ def emit_alert(store: Any, alert: dict[str, Any], *, cycle_id: str) -> bool:
                 exc,
             )
 
-    # Telegram (optional) — 429/rate handled inside alerter; never retry forever here
+    # Telegram (optional) — push throttle first; 429/rate inside alerter
     if telegram_enabled():
         channels += 1
-        try:
-            tg = get_telegram_alerter()
-            tg_result = tg.send_alert(alert, cycle_id=cycle_id)
-            if tg_result is True:
-                delivered = True
-            elif tg_result is None:
-                # Expected skip (long ban / policy drop) — alerter already throttled WARN
-                pass
-            else:
-                # Unexpected failure; alerter escalates repeated same-key fails to ERROR
-                log.warning(
-                    "telegram delivery failed cycle_id=%s alert_id=%s type=%s",
+        tg_ok, tg_skip = telegram_push_allowed(store, alert)
+        if not tg_ok:
+            log.info(
+                "telegram push skip (%s) id=%s type=%s severity=%s",
+                tg_skip,
+                alert_id,
+                alert_type,
+                alert.get("severity"),
+            )
+        else:
+            try:
+                tg = get_telegram_alerter()
+                _mark_telegram_push(alert)
+                tg_result = tg.send_alert(alert, cycle_id=cycle_id)
+                if tg_result is True:
+                    delivered = True
+                elif tg_result is None:
+                    # Expected skip (long ban / policy drop) — alerter already throttled WARN
+                    pass
+                else:
+                    # Unexpected failure; alerter escalates repeated same-key fails to ERROR
+                    log.warning(
+                        "telegram delivery failed cycle_id=%s alert_id=%s type=%s",
+                        cycle_id,
+                        alert_id,
+                        alert_type,
+                    )
+            except Exception as exc:  # noqa: BLE001 — never crash cycle
+                log.error(
+                    "telegram delivery exception cycle_id=%s alert_id=%s err=%s",
                     cycle_id,
                     alert_id,
-                    alert_type,
+                    exc,
                 )
-        except Exception as exc:  # noqa: BLE001 — never crash cycle
-            log.error(
-                "telegram delivery exception cycle_id=%s alert_id=%s err=%s",
-                cycle_id,
-                alert_id,
-                exc,
-            )
 
     if channels == 0:
         # log-only mode
