@@ -35,6 +35,8 @@ from dashboard.panels.shell import (
     refresh_age_label,
 )
 from dashboard.parsing import bucket_key, extract_jev_strength
+import dashboard.app as app_module
+from dashboard.app import jev_gate_view, prior_pulse_tone
 from dashboard.settings import bind_host, port, read_gates, refresh_seconds
 
 _TOUCHED = (
@@ -49,6 +51,7 @@ _TOUCHED = (
     "DASHBOARD_PAPER_DB",
     "DASHBOARD_BACKTEST_DB",
     "DASHBOARD_NEWS_DB",
+    "JEV_TREND_CSV",
     "DB_PATH",
     "PAPER_DB_PATH",
     "HEARTBEAT_STALE_SEC",
@@ -438,9 +441,15 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertTrue(all(row.id != "pos-closed" for row in payload.rows))
 
         probes = {item.name: item for item in store.process_liveness().data}
+        self.assertEqual(
+            [item.name for item in store.process_liveness().data],
+            ["主爬虫", "指标", "JEV", "决策引擎", "执行网关"],
+        )
         self.assertEqual(probes["主爬虫"].state, "alive")
         self.assertEqual(probes["指标"].state, "alive")
         self.assertEqual(probes["JEV"].state, "stale")
+        self.assertEqual(probes["决策引擎"].state, "alive")
+        self.assertEqual(probes["执行网关"].state, "alive")
 
         run = store.latest_backtest().data
         self.assertEqual(run.run_id, "bt-1")
@@ -714,6 +723,56 @@ class DashboardSmokeTest(unittest.TestCase):
         for marker in ("v2-topbar", "v2-subbar", "v2-statusbar", "v2-grid", "v2-kpi", "span-8"):
             self.assertIn(marker, app_text)
         self.assertNotIn("gv2-", app_text)
+        self.assertIn("grid-auto-rows: minmax(84px, auto)", app_text)
+        self.assertIn("min-height: 84px", app_text)
+        self.assertIn(".v2-warnbar", app_text)
+        self.assertIn("|x|<=500", app_text)
+        self.assertNotIn("|x|≤", app_text)
+        self.assertNotIn("不授权", app_text)
+        self.assertIn("不调权", app_text)
+        self.assertIn("延迟 --ms", app_text)
+        self.assertIn('classes("v2-statusdot ok right")', app_text)
+        self.assertIn("flex-direction: row !important", app_text)
+        render_src = inspect.getsource(app_module._render_dashboard)
+        module_src = inspect.getsource(app_module._module_tabs)
+        self.assertIn("v2-grid", render_src)
+        self.assertNotIn("v2-subbar", render_src)
+        self.assertIn("v2-subbar", module_src)
+        self.assertNotIn("v2-grid", module_src)
+        self.assertIn("v2-warnbar", render_src)
+        self.assertEqual(prior_pulse_tone("4H 存活", "75.3%"), "up")
+        self.assertEqual(prior_pulse_tone("4H 存活", "59%"), "")
+        self.assertEqual(prior_pulse_tone("当天死", "68.67%"), "down")
+        self.assertEqual(prior_pulse_tone("当天死", "49%"), "")
+        self.assertEqual(prior_pulse_tone("毕业率", "0.2%"), "mute")
+        self.assertEqual(prior_pulse_tone("见顶 P50", "1.0 min"), "mute")
+        view = jev_gate_view(
+            {
+                "filtered_n": "14",
+                "unique_token": "9",
+                "up_1h_rate": "0.714",
+                "up_4h_rate": "0.571",
+            }
+        )
+        assert view is not None
+        self.assertEqual([item[1] for item in view], ["14", "9", "71.4%", "57.1%"])
+        self.assertEqual(view[2][2], "up")
+        self.assertIsNone(jev_gate_view(None))
+        trend = self.root / "jev_validity_trend.csv"
+        trend.write_text(
+            "date,filtered_n,unique_token,up_1h_rate,up_4h_rate\n"
+            "2026-10-01,1,1,0.100000,0.100000\n"
+            "2026-10-08,14,9,0.714000,0.571000\n",
+            encoding="utf-8",
+        )
+        os.environ["JEV_TREND_CSV"] = str(trend)
+        try:
+            loaded = jev_gate_view(app_module._jev_trend_row())
+        finally:
+            os.environ.pop("JEV_TREND_CSV", None)
+        assert loaded is not None
+        self.assertEqual(loaded[0][1], "14")
+        self.assertEqual(loaded[2][1], "71.4%")
         market_src = inspect.getsource(DataStore._market_rows)
         for banned in ("rsi", "macd", "boll"):
             self.assertNotIn(banned, market_src.lower())

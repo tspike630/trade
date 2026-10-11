@@ -681,9 +681,23 @@ class DataStore:
                 jev = _probe_max(conn, "jev_signals", "fetched_at", "JEV", now)
                 if jev.state == "unknown":
                     jev = _probe_max(conn, "jev_signals", "analyzed_at", "JEV", now)
+                decision = _probe_max(conn, "decision_log", "ts", "决策引擎", now)
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
-        return _ok((crawler, indicator, jev), started)
+        gateway = self._probe_gateway(now)
+        return _ok((crawler, indicator, jev, decision, gateway), started)
+
+    def _probe_gateway(self, now: datetime) -> ProcessProbe:
+        """Last execution_log.ts. Missing ledger is a dash, not a failed read of the main db."""
+        path = self.paths.execution
+        if not path.is_file():
+            return ProcessProbe("执行网关", "unknown", None, "")
+        try:
+            with ro_connect(path) as conn:
+                return _probe_max(conn, "execution_log", "ts", "执行网关", now)
+        except sqlite3.Error:
+            log.warning("gateway heartbeat unreadable")
+            return ProcessProbe("执行网关", "unknown", None, "")
 
     def _latest_backtest(self, started: float) -> DataResult:
         path = self.paths.backtest
