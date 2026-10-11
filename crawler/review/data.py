@@ -575,3 +575,23 @@ def summarize_execution(rows: list[SignalChainRow]) -> dict[str, Any]:
         ),
         "exec_dup_count": exec_dup_count,
     }
+
+
+def load_cex_scope(prior_db: str) -> dict[str, Any]:
+    """CEX scope watch 最新快照（只读 prior.db.cex_scope_snapshots）。
+
+    缺库、缺表或其它 SQLite 错误返回 available=False，供周报写「暂无数据」，不抛错。
+    不写 prior.db，不读业务库，不改权重。
+    """
+    try:
+        conn = sqlite3.connect(f"file:{prior_db}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT * FROM cex_scope_snapshots ORDER BY snap_date DESC LIMIT 7"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return {"available": False, "reason": str(exc), "rows": []}
+    return {"available": True, "rows": [dict(r) for r in rows]}

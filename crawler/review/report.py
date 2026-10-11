@@ -103,6 +103,58 @@ def _render_dim_table(dim_name: str, dim: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _fmt_scope_med(v: Any) -> str:
+    """cex change_24h_pct / med_delta24h_new 已是百分比。"""
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):.2f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_scope_int(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        return str(int(v))
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _render_cex_scope_section(cex_scope: Optional[dict[str, Any]]) -> list[str]:
+    """§6d CEX 新币视野：有快照出表，无数据写「暂无数据」，不失败。"""
+    lines: list[str] = []
+    lines.append("### 6d. CEX 新币视野监控（只观察）")
+    lines.append("")
+    lines.append(
+        "> 数据：`prior.db.cex_scope_snapshots`（每日 1 条，upsert by `snap_date`）；"
+        "「进入视野」= 进入 top50 成交量（近似，非精确上线）；只观察不调权、不进决策。"
+    )
+    lines.append("")
+    payload = cex_scope or {}
+    rows = payload.get("rows") or []
+    if not payload.get("available") or not rows:
+        lines.append("暂无数据")
+        lines.append("")
+    else:
+        lines.append("| 日期 | 累计视野 | 新进 24h | 仍在视野 | 新进者 Δ24h 中位 |")
+        lines.append("|---|---:|---:|---:|---:|")
+        for row in rows:
+            lines.append(
+                f"| {row.get('snap_date') or '—'} | {_fmt_scope_int(row.get('n_total'))} | "
+                f"{_fmt_scope_int(row.get('n_new_24h'))} | "
+                f"{_fmt_scope_int(row.get('n_still_visible'))} | "
+                f"{_fmt_scope_med(row.get('med_delta24h_new'))} |"
+            )
+        lines.append("")
+    lines.append(
+        "> 用途：CEX 侧新币表现基线，与链上 self_survival 对照；缺数据显示「暂无数据」不失败。"
+    )
+    lines.append("")
+    return lines
+
+
 def _render_attribution_section(
     attribution: Optional[dict[str, Any]],
     fill_attr: Optional[dict[str, Any]],
@@ -211,8 +263,9 @@ def render_weekly_md(
     backtest_summary: Optional[dict[str, Any]] = None,
     optimize_section: Optional[str] = None,
     evolution_suggestions: Optional[list[dict[str, Any]]] = None,
+    cex_scope: Optional[dict[str, Any]] = None,
 ) -> str:
-    """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议）。"""
+    """返回 markdown 字符串（§1–8 + §6d 只观察 + 可选§9 R3 + §10 进化建议）。"""
     n = len(chain)
     n_exec = sum(1 for r in chain if r.exec_id is not None)
     n_pos = sum(1 for r in chain if r.position_id is not None)
@@ -359,6 +412,7 @@ def render_weekly_md(
         f"{_chg_pct(baseline.get('avg_change_4h_winsor'))} |"
     )
     lines.append("")
+    lines.extend(_render_cex_scope_section(cex_scope))
 
     # 7. 缺口
     lines.append("## 7. 缺口与下一步")
