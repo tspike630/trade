@@ -16,6 +16,7 @@ from review.data import (
     SignalChainRow,
     annotate_forward_returns,
     connect_ro,
+    load_cex_scope,
     load_jev_coverage,
     load_market_baseline,
     load_signal_chain,
@@ -311,6 +312,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             db_root=db_root,
         )
         print(f"evolution: {len(evo)} suggestions")
+        prior_db = str(db_root / "data" / "prior" / "db" / "prior.db")
+        try:
+            cex_scope = load_cex_scope(prior_db)
+        except Exception as exc:  # noqa: BLE001 —— 缺库不阻断周报
+            cex_scope = {"available": False, "reason": str(exc), "rows": []}
         md = render_weekly_md(
             period_start=period_start,
             period_end=period_end,
@@ -329,6 +335,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             backtest_summary=bt_summary,
             optimize_section=optimize_section,
             evolution_suggestions=evo,
+            cex_scope=cex_scope,
         )
         written = write_report(md, str(out_path))
         print(f"report: {written}")
