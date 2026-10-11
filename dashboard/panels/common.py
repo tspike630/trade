@@ -98,6 +98,7 @@ def data_table(
     *,
     row_key: str = "id",
     color_fields: tuple[str, ...] = (),
+    on_row_click: Callable[[dict[str, object]], None] | None = None,
 ) -> None:
     if not rows:
         ui.label("暂无记录").classes("muted")
@@ -108,3 +109,16 @@ def data_table(
         for field in color_fields:
             html = _CELL_SLOT.replace("__CLASS__", f"{field}_class")
             table.add_slot(f"body-cell-{field}", html)
+        if on_row_click is not None:
+            def handle(event: object) -> None:
+                args = getattr(event, "args", None)
+                row: dict[str, object] | None = None
+                if isinstance(args, dict):
+                    nested = args.get("row", args)
+                    if isinstance(nested, dict):
+                        row = nested
+                elif isinstance(args, (list, tuple)) and len(args) >= 2 and isinstance(args[1], dict):
+                    row = args[1]
+                if row is not None:
+                    on_row_click(row)
+            table.on("rowClick", handle)
