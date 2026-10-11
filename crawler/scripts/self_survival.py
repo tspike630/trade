@@ -6,6 +6,7 @@
 输入: 主库 dexscreener.db（只读）pair_history
 输出: data/prior/exports/self_survival_<YYYYMMDD>.md
       + merge baseline_params.json["self_db"]
+      + 成功后追加 prior.db.baseline_history（via prior_baseline_trend.py --from-self-survival）
 
 口径（务必读）:
   - 单位: (chain_id, token_address)
@@ -24,12 +25,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-# Prefer config.DB_PATH when importable; fall back to repo-root dexscreener.db.
-# Optional: config.py is the crawler package, not always importable.
+# Prefer config.DB_PATH when importable; fall back to repo-root dexscreener.db
 try:
     sys.path.insert(0, ROOT)
     from config import DB_PATH as _CFG_DB
@@ -313,6 +314,28 @@ def main():
         if spans_min
         else f"[KEY] n={n} (no spans)"
     )
+
+    # Append baseline_history snapshot (prior.db only; never fails the main run)
+    # Routine「自库存活·满窗重跑」也可显式: python3 scripts/prior_baseline_trend.py --from-self-survival
+    try:
+        trend = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prior_baseline_trend.py")
+        if os.path.isfile(trend):
+            r = subprocess.run(
+                [sys.executable, trend, "--from-self-survival"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if r.returncode == 0:
+                for line in (r.stdout or "").strip().splitlines():
+                    print(f"[TREND] {line}")
+            else:
+                print(f"[TREND] WARN append failed rc={r.returncode}: {(r.stderr or r.stdout or '')[:300]}")
+        else:
+            print(f"[TREND] skip (missing {trend})")
+    except Exception as e:
+        print(f"[TREND] WARN append skipped: {e}")
 
 
 if __name__ == "__main__":
