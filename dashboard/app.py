@@ -786,10 +786,12 @@ html, body, .shell { background: var(--v2-bg); color: var(--v2-fg); }
   color: var(--v2-fg) !important; border-bottom-color: var(--v2-accent) !important;
 }
 .v2-subtab.q-btn, .v2-subtab.q-btn .q-btn__content {
-  height: auto !important; padding: 5px 12px !important;
+  height: 22px !important; min-height: 0 !important; max-height: 22px !important;
+  padding: 0 12px !important;
   background: transparent !important; color: var(--v2-dim) !important;
   border: 1px solid transparent !important; border-bottom: none !important;
   border-radius: 4px 4px 0 0 !important; font-size: 11px !important; letter-spacing: 0 !important;
+  line-height: 22px !important;
 }
 .v2-subtab.q-btn.active, .v2-subtab.q-btn.active .q-btn__content {
   color: var(--v2-fg) !important; background: var(--v2-panel) !important;
