@@ -1,6 +1,6 @@
 # CCXT 行情旁路（CCXT Sidechannel）
 
-> 状态：Step 1 落地（2026-10-11）  
+> 状态：Step 1 + Step 2（联合归因观察）落地（2026-10-12）  
 > 范围：CCXT 公开行情（tickers / OHLCV）→ 独立库 `ccxt.db` 观察入库  
 > **严格旁路**：不接决策引擎、不改 JEV/评分/告警、不碰 paper/live、不写业务四库  
 > 体例对齐：`sources.jev`（旁路 → 入库 → 验证相关性后再加权）
@@ -93,10 +93,14 @@ sqlite3 ccxt.db "SELECT * FROM ccxt_listings ORDER BY first_seen_ts DESC LIMIT 1
 
 `review/data.load_ccxt_market_baseline` → `review/report.py` **§6b**「CEX 市场基准第二参照」：只读汇总 ticks/listings/ohlcv，最近一轮 `change_24h_pct` 中位对照 §6 hot。**只观察不调权**；缺库跳过。验收：`.venv/bin/python -m review.run --period 7d --report`。
 
-## 7. 后续（非本步）
+## 7. Step 2：CEX listings × 链上先验联合归因（观察 only）
 
+已落地 one-shot：`scripts/prior_cex_listing_join.py` → `data/prior/exports/cex_prior_join_YYYYMMDD.{md,json}`；可选 merge `baseline_params.json["cex_listing_join"]`。
 
-CEX 上线事件（`ccxt_listings`）× 链上先验（`prior.db`）联合归因，仍默认关；验证「链上新币 → CEX 上线 → 拉升」后再谈接评分/决策。
+- **口径 / 默认关 / 不调权**：见 `CCXT_PRIOR_STEP2.md`
+- 只读 `ccxt.db` + `prior.db` + `dexscreener.db`；不写业务四库 / 权重 / 告警
+- **周报不自动挂**：§6b 仍只做 CEX 市场基准；join 摘要是否旁挂留给复盘
+- 仍须更大 n + 真上线事件源，验证「链上新币 → CEX 上线 → 拉升」后再谈评分/决策
 
 ---
 
