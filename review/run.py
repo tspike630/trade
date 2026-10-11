@@ -15,6 +15,7 @@ from review.data import (
     DbPaths,
     SignalChainRow,
     annotate_forward_returns,
+    annotate_token_age,
     connect_ro,
     load_jev_coverage,
     load_market_baseline,
@@ -27,6 +28,7 @@ from review.attribution import (
     load_backtest_summary,
     signal_attribution,
 )
+from review.joint import joint_jev_age_prior
 from review.metrics import compute_signal_metrics, slice_jev_filtered
 from review.report import render_weekly_md, write_report
 from review.optimizer import (
@@ -202,6 +204,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         chain = annotate_forward_returns(chain, paths, tol_sec=args.tol_sec)
         chain = load_jev_coverage(chain, paths)
+        chain = annotate_token_age(chain, paths)
         metrics = compute_signal_metrics(chain)
         exec_summary = summarize_execution(chain)
         baseline = load_market_baseline(
@@ -220,9 +223,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         if jev_metrics is not None:
             # drop nested by_strategy noise for slice table
             jev_metrics = {k: v for k, v in jev_metrics.items() if k != "by_strategy"}
-        attr = signal_attribution(chain, baseline=baseline)
+        attr = signal_attribution(chain, baseline=baseline, db_root=db_root)
         fill_attr = fill_attribution(chain)
         bt_summary = load_backtest_summary(paths)
+        joint = joint_jev_age_prior(chain, jev_rows, db_root=db_root, min_ts=period_start)
     except FileNotFoundError as e:
         print(f"error: cannot open DB read-only: {e}", file=sys.stderr)
         return 2
@@ -244,6 +248,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"fills={fill_attr.get('note')} "
         f"backtest={'ok' if bt_summary.get('ok') else bt_summary.get('note')}"
     )
+    jev_n = (joint.get("jev_filtered") or {}).get("n", 0)
+    full_n = (joint.get("full_sample") or {}).get("n", 0)
+    print(f"joint: JEV×age×prior jev_n={jev_n} full_n={full_n}")
 
     opt_result = None
     optimize_section = None
@@ -304,6 +311,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             attribution=attr,
             fill_attr=fill_attr,
             jev_slice_metrics=jev_metrics,
+            joint=joint,
             opt_result=opt_result,
             optimize_section=optimize_section,
             period_start=period_start,
@@ -327,8 +335,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             attribution=attr,
             fill_attr=fill_attr,
             backtest_summary=bt_summary,
+            joint=joint,
             optimize_section=optimize_section,
             evolution_suggestions=evo,
+            db_root=db_root,
         )
         written = write_report(md, str(out_path))
         print(f"report: {written}")
