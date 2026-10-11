@@ -28,11 +28,14 @@ from dashboard.data import DataStore, DbPaths, _WRITE_RE, connect_ro
 from dashboard.format_util import fmt_hold, fmt_liq, fmt_pct, fmt_usd
 from dashboard.panels.registry import PANELS
 from dashboard.panels.shell import (
+    TOP_TABS,
     db_status_line,
     heartbeat_summary,
+    host_visible,
     live_caption,
     panel_group,
     refresh_age_label,
+    select_top_tab,
 )
 from dashboard.parsing import bucket_key, extract_jev_strength
 import dashboard.app as app_module
@@ -932,6 +935,69 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(stats.data.med_4h, "+4.00%")
         self.assertEqual(stats.data.mean_1h_w, "+2.00%")
         self.assertEqual(paths.main.stat().st_mtime_ns, before)
+
+    def test_top_tabs_match_skeleton_and_skip_dead_routes(self) -> None:
+        labels = [tab.label for tab in TOP_TABS]
+        self.assertEqual(
+            labels,
+            [
+                "DASHBOARD",
+                "MARKETS",
+                "CRYPTO",
+                "PORTFOLIO",
+                "SIGNALS",
+                "EXECUTION",
+                "NEWS",
+                "AI CHAT",
+                "BACKTEST",
+                "ALGO",
+                "NODES",
+                "QUANT LAB",
+                "SETTINGS",
+            ],
+        )
+        self.assertEqual(
+            [tab.label for tab in TOP_TABS if tab.kind == "live"],
+            ["DASHBOARD", "MARKETS", "SIGNALS", "EXECUTION", "AI CHAT"],
+        )
+        self.assertEqual(
+            [tab.label for tab in TOP_TABS if tab.kind == "placeholder"],
+            ["CRYPTO", "PORTFOLIO", "NEWS", "BACKTEST", "ALGO", "NODES", "QUANT LAB", "SETTINGS"],
+        )
+        self.assertEqual(select_top_tab("DASHBOARD", "CRYPTO"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "PORTFOLIO"), "DASHBOARD")
+        self.assertEqual(select_top_tab("MARKETS", "NEWS"), "MARKETS")
+        self.assertEqual(select_top_tab("AI CHAT", "BACKTEST"), "AI CHAT")
+        self.assertEqual(select_top_tab("DASHBOARD", "ALGO"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "NODES"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "QUANT LAB"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "SETTINGS"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "no-such-tab"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "MARKETS"), "MARKETS")
+        self.assertEqual(select_top_tab("DASHBOARD", "SIGNALS"), "SIGNALS")
+        self.assertEqual(select_top_tab("DASHBOARD", "EXECUTION"), "EXECUTION")
+        self.assertEqual(select_top_tab("MARKETS", "AI CHAT"), "AI CHAT")
+        self.assertEqual(select_top_tab("AI CHAT", "AI CHAT"), "AI CHAT")
+        self.assertTrue(host_visible("DASHBOARD", "OVERVIEW", "OVERVIEW"))
+        self.assertFalse(host_visible("DASHBOARD", "OVERVIEW", "SIGNALS"))
+        self.assertTrue(host_visible("DASHBOARD", "SIGNALS", "SIGNALS"))
+        self.assertTrue(host_visible("SIGNALS", "OVERVIEW", "SIGNALS"))
+        self.assertFalse(host_visible("SIGNALS", "OVERVIEW", "OVERVIEW"))
+        self.assertTrue(host_visible("EXECUTION", "OVERVIEW", "EXECUTION"))
+        self.assertTrue(host_visible("DASHBOARD", "EXECUTION", "EXECUTION"))
+        self.assertFalse(host_visible("EXECUTION", "OVERVIEW", "SIGNALS"))
+        self.assertTrue(host_visible("MARKETS", "OVERVIEW", "MARKETS"))
+        self.assertTrue(host_visible("AI CHAT", "OVERVIEW", "AI CHAT"))
+        self.assertFalse(host_visible("NEWS", "OVERVIEW", "MARKETS"))
+        self.assertFalse(host_visible("BACKTEST", "OVERVIEW", "EXECUTION"))
+        app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+        self.assertIn('classes("v2-tab placeholder")', app_text)
+        self.assertIn("select_top_tab", app_text)
+        self.assertEqual(app_text.count("@ui.page("), 2)
+        for dead in ("/crypto", "/portfolio", "/news", "/backtest", "/algo", "/nodes", "/settings", "/quant"):
+            self.assertNotIn(f'@ui.page("{dead}', app_text)
+        self.assertIn("v2-subbar", inspect.getsource(app_module._module_tabs))
+        self.assertNotIn("v2-subbar", inspect.getsource(app_module._render_dashboard))
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent

@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, assert_never
+from typing import Literal
 
 from fastapi import Request
 from nicegui import app, ui
@@ -32,9 +32,13 @@ from dashboard.panels.common import panel_box, panel_guard, show_unavailable
 from dashboard.panels.markets import render_markets
 from dashboard.panels.registry import PANELS
 from dashboard.panels.shell import (
+    TOP_TABS,
+    HostName as HostKey,
     db_status_line,
     heartbeat_summary,
+    host_visible,
     panel_group,
+    select_top_tab,
     session_clock,
 )
 from dashboard.settings import allow_insecure, api_secret, bind_host, db_root, port, read_gates, refresh_seconds
@@ -48,7 +52,6 @@ except ImportError:
 log = logging.getLogger("dashboard")
 Access = Literal["ok", "open", "needed", "unconfigured"]
 Section = Literal["home", "chat"]
-HostKey = Literal["OVERVIEW", "SIGNALS", "EXECUTION", "MARKETS", "AI CHAT"]
 _health_ready = False
 _logging_ready = False
 
@@ -590,15 +593,33 @@ body { margin: 0; }
 .v2-brand { padding: 0 14px; font-weight: 700; font-size: 13px; letter-spacing: .5px; color: var(--v2-fg); white-space: nowrap; }
 .v2-brand .sub { color: var(--v2-mute); font-weight: 400; font-size: 10px; margin-left: 6px; }
 .v2-tab {
-  height: 100%; padding: 0 12px; display: flex; align-items: center; gap: 6px;
-  color: var(--v2-dim); font-size: 11px; letter-spacing: .8px; text-transform: uppercase;
+  height: 100%; padding: 0 8px; display: flex; align-items: center; gap: 6px;
+  color: var(--v2-dim); font-size: 11px; letter-spacing: .5px; text-transform: uppercase;
   border-bottom: 2px solid transparent; cursor: pointer; white-space: nowrap;
   background: transparent; border-top: none; border-left: none; border-right: none;
   font-family: var(--v2-mono);
 }
 .v2-tab:hover { color: var(--v2-fg); background: rgba(255,255,255,.03); }
 .v2-tab.active { color: var(--v2-fg); border-bottom-color: var(--v2-accent); }
-.v2-topright { margin-left: auto; display: flex; align-items: center; gap: 8px; padding: 0 10px; }
+.v2-tabs {
+  display: flex; align-items: stretch; height: 100%; min-width: 0; flex: 1 1 auto;
+  overflow-x: auto; overflow-y: hidden; scrollbar-width: thin;
+  scrollbar-color: var(--v2-border-strong) transparent;
+}
+.v2-tabs::-webkit-scrollbar { height: 3px; }
+.v2-tabs::-webkit-scrollbar-thumb { background: var(--v2-border-strong); }
+.v2-tab { flex: 0 0 auto; }
+.v2-tab.placeholder {
+  color: var(--v2-mute); cursor: default; user-select: none;
+  border-bottom-color: transparent;
+}
+.v2-tab.placeholder:hover,
+.v2-tab.placeholder:hover > * { color: var(--v2-mute); background: transparent; }
+.v2-tab.placeholder > * {
+  margin: 0; padding: 0; color: inherit; font: inherit; letter-spacing: inherit;
+  text-transform: inherit; line-height: 1; white-space: nowrap;
+}
+.v2-topright { margin-left: auto; display: flex; align-items: center; gap: 8px; padding: 0 10px; flex: 0 0 auto; }
 .v2-clock { font-size: 11px; color: var(--v2-dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .v2-statusdot { width: 7px; height: 7px; border-radius: 50%; background: var(--v2-up); box-shadow: 0 0 4px var(--v2-up); display: inline-block; }
 .v2-realtime { font-size: 11px; color: var(--v2-dim); }
@@ -774,9 +795,9 @@ html, body, .shell { background: var(--v2-bg); color: var(--v2-fg); }
   font-family: var(--v2-mono) !important; font-weight: 400 !important;
 }
 .v2-tab.q-btn, .v2-tab.q-btn .q-btn__content {
-  height: 40px !important; padding: 0 12px !important; border-radius: 0 !important;
+  height: 40px !important; padding: 0 8px !important; border-radius: 0 !important;
   background: transparent !important; color: var(--v2-dim) !important;
-  font-size: 11px !important; letter-spacing: .8px !important;
+  font-size: 11px !important; letter-spacing: .5px !important;
   border: none !important; border-bottom: 2px solid transparent !important;
 }
 .v2-tab.q-btn:hover, .v2-tab.q-btn:hover .q-btn__content {
@@ -785,6 +806,21 @@ html, body, .shell { background: var(--v2-bg); color: var(--v2-fg); }
 .v2-tab.q-btn.active, .v2-tab.q-btn.active .q-btn__content {
   color: var(--v2-fg) !important; border-bottom-color: var(--v2-accent) !important;
 }
+.v2-tab.placeholder, .v2-tab.placeholder > * {
+  height: 40px; box-sizing: border-box; display: flex; align-items: center;
+  color: var(--v2-mute) !important; background: transparent !important;
+  cursor: default !important; border-bottom: 2px solid transparent !important;
+  font-family: var(--v2-mono) !important; font-size: 11px !important;
+  letter-spacing: .5px !important; text-transform: uppercase;
+  padding: 0 8px; width: auto !important; flex: 0 0 auto !important;
+}
+@media (max-width: 1440px) {
+  .v2-tab, .v2-tab.q-btn, .v2-tab.q-btn .q-btn__content, .v2-tab.placeholder {
+    padding-left: 6px !important; padding-right: 6px !important;
+    letter-spacing: .3px !important;
+  }
+}
+.v2-tab.placeholder > * { height: auto; padding: 0 !important; border: none !important; }
 .v2-subtab.q-btn, .v2-subtab.q-btn .q-btn__content {
   height: 22px !important; min-height: 0 !important; max-height: 22px !important;
   padding: 0 12px !important;
@@ -977,21 +1013,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
     host_keys: tuple[HostKey, ...] = ("OVERVIEW", "SIGNALS", "EXECUTION", "MARKETS", "AI CHAT")
 
     def host_on(key: HostKey) -> bool:
-        tab = nav["tab"]
-        sub = nav["sub"]
-        match key:
-            case "OVERVIEW":
-                return tab == "DASHBOARD" and sub == "OVERVIEW"
-            case "SIGNALS":
-                return tab == "DASHBOARD" and sub == "SIGNALS"
-            case "EXECUTION":
-                return tab == "DASHBOARD" and sub == "EXECUTION"
-            case "MARKETS":
-                return tab == "MARKETS"
-            case "AI CHAT":
-                return tab == "AI CHAT"
-            case _ as unreachable:
-                assert_never(unreachable)
+        return host_visible(str(nav["tab"]), str(nav["sub"]), key)
 
     def on_chain(event: object) -> None:
         value = getattr(event, "value", None) or "all"
@@ -1169,9 +1191,10 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
             refresh_sub()
 
     def switch_tab(key: str) -> None:
-        if key not in ("DASHBOARD", "MARKETS", "AI CHAT") or nav["tab"] == key:
+        nxt = select_top_tab(str(nav["tab"]), key)
+        if nxt == nav["tab"]:
             return
-        nav["tab"] = key
+        nav["tab"] = nxt
         apply_nav()
 
     def switch_sub(key: str) -> None:
@@ -1192,11 +1215,18 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
 
     @ui.refreshable
     def tab_bar() -> None:
-        for name in ("DASHBOARD", "MARKETS", "AI CHAT"):
-            active = "active" if nav["tab"] == name else ""
-            ui.button(name, on_click=lambda k=name: switch_tab(k)).props(
-                "flat dense unelevated no-caps"
-            ).classes(f"v2-tab {active}".rstrip())
+        with ui.element("div").classes("v2-tabs").props("role=tablist"):
+            for spec in TOP_TABS:
+                if spec.kind == "placeholder":
+                    ui.label(spec.label).classes("v2-tab placeholder").props(
+                        'role=tab aria-disabled=true aria-selected=false tabindex=-1 title="未接线"'
+                    )
+                    continue
+                active = nav["tab"] == spec.label
+                ui.button(spec.label, on_click=lambda k=spec.label: switch_tab(k)).props(
+                    "flat dense unelevated no-caps role=tab aria-selected="
+                    + ("true" if active else "false")
+                ).classes(f"v2-tab{' active' if active else ''}")
 
     nav["refresh_tabs"] = tab_bar.refresh
 
