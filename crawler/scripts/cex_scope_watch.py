@@ -10,6 +10,8 @@ on-chain → CEX chain is not verifiable yet.
   .venv/bin/python scripts/cex_scope_watch.py --loop --interval 3600
 
 Reads (mode=ro): ccxt.db -> ccxt_listings, ccxt_ticks
+Default ccxt path matches sources/ccxt/config.py (CCXT_DB_PATH or crawler/ccxt.db)
+without importing the sources package.
 Writes: prior.db -> cex_scope_snapshots (1 row per UTC date, idempotent upsert)
 Never touches business tables. No weights/gates/decisions. Default off
 (not started by main.py / decision engine).
@@ -22,6 +24,7 @@ snapshot_ts on the snapshot row is unix seconds.
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 import time
@@ -33,9 +36,15 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from logging_setup import get_logger, setup_logging  # noqa: E402
-from sources.ccxt.config import DB_PATH as DB_CCXT  # noqa: E402
 
 log = get_logger("cex_scope_watch")
+
+# 与 sources/ccxt/config.py 同一默认：CCXT_DB_PATH 或 crawler/ccxt.db。
+# 不 import sources（包初始化会拉起 Helius/httpx），本脚本只读 sqlite。
+_ccxt_env = os.environ.get("CCXT_DB_PATH", "").strip()
+DB_CCXT = _ccxt_env or str(_ROOT / "ccxt.db")
+if not Path(DB_CCXT).is_absolute():
+    DB_CCXT = str((_ROOT / DB_CCXT).resolve())
 
 DB_PRIOR = str(_ROOT / "data" / "prior" / "db" / "prior.db")
 _WINDOW_SEC = 86400

@@ -27,7 +27,7 @@ Step 2 已验收通过，但带偏差：匹配率脏（符号撞车），传导�
 
 默认路径：
 
-- 读：`sources.ccxt.config.DB_PATH`（`CCXT_DB_PATH` 或仓库内 `crawler/ccxt.db`），可用 `--db-ccxt` 覆盖。连接 `mode=ro` + `PRAGMA query_only`。
+- 读：与 `sources/ccxt/config.py` 相同的默认路径（环境变量 `CCXT_DB_PATH`，否则 `crawler/ccxt.db`），可用 `--db-ccxt` 覆盖。脚本不 `import sources`（该包初始化会拉起 Helius）。连接 `mode=ro` + `PRAGMA query_only`。
 - 写：`crawler/data/prior/db/prior.db` 的 `cex_scope_snapshots`，可用 `--db-prior` 覆盖。
 
 `ccxt_ticks.ts` 与 `ccxt_listings.first_seen_ts` 在 Step 1 里是 **epoch 毫秒**（`sources/ccxt/core.py` 用 `time.time()*1000`）。24h 窗口按毫秒比较。快照列 `snapshot_ts` 仍是 unix 秒。
