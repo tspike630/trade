@@ -1,8 +1,6 @@
 # 交易监控看板
 
-本仓已放在仓库根。换机以 `docs/RECOVERY.md`「交易看板」为准：依赖是仓库根的 `requirements-dashboard.txt`，库目录用 `DASHBOARD_DB_ROOT` 指向 `crawler/`。
-
-只读监控包。它直接读本地 SQLite（主库、执行账本、模拟盘、回测、新闻），不写库，也不提供开闸或下单开关。
+只读监控包，复制进已有的 `dexscreener-crawler` 项目根目录后使用。它直接读本地 SQLite（主库、执行账本、模拟盘、回测、新闻），不写库，也不提供开闸或下单开关。
 
 ```bash
 cp -a dashboard requirements-dashboard.txt /path/to/dexscreener-crawler/

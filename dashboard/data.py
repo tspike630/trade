@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import statistics
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -184,11 +185,32 @@ class PositionRow:
     pnl_pct: float | None
     pnl_usd: float | None
     mtm_usd: float | None
+    size_usd: float | None
     tp_pct: float | None
     sl_pct: float | None
     max_hold_min: float | None
     hold_seconds: float | None
     status: str
+
+
+@dataclass(frozen=True)
+class MarketRow:
+    chain_id: str
+    token_address: str
+    pair_address: str
+    price_usd: float | None
+    liquidity_usd: float | None
+    change_5m: float | None
+    change_1h: float | None
+    change_4h: float | None
+    jev_strength: float | None
+    coverage: float | None
+    tier: str
+    volatility: float | None = None
+    sentiment: str = ""
+    symbol: str = ""
+    change_15m: float | None = None
+    change_24h: float | None = None
 
 
 @dataclass(frozen=True)
@@ -202,6 +224,28 @@ class PositionsPayload:
     missing_price: int
     price_note: str
     rows: tuple[PositionRow, ...]
+
+
+@dataclass(frozen=True)
+class MarketBaseStats:
+    """Hot-tier indicator_history snapshot. Percents are already in percent units."""
+
+    n_1h: int
+    med_1h: str
+    med_4h: str
+    mean_1h_w: str
+
+
+@dataclass(frozen=True)
+class StrategyBucketRow:
+    strategy_id: str
+    n: int
+    ok_rate: str
+
+
+@dataclass(frozen=True)
+class StrategyBuckets:
+    rows: tuple[StrategyBucketRow, ...]
 
 
 @dataclass(frozen=True)
@@ -241,6 +285,8 @@ class ExecutionRow:
     executed: int | None
     executor: str
     receipt_summary: str
+    validation_ok: int | None = None
+    validation_errors: str = ""
 
 
 @dataclass(frozen=True)
@@ -635,9 +681,23 @@ class DataStore:
                 jev = _probe_max(conn, "jev_signals", "fetched_at", "JEV", now)
                 if jev.state == "unknown":
                     jev = _probe_max(conn, "jev_signals", "analyzed_at", "JEV", now)
+                decision = _probe_max(conn, "decision_log", "ts", "决策引擎", now)
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
-        return _ok((crawler, indicator, jev), started)
+        gateway = self._probe_gateway(now)
+        return _ok((crawler, indicator, jev, decision, gateway), started)
+
+    def _probe_gateway(self, now: datetime) -> ProcessProbe:
+        """Last execution_log.ts. Missing ledger is a dash, not a failed read of the main db."""
+        path = self.paths.execution
+        if not path.is_file():
+            return ProcessProbe("执行网关", "unknown", None, "")
+        try:
+            with ro_connect(path) as conn:
+                return _probe_max(conn, "execution_log", "ts", "执行网关", now)
+        except sqlite3.Error:
+            log.warning("gateway heartbeat unreadable")
+            return ProcessProbe("执行网关", "unknown", None, "")
 
     def _latest_backtest(self, started: float) -> DataResult:
         path = self.paths.backtest
@@ -792,6 +852,7 @@ class DataStore:
                     pnl_pct=pnl_pct,
                     pnl_usd=pnl_usd,
                     mtm_usd=_mtm(entry, mark, qty, size_usd),
+                    size_usd=size_usd,
                     tp_pct=safe_float(_cell(row, "tp_pct")),
                     sl_pct=safe_float(_cell(row, "sl_pct")),
                     max_hold_min=safe_float(_cell(row, "max_hold_min")),
@@ -958,6 +1019,8 @@ class DataStore:
                         "executed",
                         "executor",
                         "receipt_json",
+                        "validation_ok",
+                        "validation_errors",
                     )
                     if name in cols
                 ]
@@ -979,6 +1042,8 @@ class DataStore:
                 executed=_as_int(_cell(row, "executed")),
                 executor=clip(_cell(row, "executor"), 40),
                 receipt_summary=receipt_summary(parse_json(str(_cell(row, "receipt_json") or ""))),
+                validation_ok=_as_int(_cell(row, "validation_ok")),
+                validation_errors=clip(_cell(row, "validation_errors"), 160),
             )
             for row in rows
         )
@@ -1114,6 +1179,229 @@ class DataStore:
         dups = {decision_id for decision_id, count in counts.items() if count > 1}
         return latest, dups, ""
 
+
+    def market_base_stats(self) -> DataResult:
+        """Hot tier, last 24h: n / median 1h / median 4h / winsor mean 1h."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._market_base_stats(started), "market_base_stats")
+        except Exception as exc:
+            log.warning("read failed market_base_stats: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "market_base_stats")
+
+    def strategy_buckets(self) -> DataResult:
+        """decision_log grouped by strategy_id over 168h, with execution pass rate."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._strategy_buckets(started), "strategy_buckets")
+        except Exception as exc:
+            log.warning("read failed strategy_buckets: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "strategy_buckets")
+
+    def market_rows(self, chain: str | None = None, limit: int = 100) -> DataResult:
+        started = time.perf_counter()
+        try:
+            return _finish(self._market_rows(started, chain, limit), "market_rows")
+        except Exception as exc:
+            log.warning("read failed market_rows: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "market_rows")
+
+    def _market_rows(self, started: float, chain: str | None, limit: int) -> DataResult:
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        limit = _clamp(limit, 1, 300)
+        try:
+            with ro_connect(path) as conn:
+                miss = _missing_table(conn, "token_indicators", path.name)
+                if miss:
+                    return _unavail(miss, started)
+                ti_cols = _columns(conn, "token_indicators")
+                ts_col = "updated_at" if "updated_at" in ti_cols else ("recorded_at" if "recorded_at" in ti_cols else None)
+                if not ts_col:
+                    return _unavail("token_indicators 缺少 updated_at/recorded_at", started)
+                where = ""
+                params: list[Any] = []
+                if chain and chain.lower() not in ("all", "*", "any"):
+                    where = "WHERE chain_id = ?"
+                    params.append(chain)
+                order = f"ORDER BY CASE WHEN tier = 'hot' THEN 0 ELSE 1 END, {ts_col} DESC"
+                sql = f"SELECT * FROM token_indicators {where} {order} LIMIT ?"
+                params.append(limit)
+                rows = _exec(conn, sql, tuple(params)).fetchall()
+                pair_keys: list[tuple[str, str]] = []
+                token_keys: list[tuple[str, str]] = []
+                for row in rows:
+                    ch = str(_cell(row, "chain_id") or "")
+                    tok = str(_cell(row, "token_address") or "")
+                    pa = str(_cell(row, "primary_pair_address") or "")
+                    if pa:
+                        pair_keys.append((ch, pa))
+                    token_keys.append((ch, tok))
+                quotes = _load_quotes(conn, pair_keys) if _table_exists(conn, "pair_history") else {}
+                cov = _load_coverage(conn, token_keys) if _table_exists(conn, "jev_signals") else {}
+                symbols = _load_symbols(conn, token_keys) if _table_exists(conn, "tokens") else {}
+                out: list[MarketRow] = []
+                for row in rows:
+                    ch = str(_cell(row, "chain_id") or "")
+                    tok = str(_cell(row, "token_address") or "")
+                    pa = str(_cell(row, "primary_pair_address") or "")
+                    price, liq = quotes.get((ch, pa), (None, None))
+                    strength = safe_float(_cell(row, "jev_strength"))
+                    if strength is None:
+                        strength = safe_float(_cell(row, "jev_score"))
+                    coverage = cov.get((ch, tok))
+                    if coverage is None:
+                        conf = safe_float(_cell(row, "jev_confidence"))
+                        if conf is not None:
+                            coverage = conf * 100.0 if conf <= 1.0 else conf
+                    vol = safe_float(_cell(row, "volatility"))
+                    if vol is None:
+                        vol = safe_float(_cell(row, "volatility_24h"))
+                    sent_parts: list[str] = []
+                    for key in (
+                        "sentiment_score",
+                        "sentiment_heat_score",
+                        "sentiment_polarity",
+                        "sentiment_mentions_1h",
+                    ):
+                        val = safe_float(_cell(row, key))
+                        if val is not None:
+                            sent_parts.append(f"{key}={val:.4g}")
+                    out.append(
+                        MarketRow(
+                            chain_id=ch,
+                            token_address=tok,
+                            pair_address=pa,
+                            price_usd=price,
+                            liquidity_usd=liq,
+                            change_5m=safe_float(_cell(row, "change_5m")),
+                            change_1h=safe_float(_cell(row, "change_1h")),
+                            change_4h=safe_float(_cell(row, "change_4h")),
+                            jev_strength=strength,
+                            coverage=coverage,
+                            tier=str(_cell(row, "tier") or ""),
+                            volatility=vol,
+                            sentiment="; ".join(sent_parts),
+                            symbol=symbols.get((ch, tok), "") or str(_cell(row, "symbol") or ""),
+                            change_15m=safe_float(_cell(row, "change_15m")),
+                            change_24h=safe_float(_cell(row, "change_24h")),
+                        )
+                    )
+                return _ok(out, started)
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+
+    def _market_base_stats(self, started: float) -> DataResult:
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=24)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "indicator_history", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "indicator_history")
+                absent = _require(cols, ("change_1h", "change_4h", "tier"))
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                if "recorded_at" in cols:
+                    ts_col = _ident("recorded_at")
+                elif "ts" in cols:
+                    ts_col = _ident("ts")
+                else:
+                    return _unavail(f"缺少字段：recorded_at（{path.name}）", started)
+                lower = (start - timedelta(days=1)).strftime("%Y-%m-%d")
+                rows = _exec(
+                    conn,
+                    f"SELECT {ts_col} AS ts, change_1h, change_4h FROM indicator_history "
+                    f"WHERE tier = 'hot' AND {ts_col} >= ?",
+                    (lower,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        change_1h: list[float] = []
+        change_4h: list[float] = []
+        kept = 0
+        for row in rows:
+            if not _in_range(row["ts"], start, end, end_inclusive=True):
+                continue
+            kept += 1
+            value_1h = safe_float(row["change_1h"])
+            value_4h = safe_float(row["change_4h"])
+            if value_1h is not None:
+                change_1h.append(value_1h)
+            if value_4h is not None:
+                change_4h.append(value_4h)
+        if kept == 0:
+            return _unavail("indicator_history tier=hot 近 24h 无行", started)
+        winsor = [value for value in change_1h if abs(value) <= 500]
+        return _ok(
+            MarketBaseStats(
+                n_1h=len(change_1h),
+                med_1h=_fmt_signed_pct(_median(change_1h)),
+                med_4h=_fmt_signed_pct(_median(change_4h)),
+                mean_1h_w=_fmt_signed_pct(_mean(winsor)),
+            ),
+            started,
+        )
+
+    def _strategy_buckets(self, started: float) -> DataResult:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=7)
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "decision_log", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "decision_log")
+                absent = _require(cols, ("id", "ts", "strategy_id"))
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                lower = (start - timedelta(days=1)).strftime("%Y-%m-%d")
+                rows = _exec(
+                    conn,
+                    "SELECT id, ts, strategy_id FROM decision_log WHERE ts >= ?",
+                    (lower,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        kept = [
+            (int(row["id"]), str(row["strategy_id"] or "").strip() or "—")
+            for row in rows
+            if _in_range(row["ts"], start, end, end_inclusive=True)
+        ]
+        if not kept:
+            return _ok(StrategyBuckets(rows=()), started)
+        latest, _dups, note = self._latest_execs([item[0] for item in kept])
+        counts: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
+        for decision_id, strategy_id in kept:
+            cell = counts[strategy_id]
+            cell[0] += 1
+            if note:
+                continue
+            exec_row = latest.get(decision_id)
+            if exec_row is None:
+                continue
+            cell[1] += 1
+            if _as_int(_cell(exec_row, "validation_ok")) == 1:
+                cell[2] += 1
+        ordered = sorted(counts.items(), key=lambda item: (-item[1][0], item[0]))[:12]
+        payload = tuple(
+            StrategyBucketRow(
+                strategy_id=strategy_id,
+                n=n,
+                ok_rate=(f"{(n_ok / n_with) * 100:.1f}%" if n_with else "—"),
+            )
+            for strategy_id, (n, n_with, n_ok) in ordered
+        )
+        return _ok(StrategyBuckets(rows=payload), started)
+
     def _market_lookups(
         self,
         pair_keys: list[tuple[str, str]],
@@ -1140,6 +1428,24 @@ def _missing_table(conn: sqlite3.Connection, table: str, db_name: str) -> str:
     if _table_exists(conn, table):
         return ""
     return f"缺少数据表：{table}（{db_name}）"
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(statistics.median(values))
+
+
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(statistics.fmean(values))
+
+
+def _fmt_signed_pct(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:+.2f}%"
 
 
 def _clamp(value: int, low: int, high: int) -> int:
@@ -1234,6 +1540,46 @@ def _hold_seconds(opened: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return max(0.0, (datetime.now(timezone.utc) - stamp).total_seconds())
+
+
+
+def _load_coverage(
+    conn: sqlite3.Connection,
+    keys: list[tuple[str, str]],
+) -> dict[tuple[str, str], float | None]:
+    if not _table_exists(conn, "jev_signals"):
+        return {}
+    cols = _columns(conn, "jev_signals")
+    if "token_address" not in cols or "coverage_pct" not in cols:
+        return {}
+    has_chain = "chain_id" in cols
+    time_bits = [c for c in ("fetched_at", "analyzed_at") if c in cols]
+    if len(time_bits) >= 2:
+        order = f"COALESCE({', '.join(time_bits)}) DESC"
+    elif len(time_bits) == 1:
+        order = f"{time_bits[0]} DESC"
+    else:
+        order = "rowid DESC"
+    out: dict[tuple[str, str], float | None] = {}
+    seen: set[tuple[str, str]] = set()
+    for chain, token in keys:
+        if not token or (chain, token) in seen:
+            continue
+        seen.add((chain, token))
+        if has_chain and chain:
+            row = _exec(
+                conn,
+                f"SELECT coverage_pct FROM jev_signals WHERE chain_id=? AND token_address=? ORDER BY {order} LIMIT 1",
+                (chain, token),
+            ).fetchone()
+        else:
+            row = _exec(
+                conn,
+                f"SELECT coverage_pct FROM jev_signals WHERE token_address=? ORDER BY {order} LIMIT 1",
+                (token,),
+            ).fetchone()
+        out[(chain, token)] = safe_float(row["coverage_pct"]) if row else None
+    return out
 
 
 def _load_quotes(
