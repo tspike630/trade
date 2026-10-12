@@ -62,12 +62,13 @@ def build_strategies(ids: list[str], args: argparse.Namespace) -> list:
     out = []
     for sid in ids:
         kwargs: dict = {"position_pct": args.position_pct}
-        if sid == "jev_strength_v1":
+        # factor_* twins receive the same CLI thresholds as the legacy id.
+        if sid in ("jev_strength_v1", "factor_jev_strength_v1"):
             kwargs["min_jev_strength"] = args.min_jev_strength
-        elif sid == "tech_momentum_v1":
+        elif sid in ("tech_momentum_v1", "factor_tech_momentum_v1"):
             kwargs["min_change_5m"] = args.min_change_5m
             kwargs["min_volume_strength"] = args.min_volume_strength
-        elif sid == "combined_jev_tech_v1":
+        elif sid in ("combined_jev_tech_v1", "factor_combined_jev_tech_v1"):
             kwargs["min_jev_strength"] = args.min_jev_strength
             kwargs["min_change_5m"] = args.min_change_5m
             kwargs["min_volume_strength"] = args.min_volume_strength
