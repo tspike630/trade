@@ -31,10 +31,14 @@ class FactorStrategy(BaseStrategy):
         buy_params: dict[str, dict[str, Any]] | None = None,
         sell_params: dict[str, dict[str, Any]] | None = None,
         position_pct: float = 0.05,
+        mode: str = "or",
         **kwargs: Any,
     ):
         super().__init__(strategy_id=strategy_id, position_pct=position_pct, **kwargs)
         self.strategy_id = strategy_id
+        self.mode = str(mode).lower()
+        if self.mode not in ("or", "and"):
+            raise ValueError(f"mode must be 'or'|'and', got {mode!r}")
         # Legacy strategies take thresholds as constructor kwargs
         # (min_jev_strength, min_change_5m, ...). Forward them onto each buy
         # factor so get_strategy("factor_jev_strength_v1", min_jev_strength=0.15)
@@ -98,15 +102,33 @@ class FactorStrategy(BaseStrategy):
         return signals
 
     def _first_hit(self, row: dict[str, Any]) -> dict[str, Any] | None:
-        """Buy chain: the first factor that hits owns the token."""
+        """or: the first hit owns the token; and: every factor must hit (reasons joined)."""
+        if self.mode == "or":
+            for bf in self._buy_factors:
+                try:
+                    cand = bf.fit_tick(row)
+                except Exception:  # noqa: BLE001
+                    cand = None
+                if cand is not None:
+                    return cand
+            return None
+        merged: dict[str, Any] = {}
+        reasons: list[str] = []
         for bf in self._buy_factors:
             try:
                 cand = bf.fit_tick(row)
             except Exception:  # noqa: BLE001
                 cand = None
-            if cand is not None:
-                return cand
-        return None
+            if cand is None:
+                return None
+            size = cand.get("size_pct", self.params.get("position_pct", 0.05))
+            merged["size_pct"] = size
+            reasons.append(str(cand.get("reason", bf.factor_name)))
+            for k, v in cand.items():
+                if k not in ("size_pct", "reason") and k not in merged:
+                    merged[k] = v
+        merged["reason"] = " AND ".join(reasons)
+        return merged
 
     def _first_sell(
         self, position: dict[str, Any], data: dict[str, Any]
