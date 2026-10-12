@@ -19,11 +19,23 @@ STRATEGY_REGISTRY: dict[str, type] = {
     CombinedJevTechStrategy.strategy_id: CombinedJevTechStrategy,
 }
 
-# Plan 03: factor_ combos (equivalent buy logic, factor chain, noop sell).
-_FACTOR_COMBOS: dict[str, tuple[list[str], list[str]]] = {
-    "factor_jev_strength_v1": (["jev_strength"], ["noop"]),
-    "factor_tech_momentum_v1": (["tech_momentum"], ["noop"]),
-    "factor_combined_jev_tech_v1": (["combined_jev_tech"], ["noop"]),
+# Plan 03: factor_ combos. Tuple is (buy, sell, sell_params).
+# Original three keep sell=noop so previously verified behavior stays put.
+# timeexit / trail are registry-only (not the live default).
+_FACTOR_COMBOS: dict[str, tuple[list[str], list[str], dict[str, dict[str, float]]]] = {
+    "factor_jev_strength_v1": (["jev_strength"], ["noop"], {}),
+    "factor_tech_momentum_v1": (["tech_momentum"], ["noop"], {}),
+    "factor_combined_jev_tech_v1": (["combined_jev_tech"], ["noop"], {}),
+    "factor_jev_timeexit_v1": (
+        ["jev_strength"],
+        ["time_exit"],
+        {"time_exit": {"max_hold_seconds": 3600.0}},
+    ),
+    "factor_jev_trail_v1": (
+        ["jev_strength"],
+        ["trail_stop"],
+        {"trail_stop": {"trail_pct": 0.20}},
+    ),
 }
 
 
@@ -31,12 +43,13 @@ def _make_factor_strategy(sid: str) -> type:
     """Factory class so get_strategy(sid, **kwargs) builds the registered combo."""
 
     def _init(self: FactorStrategy, **kw: Any) -> None:
-        buy_factors, sell_factors = _FACTOR_COMBOS[sid]
+        buy_factors, sell_factors, sell_params = _FACTOR_COMBOS[sid]
         FactorStrategy.__init__(
             self,
             strategy_id=sid,
             buy_factors=buy_factors,
             sell_factors=sell_factors,
+            sell_params=sell_params,
             **kw,
         )
 
