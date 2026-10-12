@@ -47,3 +47,15 @@ cd /workspace/crawler   # or repo root; both trees match
 ```
 
 Compare `decision_log` counts, distinct tokens, and `reason` for the two strategy ids. Backtest `trades` / `win_rate` / `total_pnl_usd` should match on the same window.
+
+## Step 2/3 (sell mount + tech buy factors)
+
+Registry-only additions. `DECISION_DEFAULT_STRATEGY` is still `jev_strength_v1`. No cron or hook wiring.
+
+New combos: `factor_jev_timeexit_v1` (`time_exit` 3600s), `factor_jev_trail_v1` (`trail_stop` 20%), `factor_rsi_bounce_v1`, `factor_macd_cross_v1`, `factor_boll_breakout_v1`, `factor_jev_rsi_and_v1` (`mode=and`).
+
+`list_strategies()` length is **12** (3 legacy + 3 original factor + 2 sell + 4 tech). The plan text says 10; the listed ids sum to 12.
+
+Backtest ticks pass `open_positions` from the ledger. `time_exit` also accepts ledger `opened_at` and replay `bar_ts`. The engine's own max-hold (default 60 min) runs before the sell factor, so a `time_exit` close shows up when `--max-hold-min` is above 60 and price has not already hit tp/sl. Sample reason: `time_exit age=3600s>=3600s`. `trail_stop` stays quiet: ledger rows have no `peak_price`.
+
+`macd_cross` is a single-bar approximation (`macd > signal` and `macd > 0`). `boll_breakout` returns None on live hot rows that have no `price_usd`. Column name is `rsi_14`. Missing technical columns are dropped via PRAGMA and do not crash the SELECT.
