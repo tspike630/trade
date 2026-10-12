@@ -59,6 +59,20 @@ _WRITE_RE = re.compile(
     r"(?i)\b(insert|update|delete|replace|alter|drop|create|attach|detach|vacuum|reindex)\b"
 )
 _CLOSED_STATUS = {"closed", "close", "cancelled", "canceled", "liquidated", "expired"}
+_MARKET_CHAINS = frozenset({"solana", "ethereum", "bsc", "base"})
+_MARKET_FIELDS = (
+    "chain_id",
+    "token_address",
+    "primary_pair_address",
+    "tier",
+    "jev_strength",
+    "jev_confidence",
+    "change_5m",
+    "change_15m",
+    "change_1h",
+    "change_4h",
+    "change_24h",
+)
 _POSITION_FIELDS = (
     "id",
     "chain_id",
@@ -254,6 +268,24 @@ class RejectionReport:
     days: int
     total: int
     buckets: tuple[RejectionBucket, ...]
+
+
+@dataclass(frozen=True)
+class MarketRow:
+    """One token_indicators line. Display columns stay on change_*, liquidity, JEV, coverage, tier."""
+
+    chain_id: str
+    token_address: str
+    symbol: str
+    change_5m: float | None
+    change_15m: float | None
+    change_1h: float | None
+    change_4h: float | None
+    change_24h: float | None
+    liquidity_usd: float | None
+    jev_strength: float | None
+    coverage: float | None
+    tier: str
 
 
 class MissingTable(LookupError):
@@ -491,6 +523,14 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed rejection_buckets: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "rejection_buckets")
+
+    def market_rows(self, *, chain: str | None = None, limit: int = 80) -> DataResult:
+        started = time.perf_counter()
+        try:
+            return _finish(self._market_rows(started, chain, limit), "market_rows")
+        except Exception as exc:
+            log.warning("read failed market_rows: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "market_rows")
 
     def _today_execution_stats(self, started: float) -> DataResult:
         path = self.paths.execution
@@ -1026,6 +1066,66 @@ class DataStore:
         )
         return _ok(RejectionReport(window_days, total, ordered), started)
 
+    def _market_rows(self, started: float, chain: str | None, limit: int) -> DataResult:
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        chain_norm = (chain or "").strip().lower()
+        bounded = _clamp(limit, 1, 100)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "token_indicators", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "token_indicators")
+                if "token_address" not in cols:
+                    return _unavail(f"缺少字段：token_address（{path.name}）", started)
+                if chain_norm and chain_norm != "all":
+                    if chain_norm not in _MARKET_CHAINS or "chain_id" not in cols:
+                        return _ok((), started)
+                wanted = [name for name in _MARKET_FIELDS if name in cols]
+                order_col = ""
+                if "change_5m" in cols:
+                    order_col = "change_5m"
+                elif "updated_at" in cols:
+                    order_col = "updated_at"
+                params: list[Any] = []
+                where = ""
+                if chain_norm and chain_norm != "all":
+                    where = " WHERE chain_id = ?"
+                    params.append(chain_norm)
+                order = ""
+                if order_col:
+                    _ident(order_col)
+                    order = (
+                        f" ORDER BY CASE WHEN {order_col} IS NULL THEN 1 ELSE 0 END, {order_col} DESC"
+                    )
+                rows = _exec(
+                    conn,
+                    f"SELECT {', '.join(_ident(name) for name in wanted)} "
+                    f"FROM token_indicators{where}{order} LIMIT ?",
+                    (*params, bounded),
+                ).fetchall()
+                pair_keys = [
+                    (str(_cell(row, "chain_id") or ""), str(_cell(row, "primary_pair_address") or ""))
+                    for row in rows
+                    if _cell(row, "primary_pair_address")
+                ]
+                quotes: dict[tuple[str, str], tuple[float | None, float | None]] = {}
+                if pair_keys and _table_exists(conn, "pair_history"):
+                    quotes = _load_quotes(conn, pair_keys)
+                token_keys = [
+                    (str(_cell(row, "chain_id") or ""), str(_cell(row, "token_address") or ""))
+                    for row in rows
+                    if _cell(row, "token_address")
+                ]
+                symbols = _load_symbols(conn, token_keys)
+                coverage = _coverage_map(conn, list(rows))
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        payload = tuple(_market_row(row, quotes, symbols, coverage) for row in rows)
+        return _ok(payload, started)
+
     def _decision_ids_between(
         self,
         start: datetime,
@@ -1400,6 +1500,32 @@ def _strength_fallback(
         if value is not None:
             found[(chain, token)] = value
     return found
+
+
+def _market_row(
+    row: sqlite3.Row,
+    quotes: dict[tuple[str, str], tuple[float | None, float | None]],
+    symbols: dict[tuple[str, str], str],
+    coverage: dict[tuple[str, str], float],
+) -> MarketRow:
+    chain = str(_cell(row, "chain_id") or "")
+    token = str(_cell(row, "token_address") or "")
+    pair = str(_cell(row, "primary_pair_address") or "")
+    _price, liquidity = quotes.get((chain, pair), (None, None))
+    return MarketRow(
+        chain_id=chain,
+        token_address=token,
+        symbol=symbols.get((chain, token), ""),
+        change_5m=safe_float(_cell(row, "change_5m")),
+        change_15m=safe_float(_cell(row, "change_15m")),
+        change_1h=safe_float(_cell(row, "change_1h")),
+        change_4h=safe_float(_cell(row, "change_4h")),
+        change_24h=safe_float(_cell(row, "change_24h")),
+        liquidity_usd=liquidity,
+        jev_strength=safe_float(_cell(row, "jev_strength")),
+        coverage=coverage.get((chain, token)),
+        tier=clip(_cell(row, "tier"), 24),
+    )
 
 
 def _probe_checkpoint(conn: sqlite3.Connection, now: datetime) -> ProcessProbe:

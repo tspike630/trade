@@ -19,6 +19,17 @@ python -m dashboard.app
 - 刷新：`DASHBOARD_REFRESH_SEC`，限制在 30–60 秒，默认 45。信号流和其余面板共用这个轮询。
 - 数据目录：`DASHBOARD_DB_ROOT`。相对文件名再拼到这个目录上。
 
+## 界面外壳
+
+只读壳用 Obsidian 色：页面底 `#080808`，顶栏和底栏 `#111111`，强调色 `#d97706`。数据查询仍在 `dashboard/data.py`，连接保持 `mode=ro`。
+
+- 顶栏：CRYPTO TERMINAL / 链上新币投研终端、实时点、进程心跳、UTC 时钟、刷新。
+- 模块标签：DASHBOARD / MARKETS / AI CHAT。`/chat` 是同一套鉴权下的 AI CHAT。
+- DASHBOARD 内子标签：OVERVIEW 首屏是四列状态卡，下面整行持仓表和信号流；风险面板排在后面，三闸门是标题行里的小标签。SIGNALS、EXECUTION 仍是子页。注册表里新增且未指定分组的面板排在风险面板之后。
+- 底栏只有一条：左侧版本、会话、库、进程，右侧刷新年龄和间隔。
+- MARKETS 读 `token_indicators`，流动性取 `primary_pair_address` 在 `pair_history` 的最新值，覆盖率沿用信号流的口径。列只有 change_*、流动性、JEV、覆盖、档。不展示 RSI、MACD、BOLL。
+- 本仓库没有 `dashboard.chat` 时，AI CHAT 只显示未挂载说明，不调用模型，不写 `dashboard_state.db`。挂上模块并提供 `render(store)` 后，同一页会调用它。
+
 单库路径沿用爬虫里已有的环境变量，也可以单独覆盖：
 
 | 库 | 默认文件 | 环境变量（按顺序） |
