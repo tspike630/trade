@@ -18,7 +18,7 @@ import json
 import sqlite3
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,20 +30,12 @@ from config import (  # noqa: E402
     PAPER_DB_PATH,
     PAPER_START_CASH,
 )
+from execution.exits import scan_exits  # noqa: E402
 from store import Store, norm_address, norm_chain  # noqa: E402
 
 
 def _utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _parse(ts: str | None) -> datetime | None:
-    if not ts:
-        return None
-    try:
-        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
 
 
 class PaperLedger:
@@ -250,28 +242,15 @@ def tick(
     ledger: PaperLedger,
     store: Store,
 ) -> list[dict[str, Any]]:
-    """Mark open positions; close on TP/SL/max hold."""
+    """Mark open positions; close on TP/SL/max hold (unified exit rules)."""
     actions = []
-    now = datetime.now(timezone.utc)
-    for p in ledger.list_open():
-        px = latest_price(store, p["chain_id"], p["pair_address"])
-        if px is None:
-            continue
-        entry = float(p["entry_price"])
-        tp = p["tp_pct"]
-        sl = p["sl_pct"]
-        reason = None
-        if tp is not None and px >= entry * (1 + float(tp) / 100.0):
-            reason = "take_profit"
-        elif sl is not None and px <= entry * (1 - float(sl) / 100.0):
-            reason = "stop_loss"
-        else:
-            opened = _parse(p["opened_at"])
-            hold = p["max_hold_min"]
-            if opened and hold is not None and now >= opened + timedelta(minutes=float(hold)):
-                reason = "max_hold"
-        if reason:
-            actions.append(ledger.close_position(p["id"], price=px, reason=reason))
+
+    def price_lookup(p):
+        return latest_price(store, p["chain_id"], p["pair_address"])
+
+    for pos, reason in scan_exits(ledger.list_open(), price_lookup):
+        px = price_lookup(pos)
+        actions.append(ledger.close_position(pos["id"], price=px, reason=reason))
     return actions
 
 
