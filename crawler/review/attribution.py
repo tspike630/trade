@@ -153,24 +153,64 @@ def _extract_created_ms(raw: dict[str, Any]) -> Optional[float]:
     return None
 
 
-def _token_age_bucket(r: SignalChainRow) -> str:
-    created_ms = _extract_created_ms(r.raw or {})
-    if created_ms is None:
-        return "unknown"
-    try:
-        signal_dt = parse_ts(r.ts)
-    except (TypeError, ValueError):
-        return "unknown"
-    age_sec = signal_dt.timestamp() - (created_ms / 1000.0)
-    if age_sec < 0:
+def _token_age_bucket_computed(r: SignalChainRow) -> str:
+    """Coarse bucket from token_age_hours (pairs.pair_created_at) or raw_json fallback."""
+    age_hours = r.token_age_hours
+    if age_hours is None:
+        # fallback: creation ms from signal raw_json (legacy)
+        created_ms = _extract_created_ms(r.raw or {})
+        if created_ms is None:
+            return "unknown"
+        try:
+            signal_dt = parse_ts(r.ts)
+        except (TypeError, ValueError):
+            return "unknown"
+        age_hours = (
+            signal_dt.timestamp() * 1000.0 - float(created_ms)
+        ) / 3600000.0
+    if age_hours < 0:
         # clock skew / future createdAt → treat as unknown rather than negative age
         return "unknown"
-    age_days = age_sec / 86400.0
+    age_days = age_hours / 24.0
     if age_days < 1:
         return "<1d"
     if age_days <= 7:
         return "1-7d"
     return ">7d"
+
+
+def _token_age_bucket(
+    r: SignalChainRow,
+    tags: Optional[dict] = None,
+) -> tuple[str, Optional[str]]:
+    """Prefer prior.db.decision_prior_tags.age_bucket (mapped fine→coarse).
+
+    Returns (coarse_bucket, mismatch_note|None). Cross-checks computed age.
+    """
+    computed = _token_age_bucket_computed(r)
+    if not tags:
+        return computed, None
+    tag = tags.get(str(r.decision_id))
+    if not tag:
+        return computed, None
+    fine = tag.get("age_bucket") or "unknown"
+    # lazy import to avoid cycle (joint imports _extract_created_ms from here)
+    from review.joint import fine_to_coarse_age
+
+    prior_coarse = fine_to_coarse_age(fine)
+    note = None
+    if prior_coarse != computed:
+        note = (
+            f"decision_id={r.decision_id}: prior_tagger fine={fine}→{prior_coarse} "
+            f"vs computed={computed}"
+        )
+    return prior_coarse, note
+
+
+# back-compat alias used by older call sites expecting str
+def _token_age_bucket_str(r: SignalChainRow) -> str:
+    b, _ = _token_age_bucket(r, tags=None)
+    return b
 
 
 def _regime_from_baseline(baseline: dict | None) -> str:
@@ -207,18 +247,34 @@ def signal_attribution(
     rows: list[SignalChainRow],
     *,
     baseline: dict | None = None,
+    db_root: str | Path | None = None,
 ) -> dict:
-    """按维度分桶，每桶：n, up_1h_rate, up_4h_rate, median_1h, median_4h（有 fwd 的样本）。"""
+    """按维度分桶，每桶：n, up_1h_rate, up_4h_rate, median_1h, median_4h（有 fwd 的样本）。
+
+    token_age：若 prior.db.decision_prior_tags 有行，优先用 age_bucket（细→粗）
+    覆盖/对齐，与现算交叉校验，不一致记 note；分桶源=prior_tagger。
+    """
     strength_g: dict[str, list[SignalChainRow]] = defaultdict(list)
     coverage_g: dict[str, list[SignalChainRow]] = defaultdict(list)
     liq_g: dict[str, list[SignalChainRow]] = defaultdict(list)
     age_g: dict[str, list[SignalChainRow]] = defaultdict(list)
 
+    # prefer prior_tagger tags (read-only); lazy import avoids cycle
+    from review.joint import load_decision_prior_tags, BUCKET_SOURCE_PRIOR, BUCKET_SOURCE_COMPUTED
+
+    root = Path(db_root) if db_root else Path(__file__).resolve().parents[1]
+    tags = load_decision_prior_tags(root)
+    use_prior = bool(tags)
+    age_mismatch: list[str] = []
+
     for r in rows:
         strength_g[_strength_bucket(r.jev_strength)].append(r)
         coverage_g[_coverage_bucket(r.jev_coverage)].append(r)
         liq_g[_liq_bucket(r.liquidity_at_signal)].append(r)
-        age_g[_token_age_bucket(r)].append(r)
+        age_b, age_note = _token_age_bucket(r, tags=tags if use_prior else None)
+        age_g[age_b].append(r)
+        if age_note:
+            age_mismatch.append(age_note)
 
     regime = _regime_from_baseline(baseline)
     # period-level regime: all rows share one bucket (baseline-driven)
@@ -236,9 +292,31 @@ def signal_attribution(
         if med_src is None:
             med_src = baseline.get("median_change_1h")
 
+    n_period = len({str(r.decision_id) for r in rows})
+    n_tagged = sum(1 for r in rows if str(r.decision_id) in tags) if tags else 0
+    bucket_source = BUCKET_SOURCE_PRIOR if use_prior else BUCKET_SOURCE_COMPUTED
+    if use_prior:
+        age_note = (
+            f"分桶源={bucket_source}（prior.db.decision_prior_tags.age_bucket 细→粗；"
+            f"本期 {n_tagged}/{n_period}）；"
+            "与现算 token_age 交叉校验；"
+            "pairs.pair_created_at via chain_id+pair_address (fallback token_address)"
+        )
+        if age_mismatch:
+            age_note += f"；不一致 {len(age_mismatch)} 条"
+    else:
+        age_note = (
+            "分桶源=computed；pairs.pair_created_at via chain_id+pair_address "
+            "(fallback token_address); age_hours=(signal_ts_ms-pair_created_at)/3600000; "
+            "missing → unknown"
+        )
+
     return {
         "n": len(rows),
         "caveat": CAVEAT,
+        "bucket_source": bucket_source,
+        "prior_tags_period": f"{n_tagged}/{n_period}",
+        "age_mismatch_notes": age_mismatch,
         "dimensions": {
             "strength": {
                 "edges": STRENGTH_EDGES,
@@ -263,7 +341,8 @@ def signal_attribution(
             },
             "token_age": {
                 "edges": TOKEN_AGE_EDGES,
-                "note": "from signal raw_json creation fields; missing → unknown",
+                "note": age_note,
+                "bucket_source": bucket_source,
                 "buckets": _ordered_bucket_map(
                     ["<1d", "1-7d", ">7d", "unknown"],
                     age_g,

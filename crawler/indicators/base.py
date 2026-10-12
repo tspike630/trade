@@ -58,6 +58,8 @@ TOKEN_INDICATOR_COLS = [
     "sentiment_heat_score",
     "sentiment_polarity",
     "sentiment_updated_at",
+    "spike_ratio",
+    "spike",
     "composite_score",
     "composite_updated_at",
     "tier",
@@ -87,6 +89,8 @@ _MIGRATE_TOKEN_INDICATORS = [
     ("sentiment_growth_24h", "REAL"),
     ("sentiment_heat_score", "REAL"),
     ("sentiment_polarity", "REAL"),
+    ("spike_ratio", "REAL"),
+    ("spike", "INTEGER"),
 ]
 _MIGRATE_INDICATOR_HISTORY = [
     ("rsi_14", "REAL"),
@@ -100,6 +104,8 @@ _MIGRATE_INDICATOR_HISTORY = [
     ("sentiment_mentions_1h", "REAL"),
     ("sentiment_heat_score", "REAL"),
     ("sentiment_polarity", "REAL"),
+    ("spike_ratio", "REAL"),
+    ("spike", "INTEGER"),
 ]
 
 
@@ -501,9 +507,10 @@ class IndicatorStore:
                 jev_score, jev_strength,
                 sentiment_score, sentiment_mentions_1h,
                 sentiment_heat_score, sentiment_polarity,
+                spike_ratio, spike,
                 composite_score,
                 tier, primary_pair_address
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chain_id,
@@ -529,6 +536,8 @@ class IndicatorStore:
                 row.get("sentiment_mentions_1h"),
                 row.get("sentiment_heat_score"),
                 row.get("sentiment_polarity"),
+                row.get("spike_ratio"),
+                row.get("spike"),
                 row.get("composite_score"),
                 row.get("tier"),
                 row.get("primary_pair_address"),

@@ -2,13 +2,14 @@
 
 阶段一只读监控：风险、持仓、信号流、执行记录。手动确认交易（P4）不在本包内。
 
-把 `dashboard/` 放在 `dexscreener-crawler` 根目录，和 `dexscreener.db` 同级。默认数据目录是 `dashboard` 包的上一级，也就是项目根。
+本仓把 `dashboard/` 放在仓库根（与 `crawler/` 同级）。SQLite 在 `crawler/`，不在看板旁边，所以启动前要设 `DASHBOARD_DB_ROOT` 指向 `crawler`（步骤见 `docs/RECOVERY.md`「交易看板」）。不设时，默认数据目录是本包的上一级（仓库根），读不到采集库。
 
 ## 启动
 
 ```bash
 pip install -r requirements-dashboard.txt
 export API_SECRET='your-long-secret'
+export DASHBOARD_DB_ROOT="$PWD/crawler"   # 本仓：库在 crawler/
 python -m dashboard.app
 ```
 
@@ -17,6 +18,17 @@ python -m dashboard.app
 - 端口：`DASHBOARD_PORT`，默认 `8081`。
 - 刷新：`DASHBOARD_REFRESH_SEC`，限制在 30–60 秒，默认 45。信号流和其余面板共用这个轮询。
 - 数据目录：`DASHBOARD_DB_ROOT`。相对文件名再拼到这个目录上。
+
+## 界面外壳
+
+只读壳用 Obsidian 色：页面底 `#080808`，顶栏和底栏 `#111111`，强调色 `#d97706`。数据查询仍在 `dashboard/data.py`，连接保持 `mode=ro`。
+
+- 顶栏：CRYPTO TERMINAL / 链上新币投研终端、实时点、进程心跳、UTC 时钟、刷新。
+- 模块标签：DASHBOARD / MARKETS / AI CHAT。`/chat` 是同一套鉴权下的 AI CHAT。
+- DASHBOARD 内子标签：OVERVIEW（风险 + 持仓）、SIGNALS、EXECUTION。注册表里新增的面板默认落在 OVERVIEW。
+- 底栏：会话时长、库文件就绪数、进程心跳、距上次刷新的秒数。
+- MARKETS 读 `token_indicators`，流动性取 `primary_pair_address` 在 `pair_history` 的最新值，覆盖率沿用信号流的口径。列只有 change_*、流动性、JEV、覆盖、档。不展示 RSI、MACD、BOLL。
+- 本仓库没有 `dashboard.chat` 时，AI CHAT 只显示未挂载说明，不调用模型，不写 `dashboard_state.db`。挂上模块并提供 `render(store)` 后，同一页会调用它。
 
 单库路径沿用爬虫里已有的环境变量，也可以单独覆盖：
 

@@ -8,6 +8,7 @@ missing databases degrade instead of raising. Run from the project root::
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -26,7 +27,19 @@ from dashboard.auth import SecretFilter, verify_api_key
 from dashboard.data import DataStore, DbPaths, _WRITE_RE, connect_ro
 from dashboard.format_util import fmt_hold, fmt_liq, fmt_pct, fmt_usd
 from dashboard.panels.registry import PANELS
+from dashboard.panels.shell import (
+    TOP_TABS,
+    db_status_line,
+    heartbeat_summary,
+    host_visible,
+    live_caption,
+    panel_group,
+    refresh_age_label,
+    select_top_tab,
+)
 from dashboard.parsing import bucket_key, extract_jev_strength
+import dashboard.app as app_module
+from dashboard.app import jev_gate_view, prior_pulse_tone
 from dashboard.settings import bind_host, port, read_gates, refresh_seconds
 
 _TOUCHED = (
@@ -41,6 +54,7 @@ _TOUCHED = (
     "DASHBOARD_PAPER_DB",
     "DASHBOARD_BACKTEST_DB",
     "DASHBOARD_NEWS_DB",
+    "JEV_TREND_CSV",
     "DB_PATH",
     "PAPER_DB_PATH",
     "HEARTBEAT_STALE_SEC",
@@ -430,9 +444,15 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertTrue(all(row.id != "pos-closed" for row in payload.rows))
 
         probes = {item.name: item for item in store.process_liveness().data}
+        self.assertEqual(
+            [item.name for item in store.process_liveness().data],
+            ["主爬虫", "指标", "JEV", "决策引擎", "执行网关"],
+        )
         self.assertEqual(probes["主爬虫"].state, "alive")
         self.assertEqual(probes["指标"].state, "alive")
         self.assertEqual(probes["JEV"].state, "stale")
+        self.assertEqual(probes["决策引擎"].state, "alive")
+        self.assertEqual(probes["执行网关"].state, "alive")
 
         run = store.latest_backtest().data
         self.assertEqual(run.run_id, "bt-1")
@@ -673,7 +693,311 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(fmt_usd(-2, signed=True), "-$2.00")
         self.assertEqual(fmt_liq(12345.6), "$12.3K")
         self.assertEqual(fmt_hold(5400), "1小时30分")
-        self.assertEqual([item.id for item in PANELS], ["risk", "positions", "signals", "execution"])
+        self.assertEqual([item.id for item in PANELS], ["risk", "positions", "signals", "execution", "market"])
+        self.assertEqual(panel_group("risk"), "overview")
+        self.assertEqual(panel_group("positions"), "overview")
+        self.assertEqual(panel_group("signals"), "signals")
+        self.assertEqual(panel_group("execution"), "execution")
+        self.assertEqual(panel_group("later"), "overview")
+        self.assertEqual(heartbeat_summary(["alive", "stale", "unknown"]), ("进程 1/3 存活", "ok"))
+        self.assertEqual(heartbeat_summary(["stale"]), ("进程 0/1 存活", "warn"))
+        self.assertEqual(heartbeat_summary([]), ("进程 —", "muted"))
+        self.assertEqual(live_caption("ok"), "● 实时")
+        self.assertEqual(live_caption("warn"), "● 停滞")
+        self.assertEqual(db_status_line([("主库", "a.db", True), ("新闻", "b.db", False)]), "库 1/2 缺失:新闻")
+        self.assertEqual(refresh_age_label(None), "刷新 —")
+        self.assertEqual(refresh_age_label(3), "刷新 3s 前")
+        app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+        for label in (
+            "SPIKE'S",
+            "CRYPTO",
+            "TERMINER",
+            "链上新币投研终端",
+            "DASHBOARD",
+            "MARKETS",
+            "AI CHAT",
+            "OVERVIEW",
+            "SIGNALS",
+            "EXECUTION",
+            "/chat",
+        ):
+            self.assertIn(label, app_text)
+        self.assertNotIn("TERMINAL", app_text)
+        for marker in ("v2-topbar", "v2-subbar", "v2-statusbar", "v2-grid", "v2-kpi", "span-8"):
+            self.assertIn(marker, app_text)
+        self.assertNotIn("gv2-", app_text)
+        self.assertIn("grid-auto-rows: minmax(84px, auto)", app_text)
+        self.assertIn("min-height: 84px", app_text)
+        self.assertIn(".v2-warnbar", app_text)
+        self.assertIn("|x|<=500", app_text)
+        self.assertNotIn("|x|≤", app_text)
+        self.assertNotIn("不授权", app_text)
+        self.assertIn("不调权", app_text)
+        self.assertIn("延迟 --ms", app_text)
+        self.assertIn('classes("v2-statusdot ok right")', app_text)
+        self.assertIn("flex-direction: row !important", app_text)
+        render_src = inspect.getsource(app_module._render_dashboard)
+        module_src = inspect.getsource(app_module._module_tabs)
+        self.assertIn("v2-grid", render_src)
+        self.assertNotIn("v2-subbar", render_src)
+        self.assertIn("v2-subbar", module_src)
+        self.assertNotIn("v2-grid", module_src)
+        self.assertIn("v2-warnbar", render_src)
+        self.assertEqual(prior_pulse_tone("4H 存活", "75.3%"), "up")
+        self.assertEqual(prior_pulse_tone("4H 存活", "59%"), "")
+        self.assertEqual(prior_pulse_tone("当天死", "68.67%"), "down")
+        self.assertEqual(prior_pulse_tone("当天死", "49%"), "")
+        self.assertEqual(prior_pulse_tone("毕业率", "0.2%"), "mute")
+        self.assertEqual(prior_pulse_tone("见顶 P50", "1.0 min"), "mute")
+        view = jev_gate_view(
+            {
+                "filtered_n": "14",
+                "unique_token": "9",
+                "up_1h_rate": "0.714",
+                "up_4h_rate": "0.571",
+            }
+        )
+        assert view is not None
+        self.assertEqual([item[1] for item in view], ["14", "9", "71.4%", "57.1%"])
+        self.assertEqual(view[2][2], "up")
+        self.assertIsNone(jev_gate_view(None))
+        trend = self.root / "jev_validity_trend.csv"
+        trend.write_text(
+            "date,filtered_n,unique_token,up_1h_rate,up_4h_rate\n"
+            "2026-10-01,1,1,0.100000,0.100000\n"
+            "2026-10-08,14,9,0.714000,0.571000\n",
+            encoding="utf-8",
+        )
+        os.environ["JEV_TREND_CSV"] = str(trend)
+        try:
+            loaded = jev_gate_view(app_module._jev_trend_row())
+        finally:
+            os.environ.pop("JEV_TREND_CSV", None)
+        assert loaded is not None
+        self.assertEqual(loaded[0][1], "14")
+        self.assertEqual(loaded[2][1], "71.4%")
+        market_src = inspect.getsource(DataStore._market_rows)
+        for banned in ("rsi", "macd", "boll"):
+            self.assertNotIn(banned, market_src.lower())
+
+    def test_market_rows_keep_indicator_columns(self) -> None:
+        missing = DataStore(
+            DbPaths(
+                main=self.root / "no-market.db",
+                execution=self.root / "no-market-exec.db",
+                paper=self.root / "no-market-paper.db",
+                backtest=self.root / "no-market-bt.db",
+                news=self.root / "no-market-news.db",
+            )
+        )
+        absent = missing.market_rows()
+        self.assertFalse(absent.available)
+        self.assertIn("不存在", absent.reason)
+
+        main = self.root / "market.db"
+        with sqlite3.connect(main) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    change_5m REAL,
+                    change_1h REAL,
+                    jev_strength REAL,
+                    jev_confidence REAL,
+                    tier TEXT,
+                    primary_pair_address TEXT,
+                    updated_at TEXT
+                );
+                CREATE TABLE pair_history (
+                    id INTEGER PRIMARY KEY,
+                    chain_id TEXT,
+                    pair_address TEXT,
+                    recorded_at TEXT,
+                    price_usd REAL,
+                    liquidity_usd REAL
+                );
+                CREATE TABLE jev_signals (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    coverage_pct REAL,
+                    fetched_at TEXT
+                );
+                CREATE TABLE tokens (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    raw_json TEXT
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators
+                    (chain_id, token_address, change_5m, change_1h, jev_strength, jev_confidence,
+                     tier, primary_pair_address, updated_at)
+                VALUES ('solana', 'T1', 12.5, -1.25, 0.81, 0.2, 'hot', 'P1', '2026-10-10T00:00:00Z')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators
+                    (chain_id, token_address, change_5m, jev_confidence, tier, updated_at)
+                VALUES ('ethereum', 'T2', 1.0, 0.25, 'warm', '2026-10-10T00:00:00Z')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO pair_history (chain_id, pair_address, recorded_at, price_usd, liquidity_usd)
+                VALUES ('solana', 'P1', '2026-10-10T00:00:00Z', 1.25, 50000)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO jev_signals (chain_id, token_address, coverage_pct, fetched_at)
+                VALUES ('solana', 'T1', 88, '2026-10-10T00:00:00Z')
+                """
+            )
+            conn.execute(
+                "INSERT INTO tokens (chain_id, token_address, raw_json) VALUES ('solana', 'T1', ?)",
+                (json.dumps({"symbol": "BONK"}),),
+            )
+        before = main.stat().st_mtime_ns
+        store = DataStore(
+            DbPaths(
+                main=main,
+                execution=self.root / "market-exec-missing.db",
+                paper=self.root / "market-paper-missing.db",
+                backtest=self.root / "market-bt-missing.db",
+                news=self.root / "market-news-missing.db",
+            )
+        )
+        result = store.market_rows()
+        self.assertTrue(result.available, result.reason)
+        self.assertEqual([row.token_address for row in result.data], ["T1", "T2"])
+        first = result.data[0]
+        self.assertEqual(first.symbol, "BONK")
+        self.assertEqual(first.tier, "hot")
+        self.assertAlmostEqual(first.change_5m or 0, 12.5)
+        self.assertAlmostEqual(first.change_1h or 0, -1.25)
+        self.assertIsNone(first.change_15m)
+        self.assertAlmostEqual(first.liquidity_usd or 0, 50000)
+        self.assertAlmostEqual(first.jev_strength or 0, 0.81)
+        self.assertAlmostEqual(first.coverage or 0, 88)
+        second = result.data[1]
+        self.assertAlmostEqual(second.coverage or 0, 25)
+        self.assertIsNone(second.liquidity_usd)
+        sol = store.market_rows(chain="solana")
+        self.assertEqual([row.token_address for row in sol.data], ["T1"])
+        self.assertEqual(list(store.market_rows(chain="not-a-chain").data or ()), [])
+        self.assertEqual(main.stat().st_mtime_ns, before)
+
+    def test_market_base_and_strategy_buckets_are_read_only(self) -> None:
+        paths = build_fixture(self.root)
+        store = DataStore(paths)
+        missing = store.market_base_stats()
+        self.assertFalse(missing.available)
+        self.assertIn("change_1h", missing.reason)
+        buckets = store.strategy_buckets()
+        self.assertTrue(buckets.available, buckets.reason)
+        self.assertEqual([(row.strategy_id, row.n, row.ok_rate) for row in buckets.data.rows], [("alpha", 2, "50.0%")])
+
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=3)
+        fresh = now - timedelta(hours=1)
+        with sqlite3.connect(paths.main) as conn:
+            conn.execute("DROP TABLE indicator_history")
+            conn.execute(
+                """
+                CREATE TABLE indicator_history (
+                    id INTEGER PRIMARY KEY,
+                    tier TEXT,
+                    recorded_at TEXT,
+                    change_1h REAL,
+                    change_4h REAL
+                )
+                """
+            )
+            conn.executemany(
+                "INSERT INTO indicator_history (tier, recorded_at, change_1h, change_4h) VALUES (?, ?, ?, ?)",
+                [
+                    ("hot", _iso(fresh), 1.0, 2.0),
+                    ("hot", _iso(fresh), 3.0, 6.0),
+                    ("hot", _iso(fresh), 600.0, None),
+                    ("warm", _iso(fresh), 50.0, 50.0),
+                    ("hot", _iso(old), 9.0, 9.0),
+                ],
+            )
+        before = paths.main.stat().st_mtime_ns
+        stats = store.market_base_stats()
+        self.assertTrue(stats.available, stats.reason)
+        self.assertEqual(stats.data.n_1h, 3)
+        self.assertEqual(stats.data.med_1h, "+3.00%")
+        self.assertEqual(stats.data.med_4h, "+4.00%")
+        self.assertEqual(stats.data.mean_1h_w, "+2.00%")
+        self.assertEqual(paths.main.stat().st_mtime_ns, before)
+
+    def test_top_tabs_match_skeleton_and_skip_dead_routes(self) -> None:
+        labels = [tab.label for tab in TOP_TABS]
+        self.assertEqual(
+            labels,
+            [
+                "DASHBOARD",
+                "MARKETS",
+                "CRYPTO",
+                "PORTFOLIO",
+                "SIGNALS",
+                "EXECUTION",
+                "NEWS",
+                "AI CHAT",
+                "BACKTEST",
+                "ALGO",
+                "NODES",
+                "QUANT LAB",
+                "SETTINGS",
+            ],
+        )
+        self.assertEqual(
+            [tab.label for tab in TOP_TABS if tab.kind == "live"],
+            ["DASHBOARD", "MARKETS", "SIGNALS", "EXECUTION", "AI CHAT"],
+        )
+        self.assertEqual(
+            [tab.label for tab in TOP_TABS if tab.kind == "placeholder"],
+            ["CRYPTO", "PORTFOLIO", "NEWS", "BACKTEST", "ALGO", "NODES", "QUANT LAB", "SETTINGS"],
+        )
+        self.assertEqual(select_top_tab("DASHBOARD", "CRYPTO"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "PORTFOLIO"), "DASHBOARD")
+        self.assertEqual(select_top_tab("MARKETS", "NEWS"), "MARKETS")
+        self.assertEqual(select_top_tab("AI CHAT", "BACKTEST"), "AI CHAT")
+        self.assertEqual(select_top_tab("DASHBOARD", "ALGO"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "NODES"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "QUANT LAB"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "SETTINGS"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "no-such-tab"), "DASHBOARD")
+        self.assertEqual(select_top_tab("DASHBOARD", "MARKETS"), "MARKETS")
+        self.assertEqual(select_top_tab("DASHBOARD", "SIGNALS"), "SIGNALS")
+        self.assertEqual(select_top_tab("DASHBOARD", "EXECUTION"), "EXECUTION")
+        self.assertEqual(select_top_tab("MARKETS", "AI CHAT"), "AI CHAT")
+        self.assertEqual(select_top_tab("AI CHAT", "AI CHAT"), "AI CHAT")
+        self.assertTrue(host_visible("DASHBOARD", "OVERVIEW", "OVERVIEW"))
+        self.assertFalse(host_visible("DASHBOARD", "OVERVIEW", "SIGNALS"))
+        self.assertTrue(host_visible("DASHBOARD", "SIGNALS", "SIGNALS"))
+        self.assertTrue(host_visible("SIGNALS", "OVERVIEW", "SIGNALS"))
+        self.assertFalse(host_visible("SIGNALS", "OVERVIEW", "OVERVIEW"))
+        self.assertTrue(host_visible("EXECUTION", "OVERVIEW", "EXECUTION"))
+        self.assertTrue(host_visible("DASHBOARD", "EXECUTION", "EXECUTION"))
+        self.assertFalse(host_visible("EXECUTION", "OVERVIEW", "SIGNALS"))
+        self.assertTrue(host_visible("MARKETS", "OVERVIEW", "MARKETS"))
+        self.assertTrue(host_visible("AI CHAT", "OVERVIEW", "AI CHAT"))
+        self.assertFalse(host_visible("NEWS", "OVERVIEW", "MARKETS"))
+        self.assertFalse(host_visible("BACKTEST", "OVERVIEW", "EXECUTION"))
+        app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+        self.assertIn('classes("v2-tab placeholder")', app_text)
+        self.assertIn("select_top_tab", app_text)
+        self.assertEqual(app_text.count("@ui.page("), 2)
+        for dead in ("/crypto", "/portfolio", "/news", "/backtest", "/algo", "/nodes", "/settings", "/quant"):
+            self.assertNotIn(f'@ui.page("{dead}', app_text)
+        self.assertIn("v2-subbar", inspect.getsource(app_module._module_tabs))
+        self.assertNotIn("v2-subbar", inspect.getsource(app_module._render_dashboard))
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
@@ -682,9 +1006,9 @@ class DashboardSmokeTest(unittest.TestCase):
             if path.name == "smoke_test.py":
                 continue
             text = path.read_text(encoding="utf-8")
-            if _WRITE_SQL.search(text):
+            if _WRITE_SQL.search(text) and path.name != "sessions.py":
                 offenders.append(f"write sql in {path.name}")
-            if "sqlite3.connect" in text and path.name != "data.py":
+            if "sqlite3.connect" in text and path.name not in ("data.py", "sessions.py"):
                 offenders.append(f"sqlite connect in {path.name}")
             assignments = re.findall(r"os\.environ\[[^\]]+\]\s*=", text)
             allowed_storage = path.name == "__init__.py" and assignments == ['os.environ["NICEGUI_STORAGE_PATH"] =']

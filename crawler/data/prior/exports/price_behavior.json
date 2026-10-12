@@ -1,0 +1,299 @@
+{
+  "meta": {
+    "date": "20261011",
+    "generated_at": "2026-10-11T16:11:16+08:00",
+    "db": "dexscreener.db",
+    "table": "pair_history",
+    "price_field": "price_usd",
+    "n_history_rows": 547678,
+    "recorded_at_range": [
+      "2026-10-09T12:00:00Z",
+      "2026-10-11T08:11:08Z"
+    ],
+    "crawler_window_h": 44.19,
+    "short": true,
+    "tol_sec": 1200,
+    "up_mult_threshold": 1.05,
+    "unit": "(chain_id, token_address) via densest pair_address",
+    "warnings": [
+      "crawler 总窗口仅约 44.2h → 标记 SHORT；4h 收益/回撤可用但勿外推为长期市场先验",
+      "窗口 <7d：无 7d 收益先验（本 step 也不计算）"
+    ],
+    "definitions": {
+      "return": "p(t0+h)/p0 - 1; nearest within TOL else last if span>=h",
+      "pump_multiple": "max/min within window among tokens with max/min>=1.05",
+      "pump_duration_min": "minutes from low to subsequent high within window",
+      "mdd_4h": "max(0, (p0 - min_in_[t0,t0+4h])/p0) from first observed price"
+    }
+  },
+  "n_tokens_analyzed": 15575,
+  "n_skipped_lt_min_ticks": 69,
+  "span_h": {
+    "n": 15575,
+    "median": 18.193889,
+    "p10": 3.678889,
+    "p25": 9.660833,
+    "p75": 24.0375,
+    "p90": 32.870556
+  },
+  "returns": {
+    "15m": {
+      "n": 15493,
+      "median": 0.0,
+      "p10": -0.815941,
+      "p25": -0.187962,
+      "p75": 0.0,
+      "p90": 0.096246,
+      "n_eligible_span": 15493,
+      "method_counts": {
+        "nearest": 15493,
+        "last": 0
+      }
+    },
+    "1h": {
+      "n": 14985,
+      "median": -0.000167,
+      "p10": -0.892121,
+      "p25": -0.343413,
+      "p75": 0.0,
+      "p90": 0.060768,
+      "n_eligible_span": 14985,
+      "method_counts": {
+        "nearest": 14601,
+        "last": 384
+      }
+    },
+    "4h": {
+      "n": 13912,
+      "median": -0.003388,
+      "p10": -0.92439,
+      "p25": -0.448122,
+      "p75": 0.0,
+      "p90": 0.056692,
+      "n_eligible_span": 13912,
+      "method_counts": {
+        "nearest": 12271,
+        "last": 1641
+      }
+    }
+  },
+  "pump": {
+    "full": {
+      "multiple": {
+        "n": 4079,
+        "median": 1.422034,
+        "p10": 1.075716,
+        "p25": 1.149131,
+        "p75": 2.325547,
+        "p90": 5.186528
+      },
+      "duration_min": {
+        "n": 4079,
+        "median": 56.666667,
+        "p10": 5.433333,
+        "p25": 10.5,
+        "p75": 328.166667,
+        "p90": 1002.233333
+      },
+      "up_mult_threshold": 1.05
+    },
+    "1h": {
+      "multiple": {
+        "n": 3055,
+        "median": 1.46984,
+        "p10": 1.084671,
+        "p25": 1.163335,
+        "p75": 2.296395,
+        "p90": 4.600107
+      },
+      "duration_min": {
+        "n": 3055,
+        "median": 12.7,
+        "p10": 5.3,
+        "p25": 6.033333,
+        "p75": 31.95,
+        "p90": 50.55
+      },
+      "up_mult_threshold": 1.05
+    },
+    "4h": {
+      "multiple": {
+        "n": 3249,
+        "median": 1.442444,
+        "p10": 1.085232,
+        "p25": 1.158402,
+        "p75": 2.407041,
+        "p90": 5.280921
+      },
+      "duration_min": {
+        "n": 3249,
+        "median": 26.633333,
+        "p10": 5.35,
+        "p25": 6.55,
+        "p75": 76.433333,
+        "p90": 161.55
+      },
+      "up_mult_threshold": 1.05
+    }
+  },
+  "drawdown": {
+    "definition": "mdd_4h = max(0, (p0 - min_price_in_[t0,t0+4h]) / p0); entry proxy from first observed price; positive = depth of loss",
+    "mdd_4h": {
+      "n": 13912,
+      "median": 0.012042,
+      "p10": 0.0,
+      "p25": 0.0,
+      "p75": 0.45525,
+      "p90": 0.920061
+    },
+    "mdd_available_span_lt_4h": {
+      "n": 1663,
+      "median": 0.0,
+      "p10": 0.0,
+      "p25": 0.0,
+      "p75": 0.268055,
+      "p90": 0.918559
+    },
+    "note": "Primary metric is mdd_4h on tokens with span≥4h; short-span set labeled separately"
+  },
+  "jev": {
+    "available": true,
+    "n_signals": 40,
+    "n_with_series": 40,
+    "note": "age_bucket 1-24h ret_1h n=24 — still small; tables shown, avoid strong claims vs all-token baseline (selection bias)",
+    "by_age_bucket": {
+      "1-24h": {
+        "ret_1h": {
+          "n": 24,
+          "median": 0.0,
+          "p10": -0.104817,
+          "p25": -0.00665,
+          "p75": 0.012903,
+          "p90": 0.0479
+        },
+        "ret_4h": {
+          "n": 24,
+          "median": 0.0,
+          "p10": -0.448055,
+          "p25": -0.037114,
+          "p75": 0.029425,
+          "p90": 0.138627
+        },
+        "mdd_4h": {
+          "n": 24,
+          "median": 0.00665,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p75": 0.068031,
+          "p90": 0.429966
+        }
+      },
+      "1-7d": {
+        "ret_1h": {
+          "n": 2,
+          "median": -0.004752,
+          "p10": -0.068773,
+          "p25": -0.068773,
+          "p75": -0.004752,
+          "p90": -0.004752
+        },
+        "ret_4h": {
+          "n": 2,
+          "median": 0.038697,
+          "p10": -0.204229,
+          "p25": -0.204229,
+          "p75": 0.038697,
+          "p90": 0.038697
+        },
+        "mdd_4h": {
+          "n": 2,
+          "median": 0.174257,
+          "p10": 0.004752,
+          "p25": 0.004752,
+          "p75": 0.174257,
+          "p90": 0.174257
+        }
+      },
+      "<1h": {
+        "ret_1h": {
+          "n": 10,
+          "median": -0.124938,
+          "p10": -0.99128,
+          "p25": -0.988571,
+          "p75": 0.0,
+          "p90": 1.014659
+        },
+        "ret_4h": {
+          "n": 10,
+          "median": -0.936877,
+          "p10": -0.991003,
+          "p25": -0.98855,
+          "p75": 0.0,
+          "p90": 23.750987
+        },
+        "mdd_4h": {
+          "n": 10,
+          "median": 0.949435,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p75": 0.988577,
+          "p90": 0.998362
+        }
+      },
+      ">7d": {
+        "ret_1h": {
+          "n": 4,
+          "median": 0.001753,
+          "p10": -0.136695,
+          "p25": 0.00101,
+          "p75": 0.007027,
+          "p90": 0.007027
+        },
+        "ret_4h": {
+          "n": 4,
+          "median": -0.004324,
+          "p10": -0.295305,
+          "p25": -0.220969,
+          "p75": 0.253287,
+          "p90": 0.253287
+        },
+        "mdd_4h": {
+          "n": 4,
+          "median": 0.247512,
+          "p10": 0.014414,
+          "p25": 0.030675,
+          "p75": 0.301237,
+          "p90": 0.301237
+        }
+      }
+    },
+    "all_signals": {
+      "ret_1h": {
+        "n": 40,
+        "median": 0.0,
+        "p10": -0.63991,
+        "p25": -0.068773,
+        "p75": 0.006326,
+        "p90": 0.0479
+      },
+      "ret_4h": {
+        "n": 40,
+        "median": -0.004324,
+        "p10": -0.98855,
+        "p25": -0.220969,
+        "p75": 0.020466,
+        "p90": 0.250582
+      },
+      "mdd_4h": {
+        "n": 40,
+        "median": 0.016487,
+        "p10": 0.0,
+        "p25": 0.0,
+        "p75": 0.301237,
+        "p90": 0.991359
+      }
+    },
+    "n_no_series": 0,
+    "n_no_snap": 0
+  }
+}

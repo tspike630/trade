@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from typing import assert_never
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, assert_never
 
 from nicegui import ui
 
-from dashboard.data import DataStore, DecisionWindowStats, FailureRow, ProcessProbe, RateBlock
+from dashboard.data import DataStore, DecisionWindowStats, FailureRow, ProcessProbe, RateBlock, connect_ro
 from dashboard.format_util import (
     Liveness,
     confirm_label,
@@ -18,7 +22,16 @@ from dashboard.format_util import (
     short_addr,
 )
 from dashboard.panels.common import col, data_table, kpi, panel_box, show_unavailable, slow_hint
-from dashboard.settings import GateStatus, read_gates
+from dashboard.settings import GateStatus, db_root, read_gates
+
+log = logging.getLogger("dashboard.panels.risk")
+
+# §10 observe fallbacks — display only when JSON / prior.db reads fail.
+_FALLBACK_PEAK_P50_MIN = 1.0
+_FALLBACK_SURVIVE_4H = 0.753
+_FALLBACK_SAME_DAY_DEATH = 0.6867
+_FALLBACK_GRADUATION = 0.002
+_OBSERVE = "观察中·不调权"
 
 
 def render_risk(store: DataStore) -> None:
@@ -26,6 +39,7 @@ def render_risk(store: DataStore) -> None:
     extra = "risk-live" if gates.live_effective else ""
     with panel_box("风险", "闸门只读。本看板不能修改环境变量或杀开关。", extra):
         _gates(gates)
+        _priors()
         _today(store)
         _week(store)
         _processes(store)
@@ -45,6 +59,244 @@ def _gates(status: GateStatus) -> None:
     ui.label(
         "关是当前预期状态（模拟盘未开闸）。实盘若变为「开启」会标红。这里没有开关。"
     ).classes("muted gate-note")
+
+
+@dataclass(frozen=True)
+class _PriorKpis:
+    peak_p50_min: float
+    survive_4h: float
+    same_day_death: float
+    graduation_rate: float
+    peak_hint: str
+    survive_hint: str
+    death_hint: str
+    grad_hint: str
+    load_note: str
+    keys_used: tuple[str, ...]
+
+
+def _prior_candidate_roots() -> list[Path]:
+    """Prefer DASHBOARD_DB_ROOT, then project root (parent of dashboard/)."""
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in (db_root(), Path(__file__).resolve().parent.parent.parent):
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+    return roots
+
+
+def _prior_json_paths() -> list[Path]:
+    return [root / "data" / "prior" / "exports" / "baseline_params.json" for root in _prior_candidate_roots()]
+
+
+def _prior_db_paths() -> list[Path]:
+    return [root / "data" / "prior" / "db" / "prior.db" for root in _prior_candidate_roots()]
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return number
+
+
+def _load_baseline_json() -> tuple[dict[str, Any] | None, str]:
+    errors: list[str] = []
+    for path in _prior_json_paths():
+        try:
+            if not path.is_file():
+                errors.append(f"missing {path.name}")
+                continue
+            with path.open(encoding="utf-8") as handle:
+                raw = json.load(handle)
+            if isinstance(raw, dict):
+                return raw, str(path)
+            errors.append(f"invalid json shape at {path.name}")
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            log.warning("prior baseline json read failed path=%s err=%s", path, exc)
+            errors.append(f"{path.name}: {exc}")
+    return None, "; ".join(errors) if errors else "baseline_params.json unavailable"
+
+
+def _extract_from_json(params: dict[str, Any]) -> dict[str, float | None]:
+    """Map baseline_params.json keys to the four §10 KPIs."""
+    trio = params.get("weekly_baseline_trio") if isinstance(params.get("weekly_baseline_trio"), dict) else {}
+    redpump = params.get("redpump") if isinstance(params.get("redpump"), dict) else {}
+    cg = params.get("coingecko") if isinstance(params.get("coingecko"), dict) else {}
+    gmgn = params.get("gmgn") if isinstance(params.get("gmgn"), dict) else {}
+    self_db = params.get("self_db") if isinstance(params.get("self_db"), dict) else {}
+    survive = self_db.get("survive") if isinstance(self_db.get("survive"), dict) else {}
+
+    peak = _as_float(gmgn.get("median_peak_min"))
+    survive_4h = _as_float(survive.get("4h"))
+    same_day = _as_float(trio.get("same_day_death_rate"))
+    if same_day is None:
+        same_day = _as_float(cg.get("same_day_death_rate"))
+    graduation = _as_float(trio.get("graduation_rate"))
+    if graduation is None:
+        graduation = _as_float(redpump.get("graduation_rate"))
+
+    return {
+        "peak_p50_min": peak,
+        "survive_4h": survive_4h,
+        "same_day_death": same_day,
+        "graduation_rate": graduation,
+    }
+
+
+def _json_hints(params: dict[str, Any]) -> dict[str, str]:
+    meta = params.get("meta") if isinstance(params.get("meta"), dict) else {}
+    gmgn = params.get("gmgn") if isinstance(params.get("gmgn"), dict) else {}
+    n = meta.get("gmgn_n")
+    if n is None:
+        n = gmgn.get("n") or gmgn.get("acceptance_unique_tokens")
+    pack = meta.get("gmgn_pack") or ("完整数据集" if gmgn.get("complete_pack") else "GMGN")
+    peak_hint = f"GMGN {pack} n={n} · {_OBSERVE}" if n is not None else f"GMGN · {_OBSERVE}"
+    return {
+        "peak_hint": peak_hint,
+        "survive_hint": f"自库 self_survival，短窗 · {_OBSERVE}",
+        "death_hint": f"CoinGecko · {_OBSERVE}",
+        "grad_hint": f"RED-PUMP · {_OBSERVE}",
+    }
+
+
+def _load_baseline_history_row() -> dict[str, float | None] | None:
+    """Read-only latest baseline_history row; never writes prior.db."""
+    for path in _prior_db_paths():
+        try:
+            if not path.is_file():
+                continue
+            conn = connect_ro(path)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT peak_p50_min, survive_4h, same_day_death_rate, graduation_rate
+                    FROM baseline_history
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is None:
+                continue
+            return {
+                "peak_p50_min": _as_float(row["peak_p50_min"]),
+                "survive_4h": _as_float(row["survive_4h"]),
+                "same_day_death": _as_float(row["same_day_death_rate"]),
+                "graduation_rate": _as_float(row["graduation_rate"]),
+            }
+        except (OSError, FileNotFoundError, Exception) as exc:  # noqa: BLE001 — degrade to fallback
+            log.warning("prior.db baseline_history read failed path=%s err=%s", path, exc)
+    return None
+
+
+def _load_prior_kpis() -> _PriorKpis:
+    """Prefer baseline_params.json; fill gaps from prior.db; else hardcoded fallbacks."""
+    defaults = {
+        "peak_p50_min": _FALLBACK_PEAK_P50_MIN,
+        "survive_4h": _FALLBACK_SURVIVE_4H,
+        "same_day_death": _FALLBACK_SAME_DAY_DEATH,
+        "graduation_rate": _FALLBACK_GRADUATION,
+    }
+    default_hints = {
+        "peak_hint": f"GMGN 完整 n=956 · {_OBSERVE}",
+        "survive_hint": f"自库 self_survival，短窗 · {_OBSERVE}",
+        "death_hint": f"CoinGecko · {_OBSERVE}",
+        "grad_hint": f"RED-PUMP · {_OBSERVE}",
+    }
+    values = dict(defaults)
+    keys_used: list[str] = []
+    load_note = ""
+    hints = dict(default_hints)
+
+    params, json_meta = _load_baseline_json()
+    json_ok = params is not None
+    if json_ok and params is not None:
+        extracted = _extract_from_json(params)
+        hints.update(_json_hints(params))
+        for field, number in extracted.items():
+            if number is not None:
+                values[field] = number
+                keys_used.append(f"json:{field}")
+    else:
+        load_note = f"先验 JSON 不可用（{json_meta}），已用对照回退。"
+
+    missing = [
+        name
+        for name in ("peak_p50_min", "survive_4h", "same_day_death", "graduation_rate")
+        if f"json:{name}" not in keys_used
+    ]
+    if missing:
+        db_row = _load_baseline_history_row()
+        if db_row:
+            for name in missing:
+                number = db_row.get(name)
+                if number is not None:
+                    values[name] = number
+                    keys_used.append(f"db:{name}")
+            still_missing = [name for name in missing if f"db:{name}" not in keys_used]
+            if not json_ok and any(k.startswith("db:") for k in keys_used):
+                load_note = "先验 JSON 不可用，已从 prior.db baseline_history 读取。"
+            elif still_missing and not load_note:
+                load_note = "部分先验字段缺失，已用内置对照值。"
+        elif not json_ok:
+            load_note = f"先验读取失败（{json_meta}），已显示内置对照值。"
+        elif not load_note:
+            load_note = "部分先验字段缺失且 prior.db 不可用，已用内置对照值。"
+
+    for name in ("peak_p50_min", "survive_4h", "same_day_death", "graduation_rate"):
+        if f"json:{name}" not in keys_used and f"db:{name}" not in keys_used:
+            keys_used.append(f"fallback:{name}")
+
+    return _PriorKpis(
+        peak_p50_min=float(values["peak_p50_min"]),
+        survive_4h=float(values["survive_4h"]),
+        same_day_death=float(values["same_day_death"]),
+        graduation_rate=float(values["graduation_rate"]),
+        peak_hint=hints["peak_hint"],
+        survive_hint=hints["survive_hint"],
+        death_hint=hints["death_hint"],
+        grad_hint=hints["grad_hint"],
+        load_note=load_note,
+        keys_used=tuple(keys_used),
+    )
+
+
+def _fmt_peak_min(value: float) -> str:
+    return f"{value:.1f} min"
+
+
+def _fmt_pct1(value: float) -> str:
+    return f"{value * 100:.1f}%"
+
+
+def _fmt_pct2(value: float) -> str:
+    return f"{value * 100:.2f}%"
+
+
+def _priors() -> None:
+    """§10 observe baselines — display only; never touch weights/gates/env/execution."""
+    kpis = _load_prior_kpis()
+    ui.label("先验对照（观察中·不调权）").classes("section-label")
+    with ui.element("div").classes("kpi-grid"):
+        kpi("见顶 P50", _fmt_peak_min(kpis.peak_p50_min), kpis.peak_hint)
+        kpi("4h 存活", _fmt_pct1(kpis.survive_4h), kpis.survive_hint)
+        kpi("当天死", _fmt_pct2(kpis.same_day_death), kpis.death_hint)
+        kpi("毕业率", _fmt_pct1(kpis.graduation_rate), kpis.grad_hint)
+    ui.label(
+        "§10 观察基线，只读对照。不改策略权重、闸门、环境变量或执行。"
+    ).classes("muted gate-note")
+    if kpis.load_note:
+        ui.label(kpis.load_note).classes("muted gate-note")
 
 
 def _live_face(status: GateStatus) -> tuple[str, str]:

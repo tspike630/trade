@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Iterator
 
 from nicegui import ui
+
+log = logging.getLogger("dashboard.panels")
 
 UNAVAILABLE = "数据不可用"
 
@@ -33,6 +37,33 @@ def show_unavailable(reason: str) -> None:
     with ui.element("div").classes("unavailable"):
         ui.label(UNAVAILABLE).classes("unavailable-title")
         ui.label(reason or "未知原因").classes("unavailable-reason")
+
+
+def retry_button(on_retry: Callable[[], None] | None) -> None:
+    """Error-state retry. Callers keep their own queries; this only redraws."""
+    if on_retry is None:
+        return
+    ui.button("重试", on_click=on_retry).props("outline dense").classes("ghost-btn")
+
+
+def panel_guard(
+    title: str,
+    render: Callable[[], None],
+    *,
+    on_retry: Callable[[], None] | None = None,
+) -> None:
+    """Run a panel render. Failures become the existing unavailable block plus retry.
+
+    Queries stay inside the panel. There is no separate loading frame: SQLite
+    reads are synchronous, and a spinner would only flash for the same call.
+    """
+    try:
+        render()
+    except Exception:
+        log.warning("panel render failed: %s", title)
+        with panel_box(title):
+            show_unavailable(f"{title} 渲染失败")
+            retry_button(on_retry)
 
 
 def empty_state(title: str, detail: str) -> None:
@@ -67,6 +98,7 @@ def data_table(
     *,
     row_key: str = "id",
     color_fields: tuple[str, ...] = (),
+    on_row_click: Callable[[dict[str, object]], None] | None = None,
 ) -> None:
     if not rows:
         ui.label("暂无记录").classes("muted")
@@ -77,3 +109,16 @@ def data_table(
         for field in color_fields:
             html = _CELL_SLOT.replace("__CLASS__", f"{field}_class")
             table.add_slot(f"body-cell-{field}", html)
+        if on_row_click is not None:
+            def handle(event: object) -> None:
+                args = getattr(event, "args", None)
+                row: dict[str, object] | None = None
+                if isinstance(args, dict):
+                    nested = args.get("row", args)
+                    if isinstance(nested, dict):
+                        row = nested
+                elif isinstance(args, (list, tuple)) and len(args) >= 2 and isinstance(args[1], dict):
+                    row = args[1]
+                if row is not None:
+                    on_row_click(row)
+            table.on("rowClick", handle)

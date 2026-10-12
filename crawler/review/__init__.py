@@ -5,7 +5,10 @@ from review.data import (
     DbPaths,
     SignalChainRow,
     annotate_forward_returns,
+    annotate_token_age,
+    load_ccxt_market_baseline,
     load_market_baseline,
+    load_sentiment_spike_linkage,
     load_signal_chain,
     summarize_execution,
 )
@@ -20,19 +23,23 @@ from review.optimizer import (
 )
 from review.report import render_weekly_md, write_report
 from review.evolution import build_evolution_suggestions, format_evolution_section
+from review.joint import joint_jev_age_prior
 
 __all__ = [
     "DbPaths",
     "OptimizeResult",
     "SignalChainRow",
     "annotate_forward_returns",
+    "annotate_token_age",
     "build_evolution_suggestions",
     "build_param_grid",
     "format_evolution_section",
     "compute_signal_metrics",
     "fill_attribution",
     "format_optimize_summary",
+    "load_ccxt_market_baseline",
     "load_market_baseline",
+    "load_sentiment_spike_linkage",
     "load_signal_chain",
     "optimize",
     "render_weekly_md",
@@ -41,5 +48,6 @@ __all__ = [
     "slice_jev_filtered",
     "summarize_execution",
     "time_split",
+    "joint_jev_age_prior",
     "write_report",
 ]
