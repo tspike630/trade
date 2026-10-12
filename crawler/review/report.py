@@ -753,6 +753,25 @@ def _render_factor_layer_section(
         lines.append("")
     lines.append("> 只观察不调权；分层结论待样本累计；落地须走 R4。")
     lines.append("")
+    ic_hist = factor_layers.get("ic_history") or {}
+    summary = ic_hist.get("summary") or {}
+    if summary:
+        lines.append("### IC 历史序列（多期，因子有效性）")
+        lines.append("")
+        lines.append(
+            "> **Caveat（钉死）：** IC mean/IR 观察用；单期 IC 噪音大，连续多期 IR≥0.5 才谈「有效候选」；不触发任何自动动作。"
+        )
+        lines.append("")
+        lines.append("| factor | 期数 | IC mean | IC std | IR | 稳定性 |")
+        lines.append("|---|---:|---:|---:|---:|---|")
+        for fname, s in sorted(summary.items()):
+            lines.append(
+                f"| `{fname}` | {s['n_periods']} | {_num(s.get('ic_mean'), 3)} | "
+                f"{_num(s.get('ic_std'), 3)} | {_num(s.get('ir'), 2)} | {s.get('stability', '')} |"
+            )
+        lines.append("")
+        lines.append(f"> 历史文件：`{ic_hist.get('path', '')}`（幂等追加，同期重跑覆盖）")
+        lines.append("")
     return lines
 
 

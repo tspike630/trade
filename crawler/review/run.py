@@ -42,6 +42,7 @@ from review.factor_layers import (
     list_factors,
     performance_matrix,
 )
+from review.factor_ic_history import load_history, summarize_all, upsert_row
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PERIOD_RE = re.compile(r"^(\d+)([dDhHmM])$")
@@ -186,6 +187,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--factors",
         default=None,
         help="comma-separated factor names for layers (default: all registered)",
+    )
+    parser.add_argument(
+        "--ic-history",
+        default=None,
+        help="IC history CSV path (default exports/reports/factor_ic_history.csv; "
+        "only with --factor-layers)",
     )
     args = parser.parse_args(argv)
 
@@ -353,6 +360,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "layers": layers,
                 "matrix": performance_matrix(metrics.get("by_strategy") or {}),
                 "factors": sorted(layers),
+            }
+            # IC 历史：当期 IC 入 csv（同期覆盖）+ 多期汇总。仅 --factor-layers 时写。
+            hist_path = (
+                Path(args.ic_history)
+                if args.ic_history
+                else db_root / "exports" / "reports" / "factor_ic_history.csv"
+            )
+            period_end_key = period_end[:10]
+            for fname, res in layers.items():
+                upsert_row(
+                    hist_path,
+                    period_end_key,
+                    fname,
+                    res.get("ic"),
+                    res.get("monotonic", "n/a"),
+                    int(res.get("n", 0)),
+                )
+            hist = load_history(hist_path)
+            factor_layer_result["ic_history"] = {
+                "path": str(hist_path.resolve()),
+                "summary": summarize_all(hist, sorted(layers)),
             }
         md = render_weekly_md(
             period_start=period_start,
