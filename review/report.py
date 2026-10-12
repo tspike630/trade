@@ -285,7 +285,7 @@ def render_weekly_md(
     evolution_suggestions: Optional[list[dict[str, Any]]] = None,
     factor_layers: Optional[dict[str, Any]] = None,
 ) -> str:
-    """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议 + 可选§11 因子分层）。"""
+    """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议 + 可选§11 因子分层 + §12 因子进化指针）。"""
     n = len(chain)
     n_exec = sum(1 for r in chain if r.exec_id is not None)
     n_pos = sum(1 for r in chain if r.position_id is not None)
@@ -481,6 +481,16 @@ def render_weekly_md(
 
     # 11. 因子分层（默认关；§8 归因保持原样）
     lines.extend(_render_factor_layer_section(factor_layers))
+
+    # 12. 因子进化引用（不改写 §1–§11 正文；不自动激活）
+    lines.append("## 12. 因子进化（候选，不自动激活）")
+    lines.append("")
+    lines.append(
+        "本周候选因子、回测与门槛见 `python -m review.factor_loop` 产物："
+        "`review/factor_candidates.db` 与 `exports/reports/factor_loop_*.md`。"
+        "过门槛只记 status=accepted（待人工激活），不自动启用策略、不自动调参。"
+    )
+    lines.append("")
 
     lines.append("---")
     lines.append("")
