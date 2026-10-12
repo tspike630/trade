@@ -36,6 +36,12 @@ from review.optimizer import (
     optimize,
 )
 from review.evolution import build_evolution_suggestions
+from review.factor_layers import (
+    FACTOR_GETTERS,
+    factor_layers,
+    list_factors,
+    performance_matrix,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PERIOD_RE = re.compile(r"^(\d+)([dDhHmM])$")
@@ -169,6 +175,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="R3 scaffold: param-grid / time-split dry-run "
         "(skip if history/samples insufficient; never writes config)",
+    )
+    parser.add_argument(
+        "--factor-layers",
+        action="store_true",
+        help="append §11 factor layer tables + performance matrix "
+        "(default off; does not change §1–§10)",
+    )
+    parser.add_argument(
+        "--factors",
+        default=None,
+        help="comma-separated factor names for layers (default: all registered)",
     )
     args = parser.parse_args(argv)
 
@@ -319,6 +336,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             db_root=db_root,
         )
         print(f"evolution: {len(evo)} suggestions")
+        factor_layer_result: Optional[dict[str, Any]] = None
+        if args.factor_layers:
+            want = [
+                f.strip() for f in (args.factors or "").split(",") if f.strip()
+            ] or list_factors()
+            layers: dict[str, Any] = {}
+            for fname in want:
+                if fname not in FACTOR_GETTERS:
+                    print(f"warning: unknown factor {fname!r}; skip", file=sys.stderr)
+                    continue
+                res = factor_layers(chain, fname, min_samples=10)
+                if res is not None:
+                    layers[fname] = res
+            factor_layer_result = {
+                "layers": layers,
+                "matrix": performance_matrix(metrics.get("by_strategy") or {}),
+                "factors": sorted(layers),
+            }
         md = render_weekly_md(
             period_start=period_start,
             period_end=period_end,
@@ -339,6 +374,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             optimize_section=optimize_section,
             evolution_suggestions=evo,
             db_root=db_root,
+            factor_layers=factor_layer_result,
         )
         written = write_report(md, str(out_path))
         print(f"report: {written}")
