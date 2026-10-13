@@ -1,0 +1,19 @@
+2026-10-12T09:40:48+0800 INFO [dexscreener.decision_engine.backtest.run] backtest start strategies=['combined_jev_tech_v1', 'jev_strength_v1', 'tech_momentum_v1'] days=7.0 bar=5m filter=True dry_run=True db=/workspace/dexscreener-crawler/dexscreener.db
+2026-10-12T09:40:48+0800 INFO [dexscreener.decision_engine.backtest.replay] replay open ro db=/workspace/dexscreener-crawler/dexscreener.db
+2026-10-12T09:40:48+0800 INFO [dexscreener.decision_engine.backtest.engine] backtest window start=2026-10-09T19:12:00+00:00 end=2026-10-12T01:40:46+00:00 ind=153447 pairs=681477 tokens=14843 bars≈654 sufficient=True msg=requested --days=7 but available≈2.27d (2026-10-09T19:12:00Z → 2026-10-12T01:40:46Z); using available window
+2026-10-12T09:40:53+0800 INFO [dexscreener.decision_engine.backtest.replay] replay yielded bars=459 tokens_window=14843 ind_rows=153447
+2026-10-12T09:40:53+0800 INFO [dexscreener.decision_engine.backtest.engine] backtest done bars=459 signals=3895 filtered=2494 opens=199 closes=199
+BACKTEST OK
+  run_id: dc896366-af01-4c4b-b009-95938b10f292
+  ledger: /workspace/dexscreener-crawler/backtest_ledger.db
+  message: requested --days=7 but available≈2.27d (2026-10-09T19:12:00Z → 2026-10-12T01:40:46Z); using available window
+  window: 2026-10-09T19:12:00Z → 2026-10-12T01:40:46Z ind=153447 pairs=681477 tokens=14843
+  stats: bars=459 signals=3895 filtered=2494 opens=199 closes=199
+
+| strategy_id | trades | win_rate | PF | MDD% | return% | final_eq |
+|---|---:|---:|---:|---:|---:|---:|
+| combined_jev_tech_v1 | 56 | 66.1% | 1.43 | 11.00 | 18.88 | 11887.58 |
+| jev_strength_v1 | 117 | 64.1% | 1.25 | 7.82 | 7.20 | 10719.97 |
+| tech_momentum_v1 | 26 | 57.7% | 1.97 | 4.51 | 14.16 | 11415.50 |
+
+Note: Step 2 delivers the FRAMEWORK. Strategy edge / JEV validity conclusions remain deferred to weekly check — do not treat these numbers as production readiness.

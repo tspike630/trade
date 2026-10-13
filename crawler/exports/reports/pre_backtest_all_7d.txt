@@ -1,0 +1,25 @@
+=== pre-backtest all strategies, ~7d, dry-run ===
+time: 2026-10-10 17:42:30 HKT
+command: .venv/bin/python -m decision_engine.backtest.run --strategy all --days 7 --dry-run
+cwd: /workspace/dexscreener-crawler
+exit_code: 0
+=== stdout/stderr ===
+2026-10-10T17:42:23+0800 INFO [dexscreener.decision_engine.backtest.run] backtest start strategies=['combined_jev_tech_v1', 'jev_strength_v1', 'tech_momentum_v1'] days=7.0 bar=5m filter=True dry_run=True db=/workspace/dexscreener-crawler/dexscreener.db
+2026-10-10T17:42:23+0800 INFO [dexscreener.decision_engine.backtest.replay] replay open ro db=/workspace/dexscreener-crawler/dexscreener.db
+2026-10-10T17:42:23+0800 INFO [dexscreener.decision_engine.backtest.engine] backtest window start=2026-10-09T19:12:00+00:00 end=2026-10-10T07:21:26+00:00 ind=89377 pairs=149858 tokens=6352 bars≈146 sufficient=True msg=requested --days=7 but available≈0.51d (2026-10-09T19:12:00Z → 2026-10-10T07:21:26Z); using available window
+2026-10-10T17:42:24+0800 INFO [dexscreener.decision_engine.backtest.replay] replay yielded bars=135 tokens_window=6352 ind_rows=89377
+2026-10-10T17:42:24+0800 INFO [dexscreener.decision_engine.backtest.engine] backtest done bars=135 signals=2083 filtered=1288 opens=124 closes=124
+BACKTEST OK
+  run_id: ca410ca9-d23c-4f29-be1b-fe23e4c98d39
+  ledger: /workspace/dexscreener-crawler/backtest_ledger.db
+  message: requested --days=7 but available≈0.51d (2026-10-09T19:12:00Z → 2026-10-10T07:21:26Z); using available window
+  window: 2026-10-09T19:12:00Z → 2026-10-10T07:21:26Z ind=89377 pairs=149858 tokens=6352
+  stats: bars=135 signals=2083 filtered=1288 opens=124 closes=124
+
+| strategy_id | trades | win_rate | PF | MDD% | return% | final_eq |
+|---|---:|---:|---:|---:|---:|---:|
+| combined_jev_tech_v1 | 44 | 70.5% | 1.44 | 11.00 | 14.23 | 11423.30 |
+| jev_strength_v1 | 55 | 65.5% | 0.61 | 6.21 | -5.68 | 9432.04 |
+| tech_momentum_v1 | 25 | 56.0% | 2.78 | 4.51 | 18.40 | 11840.47 |
+
+Note: Step 2 delivers the FRAMEWORK. Strategy edge / JEV validity conclusions remain deferred to weekly check — do not treat these numbers as production readiness.
