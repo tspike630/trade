@@ -29,6 +29,7 @@ from dashboard.data import DataStore
 from dashboard.format_util import fmt_age, fmt_rate, liveness_label
 from dashboard.panels import risk as risk_panel
 from dashboard.panels.common import panel_box, panel_guard, show_unavailable
+from dashboard.panels.evolution import render_evolution_body
 from dashboard.panels.markets import render_markets
 from dashboard.panels.registry import PANELS
 from dashboard.panels.shell import (
@@ -667,6 +668,7 @@ body { margin: 0; }
 .v2-comp.span-4 { grid-column: span 4; }
 .v2-comp.span-6 { grid-column: span 6; }
 .v2-comp.span-8 { grid-column: span 8; }
+.v2-comp.span-12 { grid-column: span 12; }
 .v2-head {
   display: flex; align-items: center; gap: 8px; padding: 5px 10px;
   background: var(--v2-header); border-bottom: 1px solid var(--v2-border); flex-shrink: 0;
@@ -1102,6 +1104,13 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     "span-6",
                     lambda: _v2_btnews(store),
                     foot="latest_backtest · news_events",
+                )
+                _v2_comp(
+                    ("进化", "建议"),
+                    "span-12",
+                    render_evolution_body,
+                    foot="周报 §10 · 只观察 · 不调权",
+                    tools=("只读",),
                 )
                 ui.label("阶段一只读监控。手动交易确认不在本看板内。").classes("footer-note")
 

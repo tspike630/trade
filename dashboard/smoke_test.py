@@ -26,6 +26,12 @@ from pathlib import Path
 from dashboard.auth import SecretFilter, verify_api_key
 from dashboard.data import DataStore, DbPaths, _WRITE_RE, connect_ro
 from dashboard.format_util import fmt_hold, fmt_liq, fmt_pct, fmt_usd
+from dashboard.panels.evolution import (
+    find_latest_weekly_report,
+    load_evolution_suggestions,
+    parse_evolution_section,
+    status_class,
+)
 from dashboard.panels.registry import PANELS
 from dashboard.panels.shell import (
     TOP_TABS,
@@ -693,11 +699,12 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(fmt_usd(-2, signed=True), "-$2.00")
         self.assertEqual(fmt_liq(12345.6), "$12.3K")
         self.assertEqual(fmt_hold(5400), "1小时30分")
-        self.assertEqual([item.id for item in PANELS], ["risk", "positions", "signals", "execution", "market"])
+        self.assertEqual([item.id for item in PANELS], ["risk", "positions", "signals", "execution", "market", "evolution"])
         self.assertEqual(panel_group("risk"), "overview")
         self.assertEqual(panel_group("positions"), "overview")
         self.assertEqual(panel_group("signals"), "signals")
         self.assertEqual(panel_group("execution"), "execution")
+        self.assertEqual(panel_group("evolution"), "overview")
         self.assertEqual(panel_group("later"), "overview")
         self.assertEqual(heartbeat_summary(["alive", "stale", "unknown"]), ("进程 1/3 存活", "ok"))
         self.assertEqual(heartbeat_summary(["stale"]), ("进程 0/1 存活", "warn"))
@@ -998,6 +1005,63 @@ class DashboardSmokeTest(unittest.TestCase):
             self.assertNotIn(f'@ui.page("{dead}', app_text)
         self.assertIn("v2-subbar", inspect.getsource(app_module._module_tabs))
         self.assertNotIn("v2-subbar", inspect.getsource(app_module._render_dashboard))
+
+
+    def test_evolution_section_parse_and_registry(self) -> None:
+        sample = (
+            "# weekly\n\n"
+            "## 9. 其他\n\nignore\n\n"
+            "## 10. 进化建议\n\n"
+            "> note\n\n"
+            "| 层 | 项 | 状态 | 证据 | 行动提示 |\n"
+            "|---|---|---|---|---|\n"
+            "| 采集 | age 覆盖 | **观察中** | unknown=0/40 evidence long text | 继续观察；落地须走 R4 |\n"
+            "| 决策 | JEV 门槛 | **建议落地** | n=20 unique=12 | 交 R4 人工确认 |\n"
+            "| 复盘 | 退役规则 | **裁决** | 连续 2 周弱 | 止损退役 |\n\n"
+            "共 3 条；\n\n"
+            "### 基线滚动快照\n\n"
+            "| 层 | 项 | 状态 | 证据 | 行动提示 |\n"
+            "|---|---|---|---|---|\n"
+            "| 假 | 不该解析 | **观察中** | x | y |\n"
+        )
+        items = parse_evolution_section(sample)
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0].layer, "采集")
+        self.assertEqual(items[0].status, "观察中")
+        self.assertEqual(items[1].status, "建议落地")
+        self.assertEqual(items[2].status, "裁决")
+        self.assertEqual(status_class("观察中"), "muted")
+        self.assertEqual(status_class("**建议落地**"), "warn")
+        self.assertEqual(status_class("裁决"), "ok")
+        self.assertEqual(parse_evolution_section("# no section"), [])
+
+        reports = self.root / "exports" / "reports"
+        reports.mkdir(parents=True)
+        (reports / "review_weekly_2026-10-01.md").write_text(
+            "## 10. 进化建议\n\n_本期无进化建议（各层数据未交来）。_\n",
+            encoding="utf-8",
+        )
+        (reports / "review_weekly_2026-10-12.md").write_text(sample, encoding="utf-8")
+        latest = find_latest_weekly_report(self.root)
+        assert latest is not None
+        self.assertEqual(latest.name, "review_weekly_2026-10-12.md")
+        loaded, reason, source = load_evolution_suggestions(self.root)
+        self.assertIsNone(reason)
+        assert source is not None
+        self.assertEqual(source.name, "review_weekly_2026-10-12.md")
+        self.assertEqual(len(loaded), 3)
+        empty_root = self.root / "empty-exports"
+        empty_root.mkdir()
+        missing, miss_reason, miss_path = load_evolution_suggestions(empty_root)
+        self.assertEqual(missing, [])
+        self.assertIsNotNone(miss_reason)
+        self.assertIsNone(miss_path)
+        self.assertIn("evolution", [item.id for item in PANELS])
+        self.assertEqual(next(item.title for item in PANELS if item.id == "evolution"), "进化建议")
+        app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+        self.assertIn('("进化", "建议")', app_text)
+        self.assertIn("span-12", app_text)
+        self.assertIn("render_evolution_body", app_text)
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
