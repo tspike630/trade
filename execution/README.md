@@ -13,13 +13,33 @@ receipts into an **independent** `execution_ledger.db`.
 
 ## What it does
 
-1. Incremental read: `decision_log` where `id > last_processed_id`
+1. Incremental read: `decision_log` where `id > last_processed_id`. The SELECT adds `purpose` when `PRAGMA table_info` shows that column; older DBs omit it and purpose is read from `raw_json` only.
 2. Parse `pair_address` only from `json.loads(raw_json)["pair_address"]` (extras under `raw["extras"]`)
-3. Validate: `strategy_id`, `action∈{buy,sell}`, `chain_id`, `token_address`, `pair_address`, `size_pct∈(0,1]`
-4. Write one `execution_log` row per decision (always includes `strategy_id`)
-5. Advance cursor `last_processed_id` with **MAX** only (`--since-id` does not rewind it). A `decision_log_id` is claimed (`status=claimed`, unique) before execution; receipt, cursor, and `order_events` commit in one transaction. A bad row is stored as `rejected` and the cursor moves past it.
-6. **Step C:** `PositionManager.check_open` on buys (default pass-through when `PM_ENABLED=0`)
-7. **Step B only:** Paper fill with liquidity slippage; meta stores `strategy_id` + `decision_log_id`
+3. **Purpose gate** (before any fill): only `live_candidate` continues to validation. Other purposes are rejected with a receipt and the cursor advances, using the same claim pattern as other rejected rows. See below.
+4. Validate: `strategy_id`, `action∈{buy,sell}`, `chain_id`, `token_address`, `pair_address`, `size_pct∈(0,1]`
+5. Write one `execution_log` row per decision (always includes `strategy_id`)
+6. Advance cursor `last_processed_id` with **MAX** only (`--since-id` does not rewind it). A `decision_log_id` is claimed (`status=claimed`, unique) before execution; receipt, cursor, and `order_events` commit in one transaction. A bad row is stored as `rejected` and the cursor moves past it.
+7. **Step C:** `PositionManager.check_open` on buys (default pass-through when `PM_ENABLED=0`)
+8. **Step B only:** Paper fill with liquidity slippage; meta stores `strategy_id` + `decision_log_id`
+
+### Purpose gate (P2-38)
+
+Decision rows carry `purpose` (decision PR #37): `live_candidate` is the paper-eligible dry-run; `sample` is weekly JEV sampling and is not executable. `mode` stays `dry_run` / `live_stub` and is not the gate.
+
+Read order:
+
+1. `decision_log.purpose` when the SELECT included the column (NULL stays missing — historical rows are not backfilled and are not executable).
+2. Otherwise top-level `json.loads(raw_json)["purpose"]`.
+
+Compare after strip, case-sensitive. The only executable value is `live_candidate`. Anything else is a receipt with `status=rejected`, `executed=0`, `executor=step_a_noop`, and `reason` / `validation_errors`:
+
+| purpose | reason |
+|---------|--------|
+| `sample` | `purpose_sample` |
+| NULL, absent, or blank | `purpose_missing` |
+| any other value (`SAMPLE`, `Live_Candidate`, …) | `purpose_invalid` |
+
+The cursor advances. `order_events` (when `EXECUTION_EVENTS_ENABLED`) are `new` then `rejected` with `stage=purpose`, in the same transaction as the receipt. Dry-run (`EXECUTION_PAPER_ENABLED=0`) still writes that receipt — a sample row is not skipped silently. This does not turn on paper, PM, or risk.
 
 ### PositionManager rules (Step C)
 
