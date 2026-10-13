@@ -31,12 +31,13 @@ _INDICATOR_COLS = (
     "primary_pair_address",
     "updated_at",
     # 3-3: technical columns. Missing columns are dropped by _available_cols.
+    # token_indicators stores bands as boll_upper / boll_lower (not boll_up / boll_low).
     "rsi_14",
     "macd",
     "macd_signal",
     "boll_mid",
-    "boll_up",
-    "boll_low",
+    "boll_upper",
+    "boll_lower",
 )
 
 
