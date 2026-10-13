@@ -83,7 +83,9 @@ class ExecutionLedger:
                 validation_errors TEXT,
                 executed INTEGER NOT NULL DEFAULT 0,
                 executor TEXT,
-                receipt_json TEXT
+                receipt_json TEXT,
+                status TEXT,
+                status_updated_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_exec_log_decision
                 ON execution_log (decision_log_id);
@@ -96,7 +98,25 @@ class ExecutionLedger:
             );
             """
         )
+        self._ensure_status_columns()
         self.conn.commit()
+
+    def _ensure_status_columns(self) -> None:
+        """Idempotent migration: status + status_updated_at on execution_log.
+
+        CREATE TABLE IF NOT EXISTS does not add columns to an existing table,
+        so existing ledgers get ALTER TABLE once. Repeat opens are no-ops.
+        """
+        have = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(execution_log)").fetchall()
+        }
+        if "status" not in have:
+            self.conn.execute("ALTER TABLE execution_log ADD COLUMN status TEXT")
+        if "status_updated_at" not in have:
+            self.conn.execute(
+                "ALTER TABLE execution_log ADD COLUMN status_updated_at TEXT"
+            )
 
     # --- cursor ---
 
@@ -146,6 +166,8 @@ class ExecutionLedger:
         executor: str | None = None,
         receipt: dict[str, Any] | None = None,
         ts: str | None = None,
+        status: str | None = None,
+        status_updated_at: str | None = None,
     ) -> int:
         """Insert one execution_log row. strategy_id is required on every row."""
         if not strategy_id:
@@ -164,8 +186,9 @@ class ExecutionLedger:
             INSERT INTO execution_log (
                 ts, decision_log_id, strategy_id, action, chain_id,
                 token_address, pair_address, size_pct, reason, mode,
-                validation_ok, validation_errors, executed, executor, receipt_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                validation_ok, validation_errors, executed, executor, receipt_json,
+                status, status_updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now,
@@ -183,6 +206,8 @@ class ExecutionLedger:
                 int(executed),
                 executor,
                 receipt_json,
+                status,
+                status_updated_at,
             ),
         )
         self.conn.commit()

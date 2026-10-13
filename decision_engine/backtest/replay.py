@@ -88,7 +88,26 @@ class HistoryReplay:
         "composite_score",
         "tier",
         "primary_pair_address",
+        # 3-3: technical columns. Missing columns are dropped by _ind_cols.
+        "rsi_14",
+        "macd",
+        "macd_signal",
+        "boll_mid",
+        "boll_up",
+        "boll_low",
     )
+
+    def _ind_cols(self) -> tuple[str, ...]:
+        if not self._table_exists("indicator_history"):
+            return ()
+        try:
+            cols = {
+                str(r["name"])
+                for r in self.conn.execute("PRAGMA table_info(indicator_history)").fetchall()
+            }
+        except sqlite3.OperationalError:
+            return ()
+        return tuple(c for c in self._IND_COLS if c in cols)
 
     def __init__(
         self,
@@ -284,7 +303,11 @@ class HistoryReplay:
             return
 
         start_iso, end_iso = to_iso_z(w.start), to_iso_z(w.end)
-        cols = ", ".join(self._IND_COLS)
+        ind_cols = self._ind_cols()
+        if not ind_cols:
+            log.warning("indicator_history has no usable columns")
+            return
+        cols = ", ".join(ind_cols)
         rows = self.conn.execute(
             f"""
             SELECT {cols}
