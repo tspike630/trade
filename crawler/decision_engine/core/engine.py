@@ -31,6 +31,9 @@ class DecisionEngine:
         self.risk = risk or RiskManager()
         self.hot_limit = hot_limit
         self.tick_count = 0
+        resolved = getattr(adapter, "db_path", None)
+        if resolved is not None:
+            log.info("resolved DB_PATH=%s", resolved)
 
     def tick(self) -> dict[str, Any]:
         self.tick_count += 1

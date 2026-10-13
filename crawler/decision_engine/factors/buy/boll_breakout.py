@@ -17,6 +17,8 @@ class BollBreakoutBuyFactor(FactorBuyBase):
     def fit_tick(self, row: dict[str, Any]) -> dict[str, Any] | None:
         up = row.get("boll_upper")
         if up is None:
+            up = row.get("boll_up")  # legacy alias; stored column is boll_upper
+        if up is None:
             return None
         px = row.get("price_usd")
         if px is None:

@@ -87,6 +87,7 @@ class FactorStrategy(BaseStrategy):
             self.sell(
                 chain_id=str(pos.get("chain_id") or ""),
                 token_address=str(pos.get("token_address") or ""),
+                pair_address=pos.get("pair_address") or pos.get("primary_pair_address"),
                 size_pct=float(cand["size_pct"]),
                 reason=str(cand["reason"]),
             )

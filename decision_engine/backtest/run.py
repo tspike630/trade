@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -79,7 +80,6 @@ def build_strategies(ids: list[str], args: argparse.Namespace) -> list:
 def main(argv: list[str] | None = None) -> int:
     setup_logging()
     # Quiet per-bar strategy INFO spam during replay (engine still logs summary)
-    import logging
     for name in (
         "dexscreener.decision_engine.jev_strategy",
         "dexscreener.decision_engine.tech_strategy",
@@ -162,8 +162,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fail closed when coverage missing (default: fail-open)",
     )
-    # strategy thresholds
-    parser.add_argument("--min-jev-strength", type=float, default=0.15)
+    # strategy thresholds — default matches live JEV_MIN_STRENGTH (not the 0.15 sample).
+    # Weekly / exploratory sampling must pass --min-jev-strength 0.15 explicitly.
+    parser.add_argument(
+        "--min-jev-strength",
+        type=float,
+        default=de_config.JEV_MIN_STRENGTH,
+        help=(
+            "JEV buy threshold for jev/combined strategies "
+            f"(default {de_config.JEV_MIN_STRENGTH} from JEV_MIN_STRENGTH / "
+            "DECISION_JEV_MIN_STRENGTH, same as live). "
+            "Weekly sampling that wants 0.15 must pass --min-jev-strength 0.15 explicitly."
+        ),
+    )
     parser.add_argument("--min-change-5m", type=float, default=2.0)
     parser.add_argument("--min-volume-strength", type=float, default=0.5)
     parser.add_argument(

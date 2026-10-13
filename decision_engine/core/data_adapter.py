@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine import config as de_config
+
 log = get_logger("decision_engine.data_adapter")
 
-# Columns we care about for Step 1 strategies
+# Columns we care about for Step 1 strategies.
+# token_indicators stores bands as boll_upper / boll_lower (not boll_up / boll_low).
+# Missing columns are dropped by _available_cols.
 _INDICATOR_COLS = (
     "chain_id",
     "token_address",
@@ -30,20 +35,25 @@ _INDICATOR_COLS = (
     "tier",
     "primary_pair_address",
     "updated_at",
-    # 3-3: technical columns. Missing columns are dropped by _available_cols.
     "rsi_14",
     "macd",
     "macd_signal",
     "boll_mid",
-    "boll_up",
-    "boll_low",
+    "boll_upper",
+    "boll_lower",
 )
+
+_BOLL_COLS = ("boll_upper", "boll_mid", "boll_lower")
 
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     return {k: row[k] for k in row.keys()}
+
+
+def _iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class IndicatorDataAdapter:
@@ -56,6 +66,7 @@ class IndicatorDataAdapter:
         self.db_path = Path(db_path).resolve()
         self._use_ro_uri = use_ro_uri
         self._conn: sqlite3.Connection | None = None
+        self._logged_boll = False
         self._open()
 
     def _open(self) -> None:
@@ -69,6 +80,7 @@ class IndicatorDataAdapter:
             except sqlite3.OperationalError:
                 self._conn = sqlite3.connect(":memory:")
                 log.warning("opened in-memory stub; no indicator rows available")
+                self._log_boll_columns()
                 return
         else:
             try:
@@ -84,6 +96,28 @@ class IndicatorDataAdapter:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout = 5000")
         log.info("data_adapter open ro db=%s", self.db_path)
+        self._log_boll_columns()
+
+    def _log_boll_columns(self) -> None:
+        """Log which Bollinger columns this DB actually has (once per adapter)."""
+        if self._logged_boll:
+            return
+        self._logged_boll = True
+        present = self._table_columns("token_indicators")
+        if not present:
+            log.info("token_indicators boll columns selected=(none) table_missing=1")
+            return
+        chosen = [c for c in _BOLL_COLS if c in present]
+        missing = [c for c in _BOLL_COLS if c not in present]
+        log.info(
+            "token_indicators boll columns selected=%s",
+            ",".join(chosen) if chosen else "(none)",
+        )
+        if missing:
+            log.warning(
+                "token_indicators missing boll columns (PRAGMA filtered): %s",
+                ",".join(missing),
+            )
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -108,16 +142,21 @@ class IndicatorDataAdapter:
         ).fetchone()
         return row is not None
 
-    def _available_cols(self, table: str) -> tuple[str, ...]:
-        """PRAGMA filter: only columns that actually exist on the table."""
+    def _table_columns(self, table: str) -> set[str]:
         if not self._table_exists(table):
-            return ()
+            return set()
         try:
-            cols = {
+            return {
                 str(r["name"])
                 for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
             }
         except sqlite3.OperationalError:
+            return set()
+
+    def _available_cols(self, table: str) -> tuple[str, ...]:
+        """PRAGMA filter: only columns that actually exist on the table."""
+        cols = self._table_columns(table)
+        if not cols:
             return ()
         return tuple(c for c in _INDICATOR_COLS if c in cols)
 
@@ -129,36 +168,116 @@ class IndicatorDataAdapter:
 
     def list_hot_tokens(self, limit: int = 50) -> list[dict[str, Any]]:
         """
-        Prefer tier='hot' ordered by jev_strength DESC NULLS LAST;
-        if no hot rows, fall back to top by jev_strength globally.
+        Prefer tier='hot' ordered by jev_strength DESC NULLS LAST.
+
+        tier alone is not trusted: a token that left the hot window can stay
+        tier='hot' after funding/sentiment refresh the shared updated_at.
+        When tokens.last_seen_at is joinable, require it inside the hot window.
+        When tech_updated_at exists, also require that technical pass to be fresh.
+        Missing columns degrade to the filters that are available.
+        If every hot row is stale, return empty — do not fall back onto them.
+        If there is no hot tier at all, fall back to top jev_strength globally.
         """
         if not self._table_exists("token_indicators"):
             log.warning("token_indicators table missing")
             return []
-        cols = ", ".join(self._available_cols("token_indicators"))
-        if not cols:
+        col_names = self._available_cols("token_indicators")
+        if not col_names:
             log.warning("token_indicators has no usable columns")
             return []
         limit = max(1, int(limit))
+        ind_present = self._table_columns("token_indicators")
+        has_tech = "tech_updated_at" in ind_present
+        join_seen = "last_seen_at" in self._table_columns("tokens")
+
+        now = datetime.now(timezone.utc)
+        seen_cutoff = _iso_z(now - timedelta(seconds=de_config.HOT_SEEN_WINDOW_SEC))
+        tech_cutoff = _iso_z(now - timedelta(seconds=de_config.TECH_FRESH_SEC))
+
+        select_list = ", ".join(f"ti.{c}" for c in col_names)
+        join_sql = ""
+        where = ["ti.tier = 'hot'"]
+        params: list[Any] = []
+        if join_seen:
+            join_sql = (
+                " LEFT JOIN tokens t"
+                " ON t.chain_id = ti.chain_id AND t.token_address = ti.token_address"
+            )
+            where.append("t.last_seen_at IS NOT NULL AND t.last_seen_at >= ?")
+            params.append(seen_cutoff)
+        if has_tech:
+            where.append("ti.tech_updated_at IS NOT NULL AND ti.tech_updated_at >= ?")
+            params.append(tech_cutoff)
+        freshness_on = join_seen or has_tech
+
+        n_hot_row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM token_indicators WHERE tier = 'hot'"
+        ).fetchone()
+        n_hot = int(n_hot_row["n"]) if n_hot_row else 0
+        if freshness_on:
+            n_fresh_row = self.conn.execute(
+                f"SELECT COUNT(*) AS n FROM token_indicators ti{join_sql} "
+                f"WHERE {' AND '.join(where)}",
+                params,
+            ).fetchone()
+            n_fresh = int(n_fresh_row["n"]) if n_fresh_row else 0
+            skipped = max(0, n_hot - n_fresh)
+        else:
+            n_fresh = n_hot
+            skipped = 0
+            log.info(
+                "list_hot_tokens: freshness columns missing "
+                "(tokens.last_seen_at=%s tech_updated_at=%s); tier-only",
+                "yes" if join_seen else "no",
+                "yes" if has_tech else "no",
+            )
+
+        order_updated = "ti.updated_at" if "updated_at" in ind_present else "ti.rowid"
         sql_hot = f"""
-            SELECT {cols}
+            SELECT {select_list}
+            FROM token_indicators ti{join_sql}
+            WHERE {' AND '.join(where)}
+            ORDER BY COALESCE(ti.jev_strength, -1) DESC, {order_updated} DESC
+            LIMIT ?
+        """
+        rows = self.conn.execute(sql_hot, (*params, limit)).fetchall()
+        if rows:
+            log.info(
+                "list_hot_tokens: hot=%s fresh=%s skipped_stale=%s limit=%s got=%s "
+                "last_seen=%s tech_updated_at=%s",
+                n_hot,
+                n_fresh,
+                skipped,
+                limit,
+                len(rows),
+                "on" if join_seen else "missing",
+                "on" if has_tech else "missing",
+            )
+            return [dict(r) for r in rows]
+
+        if n_hot > 0:
+            log.info(
+                "list_hot_tokens: hot=%s fresh=%s skipped_stale=%s; "
+                "not falling back onto stale tier='hot' rows",
+                n_hot,
+                n_fresh,
+                skipped,
+            )
+            return []
+
+        sql_any = f"""
+            SELECT {", ".join(col_names)}
             FROM token_indicators
-            WHERE tier = 'hot'
             ORDER BY COALESCE(jev_strength, -1) DESC, updated_at DESC
             LIMIT ?
         """
-        rows = self.conn.execute(sql_hot, (limit,)).fetchall()
-        if not rows:
-            sql_any = f"""
-                SELECT {cols}
-                FROM token_indicators
-                ORDER BY COALESCE(jev_strength, -1) DESC, updated_at DESC
-                LIMIT ?
-            """
-            rows = self.conn.execute(sql_any, (limit,)).fetchall()
-            log.info("list_hot_tokens: no hot tier; fallback top-%s by jev_strength (%s rows)", limit, len(rows))
-        else:
-            log.info("list_hot_tokens: hot tier limit=%s got=%s", limit, len(rows))
+        rows = self.conn.execute(sql_any, (limit,)).fetchall()
+        log.info(
+            "list_hot_tokens: no hot tier; fallback top-%s by jev_strength (%s rows) "
+            "skipped_stale=0",
+            limit,
+            len(rows),
+        )
         return [dict(r) for r in rows]
 
     def get_indicators(self, chain_id: str, token_address: str) -> dict[str, Any] | None:

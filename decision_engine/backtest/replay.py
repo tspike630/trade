@@ -37,21 +37,33 @@ def to_iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _is_empty(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not str(value).strip())
+
+
 def coalesce_indicator_rows(
     prev: dict[str, Any] | None, new: dict[str, Any]
 ) -> dict[str, Any]:
     """Merge same-bar indicator_history rows.
 
-    A later NULL must not wipe RSI/MACD/BOLL written by an earlier row in the
-    bar. Non-null values from the later row still win.
+    Funding / sentiment passes write a later row whose RSI/MACD/BOLL columns
+    are NULL. A later NULL or blank must not wipe an earlier technical value.
+    When both rows have a value, the later one wins (rows are applied in
+    recorded_at order).
     """
     if not prev:
         return dict(new)
     merged = dict(prev)
     for key, val in new.items():
-        if val is not None:
-            merged[key] = val
+        if _is_empty(val):
+            continue
+        merged[key] = val
     return merged
+
+
+def merge_bar_rows(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Same merge as coalesce_indicator_rows; name kept for sweep tests."""
+    return coalesce_indicator_rows(base, incoming)
 
 
 def floor_bar(dt: datetime, bar_minutes: int) -> datetime:
@@ -106,12 +118,13 @@ class HistoryReplay:
         "tier",
         "primary_pair_address",
         # 3-3: technical columns. Missing columns are dropped by _ind_cols.
+        # indicator_history stores bands as boll_upper / boll_lower (not boll_up / boll_low).
         "rsi_14",
         "macd",
         "macd_signal",
         "boll_mid",
-        "boll_up",
-        "boll_low",
+        "boll_upper",
+        "boll_lower",
     )
 
     def _ind_cols(self) -> tuple[str, ...]:
@@ -124,7 +137,22 @@ class HistoryReplay:
             }
         except sqlite3.OperationalError:
             return ()
-        return tuple(c for c in self._IND_COLS if c in cols)
+        chosen = tuple(c for c in self._IND_COLS if c in cols)
+        if not getattr(self, "_logged_boll", False):
+            self._logged_boll = True
+            wanted = ("boll_upper", "boll_mid", "boll_lower")
+            selected = [c for c in wanted if c in cols]
+            missing = [c for c in wanted if c not in cols]
+            log.info(
+                "indicator_history boll columns selected=%s",
+                ",".join(selected) if selected else "(none)",
+            )
+            if cols and missing:
+                log.warning(
+                    "indicator_history missing boll columns (PRAGMA filtered): %s",
+                    ",".join(missing),
+                )
+        return chosen
 
     def __init__(
         self,
@@ -339,7 +367,7 @@ class HistoryReplay:
 
         coverage_map = self._load_coverage_map()
 
-        # Group by floor bar; keep latest row per token within bar
+        # Group by floor bar. Same bar+token: merge, preferring non-null fields.
         bars: dict[str, dict[str, dict[str, Any]]] = {}
         bar_order: list[str] = []
         for r in rows:
@@ -395,6 +423,10 @@ class HistoryReplay:
         def nearest_price(
             key: str, target: datetime
         ) -> tuple[Optional[float], Optional[float]]:
+            # Known simplification: entry price is the nearest pair_history print
+            # within ±price_tol_sec of the bar *start* (bidirectional). A print
+            # slightly after the bar open can be selected. As-of / bar-end pricing
+            # is a separate replay change and is intentionally left as-is.
             pts = pair_pts.get(key)
             if not pts:
                 return None, None

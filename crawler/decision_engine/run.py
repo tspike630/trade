@@ -123,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         # Continuous loop is allowed; document that --once/--ticks preferred for verify
         log.info("no --once/--ticks: will loop until interrupted")
 
-    db_path = args.db or de_config.DB_PATH
+    db_path = str(Path(args.db or de_config.DB_PATH).expanduser().resolve())
     interval = (
         args.interval if args.interval is not None else float(de_config.TICK_INTERVAL_SEC)
     )

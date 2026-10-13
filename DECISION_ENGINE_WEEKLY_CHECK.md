@@ -60,6 +60,8 @@ mkdir -p exports/reports logs
   >> logs/decision_engine_sample.log 2>&1
 ```
 
+回测 CLI `--min-jev-strength` 的默认已与实时 `JEV_MIN_STRENGTH`（0.3）对齐。这条采样必须继续显式传 `0.15`，不要依赖回测或实时的默认值。
+
 产物：`exports/reports/jev_validity_YYYYMMDD.md`、`exports/reports/jev_validity_trend.csv`、`exports/reports/review_weekly_YYYY-MM-DD.md`、`logs/jev_validity.log`、`logs/review_weekly.log`、`logs/decision_engine_sample.log`。
 
 ## 周检看什么
