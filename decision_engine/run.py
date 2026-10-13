@@ -4,6 +4,15 @@ CLI entry for decision_engine Step 1 (dry-run by default).
   python -m decision_engine.run --strategy jev_strength_v1 --dry-run --once
   python -m decision_engine.run --strategy jev_strength_v1 --dry-run --ticks 3 --interval 5
   python -m decision_engine.run --all --dry-run --once
+
+Resident loop / --once write purpose=live_candidate (paper-eligible dry-run).
+Weekly sampling (WEEKLY_CHECK, threshold 0.15) writes purpose=sample:
+
+  python -m decision_engine.run --strategy jev_strength_v1 --dry-run --once \\
+      --min-jev-strength 0.15 --purpose sample
+
+mode stays dry_run either way. Passing --min-jev-strength below the live
+default also selects sample when --purpose is omitted.
 """
 
 from __future__ import annotations
@@ -22,7 +31,12 @@ from decision_engine import config as de_config  # noqa: E402
 from decision_engine.core.data_adapter import IndicatorDataAdapter  # noqa: E402
 from decision_engine.core.engine import DecisionEngine  # noqa: E402
 from decision_engine.core.risk_manager import RiskManager  # noqa: E402
-from decision_engine.core.signal_bus import SignalBus  # noqa: E402
+from decision_engine.core.signal_bus import (  # noqa: E402
+    PURPOSE_LIVE_CANDIDATE,
+    PURPOSE_SAMPLE,
+    SignalBus,
+    resolve_run_purpose,
+)
 from decision_engine.strategies import get_strategy, list_strategies  # noqa: E402
 
 log = get_logger("decision_engine.run")
@@ -106,8 +120,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--min-jev-strength",
         type=float,
-        default=de_config.JEV_MIN_STRENGTH,
-        help=f"JEV strategy threshold (default {de_config.JEV_MIN_STRENGTH})",
+        default=None,
+        help=(
+            f"JEV strategy threshold (default {de_config.JEV_MIN_STRENGTH}). "
+            "A value below that default is the weekly sampling path and "
+            f"sets purpose={PURPOSE_SAMPLE} unless --purpose is set."
+        ),
+    )
+    parser.add_argument(
+        "--purpose",
+        choices=(PURPOSE_LIVE_CANDIDATE, PURPOSE_SAMPLE),
+        default=None,
+        help=(
+            "Why this run emits decision_log rows. "
+            f"{PURPOSE_LIVE_CANDIDATE} (default) is the resident dry-run / "
+            "paper-eligible path. "
+            f"{PURPOSE_SAMPLE} is the weekly Mon/Wed/Fri check and is not "
+            "paper-eligible. Does not change mode (dry_run stays dry_run)."
+        ),
     )
     parser.add_argument(
         "--position-pct",
@@ -136,6 +166,19 @@ def main(argv: list[str] | None = None) -> int:
             "signals still only logged to decision_log (mode=live_stub)"
         )
 
+    explicit_min = args.min_jev_strength
+    if args.min_jev_strength is None:
+        args.min_jev_strength = float(de_config.JEV_MIN_STRENGTH)
+    try:
+        purpose = resolve_run_purpose(
+            args.purpose,
+            min_jev_strength=explicit_min,
+            live_min_strength=float(de_config.JEV_MIN_STRENGTH),
+        )
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
+
     try:
         strategies = build_strategies(args)
     except KeyError as exc:
@@ -143,17 +186,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     log.info(
-        "decision_engine start db=%s dry_run=%s strategies=%s interval=%s once=%s ticks=%s",
+        "decision_engine start db=%s dry_run=%s purpose=%s strategies=%s "
+        "interval=%s once=%s ticks=%s min_jev_strength=%s",
         db_path,
         dry_run,
+        purpose,
         [s.strategy_id for s in strategies],
         interval,
         args.once,
         args.ticks,
+        args.min_jev_strength,
     )
 
     adapter = IndicatorDataAdapter(db_path)
-    bus = SignalBus(db_path, dry_run=dry_run)
+    bus = SignalBus(db_path, dry_run=dry_run, purpose=purpose)
     try:
         engine = DecisionEngine(
             adapter,
