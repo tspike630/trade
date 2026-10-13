@@ -197,6 +197,77 @@ def _render_attribution_section(
     return lines
 
 
+def _render_factor_layer_section(
+    factor_layers: Optional[dict[str, Any]],
+) -> list[str]:
+    """§11 分位数分层 + rank IC + 绩效矩阵。None → 不输出（默认关，周报逐字节不变）。
+
+    §8 已是信号层归因，这里用下一个空号 §11，不覆盖既有章节。
+    """
+    if factor_layers is None:
+        return []
+    lines: list[str] = []
+    lines.append("")
+    lines.append("## 11. 因子分层（分位数 Q1-Q5 + rank IC）")
+    lines.append("")
+    lines.append(
+        "> **Caveat（钉死）：** 观察用；样本 <10 的因子不出表；IC/单调性不作调参依据；不触发任何自动动作。"
+    )
+    lines.append("")
+    layers = factor_layers.get("layers") or {}
+    if not layers:
+        lines.append("_本期无足够样本的因子。_")
+        lines.append("")
+    for fname, res in sorted(layers.items()):
+        lines.append(
+            f"### factor: `{fname}`（n={res.get('n', 0)}，rank IC={_num(res.get('ic'), 3)}，{res.get('monotonic', '')}）"
+        )
+        lines.append("")
+        lines.append("| 层 | n | mean_ret_1h | up_1h | median_ret_1h |")
+        lines.append("|---|---:|---:|---:|---:|")
+        for layer in res.get("layers") or []:
+            lines.append(
+                f"| {layer['layer']} | {layer['n']} | {_ret(layer.get('mean_ret'))} | "
+                f"{_pct(layer.get('up_rate'))} | {_ret(layer.get('median_ret'))} |"
+            )
+        lines.append("")
+    matrix = factor_layers.get("matrix") or []
+    if matrix:
+        lines.append("### 绩效矩阵（策略 × 指标）")
+        lines.append("")
+        lines.append("| strategy | n | up_1h | med_1h | up_4h | med_4h | 校验通过 |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|")
+        for row in matrix:
+            lines.append(
+                f"| `{row['strategy']}` | {row['n']} | {_pct(row.get('up_1h'))} | "
+                f"{_ret(row.get('med_1h'))} | {_pct(row.get('up_4h'))} | "
+                f"{_ret(row.get('med_4h'))} | {_pct(row.get('validation_ok'))} |"
+            )
+        lines.append("")
+    lines.append("> 只观察不调权；分层结论待样本累计；落地须走 R4。")
+    lines.append("")
+    ic_hist = factor_layers.get("ic_history") or {}
+    summary = ic_hist.get("summary") or {}
+    if summary:
+        lines.append("### IC 历史序列（多期，因子有效性）")
+        lines.append("")
+        lines.append(
+            "> **Caveat（钉死）：** IC mean/IR 观察用；单期 IC 噪音大，连续多期 IR≥0.5 才谈「有效候选」；不触发任何自动动作。"
+        )
+        lines.append("")
+        lines.append("| factor | 期数 | IC mean | IC std | IR | 稳定性 |")
+        lines.append("|---|---:|---:|---:|---:|---|")
+        for fname, s in sorted(summary.items()):
+            lines.append(
+                f"| `{fname}` | {s['n_periods']} | {_num(s.get('ic_mean'), 3)} | "
+                f"{_num(s.get('ic_std'), 3)} | {_num(s.get('ir'), 2)} | {s.get('stability', '')} |"
+            )
+        lines.append("")
+        lines.append(f"> 历史文件：`{ic_hist.get('path', '')}`（幂等追加，同期重跑覆盖）")
+        lines.append("")
+    return lines
+
+
 def render_weekly_md(
     *,
     period_start: str,
@@ -212,8 +283,9 @@ def render_weekly_md(
     backtest_summary: Optional[dict[str, Any]] = None,
     optimize_section: Optional[str] = None,
     evolution_suggestions: Optional[list[dict[str, Any]]] = None,
+    factor_layers: Optional[dict[str, Any]] = None,
 ) -> str:
-    """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议）。"""
+    """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议 + 可选§11 因子分层）。"""
     n = len(chain)
     n_exec = sum(1 for r in chain if r.exec_id is not None)
     n_pos = sum(1 for r in chain if r.position_id is not None)
@@ -406,6 +478,9 @@ def render_weekly_md(
     lines.append("## 10. 进化建议")
     lines.append("")
     lines.append(format_evolution_section(evolution_suggestions or []))
+
+    # 11. 因子分层（默认关；§8 归因保持原样）
+    lines.extend(_render_factor_layer_section(factor_layers))
 
     lines.append("---")
     lines.append("")
