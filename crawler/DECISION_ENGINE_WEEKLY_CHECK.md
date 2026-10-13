@@ -9,7 +9,7 @@
 | 时刻 (HKT) | Routine | 作用 |
 |------------|---------|------|
 | **09:15** | JEV 周检复盘 | 先跑 `scripts/jev_validity.py`（过滤版有效性 + 趋势 CSV + 决策表） |
-| **10:19** | JEV 信号采样 | 再跑 `--once --min-jev-strength 0.15`，攒 `decision_log` |
+| **10:19** | JEV 信号采样 | 再跑 `--once --min-jev-strength 0.15 --purpose sample`，攒 `decision_log`（`purpose=sample`，不是 paper 候选） |
 
 **当天采样不计当天周检**：周一 10:19 采样写入的 buy **不进入**当天 09:15 已跑完的周检窗口；要等到**下周一**周检才会计入。周检在前、采样在后，避免「边采边验」自污染。
 
@@ -19,7 +19,7 @@
 
 | 层 | 做什么 |
 |----|--------|
-| **Bot routine「JEV 信号采样」** | 周一/三/五 **10:19** 跑 `--once --min-jev-strength 0.15`，攒 `decision_log` |
+| **Bot routine「JEV 信号采样」** | 周一/三/五 **10:19** 跑 `--once --min-jev-strength 0.15 --purpose sample`，攒 `decision_log`（`purpose=sample`） |
 | **Bot routine「JEV 周检复盘」** | 每周一 **09:15** 跑 `scripts/jev_validity.py` + `python -m review.run --period 7d --report`，按决策表复盘并发 md |
 
 若日后本机有 crontab，可把执行迁回系统 cron；bot 只做复盘即可。
@@ -29,7 +29,7 @@
 | 名称 | 时间 (HKT) | 动作 |
 |------|------------|------|
 | JEV 周检复盘 | 周一 09:15 | 跑过滤版有效性 + R1 周报 + 决策表建议发本聊天 |
-| JEV 信号采样 | 周一/三/五 10:19 | dry-run once（0.15），短结果发本聊天 |
+| JEV 信号采样 | 周一/三/五 10:19 | dry-run once（0.15，`purpose=sample`），短结果发本聊天 |
 
 24h 常驻 dry-run（默认 0.3）继续挂着：见 `DECISION_ENGINE_DRYRUN_24H.md` / `logs/decision_engine_dryrun.pid`。
 
@@ -56,11 +56,14 @@ mkdir -p exports/reports logs
 采样：
 
 ```bash
-.venv/bin/python -m decision_engine.run --strategy jev_strength_v1 --dry-run --once --min-jev-strength 0.15 \
+.venv/bin/python -m decision_engine.run --strategy jev_strength_v1 --dry-run --once \
+  --min-jev-strength 0.15 --purpose sample \
   >> logs/decision_engine_sample.log 2>&1
 ```
 
 回测 CLI `--min-jev-strength` 的默认已与实时 `JEV_MIN_STRENGTH`（0.3）对齐。这条采样必须继续显式传 `0.15`，不要依赖回测或实时的默认值。
+
+`purpose` 与 `mode` 分开：采样行是 `mode=dry_run` 且 `purpose=sample`；24h 常驻（默认 0.3，不传 `--purpose`）是 `mode=dry_run` 且 `purpose=live_candidate`。漏传 `--purpose sample` 时，只要 `--min-jev-strength` 低于实时默认，仍会写成 `sample`。执行网关应拒 `sample`；本命令只负责写入。
 
 产物：`exports/reports/jev_validity_YYYYMMDD.md`、`exports/reports/jev_validity_trend.csv`、`exports/reports/review_weekly_YYYY-MM-DD.md`、`logs/jev_validity.log`、`logs/review_weekly.log`、`logs/decision_engine_sample.log`。
 

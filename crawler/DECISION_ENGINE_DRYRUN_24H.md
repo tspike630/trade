@@ -77,10 +77,13 @@ pkill -f 'python -m decision_engine.run --strategy jev_strength_v1 --dry-run'
 主常驻保持默认 **0.3**。若需快验数据，用一次性：
 
 ```bash
-.venv/bin/python -m decision_engine.run --strategy jev_strength_v1 --dry-run --once --min-jev-strength 0.15
+.venv/bin/python -m decision_engine.run --strategy jev_strength_v1 --dry-run --once \
+  --min-jev-strength 0.15 --purpose sample
 ```
 
-或临时 env：`DECISION_JEV_MIN_STRENGTH=0.15`（仅当你明确要第二套常驻时；本 24h 任务未启用）。
+这是采样，不是常驻：`mode` 仍是 `dry_run`，`purpose=sample`（低于默认阈值时即使漏传 `--purpose` 也会写成 `sample`）。不要当 paper 候选。
+
+或临时 env：`DECISION_JEV_MIN_STRENGTH=0.15`（仅当你明确要第二套常驻时；本 24h 任务未启用）。改默认阈值且不传更低的 `--min-jev-strength` 时，purpose 仍是 `live_candidate`。
 
 ## Caveats
 

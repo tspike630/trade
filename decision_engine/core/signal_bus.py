@@ -1,4 +1,21 @@
-"""Standard signal structure + dry-run sink (log + decision_log table)."""
+"""Standard signal structure + dry-run sink (log + decision_log table).
+
+``purpose`` is separate from ``mode``. ``mode`` stays ``dry_run`` / ``live_stub``.
+``purpose`` tells the execution gateway which dry-run rows are paper-eligible:
+
+- ``sample`` — weekly check / sampling runs (Mon/Wed/Fri, threshold below the
+  resident default, typically ``--min-jev-strength 0.15``). Not paper-eligible.
+  The gateway should reject these; this layer only writes the tag.
+- ``live_candidate`` — resident dry-run loop/once and any other paper-eligible
+  path (default threshold 0.3). This is the default.
+
+Storage contract (what execution reads):
+- Column ``decision_log.purpose`` (added on existing databases with ALTER TABLE;
+  historical rows stay NULL — they are not backfilled to ``live_candidate``).
+- Top-level ``purpose`` inside ``raw_json``. The gateway SELECT already loads
+  ``raw_json``, so ``json.loads(raw_json)["purpose"]`` is visible before the
+  gateway adds the column to its SELECT.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +34,12 @@ log = get_logger("decision_engine.signal_bus")
 _BUSY_TIMEOUT_MS = 30000
 _PUBLISH_RETRY_SLEEP_SEC = 0.2
 
+# purpose enum. Do not reuse mode for this; dry_run covers both producers.
+PURPOSE_SAMPLE = "sample"
+PURPOSE_LIVE_CANDIDATE = "live_candidate"
+PURPOSES = frozenset({PURPOSE_SAMPLE, PURPOSE_LIVE_CANDIDATE})
+DEFAULT_PURPOSE = PURPOSE_LIVE_CANDIDATE
+
 DECISION_LOG_DDL = """
 CREATE TABLE IF NOT EXISTS decision_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,19 +52,78 @@ CREATE TABLE IF NOT EXISTS decision_log (
     reason TEXT,
     risk_passed INTEGER,
     mode TEXT NOT NULL,
+    purpose TEXT,
     raw_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decision_log_ts ON decision_log (ts);
 CREATE INDEX IF NOT EXISTS idx_decision_log_strategy ON decision_log (strategy_id);
 """
 
+# Created after the purpose column exists. Not part of DECISION_LOG_DDL:
+# on an older table the index would run before ALTER and fail.
+_PURPOSE_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_decision_log_purpose ON decision_log (purpose)"
+)
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def normalize_signal(sig: dict[str, Any], *, mode: str = "dry_run") -> dict[str, Any]:
-    """Ensure required keys; fill defaults."""
+def _known_purpose(value: Any) -> str | None:
+    if value is None:
+        return None
+    name = str(value).strip().lower()
+    if name in PURPOSES:
+        return name
+    return None
+
+
+def resolve_run_purpose(
+    explicit: str | None,
+    *,
+    min_jev_strength: float | None,
+    live_min_strength: float,
+) -> str:
+    """Purpose for one ``decision_engine.run`` invocation.
+
+    Resident loop and ``--once`` (no extra flags) are ``live_candidate``.
+    The WEEKLY_CHECK sampling command passes ``--min-jev-strength`` below the
+    live default (0.15 vs 0.3); that path is ``sample`` even if ``--purpose``
+    is omitted, so an existing routine still tags rows. An explicit
+    ``--purpose`` always wins. ``mode`` is not involved.
+    """
+    if explicit is not None and str(explicit).strip():
+        chosen = _known_purpose(explicit)
+        if chosen is None:
+            raise ValueError(
+                f"unknown purpose: {explicit!r} (expected one of {sorted(PURPOSES)})"
+            )
+        return chosen
+    if min_jev_strength is not None and float(min_jev_strength) < float(live_min_strength):
+        return PURPOSE_SAMPLE
+    return PURPOSE_LIVE_CANDIDATE
+
+
+def normalize_signal(
+    sig: dict[str, Any],
+    *,
+    mode: str = "dry_run",
+    purpose: str = DEFAULT_PURPOSE,
+) -> dict[str, Any]:
+    """Ensure required keys; fill defaults. ``purpose`` is always one of PURPOSES."""
+    fallback = _known_purpose(purpose) or DEFAULT_PURPOSE
+    if "purpose" not in sig or sig.get("purpose") is None or str(sig.get("purpose")).strip() == "":
+        chosen = fallback
+    else:
+        chosen = _known_purpose(sig.get("purpose"))
+        if chosen is None:
+            log.warning(
+                "unknown decision purpose %r; using %s",
+                sig.get("purpose"),
+                fallback,
+            )
+            chosen = fallback
     out = {
         "strategy_id": str(sig.get("strategy_id") or "unknown"),
         "action": str(sig.get("action") or "noop").lower(),
@@ -53,6 +135,7 @@ def normalize_signal(sig: dict[str, Any], *, mode: str = "dry_run") -> dict[str,
         "ts": sig.get("ts") or utc_now_iso(),
         "risk_passed": bool(sig.get("risk_passed", False)),
         "mode": mode,
+        "purpose": chosen,
     }
     # preserve extras in raw
     extras = {k: v for k, v in sig.items() if k not in out}
@@ -65,12 +148,27 @@ class SignalBus:
     """
     Collect candidate signals; in dry-run emit structured logs and write decision_log
     via a dedicated RW connection (separate from indicator RO adapter).
+
+    Every published row gets ``purpose`` (bus default, or the signal's own value
+    when it is a known purpose). Default is ``live_candidate``.
     """
 
-    def __init__(self, db_path: str | Path, *, dry_run: bool = True):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        dry_run: bool = True,
+        purpose: str = DEFAULT_PURPOSE,
+    ):
+        chosen = _known_purpose(purpose)
+        if chosen is None:
+            raise ValueError(
+                f"purpose must be one of {sorted(PURPOSES)}, got {purpose!r}"
+            )
         self.db_path = Path(db_path).resolve()
         self.dry_run = dry_run
         self.mode = "dry_run" if dry_run else "live_stub"
+        self.purpose = chosen
         self._rw: sqlite3.Connection | None = None
         self._emitted: list[dict[str, Any]] = []
         self._ensure_rw()
@@ -80,9 +178,30 @@ class SignalBus:
         self._rw = sqlite3.connect(str(self.db_path), timeout=30.0)
         self._rw.row_factory = sqlite3.Row
         self._rw.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        self._ensure_schema()
+        log.info(
+            "signal_bus decision_log ready db=%s mode=%s purpose=%s",
+            self.db_path,
+            self.mode,
+            self.purpose,
+        )
+
+    def _ensure_schema(self) -> None:
+        """Create decision_log and add ``purpose`` on databases that predate it.
+
+        CREATE TABLE IF NOT EXISTS does not add columns. ALTER has no DEFAULT
+        so rows written before P2-38 stay NULL instead of being relabeled
+        ``live_candidate`` (those rows include the 0.15 sampling history).
+        """
+        assert self._rw is not None
         self._rw.executescript(DECISION_LOG_DDL)
+        have = {
+            row[1] for row in self._rw.execute("PRAGMA table_info(decision_log)").fetchall()
+        }
+        if "purpose" not in have:
+            self._rw.execute("ALTER TABLE decision_log ADD COLUMN purpose TEXT")
+        self._rw.execute(_PURPOSE_INDEX_SQL)
         self._rw.commit()
-        log.info("signal_bus decision_log ready db=%s mode=%s", self.db_path, self.mode)
 
     def close(self) -> None:
         if self._rw is not None:
@@ -100,9 +219,10 @@ class SignalBus:
         return list(self._emitted)
 
     def publish(self, signal: dict[str, Any]) -> dict[str, Any] | None:
-        norm = normalize_signal(signal, mode=self.mode)
+        norm = normalize_signal(signal, mode=self.mode, purpose=self.purpose)
         log.info(
-            "SIGNAL strategy=%s action=%s chain=%s token=%s size_pct=%s risk=%s reason=%s mode=%s",
+            "SIGNAL strategy=%s action=%s chain=%s token=%s size_pct=%s risk=%s "
+            "reason=%s mode=%s purpose=%s",
             norm["strategy_id"],
             norm["action"],
             norm["chain_id"],
@@ -111,6 +231,7 @@ class SignalBus:
             norm["risk_passed"],
             norm["reason"],
             norm["mode"],
+            norm["purpose"],
         )
         if not self._persist(norm):
             return None
@@ -162,8 +283,8 @@ class SignalBus:
                 """
                 INSERT INTO decision_log
                     (ts, strategy_id, action, chain_id, token_address, size_pct,
-                     reason, risk_passed, mode, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     reason, risk_passed, mode, purpose, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     norm["ts"],
@@ -175,6 +296,7 @@ class SignalBus:
                     norm.get("reason"),
                     1 if norm.get("risk_passed") else 0,
                     norm["mode"],
+                    norm["purpose"],
                     json.dumps(raw, ensure_ascii=False, default=str),
                 ),
             )
