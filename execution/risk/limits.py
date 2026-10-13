@@ -34,7 +34,13 @@ def check_max_open(
     max_open_per_strategy: int = 5,
     **_: Any,
 ) -> dict[str, Any]:
-    """单策略最多同时持仓数（token_dedup 之外的第二道闸）。"""
+    """单策略最多同时持仓数（token_dedup 之外的第二道闸）。
+
+    SELL 不跑这条：达上限时必须仍能平仓。
+    """
+    action = str(sig.get("action") or "").strip().lower()
+    if action == "sell":
+        return {"ok": True, "note": "sell_skips_max_open"}
     sid = sig.get("strategy_id") or "(unknown)"
     n_open = len(
         [

@@ -31,7 +31,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _env_float(name: str) -> float | None:
-    """Unset / empty / 0 → None (rule off). Values > 1 treated as percent points."""
+    """Unset / empty / ≤0 → None (rule off). Value is percent points, not a fraction."""
     raw = os.environ.get(name)
     if raw is None or not str(raw).strip():
         return None
@@ -58,10 +58,8 @@ def _env_int(name: str) -> int | None:
 
 
 def _pct_to_fraction(v: float) -> float:
-    """30 → 0.30; 0.30 stays 0.30."""
-    if v > 1.0:
-        return v / 100.0
-    return v
+    """Percent points only. 30 → 0.30, 1 → 0.01. Never treat 1 as 100%."""
+    return float(v) / 100.0
 
 
 def _parse_priority(raw: str | None) -> list[str]:
@@ -165,6 +163,20 @@ class PositionManager:
         config: PositionManagerConfig | None = None,
     ) -> None:
         self.config = config or PositionManagerConfig.from_env()
+        c = self.config
+        log.info(
+            "PM parsed enabled=%s token_dedup=%s strategy_mutex=%s "
+            "max_total_pct_fraction=%s max_per_token_pct_fraction=%s "
+            "max_open_per_strategy=%s priority=%s "
+            "(PM_MAX_* env values are percent points, 1 means 1%%)",
+            c.enabled,
+            c.token_dedup,
+            c.strategy_mutex,
+            c.max_total_pct,
+            c.max_per_token_pct,
+            c.max_open_per_strategy,
+            list(c.strategy_priority),
+        )
         self._owns_ledger = False
         self.ledger = ledger
         self.paper_db: Path | None = None
@@ -383,10 +395,12 @@ class PositionManager:
 
         ledger = self._ensure_ledger()
         if ledger is None:
-            # No book to check — allow (cannot enforce without paper state)
+            # Rules are on but there is no book to enforce them against.
             return CheckResult(
-                allowed=True,
-                detail={"warning": "no_paper_ledger"},
+                allowed=False,
+                reason="pm_rejected:no_ledger",
+                rule="no_ledger",
+                detail={"error": "no_paper_ledger"},
             )
 
         opens = ledger.list_open()
