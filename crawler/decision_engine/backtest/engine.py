@@ -11,6 +11,7 @@ from decision_engine.backtest.ledger import BacktestLedger
 from decision_engine.backtest.metrics import compute_metrics
 from decision_engine.backtest.replay import HistoryReplay, parse_ts
 from decision_engine.strategies.base_strategy import BaseStrategy
+from execution.exits import scan_exits
 
 log = get_logger("decision_engine.backtest.engine")
 
@@ -62,32 +63,23 @@ class BacktestEngine:
         bar_ts: str,
         prices: dict[str, float],
     ) -> int:
+        """Unified exit rules (shared with paper/live via execution.exits)."""
         closed_n = 0
         bar_dt = parse_ts(bar_ts)
-        for p in list(self.ledger.list_open(strategy_id)):
-            key = f"{p['chain_id']}|{p['pair_address']}"
-            px = prices.get(key)
+        open_pos = list(self.ledger.list_open(strategy_id))
+
+        def price_lookup(p: dict) -> Optional[float]:
+            return prices.get(f"{p['chain_id']}|{p['pair_address']}")
+
+        for pos, reason in scan_exits(open_pos, price_lookup, now=bar_dt):
+            px = price_lookup(pos)
             if px is None:
                 continue
-            entry = float(p["entry_price"])
-            reason: Optional[str] = None
-            tp = p.get("tp_pct")
-            sl = p.get("sl_pct")
-            if tp is not None and px >= entry * (1 + float(tp) / 100.0):
-                reason = "take_profit"
-            elif sl is not None and px <= entry * (1 - float(sl) / 100.0):
-                reason = "stop_loss"
-            else:
-                opened = parse_ts(p.get("opened_at"))
-                hold = p.get("max_hold_min")
-                if opened and bar_dt and hold is not None:
-                    held_min = (bar_dt - opened).total_seconds() / 60.0
-                    if held_min >= float(hold):
-                        reason = "max_hold"
-            if reason:
-                self.ledger.close_position(p["id"], price=px, ts=bar_ts, reason=reason)
-                closed_n += 1
-                self.stats["closes"] += 1
+            self.ledger.close_position(
+                pos["id"], price=float(px), ts=bar_ts, reason=reason
+            )
+            closed_n += 1
+            self.stats["closes"] += 1
         return closed_n
 
     def _size_usd(self, strategy_id: str, size_pct: float | None) -> float:
