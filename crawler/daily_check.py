@@ -1052,7 +1052,7 @@ def run_checks(*, db: str, stale_sec: int | None) -> CheckReport:
         report.add("DB", "FAIL", f"数据库不存在: {db_path}", {})
         return report
 
-    with Store(db_path) as store:
+    with Store.open_ro(db_path) as store:
         check_history(store, report, db_path)
         check_scoring(store, report, log_path)
         check_multichain(store, report)

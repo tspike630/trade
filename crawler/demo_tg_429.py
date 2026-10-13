@@ -166,7 +166,8 @@ def test_long_ban_no_sleep_storm() -> None:
             token="000:TEST", transport=transport, sleep_fn=lambda s: sleeps.append(s)
         )
         ok = alerter.send_message("-1009", "storm")
-        assert ok is False
+        # Long ban is an expected skip (None), not a delivery failure (False).
+        assert ok is None
         assert transport.calls == 1, transport.calls
         assert sleeps == [], sleeps  # must not sleep 30s on long ban
         # second message: no HTTP

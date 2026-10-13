@@ -11,6 +11,78 @@ from logging_setup import get_logger
 
 log = get_logger("sources.ccxt.core")
 
+
+def _timeframe_ms(timeframe: str) -> int | None:
+    tf = (timeframe or "").strip().lower()
+    units = {"m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
+    if len(tf) < 2 or tf[-1] not in units:
+        return None
+    try:
+        count = int(tf[:-1])
+    except ValueError:
+        return None
+    if count <= 0:
+        return None
+    return count * units[tf[-1]]
+
+
+def candle_is_closed(ts_ms: int, timeframe: str, now_ms: int) -> bool:
+    """A bar is closed once its open time plus the timeframe is at or before now."""
+    span = _timeframe_ms(timeframe)
+    if span is None:
+        return True
+    return int(ts_ms) + span <= int(now_ms)
+
+
+def write_ohlcv(
+    conn: sqlite3.Connection,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    candles: list,
+    now_ms: int,
+) -> int:
+    """Write closed bars only. Unclosed bars are dropped so INSERT cannot freeze them.
+
+    Commits this symbol before the caller fetches the next one.
+    """
+    written = 0
+    for candle in candles:
+        ts = int(candle[0])
+        if not candle_is_closed(ts, timeframe, now_ms):
+            continue
+        cur = conn.execute(
+            """
+            INSERT INTO ccxt_ohlcv
+            (exchange, symbol, timeframe, ts, open, high, low, close, volume, quote_volume)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(exchange, symbol, timeframe, ts) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                volume = excluded.volume,
+                quote_volume = excluded.quote_volume
+            """,
+            (
+                exchange,
+                symbol,
+                timeframe,
+                ts,
+                candle[1],
+                candle[2],
+                candle[3],
+                candle[4],
+                candle[5],
+                None,
+            ),
+        )
+        if cur.rowcount and cur.rowcount > 0:
+            written += 1
+    conn.commit()
+    return written
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ccxt_ticks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,16 +232,10 @@ class CcxtFetcher:
                         )
                     except Exception:  # noqa: BLE001
                         continue
-                    for c in candles:
-                        cur = conn.execute(
-                            "INSERT OR IGNORE INTO ccxt_ohlcv"
-                            "(exchange, symbol, timeframe, ts, open, high,"
-                            " low, close, volume, quote_volume)"
-                            " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                            (exname, sym, timeframe, c[0], c[1], c[2], c[3], c[4], c[5], None),
-                        )
-                        ohlcv_rows += cur.rowcount
-                conn.commit()
+                    # Commit per symbol so the write txn does not span the next HTTP call.
+                    ohlcv_rows += write_ohlcv(
+                        conn, exname, sym, timeframe, candles, int(time.time() * 1000)
+                    )
 
                 summary[exname] = {
                     "symbols": len(rows),

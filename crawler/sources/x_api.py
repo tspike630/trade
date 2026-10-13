@@ -327,6 +327,7 @@ class XApiSource(TokenSource):
                     norm_address(item["tokenAddress"]),
                     item,
                     "source:x",
+                    clue=True,
                 )
                 store.add_pending_enrich(
                     norm_chain(item["chainId"]),

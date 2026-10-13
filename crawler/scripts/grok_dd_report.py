@@ -395,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     setup_logging()
 
-    with Store(args.db) as store:
+    with Store.open_ro(args.db) as store:
         ctx = assemble_token_context(store, args.chain, args.token)
     md = render_dd_markdown(ctx)
     out_dir = Path(args.out_dir)

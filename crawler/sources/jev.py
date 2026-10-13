@@ -133,7 +133,7 @@ class JevStore:
         self.db_path = Path(db_path)
         self._conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute("PRAGMA busy_timeout = 30000")
         self.ensure_schema()
 
     def close(self) -> None:
@@ -561,11 +561,53 @@ def fetch_and_store(
         "token_address": token_address,
         **parsed,
     }
-    try:
-        store.upsert_signal(row)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("jev upsert failed %s/%s: %s", chain_id, token_address[:12], exc)
+    _upsert_signal_with_retry(store, row, chain_id, token_address)
     return row
+
+
+def _upsert_signal_with_retry(
+    store: JevStore,
+    row: dict[str, Any],
+    chain_id: str,
+    token_address: str,
+) -> None:
+    """Retry locked writes, then append the token to the pending file."""
+    last_name = "error"
+    for attempt in range(1, 4):
+        try:
+            store.upsert_signal(row)
+            return
+        except sqlite3.OperationalError as exc:
+            last_name = type(exc).__name__
+            log.warning(
+                "jev upsert failed %s/%s attempt=%s err=%s",
+                chain_id,
+                token_address[:12],
+                attempt,
+                last_name,
+            )
+            if attempt < 3:
+                time.sleep(0.25 * attempt)
+    try:
+        path = Path(JEV_PENDING_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"chain_id": chain_id, "token_address": token_address}) + "\n"
+            )
+        log.error(
+            "jev upsert failed; stashed pending %s/%s err=%s",
+            chain_id,
+            token_address[:12],
+            last_name,
+        )
+    except OSError as exc:
+        log.error(
+            "jev upsert failed and stash failed %s/%s err=%s",
+            chain_id,
+            token_address[:12],
+            type(exc).__name__,
+        )
 
 
 def run_pass(

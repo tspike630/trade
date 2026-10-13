@@ -22,6 +22,8 @@ POLL_INTERVAL_SECONDS = 60
 PROFILE_POLL_INTERVAL_SEC = 60
 
 BATCH_SIZE = 30
+# P2-20: rows of pending_enrich loaded into one cycle. Full backlog stays in the table.
+PENDING_ENRICH_LOAD_CAP = int(os.environ.get("PENDING_ENRICH_LOAD_CAP", "300"))
 REQUEST_TIMEOUT_SECONDS = 30.0
 
 MAX_RETRIES = 4

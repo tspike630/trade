@@ -3,14 +3,81 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iso_after(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _ro_uri(path: Path) -> str:
+    return "file:" + quote(path.resolve().as_posix(), safe="/") + "?mode=ro"
+
+
+_CLUE_DESC_PREFIXES = ("helius logsSubscribe", "helius ", "x mention")
+
+
+def has_dex_profile(raw: dict[str, Any] | None) -> bool:
+    """True when raw_json already carries a non-empty DexScreener-style profile."""
+    if not isinstance(raw, dict):
+        return False
+
+    def _obj(key: str) -> dict[str, Any]:
+        value = raw.get(key)
+        return value if isinstance(value, dict) else {}
+
+    def _text(value: object) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    info = _obj("info")
+    base = _obj("baseToken")
+    for obj in (raw, info, base):
+        if _text(obj.get("name")) or _text(obj.get("symbol")):
+            return True
+    for obj in (raw, info):
+        desc = obj.get("description")
+        if _text(desc) and not str(desc).startswith(_CLUE_DESC_PREFIXES):
+            return True
+        for key in ("links", "websites", "socials"):
+            if obj.get(key):
+                return True
+        if _text(obj.get("icon")) or _text(obj.get("header")) or _text(obj.get("imageUrl")):
+            return True
+    return False
+
+
+def _append_clue_note(note: str | None, source: str) -> str:
+    parts = [part for part in (note or "").split(",") if part]
+    if source not in parts:
+        parts.append(source)
+    return ",".join(parts)
+
+
+def _x_watch_ttl_sec(mode: str) -> int:
+    env_name = "X_WATCH_HOT_TTL_SEC" if mode == "hot" else "X_EARLY_WATCH_SEC"
+    default = "21600" if mode == "hot" else "3600"
+    try:
+        return max(60, int(os.environ.get(env_name, default)))
+    except ValueError:
+        return int(default)
+
+
+def _x_watch_max_rows() -> int:
+    try:
+        return max(1, int(os.environ.get("X_WATCH_MAX_ROWS", "200")))
+    except ValueError:
+        return 200
 
 
 def norm_chain(chain_id: str) -> str:
@@ -36,8 +103,17 @@ def _parse_pair_created_at(raw: dict[str, Any]) -> int | None:
     return n
 
 class Store:
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, readonly: bool = False):
         self.db_path = Path(db_path)
+        self.readonly = readonly
+        if readonly:
+            if not self.db_path.is_file():
+                raise FileNotFoundError(f"database not found: {self.db_path}")
+            self._conn = sqlite3.connect(_ro_uri(self.db_path), uri=True, timeout=30.0)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA query_only=ON")
+            self._conn.execute("PRAGMA busy_timeout=30000")
+            return
         self._conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -45,6 +121,11 @@ class Store:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._init_schema()
+
+    @classmethod
+    def open_ro(cls, db_path: str | Path) -> "Store":
+        """Read-only connection. Skips schema migration so it does not take a write lock."""
+        return cls(db_path, readonly=True)
 
     def close(self) -> None:
         self._conn.close()
@@ -132,6 +213,7 @@ class Store:
         self._conn.commit()
         self._migrate_add_pair_flags()
         self._migrate_tier_timestamps()
+        self._migrate_clue_note()
         self._migrate_lowercase_addresses()
         self._migrate_x_social()
         self._migrate_pair_history()
@@ -151,11 +233,30 @@ class Store:
     def _migrate_tier_timestamps(self) -> None:
         cols = self._table_columns("tokens")
         cur = self._conn.cursor()
+        changed = False
         if "last_seen_at" not in cols:
             cur.execute("ALTER TABLE tokens ADD COLUMN last_seen_at TEXT")
+            changed = True
         if "last_enriched_at" not in cols:
             cur.execute("ALTER TABLE tokens ADD COLUMN last_enriched_at TEXT")
-        # Backfill: treat updated_at as last_seen; enriched rows get last_enriched_at
+            changed = True
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        # Backfill once. An unconditional UPDATE takes a RESERVED lock even
+        # when it matches zero rows, so later Store() opens must skip it.
+        row = cur.execute(
+            "SELECT value FROM schema_meta WHERE key = 'tier_ts_backfill_v1'"
+        ).fetchone()
+        if row is not None:
+            if changed:
+                self._conn.commit()
+            return
         cur.execute(
             """
             UPDATE tokens
@@ -171,14 +272,16 @@ class Store:
             """
         )
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schema_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('tier_ts_backfill_v1', ?)",
+            (_utc_now_iso(),),
         )
         self._conn.commit()
+
+    def _migrate_clue_note(self) -> None:
+        cols = self._table_columns("tokens")
+        if "clue_note" not in cols:
+            self._conn.execute("ALTER TABLE tokens ADD COLUMN clue_note TEXT")
+            self._conn.commit()
 
     def _migrate_lowercase_addresses(self) -> None:
         """Normalize chain_id / addresses to lowercase; merge PK collisions."""
@@ -293,18 +396,41 @@ class Store:
         token_address: str,
         raw: dict[str, Any],
         source: str,
+        *,
+        clue: bool = False,
     ) -> str:
-        """Upsert a token profile. Preserves pair_count/has_pairs on update. Returns inserted|updated."""
+        """Upsert a token profile. Preserves pair_count/has_pairs on update.
+
+        Returns inserted|updated|preserved. Clue sources (Helius/X) that hit an
+        existing non-empty Dex profile only annotate clue_note; they do not
+        replace raw_json, source, or last_seen_at.
+        """
         chain_id = norm_chain(chain_id)
         token_address = norm_address(token_address)
         now = _utc_now_iso()
-        raw_json = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
         cur = self._conn.cursor()
-        cur.execute(
-            "SELECT 1 FROM tokens WHERE chain_id = ? AND token_address = ?",
+        existing = cur.execute(
+            "SELECT raw_json, source, clue_note FROM tokens WHERE chain_id = ? AND token_address = ?",
             (chain_id, token_address),
-        )
-        exists = cur.fetchone() is not None
+        ).fetchone()
+        if clue and existing is not None and not has_dex_profile(raw):
+            try:
+                existing_raw = json.loads(existing["raw_json"])
+            except (json.JSONDecodeError, TypeError):
+                existing_raw = None
+            if has_dex_profile(existing_raw):
+                note = _append_clue_note(existing["clue_note"], source)
+                cur.execute(
+                    """
+                    UPDATE tokens SET clue_note = ?
+                    WHERE chain_id = ? AND token_address = ?
+                    """,
+                    (note, chain_id, token_address),
+                )
+                self._conn.commit()
+                return "preserved"
+        raw_json = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        exists = existing is not None
         cur.execute(
             """
             INSERT INTO tokens (
@@ -485,14 +611,29 @@ class Store:
     def count_alerts(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0])
 
-    def bump_counter(self, key: str, delta: int = 1) -> int:
-        cur = self.get_meta(f"counter_{key}", "0") or "0"
+    def _bump_meta(self, key: str, delta: int = 1) -> int:
+        """Atomic increment. Avoids read-modify-write lost updates across processes."""
+        delta = int(delta)
+        self._conn.execute(
+            """
+            INSERT INTO schema_meta (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = CAST(
+                    CAST(schema_meta.value AS INTEGER) + CAST(excluded.value AS INTEGER)
+                    AS TEXT
+                )
+            """,
+            (key, str(delta)),
+        )
+        self._conn.commit()
+        raw = self.get_meta(key, "0") or "0"
         try:
-            n = int(cur) + delta
+            return int(raw)
         except ValueError:
-            n = delta
-        self.set_meta(f"counter_{key}", str(n))
-        return n
+            return delta
+
+    def bump_counter(self, key: str, delta: int = 1) -> int:
+        return self._bump_meta(f"counter_{key}", delta)
 
     def get_counters(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -535,11 +676,17 @@ class Store:
         )
         self._conn.commit()
 
-    def list_pending_enrich(self) -> dict[str, list[str]]:
-        """Return {chain_id: [token_address, ...]} ordered by added_at."""
-        rows = self._conn.execute(
-            "SELECT chain_id, token_address FROM pending_enrich ORDER BY added_at ASC"
-        ).fetchall()
+    def list_pending_enrich(self, *, limit: int | None = None) -> dict[str, list[str]]:
+        """Return {chain_id: [token_address, ...]} ordered by added_at.
+
+        ``limit`` caps rows loaded into one cycle (P2-20). None loads the table.
+        """
+        sql = "SELECT chain_id, token_address FROM pending_enrich ORDER BY added_at ASC"
+        params: list[Any] = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        rows = self._conn.execute(sql, params).fetchall()
         out: dict[str, list[str]] = {}
         for r in rows:
             out.setdefault(r["chain_id"], []).append(r["token_address"])
@@ -692,9 +839,7 @@ class Store:
             return 0
 
     def bump_cycle_number(self) -> int:
-        n = self.get_cycle_number() + 1
-        self.set_meta("cycle_number", str(n))
-        return n
+        return self._bump_meta("cycle_number", 1)
 
     def get_last_profile_poll_at(self) -> str | None:
         return self.get_meta("last_profile_poll_at")
@@ -895,6 +1040,9 @@ class Store:
             );
             """
         )
+        cols = self._table_columns("x_watch")
+        if "expires_at" not in cols:
+            cur.execute("ALTER TABLE x_watch ADD COLUMN expires_at TEXT")
         self._conn.commit()
 
     def upsert_x_watch(
@@ -909,22 +1057,57 @@ class Store:
         chain_id = norm_chain(chain_id)
         token_address = norm_address(token_address)
         now = _utc_now_iso()
+        expires_at = _iso_after(_x_watch_ttl_sec(mode))
         self._conn.execute(
             """
             INSERT INTO x_watch (
                 chain_id, token_address, symbol, query_key, mode,
                 since_id, mention_count_total, mention_count_prev, mention_count_last,
-                last_searched_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, NULL, 0, 0, 0, NULL, ?, ?)
+                last_searched_at, created_at, updated_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, NULL, 0, 0, 0, NULL, ?, ?, ?)
             ON CONFLICT(chain_id, token_address) DO UPDATE SET
                 symbol = COALESCE(excluded.symbol, x_watch.symbol),
                 query_key = excluded.query_key,
                 mode = excluded.mode,
+                expires_at = excluded.expires_at,
                 updated_at = excluded.updated_at
             """,
-            (chain_id, token_address, symbol, query_key, mode, now, now),
+            (chain_id, token_address, symbol, query_key, mode, now, now, expires_at),
         )
         self._conn.commit()
+
+    def prune_x_watch(self) -> int:
+        """Drop expired watches and evict low-activity rows over the cap.
+
+        Never-searched rows are evicted last so a full FIFO cannot block new tokens.
+        """
+        now = _utc_now_iso()
+        cur = self._conn.cursor()
+        cur.execute(
+            "DELETE FROM x_watch WHERE expires_at IS NOT NULL AND expires_at < ?",
+            (now,),
+        )
+        removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        total = int(cur.execute("SELECT COUNT(*) FROM x_watch").fetchone()[0])
+        overflow = total - _x_watch_max_rows()
+        if overflow > 0:
+            cur.execute(
+                """
+                DELETE FROM x_watch WHERE rowid IN (
+                    SELECT rowid FROM x_watch
+                    ORDER BY
+                        CASE WHEN last_searched_at IS NULL THEN 1 ELSE 0 END,
+                        mention_count_total ASC,
+                        created_at ASC
+                    LIMIT ?
+                )
+                """,
+                (overflow,),
+            )
+            if cur.rowcount and cur.rowcount > 0:
+                removed += cur.rowcount
+        self._conn.commit()
+        return removed
 
     def get_x_watch(self, chain_id: str, token_address: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -935,21 +1118,35 @@ class Store:
 
     def list_x_watch(self, *, mode: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 200))
+        if not self.readonly:
+            self.prune_x_watch()
+        now = _utc_now_iso()
+        # Unsearched (new) rows first so a large already-searched FIFO cannot
+        # starve tokens that have not had a search yet.
+        order = """
+            ORDER BY
+                CASE WHEN last_searched_at IS NULL THEN 0 ELSE 1 END,
+                COALESCE(last_searched_at, created_at) ASC
+            LIMIT ?
+        """
         if mode:
             rows = self._conn.execute(
-                """
-                SELECT * FROM x_watch WHERE mode = ?
-                ORDER BY COALESCE(last_searched_at, created_at) ASC LIMIT ?
+                f"""
+                SELECT * FROM x_watch
+                WHERE mode = ?
+                  AND (expires_at IS NULL OR expires_at >= ?)
+                {order}
                 """,
-                (mode, limit),
+                (mode, now, limit),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM x_watch
-                ORDER BY COALESCE(last_searched_at, created_at) ASC LIMIT ?
+                WHERE expires_at IS NULL OR expires_at >= ?
+                {order}
                 """,
-                (limit,),
+                (now, limit),
             ).fetchall()
         return [dict(r) for r in rows]
 
