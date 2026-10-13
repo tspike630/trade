@@ -89,12 +89,13 @@ class HistoryReplay:
         "tier",
         "primary_pair_address",
         # 3-3: technical columns. Missing columns are dropped by _ind_cols.
+        # indicator_history stores bands as boll_upper / boll_lower (not boll_up / boll_low).
         "rsi_14",
         "macd",
         "macd_signal",
         "boll_mid",
-        "boll_up",
-        "boll_low",
+        "boll_upper",
+        "boll_lower",
     )
 
     def _ind_cols(self) -> tuple[str, ...]:
