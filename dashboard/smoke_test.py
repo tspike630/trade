@@ -34,6 +34,7 @@ from dashboard.panels.evolution import (
     parse_evolution_section,
     status_class,
 )
+from dashboard.panels.markets import _row as market_table_row
 from dashboard.panels.registry import PANELS
 from dashboard.panels.shell import (
     TOP_TABS,
@@ -1085,10 +1086,225 @@ class DashboardSmokeTest(unittest.TestCase):
         second = result.data[1]
         self.assertAlmostEqual(second.coverage or 0, 25)
         self.assertIsNone(second.liquidity_usd)
+        self.assertEqual(first.tech_at, "")
+        self.assertEqual(first.fresh_at, "2026-10-10T00:00:00Z")
+        self.assertEqual(first.fresh_state, "stale")
+        self.assertIn("陈旧", str(market_table_row(first)["tech"]))
+        probes = {item.name: item for item in store.process_liveness().data}
+        self.assertEqual(probes["指标"].state, "stale")
         sol = store.market_rows(chain="solana")
         self.assertEqual([row.token_address for row in sol.data], ["T1"])
         self.assertEqual(list(store.market_rows(chain="not-a-chain").data or ()), [])
         self.assertEqual(main.stat().st_mtime_ns, before)
+
+    def test_indicator_clock_with_and_without_tech_column(self) -> None:
+        """Follow tech_updated_at when present; legacy updated_at when the column is absent."""
+        now = datetime.now(timezone.utc)
+        tech_fresh = _iso(now)
+        tech_old = _iso(now - timedelta(days=2))
+        shared_fresh = _iso(now)
+        shared_recent = _iso(now - timedelta(minutes=1))
+        shared_mid = _iso(now - timedelta(hours=2))
+        shared_old = _iso(now - timedelta(days=10))
+
+        legacy = self.root / "legacy-indicators.db"
+        with sqlite3.connect(legacy) as conn:
+            conn.execute(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    tier TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators (chain_id, token_address, tier, updated_at)
+                VALUES ('solana', 'OLD', 'warm', ?)
+                """,
+                (shared_old,),
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators (chain_id, token_address, tier, updated_at)
+                VALUES ('solana', 'NEW', 'warm', ?)
+                """,
+                (shared_fresh,),
+            )
+        legacy_store = self._store(legacy)
+        legacy_rows = legacy_store.market_rows()
+        self.assertTrue(legacy_rows.available, legacy_rows.reason)
+        self.assertEqual([row.token_address for row in legacy_rows.data], ["NEW", "OLD"])
+        newest = legacy_rows.data[0]
+        self.assertEqual(newest.tech_at, "")
+        self.assertEqual(newest.fresh_at, shared_fresh)
+        self.assertEqual(newest.fresh_state, "alive")
+        self.assertEqual(market_table_row(newest)["tech_class"], "pnl-flat")
+        self.assertNotIn("陈旧", str(market_table_row(newest)["tech"]))
+        legacy_probe = {item.name: item for item in legacy_store.process_liveness().data}
+        self.assertEqual(legacy_probe["指标"].state, "alive")
+        self.assertEqual(legacy_probe["指标"].detail, "")
+
+        tech = self.root / "tech-indicators.db"
+        with sqlite3.connect(tech) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    tier TEXT,
+                    updated_at TEXT,
+                    tech_updated_at TEXT
+                );
+                CREATE TABLE indicator_history (
+                    id INTEGER PRIMARY KEY,
+                    recorded_at TEXT
+                );
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO token_indicators
+                    (chain_id, token_address, tier, updated_at, tech_updated_at)
+                VALUES ('solana', ?, ?, ?, ?)
+                """,
+                [
+                    ("FUND", "warm", shared_fresh, tech_old),
+                    ("TECH", "warm", shared_old, tech_fresh),
+                    ("GAP", "hot", shared_mid, None),
+                    ("BLANK", "cold", shared_recent, "  "),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO indicator_history (recorded_at) VALUES (?)",
+                (shared_fresh,),
+            )
+        before = tech.stat().st_mtime_ns
+        tech_store = self._store(tech)
+        tech_rows = tech_store.market_rows()
+        self.assertTrue(tech_rows.available, tech_rows.reason)
+        self.assertEqual(
+            [row.token_address for row in tech_rows.data],
+            ["GAP", "TECH", "BLANK", "FUND"],
+        )
+        by_token = {row.token_address: row for row in tech_rows.data}
+        self.assertEqual(by_token["TECH"].tech_at, tech_fresh)
+        self.assertEqual(by_token["TECH"].fresh_at, tech_fresh)
+        self.assertEqual(by_token["TECH"].fresh_state, "alive")
+        self.assertEqual(by_token["FUND"].tech_at, tech_old)
+        self.assertEqual(by_token["FUND"].fresh_at, tech_old)
+        self.assertEqual(by_token["FUND"].fresh_state, "stale")
+        self.assertIn("陈旧", str(market_table_row(by_token["FUND"])["tech"]))
+        self.assertEqual(by_token["GAP"].tech_at, "")
+        self.assertEqual(by_token["GAP"].fresh_at, shared_mid)
+        self.assertEqual(by_token["GAP"].fresh_state, "stale")
+        self.assertEqual(by_token["BLANK"].tech_at, "")
+        self.assertEqual(by_token["BLANK"].fresh_at, shared_recent)
+        self.assertEqual(by_token["BLANK"].fresh_state, "alive")
+        tech_probe = {item.name: item for item in tech_store.process_liveness().data}
+        self.assertEqual(tech_probe["指标"].state, "alive")
+        self.assertEqual(tech_probe["指标"].detail, "tech_updated_at")
+        self.assertEqual(tech.stat().st_mtime_ns, before)
+
+        stale = self.root / "stale-tech.db"
+        with sqlite3.connect(stale) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    tier TEXT,
+                    updated_at TEXT,
+                    tech_updated_at TEXT
+                );
+                CREATE TABLE indicator_history (
+                    id INTEGER PRIMARY KEY,
+                    recorded_at TEXT
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators
+                    (chain_id, token_address, tier, updated_at, tech_updated_at)
+                VALUES ('solana', 'FROZEN', 'hot', ?, ?)
+                """,
+                (shared_fresh, tech_old),
+            )
+            conn.execute(
+                "INSERT INTO indicator_history (recorded_at) VALUES (?)",
+                (shared_fresh,),
+            )
+        stale_store = self._store(stale)
+        stale_probe = {item.name: item for item in stale_store.process_liveness().data}
+        self.assertEqual(stale_probe["指标"].state, "stale")
+        self.assertEqual(stale_probe["指标"].detail, "tech_updated_at")
+        self.assertGreater(stale_probe["指标"].age_seconds or 0, 86400)
+        os.environ["HEARTBEAT_STALE_SEC"] = "10000000"
+        wide = {item.name: item for item in stale_store.process_liveness().data}
+        self.assertEqual(wide["指标"].state, "alive")
+        widened_row = stale_store.market_rows().data[0]
+        self.assertEqual(widened_row.fresh_state, "alive")
+        os.environ["HEARTBEAT_STALE_SEC"] = "10"
+        narrow = {item.name: item for item in stale_store.process_liveness().data}
+        self.assertEqual(narrow["指标"].state, "stale")
+
+        empty_tech = self.root / "null-tech.db"
+        with sqlite3.connect(empty_tech) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    tier TEXT,
+                    updated_at TEXT,
+                    tech_updated_at TEXT
+                );
+                CREATE TABLE indicator_history (
+                    id INTEGER PRIMARY KEY,
+                    recorded_at TEXT
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators
+                    (chain_id, token_address, tier, updated_at, tech_updated_at)
+                VALUES ('solana', 'UNSTAMPED', 'hot', ?, NULL)
+                """,
+                (shared_fresh,),
+            )
+            conn.execute(
+                "INSERT INTO token_indicators (chain_id, token_address, tier) VALUES ('solana', 'BARE', 'warm')"
+            )
+            conn.execute(
+                "INSERT INTO indicator_history (recorded_at) VALUES (?)",
+                (shared_fresh,),
+            )
+        os.environ.pop("HEARTBEAT_STALE_SEC", None)
+        empty_store = self._store(empty_tech)
+        empty_probe = {item.name: item for item in empty_store.process_liveness().data}
+        self.assertEqual(empty_probe["指标"].state, "unknown")
+        self.assertEqual(empty_probe["指标"].detail, "tech_updated_at")
+        bare = {row.token_address: row for row in empty_store.market_rows().data}
+        self.assertEqual(bare["UNSTAMPED"].tech_at, "")
+        self.assertEqual(bare["UNSTAMPED"].fresh_at, shared_fresh)
+        self.assertEqual(bare["BARE"].fresh_at, "")
+        self.assertEqual(bare["BARE"].fresh_state, "unknown")
+        self.assertEqual(market_table_row(bare["BARE"])["tech"], "—")
+
+    def _store(self, main: Path) -> DataStore:
+        return DataStore(
+            DbPaths(
+                main=main,
+                execution=self.root / "missing-exec.db",
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
 
     def test_market_base_and_strategy_buckets_are_read_only(self) -> None:
         paths = build_fixture(self.root)

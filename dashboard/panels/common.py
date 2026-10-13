@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Iterator, assert_never
 
 from nicegui import ui
+
+from dashboard.format_util import Liveness, fmt_ts
 
 log = logging.getLogger("dashboard.panels")
 
@@ -122,3 +124,16 @@ def data_table(
                 if row is not None:
                     on_row_click(row)
             table.on("rowClick", handle)
+
+
+def indicator_fresh_cell(fresh_at: str, state: Liveness) -> tuple[str, str]:
+    """Technical timestamp, or a stale mark. Missing stamps stay an em dash."""
+    text = fmt_ts(fresh_at) if fresh_at else ""
+    match state:
+        case "stale":
+            shown = f"{text} 陈旧" if text and text != "—" else "陈旧"
+            return shown, "pnl-neg"
+        case "alive" | "unknown":
+            return (text if text and text != "—" else "—"), "pnl-flat"
+        case _ as unreachable:
+            assert_never(unreachable)
