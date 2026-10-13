@@ -84,12 +84,13 @@ DECISION_ENGINE_STEP1_RESULT.md
 
 | 变量 | 默认 | 含义 |
 |------|------|------|
-| `DECISION_DB_PATH` | 项目 `DB_PATH` / `dexscreener.db` | SQLite 路径 |
+| `DECISION_DB_PATH` / `DB_PATH` | 项目 `DB_PATH` / `dexscreener.db` | SQLite 路径（两者都认；启动日志打绝对路径） |
 | `DECISION_TICK_INTERVAL_SEC` | `60` | 循环间隔 |
 | `DECISION_HOT_TOKEN_LIMIT` | `50` | hot 扫描上限 |
 | `DECISION_DEFAULT_STRATEGY` | `jev_strength_v1` | 默认策略 |
 | `DECISION_JEV_MIN_STRENGTH` | `0.3` | JEV 阈值 |
 | `DECISION_JEV_POSITION_PCT` | `0.05` | 信号仓位 |
+| `DECISION_COOLDOWN_SEC` | `0` | 同一 `(strategy, chain, token)` 买入冷却秒数。0 = 关闭，dry-run 观察行为不变。Step B（paper）应设为约等于 tick 间隔，避免每个 tick 对同一 token 重复开仓 |
 | `DECISION_USE_API_FALLBACK` | `0` | 是否走 API（Step 1 默认关） |
 
 ## 如何运行

@@ -12,7 +12,9 @@ class RsiBounceBuyFactor(FactorBuyBase):
 
     def _init_self(self, **kwargs: Any) -> None:
         self.oversold = float(kwargs.get("oversold", 30.0))
-        self.min_change_5m = float(kwargs.get("min_change_5m", 0.0))  # 反弹确认：5m 转正
+        # Bounce confirmation: 5m change must turn positive.
+        # Default 0.0 used to compare with `<`, so a flat 0.0 passed.
+        self.min_change_5m = float(kwargs.get("min_change_5m", 0.0))
         self.position_pct = float(kwargs.get("position_pct", 0.05))
 
     def fit_tick(self, row: dict[str, Any]) -> dict[str, Any] | None:
@@ -29,7 +31,9 @@ class RsiBounceBuyFactor(FactorBuyBase):
             c5 = float(row["change_5m"]) if row.get("change_5m") is not None else None
         except (TypeError, ValueError):
             c5 = None
-        if c5 is None or c5 < self.min_change_5m:
+        # Non-positive change is not a bounce, including the default floor of 0.
+        # A positive min_change_5m still requires c5 >= that floor.
+        if c5 is None or c5 <= 0 or c5 < self.min_change_5m:
             return None
         return {
             "size_pct": self.position_pct,

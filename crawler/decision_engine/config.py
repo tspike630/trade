@@ -27,7 +27,12 @@ try:
 except Exception:  # noqa: BLE001
     _ROOT_DB_PATH = "dexscreener.db"
 
-DB_PATH = os.environ.get("DECISION_DB_PATH", "").strip() or str(_ROOT_DB_PATH)
+# DECISION_DB_PATH wins; DB_PATH is the crawler/shared fallback (same resolution on both trees).
+DB_PATH = (
+    os.environ.get("DECISION_DB_PATH", "").strip()
+    or os.environ.get("DB_PATH", "").strip()
+    or str(_ROOT_DB_PATH)
+)
 # Resolve relative to project root
 if not Path(DB_PATH).is_absolute():
     DB_PATH = str((_ROOT / DB_PATH).resolve())
@@ -35,6 +40,24 @@ if not Path(DB_PATH).is_absolute():
 TICK_INTERVAL_SEC = int(os.environ.get("DECISION_TICK_INTERVAL_SEC", "60"))
 HOT_TOKEN_LIMIT = int(os.environ.get("DECISION_HOT_TOKEN_LIMIT", "50"))
 DEFAULT_STRATEGY = os.environ.get("DECISION_DEFAULT_STRATEGY", "jev_strength_v1")
+
+# Reader-side hot freshness. Indicators own the writes; this layer only drops stale rows.
+# Window matches crawler HOT_SEEN_WINDOW_SEC (1h): tier='hot' alone is not enough.
+HOT_SEEN_WINDOW_SEC = int(os.environ.get("DECISION_HOT_SEEN_WINDOW_SEC", "3600"))
+# tech_updated_at, when the column exists, must be within ~2× the indicator hot interval.
+_INDICATORS_HOT_INTERVAL_SEC = int(os.environ.get("INDICATORS_HOT_INTERVAL_SEC", "300"))
+TECH_FRESH_SEC = int(
+    os.environ.get(
+        "DECISION_TECH_FRESH_SEC",
+        str(max(1, _INDICATORS_HOT_INTERVAL_SEC * 2)),
+    )
+)
+
+# Per-(strategy_id, chain_id, token_address) buy cooldown. Default 0 keeps dry-run
+# observation unchanged (the same token may be signaled every tick).
+# Step B (paper) should set DECISION_COOLDOWN_SEC ≈ DECISION_TICK_INTERVAL_SEC
+# so a token is not re-bought every tick while position-manager dedup is off.
+DECISION_COOLDOWN_SEC = float(os.environ.get("DECISION_COOLDOWN_SEC", "0") or "0")
 
 # JEV strength strategy defaults
 JEV_MIN_STRENGTH = float(os.environ.get("DECISION_JEV_MIN_STRENGTH", "0.3"))

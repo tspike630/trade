@@ -15,7 +15,9 @@ class BollBreakoutBuyFactor(FactorBuyBase):
         self.position_pct = float(kwargs.get("position_pct", 0.05))
 
     def fit_tick(self, row: dict[str, Any]) -> dict[str, Any] | None:
-        up = row.get("boll_up")
+        up = row.get("boll_upper")
+        if up is None:
+            up = row.get("boll_up")  # legacy alias; stored column is boll_upper
         if up is None:
             return None
         px = row.get("price_usd")
@@ -40,5 +42,5 @@ class BollBreakoutBuyFactor(FactorBuyBase):
         return {
             "size_pct": self.position_pct,
             "reason": f"boll_breakout px={p:.8g}>{u:.8g}",
-            "boll_up": u,
+            "boll_upper": u,
         }

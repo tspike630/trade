@@ -48,7 +48,7 @@ DECISION_ENGINE_STEP2.md
 
 | 标签 | strategy_id | 逻辑（可调阈值） |
 |------|-------------|------------------|
-| A | `jev_strength_v1` | `jev_strength ≥ min`（默认回测 0.15） |
+| A | `jev_strength_v1` | `jev_strength ≥ min`（默认与实时 `JEV_MIN_STRENGTH` / `DECISION_JEV_MIN_STRENGTH` 相同，当前 0.3；要 0.15 必须显式传 `--min-jev-strength 0.15`） |
 | B | `tech_momentum_v1` | `change_5m ≥ min` 且 `volume_strength ≥ min` |
 | C | `combined_jev_tech_v1` | JEV 过滤 + 技术面确认 |
 
@@ -76,7 +76,7 @@ DECISION_ENGINE_STEP2.md
 
 ## 数据流
 
-1. **replay**：按 `--bar-minutes` 对 `indicator_history` 分桶，每 bar 取 token 最新指标行，按 hot/jev/volume 排序截断 `hot_limit`；就近附着 `pair_history` 价格/流动性与 coverage。
+1. **replay**：按 `--bar-minutes` 对 `indicator_history` 分桶。同一 bar、同一 token 合并非空字段（后写的 funding/sentiment NULL 不再盖掉 RSI/MACD/BOLL）；按 hot/jev/volume 排序截断 `hot_limit`。入场价仍是 bar 起点 ±`price_tol_sec` 的最近一笔（已知简化，可能取到 bar 起点之后的价格）。
 2. **engine**：每 bar 先管退出，再 `strategy.on_tick({hot_tokens})`，买单过过滤钩子后写入账本。
 3. **metrics**：按 `strategy_id` 汇总胜率、profit factor、最大回撤、收益、资金曲线点数。
 
@@ -100,6 +100,8 @@ DECISION_ENGINE_STEP2.md
 ```
 
 正式前待补：手续费 / 滑点参数；用周检过滤口径对拍 A/C。烟雾数字（短历史）不作有效性结论。
+
+默认 `--min-jev-strength` 与实时 `JEV_MIN_STRENGTH`（`DECISION_JEV_MIN_STRENGTH`，当前 0.3）同源，不再单独用 0.15。周检采样若要沿用 0.15，必须显式传入（`DECISION_ENGINE_WEEKLY_CHECK.md` 的采样命令已经显式传 `--min-jev-strength 0.15`）。上面的正式对比命令不传该参数，因此按实时默认 0.3 跑。
 
 ## 后续（非本 Step）
 
