@@ -9,6 +9,7 @@ missing databases degrade instead of raising. Run from the project root::
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import logging
 import os
@@ -23,7 +24,8 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from dashboard.auth import SecretFilter, verify_api_key
+from dashboard.auth import SecretFilter, attach_secret_filters, verify_api_key
+from dashboard.chat.sessions import SessionStore
 from dashboard.data import DataStore, DbPaths, _WRITE_RE, connect_ro
 from dashboard.format_util import fmt_hold, fmt_liq, fmt_pct, fmt_usd
 from dashboard.panels.evolution import (
@@ -43,10 +45,17 @@ from dashboard.panels.shell import (
     refresh_age_label,
     select_top_tab,
 )
-from dashboard.parsing import bucket_key, extract_jev_strength
 import dashboard.app as app_module
-from dashboard.app import jev_gate_view, prior_pulse_tone
-from dashboard.settings import bind_host, port, read_gates, refresh_seconds
+from dashboard.app import backtest_equity_tone, jev_gate_view, prior_pulse_tone
+from dashboard.parsing import bucket_key, extract_jev_strength, rejection_key
+from dashboard.settings import (
+    bind_host,
+    gateway_stale_seconds,
+    port,
+    read_gates,
+    refresh_seconds,
+    stale_seconds,
+)
 
 _TOUCHED = (
     "API_SECRET",
@@ -64,6 +73,8 @@ _TOUCHED = (
     "DB_PATH",
     "PAPER_DB_PATH",
     "HEARTBEAT_STALE_SEC",
+    "GATEWAY_HEARTBEAT_STALE_SEC",
+    "EXECUTION_LEDGER_PATH",
     "EXECUTION_PAPER_ENABLED",
     "PM_ENABLED",
     "LIVE_TRADING_ENABLED",
@@ -71,6 +82,7 @@ _TOUCHED = (
     "LIVE_KILL_SWITCH_PATH",
     "LIVE_EXCHANGE_API_KEY",
     "LIVE_EXCHANGE_API_SECRET",
+    "LIVE_EXCHANGE_API_URL",
 )
 _WRITE_SQL = re.compile(
     r"(?i)\b(insert\s+into|update\s+[a-z0-9_]+\s+set|delete\s+from|replace\s+into|"
@@ -635,15 +647,22 @@ class DashboardSmokeTest(unittest.TestCase):
         # Isolate from the live project's LIVE_TRADING_DISABLED kill-switch file.
         os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
         os.environ.pop("LIVE_KILL_SWITCH_PATH", None)
-        self.assertFalse(read_gates().paper_enabled)
-        self.assertFalse(read_gates().pm_enabled)
-        self.assertFalse(read_gates().live_effective)
+        idle = read_gates()
+        self.assertFalse(idle.paper_enabled)
+        self.assertFalse(idle.pm_enabled)
+        self.assertFalse(idle.live_effective)
+        self.assertEqual(idle.paper_origin, "看板进程")
+        self.assertEqual(idle.pm_origin, "看板进程")
+        self.assertFalse(idle.gateway_stale)
+        self.assertFalse(idle.exchange_url_set)
         os.environ["EXECUTION_PAPER_ENABLED"] = "YES"
         os.environ["PM_ENABLED"] = "on"
         os.environ["LIVE_TRADING_ENABLED"] = "1"
         status = read_gates()
         self.assertTrue(status.paper_enabled)
         self.assertTrue(status.pm_enabled)
+        self.assertEqual(status.paper_origin, "看板进程")
+        self.assertEqual(status.origin_hint("paper"), "看板进程")
         self.assertFalse(status.live_effective)
         self.assertEqual(status.live_block_reason, "确认短语未匹配")
 
@@ -658,10 +677,17 @@ class DashboardSmokeTest(unittest.TestCase):
         os.environ["LIVE_TRADING_ENABLED"] = "1"
         os.environ["LIVE_KILL_SWITCH_PATH"] = str(self.root / "absent-switch")
         os.environ["LIVE_TRADING_CONFIRM"] = "I_UNDERSTAND_THE_RISKS"
+        missing_url = read_gates()
+        self.assertFalse(missing_url.live_effective)
+        self.assertEqual(missing_url.live_block_reason, "交易所 URL 未设置")
+        self.assertEqual(missing_url.confirm_state, "matched")
+        os.environ["LIVE_EXCHANGE_API_URL"] = "https://exchange.example/orders"
         armed = read_gates()
         self.assertTrue(armed.live_effective)
+        self.assertTrue(armed.exchange_url_set)
         self.assertEqual(armed.confirm_state, "matched")
         self.assertNotIn("I_UNDERSTAND_THE_RISKS", armed.live_block_reason)
+        self.assertNotIn("exchange.example", armed.live_block_reason)
 
         os.environ["DASHBOARD_HOST"] = "0.0.0.0"
         self.assertEqual(bind_host(), "127.0.0.1")
@@ -688,9 +714,18 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertNotIn("abcdefghijklmnop", record.getMessage())
 
         self.assertEqual(bucket_key("liq_too_low; wide\nmore"), "liq_too_low")
+        self.assertEqual(bucket_key('["liq_too_low", "wide spread"]'), "liq_too_low")
         self.assertEqual(bucket_key("   "), "(empty)")
         self.assertEqual(bucket_key(None), "(empty)")
         self.assertEqual(len(bucket_key("a" * 100)), 80)
+        self.assertEqual(rejection_key(1, "", "rejected", {"status": "pm_rejected"}), "pm_rejected")
+        self.assertEqual(rejection_key(1, "", "validated", {"status": "paper_failed"}), "paper_failed")
+        self.assertEqual(rejection_key(0, '["slippage"]', "rejected", None), "slippage")
+        self.assertIsNone(rejection_key(1, "", "validated", {"status": "dry_run_acked"}))
+        self.assertEqual(backtest_equity_tone(11000, 10000), "up")
+        self.assertEqual(backtest_equity_tone(9000, 10000), "down")
+        self.assertEqual(backtest_equity_tone(15000, None), "mute")
+        self.assertEqual(backtest_equity_tone(10000, 10000), "mute")
         self.assertEqual(extract_jev_strength({"extras": {"jev_strength": "0.81"}}, None), 0.81)
         self.assertEqual(extract_jev_strength({}, "jev_strength=0.42 tail"), 0.42)
         self.assertEqual(fmt_pct(25), "+25.00%")
@@ -715,6 +750,8 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(refresh_age_label(None), "刷新 —")
         self.assertEqual(refresh_age_label(3), "刷新 3s 前")
         app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+        self.assertNotIn("end >= 10000", app_text)
+        self.assertIn("attach_secret_filters", app_text)
         for label in (
             "SPIKE'S",
             "CRYPTO",
@@ -786,6 +823,161 @@ class DashboardSmokeTest(unittest.TestCase):
         market_src = inspect.getsource(DataStore._market_rows)
         for banned in ("rsi", "macd", "boll"):
             self.assertNotIn(banned, market_src.lower())
+
+    def test_fresh_receipt_overrides_process_env(self) -> None:
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+        os.environ["EXECUTION_PAPER_ENABLED"] = "0"
+        os.environ["PM_ENABLED"] = "1"
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ledger = self.root / "execution_ledger.db"
+        with sqlite3.connect(ledger) as conn:
+            conn.execute(
+                "CREATE TABLE execution_log (id INTEGER PRIMARY KEY, ts TEXT, receipt_json TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO execution_log (ts, receipt_json) VALUES (?, ?)",
+                (now, json.dumps({"paper_enabled": True, "pm_enabled": False})),
+            )
+        status = read_gates()
+        self.assertTrue(status.paper_enabled)
+        self.assertFalse(status.pm_enabled)
+        self.assertEqual(status.paper_origin, "网关回执")
+        self.assertEqual(status.pm_origin, "网关回执")
+        self.assertFalse(status.gateway_stale)
+        self.assertEqual(status.origin_hint("paper"), "网关回执")
+
+    def test_stale_receipt_falls_back_and_is_labeled(self) -> None:
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+        os.environ["EXECUTION_PAPER_ENABLED"] = "0"
+        os.environ["PM_ENABLED"] = "0"
+        old = (datetime.now(timezone.utc) - timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ledger = self.root / "execution_ledger.db"
+        with sqlite3.connect(ledger) as conn:
+            conn.execute(
+                "CREATE TABLE execution_log (id INTEGER PRIMARY KEY, ts TEXT, receipt_json TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO execution_log (ts, receipt_json) VALUES (?, ?)",
+                (old, json.dumps({"paper_enabled": True, "pm_enabled": True})),
+            )
+        status = read_gates()
+        self.assertFalse(status.paper_enabled)
+        self.assertFalse(status.pm_enabled)
+        self.assertTrue(status.gateway_stale)
+        self.assertEqual(status.paper_origin, "看板进程")
+        self.assertEqual(status.origin_hint("pm"), "网关陈旧 · 看板进程")
+
+    def test_execution_ledger_path_and_gateway_window(self) -> None:
+        self.assertEqual(stale_seconds(), 900.0)
+        self.assertEqual(gateway_stale_seconds(), 120.0)
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+        ledger = self.root / "from-execution.db"
+        os.environ["EXECUTION_LEDGER_PATH"] = str(ledger)
+        self.assertEqual(DbPaths.from_env().execution, ledger)
+        override = self.root / "override.db"
+        os.environ["DASHBOARD_EXECUTION_DB"] = str(override)
+        self.assertEqual(DbPaths.from_env().execution, override)
+
+        aged = datetime.now(timezone.utc) - timedelta(seconds=200)
+        main = self.root / "dexscreener.db"
+        execution = self.root / "execution_ledger.db"
+        with sqlite3.connect(main) as conn:
+            conn.execute("CREATE TABLE decision_log (id INTEGER PRIMARY KEY, ts TEXT)")
+            conn.execute("INSERT INTO decision_log (ts) VALUES (?)", (_iso(aged),))
+        with sqlite3.connect(execution) as conn:
+            conn.execute("CREATE TABLE execution_log (id INTEGER PRIMARY KEY, ts TEXT)")
+            conn.execute("INSERT INTO execution_log (ts) VALUES (?)", (_iso(aged),))
+        store = DataStore(
+            DbPaths(
+                main=main,
+                execution=execution,
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        probes = {item.name: item for item in store.process_liveness().data}
+        self.assertEqual(probes["决策引擎"].state, "alive")
+        self.assertEqual(probes["执行网关"].state, "stale")
+
+    def test_rejection_buckets_include_status_and_json_errors(self) -> None:
+        now = datetime.now(timezone.utc)
+        execution = self.root / "execution_ledger.db"
+        with sqlite3.connect(execution) as conn:
+            conn.execute(
+                """
+                CREATE TABLE execution_log (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT,
+                    validation_ok INTEGER,
+                    validation_errors TEXT,
+                    status TEXT,
+                    receipt_json TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO execution_log
+                    (id, ts, validation_ok, validation_errors, status, receipt_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (1, _iso(now), 1, "", "rejected", json.dumps({"status": "pm_rejected"})),
+                    (2, _iso(now), 1, "", "rejected", json.dumps({"status": "risk_rejected"})),
+                    (3, _iso(now), 1, "", "validated", json.dumps({"status": "paper_failed"})),
+                    (4, _iso(now), 0, '["slippage", "wide"]', "rejected", "{}"),
+                    (5, _iso(now), 1, "", "validated", json.dumps({"status": "dry_run_acked"})),
+                ],
+            )
+        store = DataStore(
+            DbPaths(
+                main=self.root / "missing-main.db",
+                execution=execution,
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        report = store.rejection_buckets()
+        self.assertTrue(report.available, report.reason)
+        counts = {item.key: item.count for item in report.data.buckets}
+        self.assertEqual(report.data.total, 4)
+        self.assertEqual(counts, {"pm_rejected": 1, "risk_rejected": 1, "paper_failed": 1, "slippage": 1})
+        failures = store.recent_failures()
+        self.assertEqual([item.id for item in failures.data], [4, 3, 2, 1])
+        self.assertIn("slippage", failures.data[0].validation_errors)
+
+    def test_chat_context_uses_newest_messages(self) -> None:
+        sessions = SessionStore(self.root / "dashboard_state.db")
+        info = sessions.create_session("sweep")
+        for index in range(205):
+            sessions.append_message(info.id, "user", f"m{index}")
+        msgs = sessions.list_messages(info.id, limit=200)
+        self.assertEqual(len(msgs), 200)
+        self.assertEqual(msgs[0].content, "m5")
+        self.assertEqual(msgs[-1].content, "m204")
+        self.assertLess(msgs[0].id, msgs[-1].id)
+
+    def test_secret_filter_scrubs_propagated_handler_records(self) -> None:
+        os.environ["API_SECRET"] = "abcdefghijklmnop"
+        attach_secret_filters()
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        root = logging.getLogger()
+        root.addHandler(handler)
+        child = logging.getLogger("dashboard.probe.secret")
+        child.setLevel(logging.INFO)
+        child.propagate = True
+        try:
+            child.info("leak abcdefghijklmnop")
+            text = stream.getvalue()
+            self.assertNotIn("abcdefghijklmnop", text)
+            self.assertIn("[redacted]", text)
+            self.assertTrue(any(isinstance(item, SecretFilter) for item in handler.filters))
+        finally:
+            root.removeHandler(handler)
 
     def test_market_rows_keep_indicator_columns(self) -> None:
         missing = DataStore(

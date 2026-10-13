@@ -10,7 +10,10 @@ from dashboard.panels.common import col, data_table, panel_box, show_unavailable
 
 
 def render_execution(store: DataStore) -> None:
-    with panel_box("执行记录", "execution_log 最近 50 条。拒绝分布按 validation_errors 首段计数。"):
+    with panel_box(
+        "执行记录",
+        "execution_log 最近 50 条。拒绝分布含校验失败，以及 status / 回执中的 PM、风控、paper 拒绝。",
+    ):
         _buckets(store)
         _rows(store)
 

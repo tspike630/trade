@@ -21,7 +21,6 @@ from typing import Any, Iterator
 from urllib.parse import quote
 
 from dashboard.parsing import (
-    bucket_key,
     clip,
     extract_coverage,
     extract_jev_strength,
@@ -31,9 +30,20 @@ from dashboard.parsing import (
     parse_json,
     parse_ts,
     receipt_summary,
+    rejection_key,
     safe_float,
+    validation_error_text,
 )
-from dashboard.settings import db_root, resolve_db_file, stale_seconds
+from dashboard.settings import (
+    EXECUTION_DB_ENV,
+    _ReceiptFlags,
+    _as_bool,
+    _parse_utc,
+    db_root,
+    gateway_stale_seconds,
+    resolve_db_file,
+    stale_seconds,
+)
 from dashboard.format_util import Liveness
 
 log = logging.getLogger("dashboard.data")
@@ -93,7 +103,7 @@ class DbPaths:
         root = db_root()
         return cls(
             main=resolve_db_file(("DASHBOARD_MAIN_DB", "DB_PATH"), "dexscreener.db", root),
-            execution=resolve_db_file(("DASHBOARD_EXECUTION_DB",), "execution_ledger.db", root),
+            execution=resolve_db_file(EXECUTION_DB_ENV, "execution_ledger.db", root),
             paper=resolve_db_file(("DASHBOARD_PAPER_DB", "PAPER_DB_PATH"), "paper_trading.db", root),
             backtest=resolve_db_file(("DASHBOARD_BACKTEST_DB",), "backtest_ledger.db", root),
             news=resolve_db_file(("DASHBOARD_NEWS_DB",), "news_events.db", root),
@@ -328,6 +338,44 @@ def ro_connect(path: str | Path) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def latest_gate_receipt() -> _ReceiptFlags:
+    """Newest execution_log receipt. A missing ledger is an empty snapshot, not an error.
+
+    Opened with ``connect_ro`` (``mode=ro``, ``query_only``). Called from
+    ``settings.read_gates`` so the gate lights can follow the gateway without
+    a second connection helper.
+    """
+    path = resolve_db_file(EXECUTION_DB_ENV, "execution_ledger.db")
+    if not path.is_file():
+        return _ReceiptFlags(False, None, None, None)
+    try:
+        with ro_connect(path) as conn:
+            if not _table_exists(conn, "execution_log"):
+                return _ReceiptFlags(False, None, None, None)
+            cols = _columns(conn, "execution_log")
+            if "receipt_json" not in cols:
+                return _ReceiptFlags(False, None, None, None)
+            order = "id" if "id" in cols else "rowid"
+            ts_expr = "ts" if "ts" in cols else "NULL"
+            found = _exec(
+                conn,
+                f"SELECT {ts_expr} AS ts, receipt_json FROM execution_log "
+                f"ORDER BY {order} DESC LIMIT 1",
+            ).fetchone()
+    except (OSError, sqlite3.Error, FileNotFoundError):
+        log.warning("gateway receipt unreadable")
+        return _ReceiptFlags(False, None, None, None)
+    if found is None:
+        return _ReceiptFlags(False, None, None, None)
+    payload = parse_json(str(found["receipt_json"] or ""))
+    return _ReceiptFlags(
+        True,
+        _parse_utc(found["ts"]),
+        _as_bool(payload.get("paper_enabled")),
+        _as_bool(payload.get("pm_enabled")),
+    )
+
+
 def _ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000.0
 
@@ -436,10 +484,32 @@ def _age_seconds(ts: Any, now: datetime) -> float | None:
     return (now - stamp).total_seconds()
 
 
-def _liveness(age: float | None) -> Liveness:
+def _rejection_sql_clauses(cols: set[str]) -> list[str]:
+    """Static predicates for rows that can be validation, PM, risk, or paper rejects."""
+    clauses: list[str] = []
+    if "validation_ok" in cols:
+        clauses.append("COALESCE(validation_ok, 0) != 1")
+    if "validation_errors" in cols:
+        clauses.append("(validation_errors IS NOT NULL AND TRIM(validation_errors) != '')")
+    if "status" in cols:
+        clauses.append("LOWER(COALESCE(status, '')) = 'rejected'")
+    if "receipt_json" in cols:
+        clauses.append(
+            "("
+            "INSTR(receipt_json, '\"pm_rejected\"') > 0"
+            " OR INSTR(receipt_json, '\"risk_rejected\"') > 0"
+            " OR INSTR(receipt_json, '\"paper_failed\"') > 0"
+            " OR INSTR(receipt_json, '\"validation_failed\"') > 0"
+            ")"
+        )
+    return clauses
+
+
+def _liveness(age: float | None, limit: float | None = None) -> Liveness:
     if age is None:
         return "unknown"
-    if age <= stale_seconds():
+    window = stale_seconds() if limit is None else limit
+    if age <= window:
         return "alive"
     return "stale"
 
@@ -641,31 +711,53 @@ class DataStore:
                         "strategy_id",
                         "action",
                         "token_address",
+                        "validation_ok",
                         "validation_errors",
+                        "status",
+                        "receipt_json",
                     )
                     if name in cols
                 ]
+                clauses = _rejection_sql_clauses(cols)
+                if not clauses:
+                    return _unavail(f"缺少字段：validation_errors（{path.name}）", started)
+                scan = min(max(bounded * 5, bounded), 200)
                 sql = (
                     f"SELECT {', '.join(wanted)} FROM execution_log "
-                    "WHERE validation_errors IS NOT NULL AND TRIM(validation_errors) != '' "
+                    f"WHERE {' OR '.join(clauses)} "
                     "ORDER BY id DESC LIMIT ?"
                 )
-                rows = _exec(conn, sql, (bounded,)).fetchall()
+                rows = _exec(conn, sql, (scan,)).fetchall()
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
-        payload = tuple(
-            FailureRow(
-                id=int(row["id"]),
-                ts=str(_cell(row, "ts") or ""),
-                decision_log_id=_text_id(_cell(row, "decision_log_id")),
-                strategy_id=clip(_cell(row, "strategy_id"), 40),
-                action=clip(_cell(row, "action"), 24),
-                token_address=str(_cell(row, "token_address") or ""),
-                validation_errors=clip(_cell(row, "validation_errors"), 180),
+        kept: list[FailureRow] = []
+        for row in rows:
+            raw_errors = str(_cell(row, "validation_errors") or "")
+            receipt = parse_json(str(_cell(row, "receipt_json") or ""))
+            status_text = _cell(row, "status")
+            key = rejection_key(
+                _as_int(_cell(row, "validation_ok")),
+                raw_errors,
+                None if status_text is None else str(status_text),
+                receipt or None,
             )
-            for row in rows
-        )
-        return _ok(payload, started)
+            if key is None:
+                continue
+            shown = validation_error_text(raw_errors).strip() or key
+            kept.append(
+                FailureRow(
+                    id=int(row["id"]),
+                    ts=str(_cell(row, "ts") or ""),
+                    decision_log_id=_text_id(_cell(row, "decision_log_id")),
+                    strategy_id=clip(_cell(row, "strategy_id"), 40),
+                    action=clip(_cell(row, "action"), 24),
+                    token_address=str(_cell(row, "token_address") or ""),
+                    validation_errors=clip(shown, 180),
+                )
+            )
+            if len(kept) >= bounded:
+                break
+        return _ok(tuple(kept), started)
 
     def _process_liveness(self, started: float) -> DataResult:
         path = self.paths.main
@@ -694,7 +786,14 @@ class DataStore:
             return ProcessProbe("执行网关", "unknown", None, "")
         try:
             with ro_connect(path) as conn:
-                return _probe_max(conn, "execution_log", "ts", "执行网关", now)
+                return _probe_max(
+                    conn,
+                    "execution_log",
+                    "ts",
+                    "执行网关",
+                    now,
+                    limit=gateway_stale_seconds(),
+                )
         except sqlite3.Error:
             log.warning("gateway heartbeat unreadable")
             return ProcessProbe("执行网关", "unknown", None, "")
@@ -1066,9 +1165,14 @@ class DataStore:
                 absent = _require(cols, ("ts", "validation_ok", "validation_errors"))
                 if absent:
                     return _unavail(f"{absent}（{path.name}）", started)
+                selected = ["ts", "validation_ok", "validation_errors"]
+                if "status" in cols:
+                    selected.append("status")
+                if "receipt_json" in cols:
+                    selected.append("receipt_json")
                 rows = _exec(
                     conn,
-                    "SELECT ts, validation_ok, validation_errors FROM execution_log WHERE ts >= ?",
+                    f"SELECT {', '.join(selected)} FROM execution_log WHERE ts >= ?",
                     (lower,),
                 ).fetchall()
         except sqlite3.Error as exc:
@@ -1078,13 +1182,18 @@ class DataStore:
         for row in rows:
             if not _in_range(row["ts"], start, end, end_inclusive=True):
                 continue
-            errors = str(row["validation_errors"] or "")
-            ok = _as_int(row["validation_ok"])
-            if ok == 1 and not errors.strip():
+            receipt = parse_json(str(_cell(row, "receipt_json") or ""))
+            status_text = _cell(row, "status")
+            key = rejection_key(
+                _as_int(row["validation_ok"]),
+                str(row["validation_errors"] or ""),
+                None if status_text is None else str(status_text),
+                receipt or None,
+            )
+            if key is None:
                 continue
-            if ok != 1 or errors.strip():
-                counts[bucket_key(errors)] += 1
-                total += 1
+            counts[key] += 1
+            total += 1
         ordered = tuple(
             RejectionBucket(key=key, count=count)
             for key, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
@@ -1774,6 +1883,7 @@ def _probe_max(
     time_col: str,
     name: str,
     now: datetime,
+    limit: float | None = None,
 ) -> ProcessProbe:
     if table not in _TABLES or not _table_exists(conn, table):
         return ProcessProbe(name, "unknown", None, "")
@@ -1785,4 +1895,4 @@ def _probe_max(
     if row is None or not row["ts"]:
         return ProcessProbe(name, "unknown", None, "")
     age = _age_seconds(row["ts"], now)
-    return ProcessProbe(name, _liveness(age), age, "")
+    return ProcessProbe(name, _liveness(age, limit), age, "")
