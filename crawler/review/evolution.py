@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from review.data import SignalChainRow
+from review.gates import (
+    CONSECUTIVE_WEEKS,
+    MIN_RAW_N as JEV_N_GATE,
+    MIN_UNIQUE_TOKEN as JEV_UNIQUE_TOKEN_GATE,
+    UP_1H_DEGRADE as JEV_UP1H_WEAK,
+    UP_1H_PROMOTE as JEV_UP1H_PASS,
+)
 from review.optimizer import (
     MIN_HISTORY_DAYS,
     MIN_SAMPLES,
@@ -22,17 +29,27 @@ STATUS_DECIDE = "裁决"
 
 LAYERS = ("采集", "指标", "决策", "执行", "复盘")
 
-# JEV weekly-check thresholds (align DECISION_ENGINE_WEEKLY_CHECK.md)
-JEV_UNIQUE_TOKEN_GATE = 10
-JEV_N_GATE = 15
-JEV_UP1H_PASS = 0.55
-JEV_UP1H_WEAK = 0.50
-
-
 def _pct(rate: Optional[float], digits: int = 1) -> str:
     if rate is None:
         return "—"
     return f"{rate * 100:.{digits}f}%"
+
+
+def _joint_bucket_bit(joint: Optional[dict[str, Any]], label: str) -> str:
+    """Live JEV-filtered bucket stats. Omit frozen snapshot numbers."""
+    buckets = (((joint or {}).get("jev_filtered") or {}).get("buckets") or {})
+    row = buckets.get(label) or {}
+    up = row.get("up_1h")
+    if up is None:
+        up = row.get("up_1h_rate")
+    if up is None:
+        up_s = "—"
+    else:
+        try:
+            up_s = f"{float(up) * 100:.1f}%"
+        except (TypeError, ValueError):
+            up_s = "—"
+    return f"{label}: n={row.get('n', 0)} up_1h={up_s}"
 
 
 def _suggestion(
@@ -1388,8 +1405,9 @@ def build_evolution_suggestions(
             status=STATUS_WATCH,
             evidence=_jev_gate_distance(jev_slice_metrics),
             action_hint=(
-                "继续周检攒样本；连续 2 周过滤后 1h≥55% 且 unique_token≥10 "
-                "（且 n≥15）后再启动 Step2；本层只观察"
+                f"继续周检攒样本；连续 {CONSECUTIVE_WEEKS} 周过滤后 "
+                f"1h≥{_pct(JEV_UP1H_PASS, 0)} 且 unique_token≥{JEV_UNIQUE_TOKEN_GATE} "
+                f"（且 n≥{JEV_N_GATE}）后再启动 Step2；本层只观察"
             ),
         )
     )
@@ -1400,8 +1418,10 @@ def build_evolution_suggestions(
             item="策略退役规则提醒",
             status=STATUS_WATCH,
             evidence=(
-                "规则（决策表）：连续 N=2 周过滤后 1h<50% 且 unique_token≥10 → "
-                "建议降级/停用，勿进 R3 无限调参；现样本未跨门槛，规则只提醒不裁决"
+                f"规则（决策表）：连续 {CONSECUTIVE_WEEKS} 周过滤后 "
+                f"1h<{_pct(JEV_UP1H_WEAK, 0)} 且 unique_token≥{JEV_UNIQUE_TOKEN_GATE} → "
+                "建议降级/停用，勿进 R3 无限调参。"
+                f"本期：{_jev_gate_distance(jev_slice_metrics)}。规则只提醒不裁决"
             ),
             action_hint="周检写入决策表时核对此条；退役=止损，调参=修补；落地需 R4",
         )
@@ -1424,10 +1444,10 @@ def build_evolution_suggestions(
     suggestions.append(
         _suggestion(
             layer="执行",
-            item="executed=0 / paper 未开闸",
+            item="paper / executed 状态",
             status=STATUS_WATCH,
             evidence=exec_ev,
-            action_hint="开闸前属预期；开闸与换 executor 属执行层/R4，复盘不自动开闸",
+            action_hint="开闸与换 executor 属执行层/R4，复盘不自动开闸",
         )
     )
 
@@ -1462,7 +1482,7 @@ def build_evolution_suggestions(
             status=STATUS_WATCH,
             evidence=joint_ev,
             action_hint=(
-                "联合归因已出，不调权；n 仍小；监控假说「1–24h 段质量最高」（过滤后 JEV n=7 up_1h=85.7%；过滤增益最大；>7d n=4 且 4h 差）；"
+                "联合归因已出，不调权；监控假说「1–24h 段质量最高」以本期联合表为准；"
                 "落地须走 R4"
             ),
         )
@@ -1509,8 +1529,9 @@ def build_evolution_suggestions(
             item="候选分层过滤 token_age∈[1h,24h]",
             status=STATUS_WATCH,
             evidence=(
-                "过滤后 JEV 1–24h 段 n=7 up_1h=85.7%，过滤增益最大；"
-                ">7d n=4 且 4h 差；监控假说「1–24h 段质量最高」"
+                "监控假说「1–24h 段质量最高」，数字取本期联合表。"
+                f"{_joint_bucket_bit(joint, '1-24h')}；"
+                f"{_joint_bucket_bit(joint, '>7d')}"
             ),
             action_hint=(
                 "status=观察中；等 unique≥10 再攒几周才谈建议落地；"

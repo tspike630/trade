@@ -20,6 +20,7 @@ from review.data import (
     load_jev_coverage,
     load_market_baseline,
     load_signal_chain,
+    parse_ts,
     summarize_execution,
     to_iso_z,
 )
@@ -71,14 +72,14 @@ def _parse_period(period: str, now: Optional[datetime] = None) -> tuple[str, str
 
 
 def _normalize_iso(s: str) -> str:
+    """Normalize --start/--end to UTC ISO-8601 Z before string compare."""
     s = s.strip()
     if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-        return s + "T00:00:00Z"
-    if s.endswith("Z") or re.search(r"[+-]\d{2}:\d{2}$", s):
-        return s
-    if "T" not in s:
         s = s + "T00:00:00"
-    return s + "Z"
+    try:
+        return to_iso_z(parse_ts(s))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid ISO timestamp {s!r}") from exc
 
 
 def _end_date_label(period_end: str) -> str:
@@ -200,8 +201,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not (args.start and args.end):
             print("error: --start and --end must be used together", file=sys.stderr)
             return 2
-        period_start = _normalize_iso(args.start)
-        period_end = _normalize_iso(args.end)
+        try:
+            period_start = _normalize_iso(args.start)
+            period_end = _normalize_iso(args.end)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
     else:
         period = args.period or "7d"
         try:

@@ -120,8 +120,9 @@ def resolve_fine_age_bucket(
 
 
 JOINT_CAVEAT = (
-    "联合归因观察：n 仍小；监控假说「1–24h 段质量最高」（过滤后 JEV n=7 up_1h=85.7%；过滤增益最大；>7d n=4 且 4h 差），"
-    "不作为调参依据；不触发任何自动动作 / 不调权"
+    "联合归因观察：样本不足时不作为调参依据；"
+    "假说「1–24h 段质量最高」只观察，以本期联合表为准；"
+    "不触发任何自动动作 / 不调权"
 )
 
 # Map fine age bucket → self_db survive horizon key + minimum crawler window (h)
@@ -467,7 +468,7 @@ def joint_jev_age_prior(
         "mismatch_notes": mismatch_notes,
         "prior_tag_buckets": prior_tag_buckets,
         "reconcile_notes": reconcile_notes,
-        "hypothesis": "监控假说「1–24h 段质量最高」（过滤后 JEV n=7 up_1h=85.7%；过滤增益最大；>7d n=4 且 4h 差）",
+        "hypothesis": "监控假说「1–24h 段质量最高」（以本期联合表为准，不引用冻结样本）",
         "note": note,
         "prior_meta": {
             "ok": prior.get("ok"),

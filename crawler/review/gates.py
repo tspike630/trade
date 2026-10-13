@@ -1,0 +1,39 @@
+"""Shared sample floors and 1h rate lines.
+
+Used by weekly-check (`scripts/jev_validity.py`), `review.evolution`, and
+`review.factor_loop`. Passing a gate does not activate a strategy:
+`factor_loop` status max remains ``accepted``.
+
+``factor_loop`` ``n_raw`` is the parameter-scan count from
+``jev_validity.run_analysis`` (buys under one candidate's strength /
+liquidity / coverage). Weekly activation still uses the weekly-check
+sample: filtered decision_log n and unique_token for that week, not this
+scan's ``n_raw``.
+"""
+
+from __future__ import annotations
+
+# Sample floors (weekly-check / jev_validity).
+MIN_RAW_N = 15
+MIN_UNIQUE_TOKEN = 10
+
+# Filtered 1h up-rate lines.
+UP_1H_PROMOTE = 0.55  # >= promote → candidate can be accepted
+UP_1H_DEGRADE = 0.50  # < degrade → weak / reject
+
+# Weeks that must clear the promote line before Step2.
+CONSECUTIVE_WEEKS = 2
+
+# Names factor_loop already used. The old 40% retry line is the degrade line.
+GATE_HARD_N = MIN_RAW_N
+GATE_UNIQUE = MIN_UNIQUE_TOKEN
+GATE_UP_1H = UP_1H_PROMOTE
+GATE_UP_1H_DEGRADE = UP_1H_DEGRADE
+
+SAMPLE_NOTE = (
+    "factor_loop 的 n_raw 是参数扫描样本（jev_validity.run_analysis 在该候选 "
+    "strength/liq/coverage 下的过滤前计数），不等于 decision_log 周检信号样本。"
+    "激活仍走周检口径（过滤后 n≥"
+    f"{MIN_RAW_N} 且 unique_token≥{MIN_UNIQUE_TOKEN}，连续 {CONSECUTIVE_WEEKS} 周 "
+    f"1h≥{UP_1H_PROMOTE:.0%}）；本循环过门槛最多 status=accepted，不自动激活。"
+)

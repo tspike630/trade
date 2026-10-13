@@ -114,8 +114,7 @@ def _render_attribution_section(
     lines.append("")
     # MUST nail caveat
     caveat = (attribution or {}).get("caveat") or (
-        "归因观察、样本不足（当前约 40 信号 / 回测 ~0.51d）、不作为调参依据；"
-        "不触发任何自动动作"
+        "归因观察、样本不足时不作为调参依据；不触发任何自动动作"
     )
     lines.append(f"> **Caveat（钉死）：** {caveat}")
     lines.append("")
@@ -146,20 +145,32 @@ def _render_attribution_section(
     lines.append("")
     fa = fill_attr or {}
     if (fa.get("note") == "no_fills") or not fa.get("n_fills"):
-        lines.append("待模拟盘开闸（当前 paper fills/positions 为空，`note=no_fills`）。")
+        lines.append(
+            "本期无匹配成交（`note=no_fills`）。"
+            "已实现 PnL 只在 closed `positions.pnl_usd`；"
+            "信号层 mark-to-market 见第 2 节前向收益，两者不要混读。"
+        )
         lines.append("")
     else:
         lines.append(
-            f"n_fills={fa.get('n_fills')}；total_pnl_usd={fa.get('total_pnl_usd')}；"
+            f"n_fills={fa.get('n_fills')}；n_closed={fa.get('n_closed', 0)}；"
+            f"n_open={fa.get('n_open', 0)}；"
+            f"已实现 PnL（realized）={fa.get('realized_pnl_usd', fa.get('total_pnl_usd'))}；"
+            f"未平仓盯市（mtm，不并进已实现）={fa.get('mtm_pnl_usd')}；"
             f"slippage={fa.get('slippage')}。"
         )
+        lines.append(f"{fa.get('mtm_note') or ''}")
         lines.append("")
         by_s = fa.get("by_strategy") or {}
         if by_s:
-            lines.append("| strategy | n | pnl_usd |")
-            lines.append("|---|---:|---:|")
+            lines.append("| strategy | n | realized_pnl_usd | mtm_pnl_usd |")
+            lines.append("|---|---:|---:|---:|")
             for sid, m in by_s.items():
-                lines.append(f"| `{sid}` | {m.get('n', 0)} | {m.get('pnl_usd', 0)} |")
+                lines.append(
+                    f"| `{sid}` | {m.get('n', 0)} | "
+                    f"{_num(m.get('realized_pnl_usd', m.get('pnl_usd')))} | "
+                    f"{_num(m.get('mtm_pnl_usd'))} |"
+                )
             lines.append("")
 
     # optional backtest summary alongside attribution
@@ -180,10 +191,14 @@ def _render_attribution_section(
         )
         if bt.get("notes"):
             lines.append(f"notes: {bt.get('notes')}")
+        lines.append(
+            "PnL 口径：下表为回测已实现（closed `positions.pnl_usd`），"
+            "不是第 2 节信号 mark-to-market 前向收益。"
+        )
         lines.append("")
         by = bt.get("by_strategy") or {}
         if by:
-            lines.append("| strategy_id | trades | win_rate | total_pnl_usd |")
+            lines.append("| strategy_id | trades | win_rate | realized_pnl_usd |")
             lines.append("|---|---:|---:|---:|")
             for sid, m in by.items():
                 lines.append(
@@ -319,7 +334,10 @@ def render_weekly_md(
     # 2. 全策略
     lines.append("## 2. 全策略信号绩效（1h / 4h）")
     lines.append("")
-    lines.append("前向收益口径：`pair_history` 就近价格，容差默认 ±1800s（对齐 `jev_validity`）。")
+    lines.append(
+        "前向收益口径：`pair_history` 就近价格，容差默认 ±1800s（对齐 `jev_validity`）。"
+        "这是信号层 **mark-to-market** 前向收益，不是第 8 节已实现 PnL。"
+    )
     lines.append("")
     lines.append(_TABLE_HEADER)
     lines.append(_metrics_row("全策略", metrics))
@@ -359,11 +377,12 @@ def render_weekly_md(
         lines.append(_metrics_row("JEV≥0.15", jev_slice_metrics))
         lines.append("")
         lines.append(
-            f"对账提示：周检过滤后 1h/4h 上涨率见 "
-            f"`DECISION_ENGINE_JEV_VALIDITY_FILTERED.md`（约 71.4% / 57.1%，n=14）；"
+            "对账提示：与当次周检 `DECISION_ENGINE_JEV_VALIDITY_FILTERED.md` 对照，"
+            "不引用冻结样本。"
             f"本切片 up_1h={_pct(jev_slice_metrics.get('up_1h_rate'))}，"
             f"up_4h={_pct(jev_slice_metrics.get('up_4h_rate'))}，"
-            f"n={jev_slice_metrics.get('n', 0)}。"
+            f"n={jev_slice_metrics.get('n', 0)}，"
+            f"unique_token={jev_slice_metrics.get('unique_token', 0)}。"
         )
     lines.append("")
 
@@ -436,14 +455,17 @@ def render_weekly_md(
     # 7. 缺口
     lines.append("## 7. 缺口与下一步")
     lines.append("")
-    lines.append("- **成交层空：** paper `positions`/`fills` 仍为 0；`pnl_usd` / fill 字段全 None，属预期（开闸前）。")
+    n_fills = int((fill_attr or {}).get("n_fills") or 0)
+    executed_n = exec_summary.get("executed", 0)
+    strat_list = ", ".join(f"`{s}`" for s in strategies) or "—"
     lines.append(
-        "- **executed=0：** 现网 `executor=step_a_noop`，校验可通过但未实成交；R1 报告仍完整。"
+        f"- **成交层：** 本期匹配 position={n_pos}，fills={n_fills}。"
+        "已实现 PnL 见第 8 节；无匹配时成交字段为 None。"
     )
     lines.append(
-        "- **策略覆盖：** 当前库仅见 `jev_strength_v1`；B/C（`tech_momentum_v1` / "
-        "`combined_jev_tech_v1`）待信号写入后分桶自动出现。"
+        f"- **executed：** 本期 executed={executed_n}（分布见第 5 节）。"
     )
+    lines.append(f"- **策略覆盖：** 本期见 {strat_list}。")
     lines.append(
         "- **R2 半块：** 第 8 节信号层归因已落地（只读分桶）；样本不足，不作为调参依据，不触发自动动作。"
     )
@@ -468,7 +490,7 @@ def render_weekly_md(
         lines.append(optimize_section)
     else:
         lines.append(
-            "占位：历史不足（现 ~0.51d）或周检尚未跨门槛前不正式寻优；"
+            "占位：历史未达 ≥7d 或周检尚未跨门槛前不正式寻优；"
             "脚手架见 `review/optimizer.py`（`--optimize` 仅 dry_run / skip）。"
             "**不自动写配置**；正式改参需 R4 人工确认。"
         )

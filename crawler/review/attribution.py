@@ -24,8 +24,7 @@ REGIME_BEAR_LT = -2.0
 REGIME_BULL_GT = 2.0
 
 CAVEAT = (
-    "归因观察、样本不足（当前约 40 信号 / 回测 ~0.51d）、不作为调参依据；"
-    "不触发任何自动动作"
+    "归因观察、样本不足时不作为调参依据；不触发任何自动动作"
 )
 
 
@@ -362,10 +361,49 @@ def signal_attribution(
     }
 
 
-def fill_attribution(rows: list[SignalChainRow]) -> dict:
-    """占位：滑点损耗、pnl 按策略/标的归集。
+_PNL_NOTE = (
+    "信号层 fwd_1h/fwd_4h 为 mark-to-market 前向收益；"
+    "realized_pnl_usd / total_pnl_usd 只含已平仓 positions.pnl_usd；"
+    "未平仓若自带 pnl_usd 记在 mtm_pnl_usd，不要与已实现混加"
+)
 
-    当前无成交时返回空结构 + note=no_fills；开闸后不改签名即可填。
+
+def _pnl_kind(row: SignalChainRow) -> str:
+    """Split closed realized PnL from open mark-to-market."""
+    status = (getattr(row, "position_status", None) or "").strip().lower()
+    if status == "open":
+        return "mtm"
+    if status == "closed":
+        return "realized"
+    if row.pnl_usd is not None:
+        return "realized"
+    if row.position_id is not None:
+        return "open_unmarked"
+    return "other"
+
+
+def _empty_fill_attr() -> dict[str, Any]:
+    return {
+        "note": "no_fills",
+        "n_fills": 0,
+        "n_open": 0,
+        "n_closed": 0,
+        "by_strategy": {},
+        "by_token": {},
+        "slippage": None,
+        "total_pnl_usd": None,
+        "realized_pnl_usd": None,
+        "mtm_pnl_usd": None,
+        "pnl_basis": "realized",
+        "mtm_note": _PNL_NOTE,
+    }
+
+
+def fill_attribution(rows: list[SignalChainRow]) -> dict:
+    """滑点占位 + PnL 按策略/标的归集。
+
+    total_pnl_usd 与 realized_pnl_usd 相同，只计已平仓。
+    未平仓的 pnl_usd（若库内写成盯市）放在 mtm_pnl_usd，不并进已实现。
     """
     fills = [
         r
@@ -375,45 +413,91 @@ def fill_attribution(rows: list[SignalChainRow]) -> dict:
         or r.pnl_usd is not None
     ]
     if not fills:
-        return {
-            "note": "no_fills",
-            "n_fills": 0,
-            "by_strategy": {},
-            "by_token": {},
-            "slippage": None,
-            "total_pnl_usd": None,
-        }
+        return _empty_fill_attr()
 
     by_strategy: dict[str, dict[str, Any]] = {}
     by_token: dict[str, dict[str, Any]] = {}
-    strat_pnl: dict[str, list[float]] = defaultdict(list)
-    tok_pnl: dict[str, list[float]] = defaultdict(list)
+    strat_realized: dict[str, list[float]] = defaultdict(list)
+    strat_mtm: dict[str, list[float]] = defaultdict(list)
+    tok_realized: dict[str, list[float]] = defaultdict(list)
+    tok_mtm: dict[str, list[float]] = defaultdict(list)
+    n_open = 0
+    n_closed = 0
+    realized_all: list[float] = []
+    mtm_all: list[float] = []
+
     for r in fills:
+        kind = _pnl_kind(r)
         sid = r.strategy_id or "(unknown)"
         tok = f"{r.chain_id}:{r.token_address}" if r.token_address else "(unknown)"
-        if r.pnl_usd is not None:
-            strat_pnl[sid].append(float(r.pnl_usd))
-            tok_pnl[tok].append(float(r.pnl_usd))
-        by_strategy.setdefault(sid, {"n": 0, "pnl_usd": 0.0})
+        by_strategy.setdefault(
+            sid,
+            {
+                "n": 0,
+                "pnl_usd": None,
+                "realized_pnl_usd": None,
+                "mtm_pnl_usd": None,
+                "pnl_basis": "realized",
+            },
+        )
         by_strategy[sid]["n"] += 1
-        by_token.setdefault(tok, {"n": 0, "pnl_usd": 0.0})
+        by_token.setdefault(
+            tok,
+            {
+                "n": 0,
+                "pnl_usd": None,
+                "realized_pnl_usd": None,
+                "mtm_pnl_usd": None,
+                "pnl_basis": "realized",
+            },
+        )
         by_token[tok]["n"] += 1
+        if r.pnl_usd is None:
+            if kind in ("mtm", "open_unmarked"):
+                n_open += 1
+            elif kind == "realized":
+                n_closed += 1
+            continue
+        value = float(r.pnl_usd)
+        if kind == "mtm":
+            n_open += 1
+            strat_mtm[sid].append(value)
+            tok_mtm[tok].append(value)
+            mtm_all.append(value)
+        else:
+            n_closed += 1
+            strat_realized[sid].append(value)
+            tok_realized[tok].append(value)
+            realized_all.append(value)
 
-    for sid, pnls in strat_pnl.items():
+    for sid, pnls in strat_realized.items():
+        by_strategy[sid]["realized_pnl_usd"] = sum(pnls)
         by_strategy[sid]["pnl_usd"] = sum(pnls)
         by_strategy[sid]["median_pnl"] = _median(pnls)
-    for tok, pnls in tok_pnl.items():
+    for sid, pnls in strat_mtm.items():
+        by_strategy[sid]["mtm_pnl_usd"] = sum(pnls)
+    for tok, pnls in tok_realized.items():
+        by_token[tok]["realized_pnl_usd"] = sum(pnls)
         by_token[tok]["pnl_usd"] = sum(pnls)
         by_token[tok]["median_pnl"] = _median(pnls)
+    for tok, pnls in tok_mtm.items():
+        by_token[tok]["mtm_pnl_usd"] = sum(pnls)
 
-    all_pnl = [float(r.pnl_usd) for r in fills if r.pnl_usd is not None]
+    realized_sum = sum(realized_all) if realized_all else None
+    mtm_sum = sum(mtm_all) if mtm_all else None
     return {
         "note": "fills_present",
         "n_fills": len(fills),
+        "n_open": n_open,
+        "n_closed": n_closed,
         "by_strategy": by_strategy,
         "by_token": by_token,
         "slippage": None,  # no fill vs signal price ledger yet
-        "total_pnl_usd": sum(all_pnl) if all_pnl else None,
+        "total_pnl_usd": realized_sum,
+        "realized_pnl_usd": realized_sum,
+        "mtm_pnl_usd": mtm_sum,
+        "pnl_basis": "realized",
+        "mtm_note": _PNL_NOTE,
     }
 
 

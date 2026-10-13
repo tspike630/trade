@@ -1,7 +1,7 @@
 """R3 参数寻优脚手架：网格枚举 + 时间切分护栏 + 稳健性评分。
 
 只搭框架，默认不跑正式寻优、不写配置、不改策略参数/闸门。
-正式寻优门槛：历史 ≥7d 且周检跨门槛后再开；当前约 0.51d。
+正式寻优门槛：历史 ≥7d 且周检跨门槛后再开。
 """
 
 from __future__ import annotations
@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence, Union
+
+from review.gates import CONSECUTIVE_WEEKS, MIN_RAW_N
 
 # ---------------------------------------------------------------------------
 # Constants / defaults
@@ -31,7 +33,7 @@ DEFAULT_SL: list[float] = [4.0, 5.0, 6.0]
 DEFAULT_MAX_HOLD: list[float] = [30.0, 60.0, 120.0]
 
 MIN_HISTORY_DAYS = 7.0
-MIN_SAMPLES = 15  # 对齐周检 n≥15 门槛的软门槛
+MIN_SAMPLES = MIN_RAW_N  # 对齐周检 n 门槛，不单独漂移
 TRAIN_RATIO_DEFAULT = 0.7
 
 # 稳健性：相邻点核心指标相对突变超过该比例 → 高风险
@@ -426,7 +428,9 @@ def check_optimize_gates(
     if n_samples < min_samples:
         reasons.append(f"样本不足：n={n_samples} < {min_samples}")
     if not weekly_check_passed:
-        reasons.append("周检尚未跨门槛（连续 2 周过滤后达标前不正式寻优）")
+        reasons.append(
+            f"周检尚未跨门槛（连续 {CONSECUTIVE_WEEKS} 周过滤后达标前不正式寻优）"
+        )
     if reasons:
         return False, "；".join(reasons)
     return True, ""

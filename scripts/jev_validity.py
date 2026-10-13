@@ -24,6 +24,16 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 _REPO = Path(__file__).resolve().parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from review.gates import (
+    CONSECUTIVE_WEEKS,
+    MIN_RAW_N,
+    MIN_UNIQUE_TOKEN,
+    UP_1H_DEGRADE,
+    UP_1H_PROMOTE,
+)
 
 
 def default_db_path() -> Path:
@@ -39,8 +49,6 @@ def default_db_path() -> Path:
 
 DEFAULT_DB = default_db_path()
 DEFAULT_TREND_CSV = _REPO / "exports" / "reports" / "jev_validity_trend.csv"
-MIN_UNIQUE_TOKEN = 10
-MIN_RAW_N = 15
 STRATEGY_ID = "jev_strength_v1"
 STRENGTH_RE = re.compile(r"jev_strength=([0-9.]+)")
 HK_TZ = timezone(timedelta(hours=8))
@@ -515,9 +523,15 @@ def decision_line(
     sample_ok = n >= MIN_RAW_N and unique_token >= MIN_UNIQUE_TOKEN
     tw = ""
     if two_week_ok is True:
-        tw = " 连续2周门槛：满足（1h≥55% 且 unique_token≥10）。"
+        tw = (
+            f" 连续{CONSECUTIVE_WEEKS}周门槛：满足"
+            f"（1h≥{UP_1H_PROMOTE:.0%} 且 unique_token≥{MIN_UNIQUE_TOKEN}）。"
+        )
     elif two_week_ok is False:
-        tw = " 连续2周门槛：未满足（需连续 2 周 1h≥55% 且 unique_token≥10）。"
+        tw = (
+            f" 连续{CONSECUTIVE_WEEKS}周门槛：未满足（需连续 {CONSECUTIVE_WEEKS} 周 "
+            f"1h≥{UP_1H_PROMOTE:.0%} 且 unique_token≥{MIN_UNIQUE_TOKEN}）。"
+        )
 
     if not sample_ok:
         if n >= MIN_RAW_N and unique_token < MIN_UNIQUE_TOKEN:
@@ -534,23 +548,23 @@ def decision_line(
             + tw
         )
     assert up_rate is not None
-    if up_rate >= 0.55:
+    if up_rate >= UP_1H_PROMOTE:
         return (
             f"n={n}≥{MIN_RAW_N} 且 unique_token={unique_token}≥{MIN_UNIQUE_TOKEN} "
-            f"且 1h 上涨率 {pct(up_rate)}≥55% → "
+            f"且 1h 上涨率 {pct(up_rate)}≥{UP_1H_PROMOTE:.0%} → "
             "有效需过滤，可进 Step2（仍建议 paper 先行）。"
             + tw
         )
-    if up_rate < 0.50:
+    if up_rate < UP_1H_DEGRADE:
         return (
             f"n={n}≥{MIN_RAW_N} 且 unique_token={unique_token}≥{MIN_UNIQUE_TOKEN} "
-            f"且 1h 上涨率 {pct(up_rate)}<50% → "
+            f"且 1h 上涨率 {pct(up_rate)}<{UP_1H_DEGRADE:.0%} → "
             "当前数据下单因子确认偏弱，降级建议；Step2 可转向技术面。"
             + tw
         )
     return (
         f"n={n}≥{MIN_RAW_N} 且 unique_token={unique_token}≥{MIN_UNIQUE_TOKEN} "
-        f"且 1h 上涨率 {pct(up_rate)} 介于 50–55% → "
+        f"且 1h 上涨率 {pct(up_rate)} 介于 {UP_1H_DEGRADE:.0%}–{UP_1H_PROMOTE:.0%} → "
         "边缘区间，继续积累样本后再判；暂不据此开 Step2。"
         + tw
     )
@@ -732,19 +746,21 @@ def _parse_int(s: str) -> Optional[int]:
 
 
 def week_gate_ok(row: dict[str, str]) -> bool:
-    """One week satisfies 1h≥55% and unique_token≥10."""
+    """One week satisfies the promote 1h line and unique_token floor."""
     up = _parse_rate(row.get("up_1h_rate", ""))
     ut = _parse_int(row.get("unique_token", ""))
     if up is None or ut is None:
         return False
-    return up >= 0.55 and ut >= MIN_UNIQUE_TOKEN
+    return up >= UP_1H_PROMOTE and ut >= MIN_UNIQUE_TOKEN
 
 
 def two_week_consecutive_ok(prior: list[dict[str, str]], current: dict[str, str]) -> bool:
-    """Current + last prior row both pass week_gate_ok."""
-    if not prior:
+    """Last CONSECUTIVE_WEEKS rows (including current) all pass week_gate_ok."""
+    need_prior = max(CONSECUTIVE_WEEKS - 1, 0)
+    if len(prior) < need_prior:
         return False
-    return week_gate_ok(prior[-1]) and week_gate_ok(current)
+    window = list(prior[-need_prior:]) + [current] if need_prior else [current]
+    return all(week_gate_ok(row) for row in window)
 
 
 def compare_week_section(
@@ -989,15 +1005,18 @@ def render_md(
     a("|------|------|")
     a(f"| n<{MIN_RAW_N}，或 n≥{MIN_RAW_N} 但 unique_token<{MIN_UNIQUE_TOKEN} | 样本不足 |")
     a(
-        f"| n≥{MIN_RAW_N} 且 unique_token≥{MIN_UNIQUE_TOKEN} 且上涨率≥55% | "
+        f"| n≥{MIN_RAW_N} 且 unique_token≥{MIN_UNIQUE_TOKEN} 且上涨率≥{UP_1H_PROMOTE:.0%} | "
         "有效需过滤，可进 Step2 |"
     )
     a(
-        f"| n≥{MIN_RAW_N} 且 unique_token≥{MIN_UNIQUE_TOKEN} 且上涨率仍<50% | "
+        f"| n≥{MIN_RAW_N} 且 unique_token≥{MIN_UNIQUE_TOKEN} 且上涨率仍<{UP_1H_DEGRADE:.0%} | "
         "当前数据下单因子确认偏弱，降级建议 + Step2 可转向技术面 |"
     )
-    a("| 其他（50–55%） | 边缘，继续积累 |")
-    a("| 连续 2 周 1h≥55% 且 unique_token≥10 | Step2 启动的周检硬门槛（见趋势 CSV） |")
+    a(f"| 其他（{UP_1H_DEGRADE:.0%}–{UP_1H_PROMOTE:.0%}） | 边缘，继续积累 |")
+    a(
+        f"| 连续 {CONSECUTIVE_WEEKS} 周 1h≥{UP_1H_PROMOTE:.0%} "
+        f"且 unique_token≥{MIN_UNIQUE_TOKEN} | Step2 启动的周检硬门槛（见趋势 CSV） |"
+    )
     a("")
     a(
         f"**本跑判定：** "
@@ -1005,11 +1024,18 @@ def render_md(
     )
     a("")
     if two_week_ok is True:
-        a("**连续 2 周门槛：** 满足（本周 + 上周均 1h≥55% 且 unique_token≥10）。")
+        a(
+            f"**连续 {CONSECUTIVE_WEEKS} 周门槛：** 满足"
+            f"（最近 {CONSECUTIVE_WEEKS} 周均 1h≥{UP_1H_PROMOTE:.0%} "
+            f"且 unique_token≥{MIN_UNIQUE_TOKEN}）。"
+        )
     elif two_week_ok is False:
-        a("**连续 2 周门槛：** 未满足（需连续 2 周 1h≥55% 且 unique_token≥10）。")
+        a(
+            f"**连续 {CONSECUTIVE_WEEKS} 周门槛：** 未满足（需连续 {CONSECUTIVE_WEEKS} 周 "
+            f"1h≥{UP_1H_PROMOTE:.0%} 且 unique_token≥{MIN_UNIQUE_TOKEN}）。"
+        )
     else:
-        a("**连续 2 周门槛：** 无历史可比（首次）→ 未满足。")
+        a(f"**连续 {CONSECUTIVE_WEEKS} 周门槛：** 无历史可比（首次）→ 未满足。")
     a("")
 
     a("## 附录：排除 |ret|>500%")

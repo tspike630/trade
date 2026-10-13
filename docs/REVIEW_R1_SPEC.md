@@ -18,7 +18,7 @@
 
 - 不写任何业务库、不改策略参数
 - 不做完整归因（R2）、不做参数寻优（R3）、不自动改参（R4）
-- 不假设 paper 已有成交（当前 fills/positions = 0）
+- 不假设 paper 已有成交；有成交时 `positions.id` 为 UUID 字符串，不得按 int 解析
 
 **当前数据实况（核对日）**
 
@@ -96,8 +96,9 @@ def connect_ro(path: str) -> sqlite3.Connection:
 ### 2.3 paper（paper_trading.db）
 
 - `account(id, cash_usd, updated_at)` — 现 1 行，`cash_usd=10000`
-- `positions(..., meta_json, pnl_usd, ...)` — **0 行**；代码约定开仓时 `meta_json` 含 `strategy_id` + `decision_log_id`
-- `fills(...)` — **0 行**
+- `positions.id` 为 **TEXT**（UUID 字符串）。`SignalChainRow.position_id` 为 `Optional[str]`；`meta_json.decision_log_id` 仅在值为整数或整数字符串时解析，坏 meta 跳过。不要 `int(positions.id)`。
+- `positions(..., meta_json, pnl_usd, ...)` — 核对日 **0 行**；代码约定开仓时 `meta_json` 含 `strategy_id` + `decision_log_id`
+- `fills(...)` — 核对日 **0 行**
 
 ### 2.4 市场基准（主库）
 
@@ -230,8 +231,8 @@ class SignalChainRow:
     executed: Optional[int]
     executor: Optional[str]
     receipt: dict[str, Any]      # parsed receipt_json
-    # 成交（开闸前全 None）
-    position_id: Optional[int]
+    # 成交（无匹配时全 None；paper id 为 UUID 字符串）
+    position_id: Optional[str]
     fill_side: Optional[str]
     fill_price: Optional[float]
     pnl_usd: Optional[float]
