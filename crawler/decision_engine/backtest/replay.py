@@ -37,6 +37,23 @@ def to_iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def coalesce_indicator_rows(
+    prev: dict[str, Any] | None, new: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge same-bar indicator_history rows.
+
+    A later NULL must not wipe RSI/MACD/BOLL written by an earlier row in the
+    bar. Non-null values from the later row still win.
+    """
+    if not prev:
+        return dict(new)
+    merged = dict(prev)
+    for key, val in new.items():
+        if val is not None:
+            merged[key] = val
+    return merged
+
+
 def floor_bar(dt: datetime, bar_minutes: int) -> datetime:
     bar_minutes = max(1, int(bar_minutes))
     epoch = int(dt.timestamp())
@@ -336,7 +353,9 @@ class HistoryReplay:
                 bars[bar_ts] = {}
                 bar_order.append(bar_ts)
             tok_key = f"{r['chain_id']}|{r['token_address']}"
-            bars[bar_ts][tok_key] = dict(r)
+            bars[bar_ts][tok_key] = coalesce_indicator_rows(
+                bars[bar_ts].get(tok_key), dict(r)
+            )
 
         # Preload pair_history price/liq into sorted lists per pair for nearest lookup
         pair_pts: dict[str, list[tuple[datetime, float, Optional[float]]]] = {}

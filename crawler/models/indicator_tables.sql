@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS token_indicators (
     tier TEXT,
     primary_pair_address TEXT,
     sample_count INTEGER,
+    -- Set only when technical recomputes RSI/MACD/BOLL. Not bumped by funding/sentiment.
+    tech_updated_at TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (chain_id, token_address)
 );
@@ -96,3 +98,6 @@ CREATE TABLE IF NOT EXISTS indicator_history (
 
 CREATE INDEX IF NOT EXISTS idx_indicator_history_lookup
     ON indicator_history (chain_id, token_address, recorded_at);
+
+CREATE INDEX IF NOT EXISTS idx_indicator_history_recorded
+    ON indicator_history (recorded_at);

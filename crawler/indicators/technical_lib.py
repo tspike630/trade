@@ -149,6 +149,11 @@ def compute_pandas_ta(
                 out["macd_hist"] = _finite_or_none(_align(macd_df[colmap["hist"]], n)[-1])
     except Exception:  # noqa: BLE001
         pass
+    # Partial MACD triples are not a value. Callers keep the previous set or store NULL.
+    if any(out[key] is None for key in ("macd", "macd_signal", "macd_hist")):
+        out["macd"] = None
+        out["macd_signal"] = None
+        out["macd_hist"] = None
 
     # --- BOLL (20, 2σ) ---
     try:
