@@ -144,9 +144,41 @@ def extract_symbol(raw: dict[str, Any]) -> str | None:
     return None
 
 
-def bucket_key(errors: str | None) -> str:
-    """First segment of validation_errors, matching review.data.summarize_execution."""
+_REJECT_RECEIPT_STATUS = frozenset(
+    {
+        "validation_failed",
+        "pm_rejected",
+        "risk_rejected",
+        "paper_failed",
+    }
+)
+
+
+def validation_error_text(errors: str | None) -> str:
+    """Flatten ``validation_errors`` for display and bucketing.
+
+    The ledger stores a JSON array (``execution/ledger.py``). Older rows and
+    the review helper used a semicolon-separated string; that form still works.
+    """
     err = redact(errors).strip()
+    if not err:
+        return ""
+    if err[0] in "[{\"":
+        try:
+            loaded = json.loads(err)
+        except json.JSONDecodeError:
+            loaded = None
+        if isinstance(loaded, list):
+            parts = [str(item).strip() for item in loaded if str(item).strip()]
+            return "; ".join(parts)
+        if isinstance(loaded, str):
+            return loaded.strip()
+    return err
+
+
+def bucket_key(errors: str | None) -> str:
+    """First validation error. JSON array first, then ``;`` / newline."""
+    err = validation_error_text(errors).strip()
     if not err:
         return "(empty)"
     key = err.split(";")[0].split("\n")[0].strip()
@@ -155,6 +187,34 @@ def bucket_key(errors: str | None) -> str:
     if len(key) > 80:
         key = key[:77] + "..."
     return key
+
+
+def rejection_key(
+    validation_ok: int | None,
+    validation_errors: str | None,
+    status: str | None = None,
+    receipt: dict[str, Any] | None = None,
+) -> str | None:
+    """Bucket key for a rejected execution row, or None when the row is not a rejection.
+
+    Validation failures keep the first error segment. PM, risk, and paper
+    denials are counted from ``execution_log.status`` and the receipt status
+    even when ``validation_ok`` is 1 and ``validation_errors`` is empty.
+    """
+    errors = validation_error_text(validation_errors)
+    if validation_ok != 1 or errors.strip():
+        return bucket_key(validation_errors)
+    receipt_status = ""
+    if isinstance(receipt, dict):
+        raw_status = receipt.get("status")
+        if isinstance(raw_status, str):
+            receipt_status = raw_status.strip().lower()
+    column = (status or "").strip().lower()
+    if receipt_status in _REJECT_RECEIPT_STATUS:
+        return receipt_status
+    if column == "rejected":
+        return "rejected"
+    return None
 
 
 def receipt_summary(receipt: dict[str, Any] | None, limit: int = 160) -> str:
