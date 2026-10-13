@@ -4,6 +4,9 @@ Step A (default): validate + ledger receipt only (executed=0).
 Step B: when EXECUTION_PAPER_ENABLED / paper_enabled, validated buy/sell → PaperExecutor.
 Step C: PositionManager after validation, before executor (PM_ENABLED=0 → pass-through).
 Pre-trade risk (EXECUTION_RISK_ENABLED=0 default) runs after PM and before the executor.
+Purpose gate (P2-38): only decision purpose ``live_candidate`` may reach validation
+or a fill. ``sample``, NULL/missing, and any other value are rejected with
+executed=0 and the cursor still advances. Paper / PM / risk stay default off.
 Never calls LiveExecutor. Main decision DB is read-only.
 """
 
@@ -44,6 +47,26 @@ ALLOWED_ACTIONS = frozenset({"buy", "sell"})
 STEP_A_EXECUTOR = "step_a_noop"
 PAPER_EXECUTOR = "paper"
 PM_GATE = "position_manager"
+# decision_log.purpose (P2-38). Only live_candidate is paper-eligible.
+# Comparison is case-sensitive after strip; decision writes these literals.
+PURPOSE_LIVE_CANDIDATE = "live_candidate"
+PURPOSE_SAMPLE = "sample"
+PURPOSE_REJECT_SAMPLE = "purpose_sample"
+PURPOSE_REJECT_MISSING = "purpose_missing"
+PURPOSE_REJECT_INVALID = "purpose_invalid"
+_DECISION_LOG_COLUMNS = (
+    "id",
+    "ts",
+    "strategy_id",
+    "action",
+    "chain_id",
+    "token_address",
+    "size_pct",
+    "reason",
+    "risk_passed",
+    "mode",
+    "raw_json",
+)
 # A claimed row younger than this is treated as in-flight (another worker).
 # Older claims with no paper position are resumed. Claims that already have a
 # position are finalized without a second fill.
@@ -73,11 +96,53 @@ def _open_ro(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _decision_log_column_names(conn: sqlite3.Connection) -> set[str]:
+    """Column names from PRAGMA. Empty if the table is missing."""
+    rows = conn.execute("PRAGMA table_info(decision_log)").fetchall()
+    return {str(row[1]) for row in rows}
+
+
+def read_decision_purpose(
+    row: dict[str, Any], raw: dict[str, Any] | None
+) -> str | None:
+    """Purpose used by the gate.
+
+    Prefer ``decision_log.purpose`` when the SELECT included that column (the
+    key is present even when the value is NULL). NULL or blank stays missing
+    and does not fall through to ``raw_json`` — historical NULL rows are not
+    executable. When the column is absent, use top-level
+    ``raw_json["purpose"]``. Strip whitespace only; do not case-fold.
+    """
+    if "purpose" in row:
+        value = row.get("purpose")
+    else:
+        value = None if raw is None else raw.get("purpose")
+    if value is None:
+        return None
+    text = value.strip() if isinstance(value, str) else str(value).strip()
+    return text or None
+
+
+def purpose_reject_reason(purpose: str | None) -> str | None:
+    """None only for executable ``live_candidate``. Otherwise a reject code.
+
+    ``purpose`` is already stripped by ``read_decision_purpose``. Blank is missing.
+    """
+    if purpose is None or purpose == "":
+        return PURPOSE_REJECT_MISSING
+    if purpose == PURPOSE_LIVE_CANDIDATE:
+        return None
+    if purpose == PURPOSE_SAMPLE:
+        return PURPOSE_REJECT_SAMPLE
+    return PURPOSE_REJECT_INVALID
+
+
 def parse_decision_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     """Normalize a decision_log row.
 
     pair_address MUST come from json.loads(raw_json)["pair_address"].
     extras live under raw["extras"].
+    purpose is resolved before any claim or fill (column, else raw_json).
     """
     d = dict(row)
     raw: dict[str, Any] = {}
@@ -117,6 +182,7 @@ def parse_decision_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "size_pct": size_pct,
         "reason": reason,
         "mode": mode,
+        "purpose": read_decision_purpose(d, raw),
         "risk_passed": d.get("risk_passed"),
         "extras": extras,
         "raw": raw,
@@ -259,10 +325,15 @@ class ExecutionGateway:
     ) -> list[sqlite3.Row]:
         conn = _open_ro(self.decision_db)
         try:
+            columns = list(_DECISION_LOG_COLUMNS)
+            # Older decision DBs have no purpose column. SELECT must not name
+            # it or the read fails; purpose then comes from raw_json only.
+            if "purpose" in _decision_log_column_names(conn):
+                columns.append("purpose")
             sql = (
-                "SELECT id, ts, strategy_id, action, chain_id, token_address, "
-                "size_pct, reason, risk_passed, mode, raw_json "
-                "FROM decision_log WHERE id > ? ORDER BY id ASC"
+                "SELECT "
+                + ", ".join(columns)
+                + " FROM decision_log WHERE id > ? ORDER BY id ASC"
             )
             params: list[Any] = [int(since_id)]
             if limit is not None:
@@ -271,6 +342,15 @@ class ExecutionGateway:
             return list(conn.execute(sql, params).fetchall())
         finally:
             conn.close()
+
+    def _step_label(self) -> str:
+        if self.pm_enabled and self.paper_enabled:
+            return "B+C"
+        if self.pm_enabled:
+            return "C"
+        if self.paper_enabled:
+            return "B"
+        return "A"
 
     def _risk_ledger(self, pm: Any) -> Any | None:
         """Paper book for pre-trade checks. Does not create a DB when no path is set."""
@@ -522,26 +602,33 @@ class ExecutionGateway:
             return self._finalize_existing_position(sig, claim, pos)
         age = self._claim_age_sec(row.get("status_updated_at"))
         if age < CLAIM_STALE_SEC:
-            return {
-                "execution_log_id": claim["execution_log_id"],
-                "decision_log_id": sig["decision_log_id"],
-                "strategy_id": str(sig.get("strategy_id") or "unknown"),
-                "validation_ok": False,
-                "validation_errors": [],
-                "executed": 0,
-                "inflight": True,
-                "executor": None,
-                "error": "claim_inflight",
-                "status": "claimed",
-                "status_updated_at": row.get("status_updated_at"),
-                "exec_result": None,
-                "pm_check": None,
-                "mode": sig.get("mode"),
-                "action": sig.get("action"),
-                "pair_address": sig.get("pair_address"),
-                "receipt": None,
-            }
+            return self._inflight_result(sig, claim)
         return None
+
+    def _inflight_result(
+        self, sig: dict[str, Any], claim: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Fresh claim belongs to an in-flight worker. Do not fill or skip it."""
+        row = claim.get("row") or {}
+        return {
+            "execution_log_id": claim["execution_log_id"],
+            "decision_log_id": sig["decision_log_id"],
+            "strategy_id": str(sig.get("strategy_id") or "unknown"),
+            "validation_ok": False,
+            "validation_errors": [],
+            "executed": 0,
+            "inflight": True,
+            "executor": None,
+            "error": "claim_inflight",
+            "status": "claimed",
+            "status_updated_at": row.get("status_updated_at"),
+            "exec_result": None,
+            "pm_check": None,
+            "mode": sig.get("mode"),
+            "action": sig.get("action"),
+            "pair_address": sig.get("pair_address"),
+            "receipt": None,
+        }
 
     def _finalize_existing_position(
         self,
@@ -736,10 +823,128 @@ class ExecutionGateway:
             "receipt": receipt_body,
         }
 
+    def _reject_purpose(self, sig: dict[str, Any], reason: str) -> dict[str, Any]:
+        """Non-executable purpose. Receipt + cursor, no paper fill.
+
+        Checked before claim on the executable path. The receipt itself still
+        claims then finalizes in the same pattern as other rejected rows, so a
+        crash cannot resume this id into a fill (a stale claim is finalized
+        here instead of executed).
+        """
+        action = sig.get("action")
+        if isinstance(action, str):
+            action = action.strip().lower()
+        size_pct = sig.get("size_pct")
+        try:
+            size_pct_f: float | None = float(size_pct) if size_pct is not None else None
+        except (TypeError, ValueError):
+            size_pct_f = None
+        strategy_id = str(sig.get("strategy_id") or "unknown")
+        chain_id = sig.get("chain_id")
+        token_address = sig.get("token_address")
+        pair_address = sig.get("pair_address")
+        mode = sig.get("mode")
+        signal_reason = sig.get("reason")
+        claim = self.ledger.claim_decision(
+            decision_log_id=int(sig["decision_log_id"]),
+            strategy_id=strategy_id,
+            action=action,
+            chain_id=None if chain_id is None else str(chain_id),
+            token_address=None if token_address is None else str(token_address),
+            pair_address=None if pair_address is None else str(pair_address),
+            size_pct=size_pct_f,
+            reason=None if signal_reason is None else str(signal_reason),
+            mode=None if mode is None else str(mode),
+        )
+        if not claim["created"]:
+            status = str(claim.get("status") or "")
+            if status != "claimed":
+                out = self._duplicate_result(sig, claim)
+                out["validation_ok"] = False
+                out["error"] = reason
+                return out
+            row = claim.get("row") or {}
+            if self._claim_age_sec(row.get("status_updated_at")) < CLAIM_STALE_SEC:
+                return self._inflight_result(sig, claim)
+        receipt_body: dict[str, Any] = {
+            "step": self._step_label(),
+            "decision_log_id": sig["decision_log_id"],
+            "status": "rejected",
+            "reason": reason,
+            "error": reason,
+            "purpose": sig.get("purpose"),
+            "note": "purpose gate; not executed",
+            "paper_enabled": self.paper_enabled,
+            "pm_enabled": self.pm_enabled,
+        }
+        events: list[tuple[str, dict[str, Any] | None]] = []
+        if EXECUTION_EVENTS_ENABLED:
+            events = [
+                ("new", {"decision_log_id": sig["decision_log_id"]}),
+                (
+                    "rejected",
+                    {
+                        "stage": "purpose",
+                        "error": reason,
+                        "purpose": sig.get("purpose"),
+                    },
+                ),
+            ]
+        status_updated_at = _utc()
+        self.ledger.finalize_receipt(
+            int(claim["execution_log_id"]),
+            decision_log_id=int(sig["decision_log_id"]),
+            strategy_id=strategy_id,
+            action=action,
+            chain_id=None if chain_id is None else str(chain_id),
+            token_address=None if token_address is None else str(token_address),
+            pair_address=None if pair_address is None else str(pair_address),
+            size_pct=size_pct_f,
+            reason=None if signal_reason is None else str(signal_reason),
+            mode=None if mode is None else str(mode),
+            validation_ok=False,
+            validation_errors=[reason],
+            executed=0,
+            executor=STEP_A_EXECUTOR,
+            receipt=receipt_body,
+            status="rejected",
+            events=events,
+            advance_cursor=True,
+            ts=status_updated_at,
+        )
+        log.info(
+            "purpose gate reject decision_log_id=%s purpose=%s reason=%s",
+            sig["decision_log_id"],
+            sig.get("purpose"),
+            reason,
+        )
+        return {
+            "execution_log_id": claim["execution_log_id"],
+            "decision_log_id": sig["decision_log_id"],
+            "strategy_id": strategy_id,
+            "validation_ok": False,
+            "validation_errors": [reason],
+            "executed": 0,
+            "executor": STEP_A_EXECUTOR,
+            "error": reason,
+            "status": "rejected",
+            "status_updated_at": status_updated_at,
+            "exec_result": None,
+            "pm_check": None,
+            "mode": mode,
+            "action": action,
+            "pair_address": pair_address,
+            "purpose": sig.get("purpose"),
+            "receipt": receipt_body,
+        }
+
     def process_one(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         sig: dict[str, Any] | None = None
         try:
             sig = parse_decision_row(row)
+            reason = purpose_reject_reason(sig.get("purpose"))
+            if reason is not None:
+                return self._reject_purpose(sig, reason)
             return self._process_one_claimed(sig)
         except Exception as exc:  # noqa: BLE001 — bad message must not wedge the cursor
             log.exception(
@@ -794,11 +999,7 @@ class ExecutionGateway:
         risk_reasons: list[dict[str, Any]] | None = None
         submitted_to_executor = False
 
-        step_label = "A"
-        if self.paper_enabled:
-            step_label = "B"
-        if self.pm_enabled:
-            step_label = "C" if not self.paper_enabled else "B+C"
+        step_label = self._step_label()
 
         receipt_body: dict[str, Any] = {
             "step": step_label,

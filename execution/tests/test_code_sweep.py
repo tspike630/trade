@@ -128,9 +128,12 @@ class _PriceDB:
         )
 
     def add_decision(self, **kwargs) -> int:
+        # Sweep rows are executable dry-runs. Purpose lives in raw_json because
+        # this fixture predates the decision_log.purpose column (P2-38).
         raw = {
             "pair_address": kwargs.get("pair_address", "pair1"),
             "extras": kwargs.get("extras") or {},
+            "purpose": kwargs.get("purpose", "live_candidate"),
         }
         cur = self.conn.execute(
             """
@@ -385,7 +388,10 @@ class LedgerIdempotencyTests(unittest.TestCase):
                     size_pct, reason, mode, raw_json
                 ) VALUES (4, ?, 'strat_a', 'buy', 'solana', 'token1', 0.05, 't', 'dry_run', ?)
                 """,
-                (_iso(_now()), json.dumps({"pair_address": "pair1"})),
+                (
+                    _iso(_now()),
+                    json.dumps({"pair_address": "pair1", "purpose": "live_candidate"}),
+                ),
             )
             crawler.conn.commit()
             crawler.close()

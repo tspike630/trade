@@ -9,7 +9,7 @@ Events:
     validated  - 校验通过（未成交也停在这）
     submitted  - 已提交执行器
     filled     - 成交（executed=1）
-    rejected   - 校验失败 / 风控拒 / 执行失败（detail 带原因）
+    rejected   - 校验失败 / purpose 门禁 / 风控拒 / 执行失败（detail 带原因）
     cancelled  - 预留，尚未写入
 """
 
