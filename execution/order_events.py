@@ -1,7 +1,8 @@
 """Order event stream (NautilusTrader-style status history).
 
 execution_log 一行 = 一个信号的最新状态；order_events 一行 = 一个状态事件。
-实盘前置：submitted/accepted/filled/rejected/cancelled 状态链表达。
+状态链：new → validated → submitted → filled，或在任一阶段 rejected。
+cancelled 在 EVENTS 里预留，当前没有写入方（没有撤单路径）。
 
 Events:
     new        - 信号进入网关（校验前）
@@ -9,7 +10,7 @@ Events:
     submitted  - 已提交执行器
     filled     - 成交（executed=1）
     rejected   - 校验失败 / 风控拒 / 执行失败（detail 带原因）
-    cancelled  - 预留（超时/熔断取消）
+    cancelled  - 预留，尚未写入
 """
 
 from __future__ import annotations
@@ -49,17 +50,30 @@ def init_events(db: Path) -> None:
 
 
 def record_event(
-    db: Path,
+    db: Path | None,
     execution_log_id: int,
     event: str,
     detail: Optional[dict[str, Any]] = None,
     *,
     event_ts: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+    commit: Optional[bool] = None,
 ) -> None:
-    """幂等写一条事件；同 (execution_log_id, event) 只写一次（INSERT OR IGNORE）。"""
+    """幂等写一条事件；同 (execution_log_id, event) 只写一次（INSERT OR IGNORE）。
+
+    Pass ``conn`` to join the caller's transaction (ledger finalize). When conn
+    is omitted, a short-lived connection is opened and committed.
+    """
     if event not in EVENTS:
         raise ValueError(f"unknown_event:{event}")
-    conn = sqlite3.connect(str(db))
+    own = conn is None
+    if own:
+        if db is None:
+            raise ValueError("record_event requires db or conn")
+        conn = sqlite3.connect(str(db))
+        do_commit = True if commit is None else commit
+    else:
+        do_commit = False if commit is None else commit
     try:
         conn.execute(
             "INSERT OR IGNORE INTO order_events (execution_log_id, event, event_ts, detail_json) "
@@ -71,9 +85,11 @@ def record_event(
                 json.dumps(detail, default=str) if detail else None,
             ),
         )
-        conn.commit()
+        if do_commit:
+            conn.commit()
     finally:
-        conn.close()
+        if own and conn is not None:
+            conn.close()
 
 
 def event_chain(db: Path, execution_log_id: int) -> list[dict[str, Any]]:

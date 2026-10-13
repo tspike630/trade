@@ -7,13 +7,22 @@ with no retries. Does not touch live trading.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
 
+from config import DB_PATH
 from logging_setup import get_logger
-from paper_trade import PaperLedger, latest_price
-from store import norm_address, norm_chain
+from paper_trade import PaperLedger, latest_price, tick as paper_tick
+from store import fetch_latest_pair_price, fetch_pair_spot, norm_address, norm_chain
+
+from execution.pricing import (
+    buy_fill_price,
+    liquidity_usd_from_raw,
+    sell_fill_price,
+    slippage_rate,
+)
 
 log = get_logger("execution.paper_executor")
 
@@ -24,8 +33,6 @@ EXECUTOR_NAME = "paper"
 
 
 def _env_paper_db_default() -> str:
-    import os
-
     return (
         os.environ.get("EXECUTION_PAPER_DB", "").strip()
         or os.environ.get("PAPER_DB_PATH", "").strip()
@@ -86,41 +93,11 @@ class _CrawlerRO:
         params.append(limit)
         return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
+    def latest_pair_price(self, chain_id: str, pair_address: str) -> dict[str, Any] | None:
+        return fetch_latest_pair_price(self._conn, chain_id, pair_address)
 
-def slippage_rate(liquidity_usd: float | None) -> float:
-    """Liquidity tiers → slip fraction (not percent points).
-
-    <50k → 2%, 50k~500k → 1%, ≥500k → 0.3%, unknown → 2%.
-    """
-    if liquidity_usd is None:
-        return 0.02
-    try:
-        liq = float(liquidity_usd)
-    except (TypeError, ValueError):
-        return 0.02
-    if liq < 50_000:
-        return 0.02
-    if liq < 500_000:
-        return 0.01
-    return 0.003
-
-
-def liquidity_usd_from_raw(raw: dict[str, Any] | None) -> float | None:
-    if not raw or not isinstance(raw, dict):
-        return None
-    li = raw.get("liquidity")
-    if isinstance(li, dict):
-        val = li.get("usd")
-    elif isinstance(li, (int, float)):
-        val = li
-    else:
-        val = None
-    if val is None:
-        return None
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return None
+    def pair_spot(self, chain_id: str, pair_address: str) -> dict[str, Any] | None:
+        return fetch_pair_spot(self._conn, chain_id, pair_address)
 
 
 def _pick_float(sources: list[dict[str, Any]], keys: tuple[str, ...], default: float) -> float:
@@ -159,8 +136,6 @@ class PaperExecutor:
         store: _CrawlerRO | None = None,
     ) -> None:
         if crawler_db is None:
-            from config import DB_PATH
-
             crawler_db = DB_PATH
         self.crawler_db = Path(crawler_db).resolve()
         self._owns_store = store is None
@@ -215,6 +190,31 @@ class PaperExecutor:
             "decision_log_id": sig.get("decision_log_id"),
         }
 
+    def _position_strategy(self, pos: dict[str, Any]) -> str:
+        meta_json = pos.get("meta_json")
+        meta: dict[str, Any]
+        if isinstance(meta_json, dict):
+            meta = meta_json
+        elif not meta_json:
+            meta = {}
+        else:
+            try:
+                parsed = json.loads(meta_json)
+            except (json.JSONDecodeError, TypeError):
+                parsed = {}
+            meta = parsed if isinstance(parsed, dict) else {}
+        return str(meta.get("strategy_id") or "").strip()
+
+    def _marks(self) -> dict[str, float]:
+        """Mid marks for open positions. Equity uses these, not slipped fills."""
+        marks: dict[str, float] = {}
+        for pos in self.ledger.list_open():
+            mid = latest_price(self.store, pos["chain_id"], pos["pair_address"])
+            if mid is None or mid <= 0:
+                continue
+            marks[f"{pos['chain_id']}|{pos['pair_address']}"] = mid
+        return marks
+
     def _mid_and_slip(self, chain_id: str, pair_address: str) -> tuple[float | None, float, float | None]:
         mid = latest_price(self.store, chain_id, pair_address)
         raw = self.store.get_pair_raw(chain_id, pair_address)
@@ -230,13 +230,24 @@ class PaperExecutor:
             if sig.get("token_address")
             else None
         )
+        decision_log_id = sig.get("decision_log_id")
+        if decision_log_id is not None:
+            existing = self.ledger.find_by_decision_log_id(decision_log_id)
+            if existing is not None:
+                return {
+                    "ok": False,
+                    "error": "duplicate_decision_log_id",
+                    "executor": EXECUTOR_NAME,
+                    "position_id": existing.get("id"),
+                    "decision_log_id": decision_log_id,
+                }
         size_pct = float(sig["size_pct"])
         mid, slip, liq = self._mid_and_slip(chain_id, pair_address)
         if mid is None or mid <= 0:
             return {"ok": False, "error": "no_price", "executor": EXECUTOR_NAME}
 
-        fill_price = mid * (1.0 + slip)
-        eq = self.ledger.equity()
+        fill_price = buy_fill_price(mid, slip)
+        eq = self.ledger.equity(self._marks())
         equity_usd = float(eq["equity_usd"])
         requested_usd = size_pct * equity_usd
         cash = float(self.ledger.get_cash())
@@ -297,7 +308,7 @@ class PaperExecutor:
             "sl_pct": sl,
             "max_hold_min": hold,
             "meta": meta,
-            "equity": self.ledger.equity(),
+            "equity": self.ledger.equity(self._marks()),
         }
         log.info(
             "paper BUY pos=%s size_usd=%.4f fill=%.8g slip=%.4f truncated=%s",
@@ -315,28 +326,47 @@ class PaperExecutor:
         chain_id: str,
         token_address: str | None,
         pair_address: str | None,
-    ) -> dict[str, Any] | None:
+        strategy_id: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Match chain+token (else chain+pair) AND meta.strategy_id.
+
+        Returns (position, match_label) or (None, error_code).
+        error_code is strategy_mismatch when a different strategy holds the
+        token/pair, else None (nothing open).
+        """
         opens = self.ledger.list_open()
         chain_id = norm_chain(chain_id)
         tok = norm_address(token_address) if token_address else None
         pair = norm_address(pair_address) if pair_address else None
-        if tok:
-            for p in opens:
-                pt = p.get("token_address")
-                if (
-                    norm_chain(str(p["chain_id"])) == chain_id
-                    and pt
-                    and norm_address(str(pt)) == tok
-                ):
-                    return p
-        if pair:
-            for p in opens:
-                if (
-                    norm_chain(str(p["chain_id"])) == chain_id
-                    and norm_address(str(p["pair_address"])) == pair
-                ):
-                    return p
-        return None
+        want = str(strategy_id or "").strip()
+        token_hits: list[tuple[dict[str, Any], bool]] = []
+        pair_hits: list[tuple[dict[str, Any], bool]] = []
+        for pos in opens:
+            if norm_chain(str(pos["chain_id"])) != chain_id:
+                continue
+            same_strategy = self._position_strategy(pos) == want
+            pos_tok = pos.get("token_address")
+            token_ok = bool(
+                tok and pos_tok and norm_address(str(pos_tok)) == tok
+            )
+            pair_ok = bool(
+                pair and norm_address(str(pos["pair_address"])) == pair
+            )
+            if token_ok:
+                token_hits.append((pos, same_strategy))
+            elif pair_ok:
+                pair_hits.append((pos, same_strategy))
+        for pos, same in token_hits:
+            if same:
+                return pos, "chain+token+strategy"
+        if token_hits:
+            return None, "strategy_mismatch"
+        for pos, same in pair_hits:
+            if same:
+                return pos, "chain+pair+strategy"
+        if pair_hits:
+            return None, "strategy_mismatch"
+        return None, None
 
     def _sell(self, sig: dict[str, Any]) -> dict[str, Any]:
         chain_id = norm_chain(str(sig["chain_id"]))
@@ -346,19 +376,49 @@ class PaperExecutor:
         token_address = (
             norm_address(str(sig["token_address"])) if sig.get("token_address") else None
         )
-        pos = self._find_open(
+        strategy_id = str(sig.get("strategy_id") or "unknown").strip() or "unknown"
+        pos, match_or_err = self._find_open(
             chain_id=chain_id,
             token_address=token_address,
             pair_address=pair_address,
+            strategy_id=strategy_id,
         )
         if pos is None:
+            error = match_or_err or "no_open_position"
             return {
                 "ok": False,
-                "error": "no_open_position",
+                "error": error,
                 "executor": EXECUTOR_NAME,
                 "chain_id": chain_id,
                 "token_address": token_address,
                 "pair_address": pair_address,
+                "strategy_id": strategy_id,
+            }
+
+        try:
+            size_pct = float(sig["size_pct"])
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "error": "invalid_size_pct",
+                "executor": EXECUTOR_NAME,
+                "position_id": pos["id"],
+            }
+        # size_pct on a sell is the fraction of the open position to close.
+        # Partial closes are not implemented; refuse rather than flatten the book.
+        # A full close must send size_pct=1. Equity-fraction buys (0.05) are not
+        # a close fraction — copying that onto a sell is a partial and is rejected.
+        if size_pct < 1.0 - 1e-9:
+            return {
+                "ok": False,
+                "error": "partial_sell_rejected",
+                "executor": EXECUTOR_NAME,
+                "position_id": pos["id"],
+                "size_pct": size_pct,
+                "message": (
+                    "paper executor closes the full position only; "
+                    "size_pct must be 1. Partial close is not implemented."
+                ),
             }
 
         pos_pair = norm_address(str(pos["pair_address"]))
@@ -366,7 +426,7 @@ class PaperExecutor:
         if mid is None or mid <= 0:
             return {"ok": False, "error": "no_price", "executor": EXECUTOR_NAME}
 
-        fill_price = mid * (1.0 - slip)
+        fill_price = sell_fill_price(mid, slip)
         closed = self.ledger.close_position(
             pos["id"],
             price=fill_price,
@@ -387,15 +447,10 @@ class PaperExecutor:
             "pnl_usd": closed.get("pnl_usd"),
             "exit_price": closed.get("exit_price"),
             "exit_reason": closed.get("reason"),
-            "match": (
-                "chain+token"
-                if token_address
-                and pos.get("token_address")
-                and norm_address(str(pos["token_address"])) == token_address
-                else "chain+pair"
-            ),
+            "match": match_or_err,
+            "size_pct": size_pct,
             "meta": self._meta(sig),
-            "equity": self.ledger.equity(),
+            "equity": self.ledger.equity(self._marks()),
             "closed": closed,
         }
         log.info(
@@ -408,7 +463,14 @@ class PaperExecutor:
         return out
 
     def tick(self) -> list[dict[str, Any]]:
-        """Apply TP/SL/max_hold on open positions (uses crawler RO prices)."""
-        from paper_trade import tick as paper_tick
+        """TP/SL/max_hold via paper_trade.tick → execution.exits.scan_exits.
 
+        Close fill uses the same sell slippage as ``_sell``. This path does
+        not append execution_log or order_events: decision_log_id is unique on
+        the entry receipt, so a second receipt cannot share it. The close is
+        recorded on the paper position (exit_reason) and the fills table.
+
+        Only one tick writer may run against this paper DB (this method or
+        paper_trade.py / paper_tick_loop.sh, not both).
+        """
         return paper_tick(self.ledger, self.store)

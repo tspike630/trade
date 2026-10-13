@@ -61,7 +61,10 @@ def main(argv: list[str] | None = None) -> int:
         "--since-id",
         type=int,
         default=None,
-        help="override cursor: process decision_log id > N (still advances ledger cursor)",
+        help=(
+            "this run only: read decision_log id > N. "
+            "Does not rewind the persisted cursor (cursor advances with MAX)."
+        ),
     )
     parser.add_argument(
         "--interval",
@@ -223,12 +226,26 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0
 
-        # --loop: --since-id applies to first tick only; then follow ledger cursor
+        # --loop: --since-id applies to the first read only; cursor still uses MAX.
+        if paper_tick:
+            log.info(
+                "paper tick writer: this process is the only tick source for %s "
+                "(do not also run paper_tick_loop.sh)",
+                args.paper_db,
+            )
         first = True
+        backoff = interval
         while True:
             sid = since_override if first else None
-            tick(sid)
+            try:
+                tick(sid)
+            except Exception:
+                log.exception("execution loop tick failed; backing off")
+                time.sleep(min(backoff, 60.0))
+                backoff = min(max(backoff * 2.0, interval), 60.0)
+                continue
             first = False
+            backoff = interval
             time.sleep(interval)
 
 

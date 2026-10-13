@@ -89,6 +89,67 @@ def norm_address(address: str) -> str:
     return address.strip().lower()
 
 
+def fetch_latest_pair_price(
+    conn: sqlite3.Connection, chain_id: str, pair_address: str
+) -> dict[str, Any] | None:
+    """Newest non-null pair_history price. Uses idx_pair_history_lookup, one row.
+
+    Does not apply a staleness window; callers decide max age.
+    """
+    row = conn.execute(
+        """
+        SELECT price_usd, recorded_at
+        FROM pair_history
+        WHERE chain_id = ? AND pair_address = ? AND price_usd IS NOT NULL
+        ORDER BY recorded_at DESC
+        LIMIT 1
+        """,
+        (norm_chain(chain_id), norm_address(pair_address)),
+    ).fetchone()
+    if row is None or row["price_usd"] is None:
+        return None
+    try:
+        price = float(row["price_usd"])
+    except (TypeError, ValueError):
+        return None
+    return {
+        "price_usd": price,
+        "recorded_at": row["recorded_at"],
+        "source": "pair_history",
+    }
+
+
+def fetch_pair_spot(
+    conn: sqlite3.Connection, chain_id: str, pair_address: str
+) -> dict[str, Any] | None:
+    """pairs.raw_json priceUsd stamped with pairs.updated_at."""
+    row = conn.execute(
+        """
+        SELECT raw_json, updated_at
+        FROM pairs
+        WHERE chain_id = ? AND pair_address = ?
+        """,
+        (norm_chain(chain_id), norm_address(pair_address)),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        raw = json.loads(row["raw_json"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(raw, dict) or raw.get("priceUsd") is None:
+        return None
+    try:
+        price = float(raw["priceUsd"])
+    except (TypeError, ValueError):
+        return None
+    return {
+        "price_usd": price,
+        "recorded_at": row["updated_at"],
+        "source": "pairs.priceUsd",
+    }
+
+
 def _parse_pair_created_at(raw: dict[str, Any]) -> int | None:
     """DexScreener pairCreatedAt as ms epoch int; missing/invalid -> None (never invent)."""
     v = raw.get("pairCreatedAt")
@@ -1446,6 +1507,16 @@ class Store:
             (norm_chain(chain_id), norm_address(pair_address)),
         ).fetchone()
         return row2["m"] if row2 else None
+
+    def latest_pair_price(
+        self, chain_id: str, pair_address: str
+    ) -> dict[str, Any] | None:
+        """Newest pair_history quote: ORDER BY recorded_at DESC LIMIT 1."""
+        return fetch_latest_pair_price(self._conn, chain_id, pair_address)
+
+    def pair_spot(self, chain_id: str, pair_address: str) -> dict[str, Any] | None:
+        """Current pairs.priceUsd plus pairs.updated_at (may be newer than history)."""
+        return fetch_pair_spot(self._conn, chain_id, pair_address)
 
     def list_pair_history(
         self,

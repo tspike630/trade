@@ -13,18 +13,20 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from logging_setup import get_logger
 
 from execution.config import (
+    EXECUTION_DAILY_LOSS_USD,
     EXECUTION_EVENTS_ENABLED,
     EXECUTION_MAX_OPEN,
     EXECUTION_RISK_ENABLED,
 )
 from execution.ledger import ExecutionLedger, _utc
-from execution.order_events import init_events, record_event
+from execution.order_events import init_events
 from execution.risk import run_all
 import execution.risk.limits  # noqa: F401 — register checkers on import
 
@@ -42,6 +44,10 @@ ALLOWED_ACTIONS = frozenset({"buy", "sell"})
 STEP_A_EXECUTOR = "step_a_noop"
 PAPER_EXECUTOR = "paper"
 PM_GATE = "position_manager"
+# A claimed row younger than this is treated as in-flight (another worker).
+# Older claims with no paper position are resumed. Claims that already have a
+# position are finalized without a second fill.
+CLAIM_STALE_SEC = 60.0
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -283,21 +289,26 @@ class ExecutionGateway:
         return None
 
     def _pretrade_risk(self, pm: Any, sig: dict[str, Any]) -> list[dict[str, Any]]:
-        """After position_manager, before executor. Default off → no behavior change."""
+        """After position_manager, before executor. Default off → no behavior change.
+
+        SELL skips max_open inside the checker. Daily loss is passed through and
+        stays off unless EXECUTION_DAILY_LOSS_USD is set. Missing book fails closed
+        only when the risk gate is on.
+        """
         if not EXECUTION_RISK_ENABLED:
             return []
         ledger = self._risk_ledger(pm)
         if ledger is None:
-            return []
+            return [{"ok": False, "reason": "no_ledger"}]
         return run_all(
             ledger,
             sig,
             max_open_per_strategy=EXECUTION_MAX_OPEN,
+            daily_loss_limit_usd=EXECUTION_DAILY_LOSS_USD,
         )
 
-    def _emit_order_events(
+    def _status_events(
         self,
-        log_id: int,
         *,
         sig: dict[str, Any],
         ok: bool,
@@ -308,48 +319,29 @@ class ExecutionGateway:
         risk_reasons: list[dict[str, Any]] | None,
         submitted: bool,
         fill_receipt: dict[str, Any] | None,
-        event_ts: str,
-    ) -> None:
-        """Append the status chain after execution_log has an id.
+    ) -> list[tuple[str, dict[str, Any] | None]]:
+        """Status chain written in the same transaction as the receipt and cursor.
 
-        log_id exists only after INSERT, so `new` is written first in the
-        chain even though validation already ran. event_ts is the same UTC
-        stamp as status_updated_at. step_a_noop is not a submission.
+        ``new`` is first even though validation already ran. step_a_noop is not
+        a submission. ``cancelled`` is reserved and not emitted here.
         """
         if not EXECUTION_EVENTS_ENABLED:
-            return
-        db = self.ledger.path
-        if EXECUTION_EVENTS_ENABLED:
-            record_event(
-                db,
-                log_id,
-                "new",
-                {"decision_log_id": sig["decision_log_id"]},
-                event_ts=event_ts,
-            )
+            return []
+        events: list[tuple[str, dict[str, Any] | None]] = [
+            ("new", {"decision_log_id": sig["decision_log_id"]}),
+        ]
         if not ok:
-            if EXECUTION_EVENTS_ENABLED:
-                record_event(
-                    db,
-                    log_id,
+            events.append(
+                (
                     "rejected",
                     {"stage": "validation", "error": ";".join(errors)},
-                    event_ts=event_ts,
                 )
-            return
-        if EXECUTION_EVENTS_ENABLED:
-            record_event(
-                db,
-                log_id,
-                "validated",
-                {"validation_ok": True},
-                event_ts=event_ts,
             )
+            return events
+        events.append(("validated", {"validation_ok": True}))
         if risk_reasons:
-            if EXECUTION_EVENTS_ENABLED:
-                record_event(
-                    db,
-                    log_id,
+            events.append(
+                (
                     "rejected",
                     {
                         "stage": "risk",
@@ -357,49 +349,406 @@ class ExecutionGateway:
                             str(r.get("reason") or "") for r in risk_reasons
                         ),
                     },
-                    event_ts=event_ts,
                 )
-            return
+            )
+            return events
         if executor == PM_GATE and exec_error:
-            if EXECUTION_EVENTS_ENABLED:
-                record_event(
-                    db,
-                    log_id,
+            events.append(
+                (
                     "rejected",
                     {"stage": "position_manager", "reason": exec_error},
-                    event_ts=event_ts,
                 )
-            return
+            )
+            return events
         if submitted and executor is not None:
-            if EXECUTION_EVENTS_ENABLED:
-                record_event(
-                    db,
-                    log_id,
-                    "submitted",
-                    {"executor": executor},
-                    event_ts=event_ts,
-                )
+            events.append(("submitted", {"executor": executor}))
             if executed == 1:
-                if EXECUTION_EVENTS_ENABLED:
-                    record_event(
-                        db,
-                        log_id,
-                        "filled",
-                        {"receipt": fill_receipt},
-                        event_ts=event_ts,
-                    )
+                events.append(("filled", {"receipt": fill_receipt}))
             elif exec_error:
-                if EXECUTION_EVENTS_ENABLED:
-                    record_event(
-                        db,
-                        log_id,
+                events.append(
+                    (
                         "rejected",
                         {"stage": "executor", "error": exec_error},
-                        event_ts=event_ts,
                     )
+                )
+        return events
+
+    def _position_for_decision(self, decision_log_id: int) -> dict[str, Any] | None:
+        paper = self._paper_executor if self._paper_executor is not None else None
+        if paper is None and self.paper_enabled:
+            paper = self._get_paper()
+        if paper is None:
+            return None
+        ledger = getattr(paper, "ledger", None)
+        finder = getattr(ledger, "find_by_decision_log_id", None)
+        if not callable(finder):
+            return None
+        found = finder(decision_log_id)
+        return found if isinstance(found, dict) else None
+
+    def _claim_age_sec(self, status_updated_at: Any) -> float:
+        if not status_updated_at:
+            return CLAIM_STALE_SEC + 1.0
+        text = str(status_updated_at).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return CLAIM_STALE_SEC + 1.0
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
+
+    def _finalize(
+        self,
+        *,
+        execution_log_id: int,
+        sig: dict[str, Any],
+        strategy_id: str,
+        action: str | None,
+        size_pct_f: float | None,
+        ok: bool,
+        errors: list[str],
+        executed: int,
+        executor: str | None,
+        exec_error: str | None,
+        risk_reasons: list[dict[str, Any]] | None,
+        submitted: bool,
+        exec_result: dict[str, Any] | None,
+        pm_result: dict[str, Any] | None,
+        receipt_body: dict[str, Any],
+        order_status: str,
+    ) -> dict[str, Any]:
+        status_updated_at = _utc()
+        events = self._status_events(
+            sig=sig,
+            ok=ok,
+            errors=errors,
+            executed=executed,
+            executor=executor,
+            exec_error=exec_error,
+            risk_reasons=risk_reasons,
+            submitted=submitted,
+            fill_receipt=exec_result,
+        )
+        self.ledger.finalize_receipt(
+            execution_log_id,
+            decision_log_id=sig["decision_log_id"],
+            strategy_id=strategy_id,
+            action=action,
+            chain_id=sig.get("chain_id"),
+            token_address=sig.get("token_address"),
+            pair_address=sig.get("pair_address"),
+            size_pct=size_pct_f,
+            reason=sig.get("reason"),
+            mode=sig.get("mode"),
+            validation_ok=ok,
+            validation_errors=errors or None,
+            executed=executed,
+            executor=executor,
+            receipt=receipt_body,
+            status=order_status,
+            events=events,
+            advance_cursor=True,
+            ts=status_updated_at,
+        )
+        out = {
+            "execution_log_id": execution_log_id,
+            "decision_log_id": sig["decision_log_id"],
+            "strategy_id": strategy_id,
+            "validation_ok": ok,
+            "validation_errors": errors,
+            "executed": executed,
+            "executor": executor,
+            "error": exec_error,
+            "status": order_status,
+            "status_updated_at": status_updated_at,
+            "exec_result": exec_result,
+            "pm_check": pm_result,
+            "mode": sig.get("mode"),
+            "action": action,
+            "pair_address": sig.get("pair_address"),
+            "receipt": receipt_body,
+        }
+        log.info(
+            "receipt decision_log_id=%s strategy=%s ok=%s executed=%s executor=%s mode=%s",
+            sig["decision_log_id"],
+            strategy_id,
+            ok,
+            executed,
+            executor,
+            sig.get("mode"),
+        )
+        return out
+
+    def _duplicate_result(self, sig: dict[str, Any], claim: dict[str, Any]) -> dict[str, Any]:
+        """Terminal row already exists. Advance cursor with MAX; do not fill again."""
+        row = claim.get("row") or {}
+        self.ledger.set_last_processed_id(int(sig["decision_log_id"]))
+        return {
+            "execution_log_id": claim["execution_log_id"],
+            "decision_log_id": sig["decision_log_id"],
+            "strategy_id": str(sig.get("strategy_id") or row.get("strategy_id") or "unknown"),
+            "validation_ok": bool(row.get("validation_ok")),
+            "validation_errors": [],
+            "executed": 0,
+            "duplicate": True,
+            "already_executed": int(row.get("executed") or 0),
+            "executor": row.get("executor"),
+            "error": "duplicate_decision",
+            "status": row.get("status") or "duplicate",
+            "status_updated_at": row.get("status_updated_at"),
+            "exec_result": None,
+            "pm_check": None,
+            "mode": sig.get("mode"),
+            "action": sig.get("action"),
+            "pair_address": sig.get("pair_address"),
+            "receipt": None,
+        }
+
+    def _resume_claimed(
+        self,
+        sig: dict[str, Any],
+        claim: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """None → caller should execute. Otherwise a terminal/inflight result."""
+        status = str(claim.get("status") or "")
+        if status != "claimed":
+            return self._duplicate_result(sig, claim)
+        row = claim.get("row") or {}
+        pos = self._position_for_decision(int(sig["decision_log_id"]))
+        if pos is not None:
+            return self._finalize_existing_position(sig, claim, pos)
+        age = self._claim_age_sec(row.get("status_updated_at"))
+        if age < CLAIM_STALE_SEC:
+            return {
+                "execution_log_id": claim["execution_log_id"],
+                "decision_log_id": sig["decision_log_id"],
+                "strategy_id": str(sig.get("strategy_id") or "unknown"),
+                "validation_ok": False,
+                "validation_errors": [],
+                "executed": 0,
+                "inflight": True,
+                "executor": None,
+                "error": "claim_inflight",
+                "status": "claimed",
+                "status_updated_at": row.get("status_updated_at"),
+                "exec_result": None,
+                "pm_check": None,
+                "mode": sig.get("mode"),
+                "action": sig.get("action"),
+                "pair_address": sig.get("pair_address"),
+                "receipt": None,
+            }
+        return None
+
+    def _finalize_existing_position(
+        self,
+        sig: dict[str, Any],
+        claim: dict[str, Any],
+        pos: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Paper fill already committed. Write the receipt; do not execute again."""
+        action = sig.get("action")
+        if isinstance(action, str):
+            action = action.strip().lower()
+        try:
+            size_pct_f: float | None = (
+                float(sig["size_pct"]) if sig.get("size_pct") is not None else None
+            )
+        except (TypeError, ValueError):
+            size_pct_f = None
+        strategy_id = str(sig.get("strategy_id") or "unknown")
+        exec_result = {
+            "ok": True,
+            "executor": PAPER_EXECUTOR,
+            "resumed": True,
+            "position_id": pos.get("id"),
+            "note": "position already existed for decision_log_id; skipped second fill",
+        }
+        step_label = "B" if self.paper_enabled else "A"
+        receipt_body: dict[str, Any] = {
+            "step": step_label,
+            "decision_log_id": sig["decision_log_id"],
+            "status": "paper_executed",
+            "note": "resumed claimed decision; existing position; no second fill",
+            "paper_enabled": self.paper_enabled,
+            "pm_enabled": self.pm_enabled,
+            "exec_result": exec_result,
+            "resumed": True,
+        }
+        return self._finalize(
+            execution_log_id=int(claim["execution_log_id"]),
+            sig=sig,
+            strategy_id=strategy_id,
+            action=action,
+            size_pct_f=size_pct_f,
+            ok=True,
+            errors=[],
+            executed=1,
+            executor=PAPER_EXECUTOR,
+            exec_error=None,
+            risk_reasons=None,
+            submitted=True,
+            exec_result=exec_result,
+            pm_result=None,
+            receipt_body=receipt_body,
+            order_status="executed",
+        )
+
+    def _reject_exception(
+        self,
+        row: sqlite3.Row | dict[str, Any],
+        sig: dict[str, Any] | None,
+        exc: BaseException,
+    ) -> dict[str, Any]:
+        """Bad message → rejected receipt, then advance. Last resort re-raises."""
+        if sig is not None:
+            did = int(sig["decision_log_id"])
+        else:
+            did = int(dict(row)["id"])
+        strategy_id = str((sig or {}).get("strategy_id") or "unknown")
+        action = (sig or {}).get("action")
+        if isinstance(action, str):
+            action = action.strip().lower()
+        chain_id = (sig or {}).get("chain_id")
+        token_address = (sig or {}).get("token_address")
+        pair_address = (sig or {}).get("pair_address")
+        mode = (sig or {}).get("mode")
+        reason = (sig or {}).get("reason")
+        size_pct = (sig or {}).get("size_pct")
+        try:
+            size_pct_f: float | None = float(size_pct) if size_pct is not None else None
+        except (TypeError, ValueError):
+            size_pct_f = None
+        err = f"exception:{type(exc).__name__}:{exc}"
+        claim = self.ledger.claim_decision(
+            decision_log_id=did,
+            strategy_id=strategy_id,
+            action=action if isinstance(action, str) else None,
+            chain_id=None if chain_id is None else str(chain_id),
+            token_address=None if token_address is None else str(token_address),
+            pair_address=None if pair_address is None else str(pair_address),
+            size_pct=size_pct_f,
+            reason=None if reason is None else str(reason),
+            mode=None if mode is None else str(mode),
+        )
+        if not claim["created"] and str(claim.get("status") or "") == "claimed":
+            pos = self._position_for_decision(did)
+            if pos is not None:
+                return self._finalize_existing_position(
+                    sig
+                    or {
+                        "decision_log_id": did,
+                        "strategy_id": strategy_id,
+                        "action": action,
+                        "chain_id": chain_id,
+                        "token_address": token_address,
+                        "pair_address": pair_address,
+                        "size_pct": size_pct,
+                        "reason": reason,
+                        "mode": mode,
+                    },
+                    claim,
+                    pos,
+                )
+        if not claim["created"] and str(claim.get("status") or "") not in ("claimed", ""):
+            self.ledger.set_last_processed_id(did)
+            out = self._duplicate_result(
+                sig
+                or {
+                    "decision_log_id": did,
+                    "strategy_id": strategy_id,
+                    "action": action,
+                    "mode": mode,
+                    "pair_address": pair_address,
+                },
+                claim,
+            )
+            out["error"] = err
+            out["validation_ok"] = False
+            return out
+        stub = sig or {
+            "decision_log_id": did,
+            "strategy_id": strategy_id,
+            "action": action,
+            "chain_id": chain_id,
+            "token_address": token_address,
+            "pair_address": pair_address,
+            "size_pct": size_pct,
+            "reason": reason,
+            "mode": mode,
+        }
+        receipt_body = {
+            "step": "A",
+            "decision_log_id": did,
+            "status": "rejected",
+            "note": "exception; recorded rejected and advanced",
+            "error": err,
+            "paper_enabled": self.paper_enabled,
+            "pm_enabled": self.pm_enabled,
+        }
+        events: list[tuple[str, dict[str, Any] | None]] = []
+        if EXECUTION_EVENTS_ENABLED:
+            events = [
+                ("new", {"decision_log_id": did}),
+                ("rejected", {"stage": "exception", "error": err}),
+            ]
+        status_updated_at = _utc()
+        self.ledger.finalize_receipt(
+            int(claim["execution_log_id"]),
+            decision_log_id=did,
+            strategy_id=strategy_id,
+            action=action if isinstance(action, str) else None,
+            chain_id=None if chain_id is None else str(chain_id),
+            token_address=None if token_address is None else str(token_address),
+            pair_address=None if pair_address is None else str(pair_address),
+            size_pct=size_pct_f,
+            reason=None if reason is None else str(reason),
+            mode=None if mode is None else str(mode),
+            validation_ok=False,
+            validation_errors=[err],
+            executed=0,
+            executor=STEP_A_EXECUTOR,
+            receipt=receipt_body,
+            status="rejected",
+            events=events,
+            advance_cursor=True,
+            ts=status_updated_at,
+        )
+        return {
+            "execution_log_id": claim["execution_log_id"],
+            "decision_log_id": did,
+            "strategy_id": strategy_id,
+            "validation_ok": False,
+            "validation_errors": [err],
+            "executed": 0,
+            "executor": STEP_A_EXECUTOR,
+            "error": err,
+            "status": "rejected",
+            "status_updated_at": status_updated_at,
+            "exec_result": None,
+            "pm_check": None,
+            "mode": mode,
+            "action": action,
+            "pair_address": pair_address,
+            "receipt": receipt_body,
+        }
 
     def process_one(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
-        sig = parse_decision_row(row)
+        sig: dict[str, Any] | None = None
+        try:
+            sig = parse_decision_row(row)
+            return self._process_one_claimed(sig)
+        except Exception as exc:  # noqa: BLE001 — bad message must not wedge the cursor
+            log.exception(
+                "process_one failed decision_log_id=%s",
+                None if sig is None else sig.get("decision_log_id"),
+            )
+            return self._reject_exception(row, sig, exc)
+
+    def _process_one_claimed(self, sig: dict[str, Any]) -> dict[str, Any]:
         errors = validate_signal(sig)
         ok = len(errors) == 0
         mode = (sig.get("mode") or "").strip().lower()
@@ -414,6 +763,29 @@ class ExecutionGateway:
             size_pct_f = None
 
         strategy_id = str(sig.get("strategy_id") or "unknown")
+
+        claim = self.ledger.claim_decision(
+            decision_log_id=int(sig["decision_log_id"]),
+            strategy_id=strategy_id,
+            action=action,
+            chain_id=None if sig.get("chain_id") is None else str(sig.get("chain_id")),
+            token_address=(
+                None
+                if sig.get("token_address") is None
+                else str(sig.get("token_address"))
+            ),
+            pair_address=(
+                None if sig.get("pair_address") is None else str(sig.get("pair_address"))
+            ),
+            size_pct=size_pct_f,
+            reason=None if sig.get("reason") is None else str(sig.get("reason")),
+            mode=None if sig.get("mode") is None else str(sig.get("mode")),
+        )
+        if not claim["created"]:
+            resumed = self._resume_claimed(sig, claim)
+            if resumed is not None:
+                return resumed
+        exec_id = int(claim["execution_log_id"])
 
         executed = 0
         executor = STEP_A_EXECUTOR
@@ -508,31 +880,13 @@ class ExecutionGateway:
             order_status = "rejected"
         if exec_error:
             order_status = "rejected"
-        status_updated_at = _utc()
 
-        exec_id = self.ledger.append_receipt(
-            decision_log_id=sig["decision_log_id"],
+        return self._finalize(
+            execution_log_id=exec_id,
+            sig=sig,
             strategy_id=strategy_id,
             action=action,
-            chain_id=sig.get("chain_id"),
-            token_address=sig.get("token_address"),
-            pair_address=sig.get("pair_address"),
-            size_pct=size_pct_f,
-            reason=sig.get("reason"),
-            mode=sig.get("mode"),
-            validation_ok=ok,
-            validation_errors=errors or None,
-            executed=executed,
-            executor=executor,
-            receipt=receipt_body,
-            ts=_utc(),
-            status=order_status,
-            status_updated_at=status_updated_at,
-        )
-        self.ledger.set_last_processed_id(sig["decision_log_id"])
-        self._emit_order_events(
-            exec_id,
-            sig=sig,
+            size_pct_f=size_pct_f,
             ok=ok,
             errors=errors,
             executed=executed,
@@ -540,38 +894,11 @@ class ExecutionGateway:
             exec_error=exec_error,
             risk_reasons=risk_reasons,
             submitted=submitted_to_executor,
-            fill_receipt=exec_result,
-            event_ts=status_updated_at,
+            exec_result=exec_result,
+            pm_result=pm_result,
+            receipt_body=receipt_body,
+            order_status=order_status,
         )
-
-        out = {
-            "execution_log_id": exec_id,
-            "decision_log_id": sig["decision_log_id"],
-            "strategy_id": strategy_id,
-            "validation_ok": ok,
-            "validation_errors": errors,
-            "executed": executed,
-            "executor": executor,
-            "error": exec_error,
-            "status": order_status,
-            "status_updated_at": status_updated_at,
-            "exec_result": exec_result,
-            "pm_check": pm_result,
-            "mode": sig.get("mode"),
-            "action": action,
-            "pair_address": sig.get("pair_address"),
-            "receipt": receipt_body,
-        }
-        log.info(
-            "receipt decision_log_id=%s strategy=%s ok=%s executed=%s executor=%s mode=%s",
-            sig["decision_log_id"],
-            strategy_id,
-            ok,
-            executed,
-            executor,
-            sig.get("mode"),
-        )
-        return out
 
     def process_pending(
         self,
@@ -579,7 +906,11 @@ class ExecutionGateway:
         since_id: int | None = None,
         limit: int | None = None,
     ) -> ProcessStats:
-        """Process decision_log rows with id > since_id (default: ledger cursor)."""
+        """Process decision_log rows with id > since_id (default: ledger cursor).
+
+        ``since_id`` only changes which rows this call reads. The persisted
+        cursor moves forward with MAX and is not rewound when since_id is lower.
+        """
         cursor = (
             int(since_id)
             if since_id is not None
@@ -588,9 +919,34 @@ class ExecutionGateway:
         rows = self.fetch_pending(cursor, limit=limit)
         stats = ProcessStats()
         for row in rows:
-            result = self.process_one(row)
+            try:
+                result = self.process_one(row)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("process_pending row failed")
+                try:
+                    did = int(dict(row)["id"])
+                    self.ledger.set_last_processed_id(did)
+                except Exception:
+                    log.exception("cannot advance past unreadable decision row")
+                    break
+                result = {
+                    "decision_log_id": did,
+                    "validation_ok": False,
+                    "validation_errors": [f"exception:{type(exc).__name__}:{exc}"],
+                    "executed": 0,
+                    "executor": STEP_A_EXECUTOR,
+                    "error": f"exception:{type(exc).__name__}:{exc}",
+                    "status": "rejected",
+                }
+            if result.get("inflight"):
+                # Do not process later ids: MAX(cursor) would skip this claim.
+                stats.receipts.append(result)
+                break
             stats.processed += 1
             stats.last_decision_id = result["decision_log_id"]
+            if result.get("duplicate"):
+                stats.receipts.append(result)
+                continue
             if result["validation_ok"]:
                 stats.validation_ok += 1
             else:

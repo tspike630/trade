@@ -9,12 +9,28 @@ Paper trading ledger — virtual positions from strategy params using history/li
   python paper_trade.py demo         # seed + open + tick on temp-friendly demo
 
 Ledger: PAPER_DB_PATH (default paper_trading.db), separate from crawler DB.
+
+Tick source: only ONE writer may tick a given paper DB. Run either
+``paper_trade.py tick`` / ``paper_tick_loop.sh`` or ``execution.run --paper-tick``,
+never both. Open/close use BEGIN IMMEDIATE; a second tick source can still
+double-apply exits if it races the first.
+
+Quotes: ``latest_price`` reads ``pair_history`` ORDER BY recorded_at DESC LIMIT 1
+and ``pairs.priceUsd`` (by ``pairs.updated_at``), keeps the newer fresh quote, and
+returns None when both are older than PAPER_PRICE_MAX_AGE_SEC (default 3600).
+Stale or missing → callers treat as no_price.
+
+Exits: ``tick`` calls ``execution.exits.scan_exits`` (same rules as backtest).
+The trigger price is the mid mark. The close fill is mid × (1 − slippage),
+matching PaperExecutor signal sells. TP/SL compare that mid to the entry fill
+(entry already includes buy slippage). Equity marks use mid, not the fill.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import uuid
@@ -31,7 +47,18 @@ from config import (  # noqa: E402
     PAPER_START_CASH,
 )
 from execution.exits import scan_exits  # noqa: E402
+from execution.pricing import (  # noqa: E402
+    liquidity_usd_from_raw,
+    sell_fill_price,
+    slippage_rate,
+)
 from store import Store, norm_address, norm_chain  # noqa: E402
+
+# Busy wait for the paper book. WAL is set on open.
+PAPER_BUSY_TIMEOUT_MS = 30_000
+# Quotes older than this are not tradable (env PAPER_PRICE_MAX_AGE_SEC).
+DEFAULT_PRICE_MAX_AGE_SEC = 3600.0
+_QUOTE_FUTURE_SKEW_SEC = 300.0
 
 
 def _utc() -> str:
@@ -41,9 +68,22 @@ def _utc() -> str:
 class PaperLedger:
     def __init__(self, path: str | Path = PAPER_DB_PATH):
         self.path = Path(path)
-        self.conn = sqlite3.connect(str(self.path))
+        # isolation_level=None: autocommit unless we BEGIN. Open/close own the txn.
+        self.conn = sqlite3.connect(
+            str(self.path),
+            timeout=PAPER_BUSY_TIMEOUT_MS / 1000.0,
+            isolation_level=None,
+        )
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute(f"PRAGMA busy_timeout={PAPER_BUSY_TIMEOUT_MS}")
         self._init()
+
+    def _rollback(self) -> None:
+        try:
+            self.conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
 
     def close(self) -> None:
         self.conn.close()
@@ -99,17 +139,29 @@ class PaperLedger:
                 "INSERT INTO account (id, cash_usd, updated_at) VALUES (1, ?, ?)",
                 (PAPER_START_CASH, _utc()),
             )
-        self.conn.commit()
 
     def get_cash(self) -> float:
         return float(self.conn.execute("SELECT cash_usd FROM account WHERE id=1").fetchone()[0])
 
-    def set_cash(self, cash: float) -> None:
+    def _add_cash(self, delta: float, *, now: str | None = None) -> None:
+        """Relative cash update. Caller owns the transaction (no commit here)."""
         self.conn.execute(
-            "UPDATE account SET cash_usd=?, updated_at=? WHERE id=1",
-            (cash, _utc()),
+            "UPDATE account SET cash_usd = cash_usd + ?, updated_at = ? WHERE id = 1",
+            (float(delta), now or _utc()),
         )
-        self.conn.commit()
+
+    def set_cash(self, cash: float) -> None:
+        """Absolute cash set for CLI init/reset. Own transaction; not used by open/close."""
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "UPDATE account SET cash_usd=?, updated_at=? WHERE id=1",
+                (float(cash), _utc()),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self._rollback()
+            raise
 
     def open_position(
         self,
@@ -128,72 +180,116 @@ class PaperLedger:
         pair_address = norm_address(pair_address)
         if price <= 0 or size_usd <= 0:
             raise ValueError("price/size must be > 0")
-        cash = self.get_cash()
-        if size_usd > cash:
-            raise ValueError(f"insufficient cash {cash} < {size_usd}")
         qty = size_usd / price
         pid = str(uuid.uuid4())
         now = _utc()
-        self.set_cash(cash - size_usd)
-        self.conn.execute(
-            """
-            INSERT INTO positions (
-                id, chain_id, pair_address, token_address, qty, entry_price, size_usd,
-                opened_at, status, tp_pct, sl_pct, max_hold_min, meta_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
-            """,
-            (
-                pid,
-                chain_id,
-                pair_address,
-                norm_address(token_address) if token_address else None,
-                qty,
-                price,
-                size_usd,
-                now,
-                tp_pct,
-                sl_pct,
-                max_hold_min,
-                json.dumps(meta or {}),
-            ),
-        )
-        self.conn.execute(
-            """
-            INSERT INTO fills (position_id, side, price, qty, notional_usd, created_at, note)
-            VALUES (?, 'buy', ?, ?, ?, ?, 'open')
-            """,
-            (pid, price, qty, size_usd, now),
-        )
-        self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            cash = self.get_cash()
+            if size_usd > cash:
+                raise ValueError(f"insufficient cash {cash} < {size_usd}")
+            self._add_cash(-size_usd, now=now)
+            if self.get_cash() < -1e-6:
+                raise ValueError("insufficient cash")
+            self.conn.execute(
+                """
+                INSERT INTO positions (
+                    id, chain_id, pair_address, token_address, qty, entry_price, size_usd,
+                    opened_at, status, tp_pct, sl_pct, max_hold_min, meta_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+                """,
+                (
+                    pid,
+                    chain_id,
+                    pair_address,
+                    norm_address(token_address) if token_address else None,
+                    qty,
+                    price,
+                    size_usd,
+                    now,
+                    tp_pct,
+                    sl_pct,
+                    max_hold_min,
+                    json.dumps(meta or {}),
+                ),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO fills (position_id, side, price, qty, notional_usd, created_at, note)
+                VALUES (?, 'buy', ?, ?, ?, ?, 'open')
+                """,
+                (pid, price, qty, size_usd, now),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self._rollback()
+            raise
         return pid
 
     def close_position(
         self, pid: str, *, price: float, reason: str
     ) -> dict[str, Any]:
-        row = self.conn.execute("SELECT * FROM positions WHERE id=?", (pid,)).fetchone()
-        if not row or row["status"] != "open":
-            raise ValueError("position not open")
-        qty = float(row["qty"])
-        notional = qty * price
-        pnl = notional - float(row["size_usd"])
         now = _utc()
-        self.set_cash(self.get_cash() + notional)
-        self.conn.execute(
-            """
-            UPDATE positions SET status='closed', exit_price=?, closed_at=?,
-                   exit_reason=?, pnl_usd=? WHERE id=?
-            """,
-            (price, now, reason, pnl, pid),
-        )
-        self.conn.execute(
-            """
-            INSERT INTO fills (position_id, side, price, qty, notional_usd, created_at, note)
-            VALUES (?, 'sell', ?, ?, ?, ?, ?)
-            """,
-            (pid, price, qty, notional, now, reason),
-        )
-        self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM positions WHERE id=?", (pid,)
+            ).fetchone()
+            if not row or row["status"] != "open":
+                raise ValueError("position not open")
+            qty = float(row["qty"])
+            notional = qty * price
+            pnl = notional - float(row["size_usd"])
+            cur = self.conn.execute(
+                """
+                UPDATE positions SET status='closed', exit_price=?, closed_at=?,
+                       exit_reason=?, pnl_usd=?
+                WHERE id=? AND status='open'
+                """,
+                (price, now, reason, pnl, pid),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("position not open")
+            self._add_cash(notional, now=now)
+            self.conn.execute(
+                """
+                INSERT INTO fills (position_id, side, price, qty, notional_usd, created_at, note)
+                VALUES (?, 'sell', ?, ?, ?, ?, ?)
+                """,
+                (pid, price, qty, notional, now, reason),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self._rollback()
+            raise
         return {"id": pid, "pnl_usd": pnl, "exit_price": price, "reason": reason}
+
+    def find_by_decision_log_id(self, decision_log_id: Any) -> dict[str, Any] | None:
+        """Position whose meta.decision_log_id matches (open or closed). None if unset."""
+        if decision_log_id is None:
+            return None
+        text = str(decision_log_id).strip()
+        if not text:
+            return None
+        params: list[Any] = [text]
+        numeric: int | None = None
+        try:
+            numeric = int(text)
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is not None:
+            params.append(numeric)
+            where = (
+                "CAST(json_extract(meta_json, '$.decision_log_id') AS TEXT) = ? "
+                "OR json_extract(meta_json, '$.decision_log_id') = ?"
+            )
+        else:
+            where = "CAST(json_extract(meta_json, '$.decision_log_id') AS TEXT) = ?"
+        row = self.conn.execute(
+            f"SELECT * FROM positions WHERE {where} ORDER BY opened_at ASC LIMIT 1",
+            params,
+        ).fetchone()
+        return dict(row) if row else None
 
     def list_open(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self.conn.execute(
@@ -222,35 +318,127 @@ class PaperLedger:
         }
 
 
-def latest_price(store: Store, chain_id: str, pair_address: str) -> float | None:
-    # prefer latest history, else pair raw
-    hist = store.list_pair_history(chain_id, pair_address, limit=500)
-    if hist:
-        for p in reversed(hist):
-            if p.get("price_usd") is not None:
-                return float(p["price_usd"])
-    raw = store.get_pair_raw(chain_id, pair_address)
-    if raw and raw.get("priceUsd") is not None:
+def price_max_age_sec() -> float:
+    raw = os.environ.get("PAPER_PRICE_MAX_AGE_SEC", "").strip()
+    if not raw:
+        return DEFAULT_PRICE_MAX_AGE_SEC
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PRICE_MAX_AGE_SEC
+
+
+def _parse_quote_ts(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def quote_is_fresh(
+    recorded_at: Any,
+    *,
+    now: datetime | None = None,
+    max_age_sec: float,
+) -> bool:
+    dt = _parse_quote_ts(recorded_at)
+    if dt is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    age = (now - dt).total_seconds()
+    if age < -_QUOTE_FUTURE_SKEW_SEC:
+        return False
+    return age <= float(max_age_sec)
+
+
+def latest_price(
+    store: Any,
+    chain_id: str,
+    pair_address: str,
+    *,
+    max_age_sec: float | None = None,
+    now: datetime | None = None,
+) -> float | None:
+    """Newest fresh quote, or None (no_price).
+
+    Candidates: ``store.latest_pair_price`` (history DESC LIMIT 1) and
+    ``store.pair_spot`` (pairs.priceUsd / updated_at). The newer timestamp wins.
+    Older than max_age_sec (default PAPER_PRICE_MAX_AGE_SEC) is dropped.
+    """
+    limit = price_max_age_sec() if max_age_sec is None else float(max_age_sec)
+    now = now or datetime.now(timezone.utc)
+    candidates: list[tuple[datetime, float]] = []
+    for getter in ("latest_pair_price", "pair_spot"):
+        fn = getattr(store, getter, None)
+        if not callable(fn):
+            continue
+        quote = fn(chain_id, pair_address)
+        if not quote or quote.get("price_usd") is None:
+            continue
+        if not quote_is_fresh(quote.get("recorded_at"), now=now, max_age_sec=limit):
+            continue
+        stamped = _parse_quote_ts(quote.get("recorded_at"))
+        if stamped is None:
+            continue
         try:
-            return float(raw["priceUsd"])
+            price = float(quote["price_usd"])
         except (TypeError, ValueError):
-            return None
-    return None
+            continue
+        if price <= 0:
+            continue
+        candidates.append((stamped, price))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
+
+def _close_fill(store: Any, chain_id: str, pair_address: str, mid: float) -> tuple[float, float]:
+    """Tick close fill. Same slippage curve as a signal sell."""
+    raw = None
+    get_raw = getattr(store, "get_pair_raw", None)
+    if callable(get_raw):
+        raw = get_raw(chain_id, pair_address)
+    slip = slippage_rate(liquidity_usd_from_raw(raw))
+    return sell_fill_price(mid, slip), slip
 
 
 def tick(
     ledger: PaperLedger,
     store: Store,
+    *,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Mark open positions; close on TP/SL/max hold (unified exit rules)."""
-    actions = []
+    """Close on TP/SL/max_hold via execution.exits.scan_exits.
 
-    def price_lookup(p):
-        return latest_price(store, p["chain_id"], p["pair_address"])
+    Trigger price is the mid mark. Fill price is mid × (1 − slip), same as
+    PaperExecutor signal sells. Does not write execution_log / order_events:
+    the entry receipt already owns decision_log_id (unique). The close is on
+    the paper position (exit_reason) and fills row.
+    """
+    actions: list[dict[str, Any]] = []
 
-    for pos, reason in scan_exits(ledger.list_open(), price_lookup):
+    def price_lookup(p: dict[str, Any]) -> float | None:
+        return latest_price(store, p["chain_id"], p["pair_address"], now=now)
+
+    for pos, reason in scan_exits(ledger.list_open(), price_lookup, now=now):
         px = price_lookup(pos)
-        actions.append(ledger.close_position(pos["id"], price=px, reason=reason))
+        if px is None:
+            continue
+        fill, slip = _close_fill(store, pos["chain_id"], pos["pair_address"], px)
+        closed = ledger.close_position(pos["id"], price=fill, reason=reason)
+        closed["mid_price"] = px
+        closed["fill_price"] = fill
+        closed["slippage"] = slip
+        actions.append(closed)
     return actions
 
 

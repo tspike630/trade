@@ -17,7 +17,7 @@ receipts into an **independent** `execution_ledger.db`.
 2. Parse `pair_address` only from `json.loads(raw_json)["pair_address"]` (extras under `raw["extras"]`)
 3. Validate: `strategy_id`, `action∈{buy,sell}`, `chain_id`, `token_address`, `pair_address`, `size_pct∈(0,1]`
 4. Write one `execution_log` row per decision (always includes `strategy_id`)
-5. Advance cursor `last_processed_id`
+5. Advance cursor `last_processed_id` with **MAX** only (`--since-id` does not rewind it). A `decision_log_id` is claimed (`status=claimed`, unique) before execution; receipt, cursor, and `order_events` commit in one transaction. A bad row is stored as `rejected` and the cursor moves past it.
 6. **Step C:** `PositionManager.check_open` on buys (default pass-through when `PM_ENABLED=0`)
 7. **Step B only:** Paper fill with liquidity slippage; meta stores `strategy_id` + `decision_log_id`
 
@@ -29,21 +29,32 @@ Master switch **`PM_ENABLED=0`** (default) → all buys allowed (pass-through).
 |-----|---------|---------|
 | `PM_TOKEN_DEDUP` | 0 | deny buy if same chain+token already open (token missing → pair match). Arbitration: `PM_STRATEGY_PRIORITY` whitelist or FCFS |
 | `PM_STRATEGY_MUTEX` | 0 | deny if another strategy already has opens (same arbitration) |
-| `PM_MAX_TOTAL_PCT` | off | deny if open size_pct sum + new > limit (suggest **30** percent points) |
-| `PM_MAX_PER_TOKEN_PCT` | off | deny if token exposure + new > limit (suggest **10**) |
+| `PM_MAX_TOTAL_PCT` | off | deny if open size_pct sum + new > limit. **Percent points only** (30 → 0.30, 1 → 0.01) |
+| `PM_MAX_PER_TOKEN_PCT` | off | deny if token exposure + new > limit. Percent points only (suggest **10**) |
 | `PM_MAX_OPEN_PER_STRATEGY` | off | deny if strategy open count ≥ limit (suggest **5**) |
 | `PM_STRATEGY_PRIORITY` | empty | comma list, earlier = higher priority for conflict arbitration |
 
 Reject reason format: `pm_rejected:<rule_name>` (e.g. `pm_rejected:token_dedup`).
+`PM_ENABLED=1` with no paper book is `pm_rejected:no_ledger` (fail closed). `PM_ENABLED=0` still passes through.
+Startup logs the parsed fractions (`PM_MAX_*` are percent points: `1` means 1%, not 100%).
+
+Pre-trade risk stays **off** (`EXECUTION_RISK_ENABLED` accepts `1/true/yes/on`, default off).
+When it is on, SELL skips `max_open` so a full book can still close. `EXECUTION_DAILY_LOSS_USD` is unset by default (daily-loss check stays off). A missing book fails closed only while the risk gate is on.
 
 ### Paper fill rules (Step B)
 
-- **Price:** `paper_trade.latest_price` (history, else pair raw)
+- **Price:** `paper_trade.latest_price` — `pair_history` `ORDER BY recorded_at DESC LIMIT 1`, compared with `pairs.priceUsd` / `pairs.updated_at`; the newer fresh quote wins. Older than `PAPER_PRICE_MAX_AGE_SEC` (default **3600**) → `None` / `no_price` (no fill).
 - **Slippage** from `store.get_pair_raw().liquidity.usd`: `<50k→2%`, `50k~500k→1%`, `≥500k→0.3%`, unknown→`2%`
-  - buy: mid × (1+slip); sell: mid × (1−slip)
-- **Size:** `size_pct * equity()`; if over cash → **truncate** to cash (record actual), do not raise
-- **Sell match:** `chain+token` first, else `chain+pair`
-- **TP/SL/max_hold:** from signal (`tp_pct`/`sl_pct`/`max_hold_min` or extras), else `10%` / `5%` / `60min`
+  - buy fill: mid × (1+slip); signal sell and tick close: mid × (1−slip)
+  - TP/SL **trigger** compares mid to the entry **fill** (entry already includes buy slippage)
+  - equity marks use **mid**, not the slipped fill
+- **Size:** `size_pct * equity(marks)`; if over cash → **truncate** to cash (record actual), do not raise
+- **Sell match:** `chain+token` else `chain+pair`, and `meta.strategy_id` must match. A different strategy's position is `strategy_mismatch` (not closed).
+- **Partial sell:** `size_pct` on a sell is the fraction of the position to close. `size_pct < 1` → `partial_sell_rejected` (position left open). Full close requires `size_pct=1`. Copying a buy's equity fraction (for example 0.05) onto a sell is rejected.
+- **Idempotent buy:** `meta.decision_log_id` already on a position → `duplicate_decision_log_id` (no second open)
+- **TP/SL/max_hold:** from signal (`tp_pct`/`sl_pct`/`max_hold_min` or extras), else `10%` / `5%` / `60min`. Tick calls `execution.exits.scan_exits` (same rules as backtest). `opened_at` may end in `Z`.
+- **Tick events:** tick closes update the paper position and `fills` only. They do not append `execution_log` / `order_events`, because `decision_log_id` is unique on the entry receipt.
+- **One tick writer** per paper DB: `paper_trade.py tick` / `paper_tick_loop.sh` **or** `execution.run --paper-tick`, not both.
 - Main crawler DB opened **read-only** inside `PaperExecutor`
 
 ## Paths / env
@@ -58,6 +69,9 @@ Reject reason format: `pm_rejected:<rule_name>` (e.g. `pm_rejected:token_dedup`)
 | PM master | **`PM_ENABLED=0`** (off → pass-through) |
 | PM rules | `PM_TOKEN_DEDUP` / `PM_STRATEGY_MUTEX` / `PM_MAX_*` default off |
 | Poll interval | `5` s (`EXECUTION_POLL_SEC`) |
+| Quote max age | `PAPER_PRICE_MAX_AGE_SEC` default **3600** |
+| Risk gate | **`EXECUTION_RISK_ENABLED=0`** |
+| Daily loss limit | `EXECUTION_DAILY_LOSS_USD` unset (off) |
 
 ## CLI
 
@@ -122,7 +136,8 @@ sig_buy = {
 }
 sig_sell = dict(sig_buy)
 sig_sell["action"] = "sell"
-sig_sell["decision_log_id"] = int(row["id"])  # meta only
+sig_sell["decision_log_id"] = int(row["id"]) + 1  # distinct id; buy id stays on the position
+sig_sell["size_pct"] = 1.0  # full close; size_pct<1 is partial_sell_rejected
 
 with PaperExecutor(paper_db=paper, crawler_db="dexscreener.db") as ex:
     buy = ex.execute(sig_buy)

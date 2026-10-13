@@ -18,10 +18,14 @@ DEFAULT_MAX_HOLD_MIN = 60.0
 
 
 def _parse_ts(s: Any) -> Optional[datetime]:
+    """Parse an ISO timestamp. Trailing Z is UTC (Python ≤3.10 fromisoformat rejects Z)."""
     if not s:
         return None
+    text = str(s).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
     try:
-        dt = datetime.fromisoformat(str(s))
+        dt = datetime.fromisoformat(text)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
