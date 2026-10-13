@@ -1,0 +1,1108 @@
+{
+  "generated_at": "2026-10-13T01:47:03Z",
+  "source": "dexscreener-crawler",
+  "enabled_chains": [
+    "solana",
+    "ethereum",
+    "bsc",
+    "base"
+  ],
+  "alert_min_score": 25.0,
+  "health": {
+    "ok": true,
+    "message": "OK: age=101s status=ok cycle_id=20261013T014519Z-d120e20f",
+    "heartbeat": {
+      "timestamp": "2026-10-13T01:45:23Z",
+      "cycle_id": "20261013T014519Z-d120e20f",
+      "status": "ok",
+      "last_error": null,
+      "pid": 81323,
+      "stats": {
+        "cycle_number": 2779,
+        "tokens_total": 67530,
+        "pairs_total": 31057,
+        "enrich_batches": 19,
+        "validation_errors": 0,
+        "alerts_emitted": 5,
+        "enrich_pending_remaining": 59,
+        "interrupted": false
+      },
+      "counters": {
+        "cycles_ok": 2768,
+        "cycles_fail": 2,
+        "alerts_emitted": 115247,
+        "validation_errors": 0
+      }
+    }
+  },
+  "stats": {
+    "tokens": 67573,
+    "pairs": 31063,
+    "alerts": 129633,
+    "pair_history_rows": 1131648,
+    "pending_enrich": 13750,
+    "cycle_number": 2780
+  },
+  "top_scores": [
+    {
+      "chain_id": "solana",
+      "token_address": "8timkgvsrat9tm2esko8zvtt99lzlpefum4snzazixaq",
+      "quality_score": 92.9,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:46:53Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "eqawfcwutts6lvryt4v4iigzbr6rztj6aqv3hl9kpump",
+      "quality_score": 92.9,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:46:55Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "7k52ayqw9rwgjwzmq7o2d1p6e7bji6hsmsqaly5ecxlh",
+      "quality_score": 92.0,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:46:53Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "2j5sas7xy776qcbpypqbzjyqsatkifgrwjferthnw2zm",
+      "quality_score": 91.2,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:46:53Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "aq2y8twm9eebwsksobbhqdawfkilhjdef2kuujgpump",
+      "quality_score": 91.2,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:46:55Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "9twd5vxapyswwuptvpgdmdxvvhsuqwijc4a1qvyzpump",
+      "quality_score": 91.2,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:46:55Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "6mix12lihrqfojaqenfpuc65qkwd6x4y5qg93ofbordr",
+      "quality_score": 91.2,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:46:55Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "2kbrlsbvexdf3yjm35yjvchr8gc5o1wzrzqpbdhjpump",
+      "quality_score": 91.2,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:47:01Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "aepbdj3rvimjkchm1xivam1vnup7vbzrsn68gu5xpump",
+      "quality_score": 90.6,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:47:00Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "hzychqan2uohgrnl9v2chcffqx3bvjujd5zu2hd5mzqy",
+      "quality_score": 90.3,
+      "quality_tags": "[\"high_social\"]",
+      "scored_at": "2026-10-13T01:46:59Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "7vertkgf9klhxxjxhx6uawuoyztp9ldgj2bwmvxvpump",
+      "quality_score": 89.9,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:46:53Z"
+    },
+    {
+      "chain_id": "solana",
+      "token_address": "ripsrnkeflpkf7e8plycbxwcxddgtnbdqgqkkedcvng",
+      "quality_score": 89.6,
+      "quality_tags": "[\"high_liq\", \"high_social\"]",
+      "scored_at": "2026-10-13T01:46:53Z"
+    }
+  ],
+  "low_scores": [],
+  "history_samples": [
+    {
+      "chain_id": "solana",
+      "pair_address": "91kvls6amtyckg1n3imfdd63eoah6hymqd8fnhtdcy4p",
+      "points": 8,
+      "series": [
+        {
+          "t": "2026-10-09T18:21:34Z",
+          "price": 0.0008699,
+          "liq": 93640.29,
+          "vol_h24": 0.94,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T18:47:15Z",
+          "price": 0.0008699,
+          "liq": 93640.29,
+          "vol_h24": 0.94,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T18:52:49Z",
+          "price": 0.0008699,
+          "liq": 93640.29,
+          "vol_h24": 0.94,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T18:58:37Z",
+          "price": 0.0008699,
+          "liq": 93640.29,
+          "vol_h24": 0.94,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:04:13Z",
+          "price": 0.0008699,
+          "liq": 93640.29,
+          "vol_h24": 0.94,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:09:53Z",
+          "price": 0.0008699,
+          "liq": 93640.29,
+          "vol_h24": 0.94,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:15:33Z",
+          "price": 0.0008699,
+          "liq": 93640.29,
+          "vol_h24": 0.94,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:21:10Z",
+          "price": 0.0008699,
+          "liq": 93640.29,
+          "vol_h24": 0.94,
+          "tier": "hot"
+        }
+      ]
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "bofa2viusudpbtums2krug6ahnemawjnfwqtjdgx5bkw",
+      "points": 8,
+      "series": [
+        {
+          "t": "2026-10-09T18:21:35Z",
+          "price": 0.005414,
+          "liq": 2138392.89,
+          "vol_h24": 8761790.9,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T18:47:16Z",
+          "price": 0.005318,
+          "liq": 2138528.49,
+          "vol_h24": 8536575.02,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T18:52:49Z",
+          "price": 0.005337,
+          "liq": 2144724.04,
+          "vol_h24": 8554212.05,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T18:58:37Z",
+          "price": 0.005329,
+          "liq": 2143138.24,
+          "vol_h24": 8493239.08,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:04:12Z",
+          "price": 0.005283,
+          "liq": 2133120.06,
+          "vol_h24": 8461273.61,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:09:53Z",
+          "price": 0.005313,
+          "liq": 2139694.16,
+          "vol_h24": 8385753.85,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:15:33Z",
+          "price": 0.005297,
+          "liq": 2135522.99,
+          "vol_h24": 8356546.09,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:21:10Z",
+          "price": 0.005301,
+          "liq": 2135901.92,
+          "vol_h24": 8339661.62,
+          "tier": "hot"
+        }
+      ]
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "2axxcn6on9bbt5owwmth53c7qhuxvhleu718kqt8rvy2",
+      "points": 8,
+      "series": [
+        {
+          "t": "2026-10-09T18:21:32Z",
+          "price": 2.36,
+          "liq": 4139136.45,
+          "vol_h24": 10808411.37,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T18:47:21Z",
+          "price": 2.34,
+          "liq": 4119968.93,
+          "vol_h24": 10547857.43,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T18:52:49Z",
+          "price": 2.34,
+          "liq": 4122019.78,
+          "vol_h24": 10502763.01,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T18:58:37Z",
+          "price": 2.34,
+          "liq": 4119823.66,
+          "vol_h24": 10448864.48,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:04:13Z",
+          "price": 2.33,
+          "liq": 4113623.79,
+          "vol_h24": 10429152.84,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:09:53Z",
+          "price": 2.33,
+          "liq": 4116691.74,
+          "vol_h24": 10381257.58,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:15:33Z",
+          "price": 2.33,
+          "liq": 4119461.08,
+          "vol_h24": 10347886.47,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:21:10Z",
+          "price": 2.33,
+          "liq": 4118681.11,
+          "vol_h24": 10312947.34,
+          "tier": "hot"
+        }
+      ]
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "c2bw9dvjeywm9zac2ycfq6kfx8xghjttfzobsdd4tyxz",
+      "points": 8,
+      "series": [
+        {
+          "t": "2026-10-09T18:51:42Z",
+          "price": 0.04119,
+          "liq": 561756.21,
+          "vol_h24": 270627.06,
+          "tier": "warm"
+        },
+        {
+          "t": "2026-10-09T18:57:32Z",
+          "price": 0.04141,
+          "liq": 563266.47,
+          "vol_h24": 270819.05,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:03:08Z",
+          "price": 0.04141,
+          "liq": 563137.3,
+          "vol_h24": 273791.39,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:08:41Z",
+          "price": 0.04199,
+          "liq": 567419.96,
+          "vol_h24": 278706.43,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:14:28Z",
+          "price": 0.04221,
+          "liq": 568472.77,
+          "vol_h24": 283835.31,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:20:04Z",
+          "price": 0.04249,
+          "liq": 570243.7,
+          "vol_h24": 288741.81,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:25:39Z",
+          "price": 0.04275,
+          "liq": 571769.28,
+          "vol_h24": 293782.81,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:31:23Z",
+          "price": 0.04299,
+          "liq": 572970.48,
+          "vol_h24": 298740.0,
+          "tier": "hot"
+        }
+      ]
+    },
+    {
+      "chain_id": "solana",
+      "pair_address": "evaonvtn4xg64wckwvfoxr4xefs6tmyancmvioevqg6g",
+      "points": 8,
+      "series": [
+        {
+          "t": "2026-10-09T18:50:40Z",
+          "price": 0.0002728,
+          "liq": 46127.55,
+          "vol_h24": 100796.29,
+          "tier": "warm"
+        },
+        {
+          "t": "2026-10-09T18:56:24Z",
+          "price": 0.0002738,
+          "liq": 46252.0,
+          "vol_h24": 100223.54,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:02:02Z",
+          "price": 0.0002748,
+          "liq": 46330.43,
+          "vol_h24": 100186.09,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:07:28Z",
+          "price": 0.0002742,
+          "liq": 46305.58,
+          "vol_h24": 99984.13,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:13:20Z",
+          "price": 0.0002782,
+          "liq": 46618.24,
+          "vol_h24": 99643.1,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:18:54Z",
+          "price": 0.0002791,
+          "liq": 46695.25,
+          "vol_h24": 99398.14,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:24:31Z",
+          "price": 0.00028,
+          "liq": 46752.86,
+          "vol_h24": 98694.29,
+          "tier": "hot"
+        },
+        {
+          "t": "2026-10-09T19:30:16Z",
+          "price": 0.0002817,
+          "liq": 46914.17,
+          "vol_h24": 98301.09,
+          "tier": "hot"
+        }
+      ]
+    }
+  ],
+  "recent_alerts": [
+    {
+      "id": 129633,
+      "created_at": "2026-10-13T01:47:03Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "1v7bhrjdknkzs66aisyet881holnemdg8gzarvdtkaly",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/1v7bhrjdknkzs66aisyet881holnemdg8gzarvdtkaly",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=21KGivWkokJauHwjaajcL9ZLA74DpGHxbQGywuBdbnu3z18huo9EUJug1dSYLdzm9GgQRwc77THrVouNqb4cVW1B",
+        "signature": "21KGivWkokJauHwjaajcL9ZLA74DpGHxbQGywuBdbnu3z18huo9EUJug1dSYLdzm9GgQRwc77THrVouNqb4cVW1B",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129632,
+      "created_at": "2026-10-13T01:47:02Z",
+      "type": "liquidity_drop",
+      "chain_id": "solana",
+      "token_address": "9neqaucb16sq3tn1psbkwqyhpdlmfhwjkgymrejsagte",
+      "pair_address": "3hyhqc6ne6sapvt5sptkawruxv9zpyyluk1ifrw8baov",
+      "severity": "high",
+      "message": "liquidity.usd dropped 100.0% (68373674.12 → 13851.68) threshold=30.0%",
+      "delivered": 0,
+      "payload": {
+        "old_liquidity_usd": 68373674.12,
+        "new_liquidity_usd": 13851.68,
+        "drop_pct": 99.9797,
+        "threshold_pct": 30.0
+      }
+    },
+    {
+      "id": 129631,
+      "created_at": "2026-10-13T01:47:01Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "9neqaucb16sq3tn1psbkwqyhpdlmfhwjkgymrejsagte",
+      "pair_address": "3hyhqc6ne6sapvt5sptkawruxv9zpyyluk1ifrw8baov",
+      "severity": "high",
+      "message": "priceUsd changed -100.0% (0.06537 → 1.327e-05) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 0.06537,
+        "new_priceUsd": 1.327e-05,
+        "change_pct": -99.9797,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 129630,
+      "created_at": "2026-10-13T01:46:59Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "4nrsznzqtdy3p3sszywgpzgoahmxvqosk2p7nbf1dyav",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/4nrsznzqtdy3p3sszywgpzgoahmxvqosk2p7nbf1dyav",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=558VSfNboaXThvS6HmLXtxnU3FR1bWCW3mckGumn1ygoy1yMXAMw6NJJbuEmtzNiQrHdtiQWCh5AyqmrWxNj1vey",
+        "signature": "558VSfNboaXThvS6HmLXtxnU3FR1bWCW3mckGumn1ygoy1yMXAMw6NJJbuEmtzNiQrHdtiQWCh5AyqmrWxNj1vey",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129629,
+      "created_at": "2026-10-13T01:46:59Z",
+      "type": "liquidity_drop",
+      "chain_id": "solana",
+      "token_address": "shib5gsovkpjwkxrxrk7sbqfzb2r9rqb3tgqwyx4rww",
+      "pair_address": "6y4xduhpsunzegupwbkebfewh98u6fgqo1uus7u7xxzq",
+      "severity": "high",
+      "message": "liquidity.usd dropped 49.8% (6690.82 → 3358.13) threshold=30.0%",
+      "delivered": 1,
+      "payload": {
+        "old_liquidity_usd": 6690.82,
+        "new_liquidity_usd": 3358.13,
+        "drop_pct": 49.8099,
+        "threshold_pct": 30.0
+      }
+    },
+    {
+      "id": 129628,
+      "created_at": "2026-10-13T01:46:57Z",
+      "type": "liquidity_drop",
+      "chain_id": "solana",
+      "token_address": "2fpytwczlug1mdrwsyop4d6s1tm7hakhyrjknb5w6pxk",
+      "pair_address": "8iqfhwycegreswnlm8nkg9gc8dvzungzymzuyuscgkmk",
+      "severity": "high",
+      "message": "liquidity.usd dropped 100.0% (2844142860.2 → 573786.0) threshold=30.0%",
+      "delivered": 1,
+      "payload": {
+        "old_liquidity_usd": 2844142860.2,
+        "new_liquidity_usd": 573786.0,
+        "drop_pct": 99.9798,
+        "threshold_pct": 30.0
+      }
+    },
+    {
+      "id": 129627,
+      "created_at": "2026-10-13T01:46:55Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "2fpytwczlug1mdrwsyop4d6s1tm7hakhyrjknb5w6pxk",
+      "pair_address": "8iqfhwycegreswnlm8nkg9gc8dvzungzymzuyuscgkmk",
+      "severity": "high",
+      "message": "priceUsd changed -100.0% (1406560.63 → 283.78) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 1406560.63,
+        "new_priceUsd": 283.78,
+        "change_pct": -99.9798,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 129626,
+      "created_at": "2026-10-13T01:46:55Z",
+      "type": "volume_h24_jump",
+      "chain_id": "solana",
+      "token_address": "b6h248njkacbakacnji889a26tcigxgn8cxhej4dx391",
+      "pair_address": "2c9f3unmbxftqesmsscbw5yxjwd9hxfsmlxti9mqtwpr",
+      "severity": "medium",
+      "message": "volume.h24 changed +645.7% (2.91 → 21.7) threshold=50.0%",
+      "delivered": 0,
+      "payload": {
+        "old_volume_h24": 2.91,
+        "new_volume_h24": 21.7,
+        "change_pct": 645.7045,
+        "threshold_pct": 50.0
+      }
+    },
+    {
+      "id": 129625,
+      "created_at": "2026-10-13T01:46:53Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "9a8pquaaaoo51tabtashsxmbm3cpsrnkxzfn6f8dpump",
+      "pair_address": "jeabtuevpxeja2fku1nbtxizsfbp8ww7g7k1rupfautf",
+      "severity": "high",
+      "message": "priceUsd changed +116.2% (0.0001063 → 0.0002298) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 0.0001063,
+        "new_priceUsd": 0.0002298,
+        "change_pct": 116.1806,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 129624,
+      "created_at": "2026-10-13T01:46:53Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "66pkyxvn1q38jwbiubwvv4hqji2bdmf6knn8mr8zpump",
+      "pair_address": "537uz5nnnwj7s2kyttvgeoqgtumuygux7r6idivqqk5x",
+      "severity": "high",
+      "message": "priceUsd changed -83.3% (1.947e-06 → 3.243e-07) threshold=20.0%",
+      "delivered": 0,
+      "payload": {
+        "old_priceUsd": 1.947e-06,
+        "new_priceUsd": 3.243e-07,
+        "change_pct": -83.3436,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 129623,
+      "created_at": "2026-10-13T01:46:53Z",
+      "type": "volume_h24_jump",
+      "chain_id": "solana",
+      "token_address": "4r9ehwkhzwzlnypsfcr9ex4leawnqwkxd6dadsrqpump",
+      "pair_address": "2u5qqncytwyaqhmxjnozwlpe6byexnte8mn7somnyvd8",
+      "severity": "medium",
+      "message": "volume.h24 changed +71.9% (1361.4 → 2340.22) threshold=50.0%",
+      "delivered": 0,
+      "payload": {
+        "old_volume_h24": 1361.4,
+        "new_volume_h24": 2340.22,
+        "change_pct": 71.898,
+        "threshold_pct": 50.0
+      }
+    },
+    {
+      "id": 129622,
+      "created_at": "2026-10-13T01:46:53Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "4r9ehwkhzwzlnypsfcr9ex4leawnqwkxd6dadsrqpump",
+      "pair_address": "2u5qqncytwyaqhmxjnozwlpe6byexnte8mn7somnyvd8",
+      "severity": "high",
+      "message": "priceUsd changed -64.1% (6.402e-07 → 2.3e-07) threshold=20.0%",
+      "delivered": 0,
+      "payload": {
+        "old_priceUsd": 6.402e-07,
+        "new_priceUsd": 2.3e-07,
+        "change_pct": -64.0737,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 129621,
+      "created_at": "2026-10-13T01:46:53Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "4zcbr5ga3yzck6dmsaigjxh3w4igrhtvzdltiwwgpump",
+      "pair_address": "gkeyfrl8zdercnfc81sfrwsjdyhwbyng9za1uegcmwwh",
+      "severity": "high",
+      "message": "priceUsd changed -98.5% (4.935e-07 → 7.288e-09) threshold=20.0%",
+      "delivered": 0,
+      "payload": {
+        "old_priceUsd": 4.935e-07,
+        "new_priceUsd": 7.288e-09,
+        "change_pct": -98.5232,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 129620,
+      "created_at": "2026-10-13T01:46:51Z",
+      "type": "liquidity_drop",
+      "chain_id": "solana",
+      "token_address": "9ffcjct1ayyccqsheh3vmsm6nkga1eigcq1liozpump",
+      "pair_address": "bveazzdvng1hqj8qi3pwkzdg3ubyxtsgoghyawkzbcgg",
+      "severity": "high",
+      "message": "liquidity.usd dropped 96.8% (59090.59 → 1893.39) threshold=30.0%",
+      "delivered": 1,
+      "payload": {
+        "old_liquidity_usd": 59090.59,
+        "new_liquidity_usd": 1893.39,
+        "drop_pct": 96.7958,
+        "threshold_pct": 30.0
+      }
+    },
+    {
+      "id": 129619,
+      "created_at": "2026-10-13T01:46:51Z",
+      "type": "volume_h24_jump",
+      "chain_id": "solana",
+      "token_address": "9ffcjct1ayyccqsheh3vmsm6nkga1eigcq1liozpump",
+      "pair_address": "bveazzdvng1hqj8qi3pwkzdg3ubyxtsgoghyawkzbcgg",
+      "severity": "medium",
+      "message": "volume.h24 changed +57.7% (50828.59 → 80173.38) threshold=50.0%",
+      "delivered": 0,
+      "payload": {
+        "old_volume_h24": 50828.59,
+        "new_volume_h24": 80173.38,
+        "change_pct": 57.7328,
+        "threshold_pct": 50.0
+      }
+    },
+    {
+      "id": 129618,
+      "created_at": "2026-10-13T01:46:51Z",
+      "type": "price_change",
+      "chain_id": "solana",
+      "token_address": "9ffcjct1ayyccqsheh3vmsm6nkga1eigcq1liozpump",
+      "pair_address": "bveazzdvng1hqj8qi3pwkzdg3ubyxtsgoghyawkzbcgg",
+      "severity": "high",
+      "message": "priceUsd changed -99.6% (0.0005008 → 1.877e-06) threshold=20.0%",
+      "delivered": 1,
+      "payload": {
+        "old_priceUsd": 0.0005008,
+        "new_priceUsd": 1.877e-06,
+        "change_pct": -99.6252,
+        "threshold_pct": 20.0
+      }
+    },
+    {
+      "id": 129617,
+      "created_at": "2026-10-13T01:46:39Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "6yngscm4xnssuhjhzr98s7vgnjvvvxvfwnemy2hwahhc",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/6yngscm4xnssuhjhzr98s7vgnjvvvxvfwnemy2hwahhc",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=5b2Jg7WtozJJzyjBKLdD6A64HmbEvHnWtkT6eP5uZDvnTSDwsMFbthruJUX5hBdhbdcTX2EjtrdJvB7jcxPPjXyj",
+        "signature": "5b2Jg7WtozJJzyjBKLdD6A64HmbEvHnWtkT6eP5uZDvnTSDwsMFbthruJUX5hBdhbdcTX2EjtrdJvB7jcxPPjXyj",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129616,
+      "created_at": "2026-10-13T01:46:37Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "wxtrcaws9ydf78azjotg3w78nvj2jqrhp3tefmbfs6p",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/wxtrcaws9ydf78azjotg3w78nvj2jqrhp3tefmbfs6p",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=61f3d9puZ59aPb9PK4HjwVDMX6VAwdGEW3hovvRKTviA7zeKbAG3qEg887r4aAfqMW2wzSvrp8y6id1uqKCswJjt",
+        "signature": "61f3d9puZ59aPb9PK4HjwVDMX6VAwdGEW3hovvRKTviA7zeKbAG3qEg887r4aAfqMW2wzSvrp8y6id1uqKCswJjt",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129615,
+      "created_at": "2026-10-13T01:46:34Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "ejgt5gvujt4gdzwzovos8pi9xyse2yv1ms6x92mw1jmk",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/ejgt5gvujt4gdzwzovos8pi9xyse2yv1ms6x92mw1jmk",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=5UUV7ba2thgiNh43a48CGGKQAUMpSTcLPRgWzxyP5nhQAAQXyy3z38NK9eJBeoMghN2gHohJQMAQzFEKoLfTAwJD",
+        "signature": "5UUV7ba2thgiNh43a48CGGKQAUMpSTcLPRgWzxyP5nhQAAQXyy3z38NK9eJBeoMghN2gHohJQMAQzFEKoLfTAwJD",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129614,
+      "created_at": "2026-10-13T01:46:34Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "91h5m4sjdakfyfvnajpwnqo3qqa79cfgsdtmt5vd7nsd",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/91h5m4sjdakfyfvnajpwnqo3qqa79cfgsdtmt5vd7nsd",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=33yFoqNDDHCjf7nijSqskCx7k4QXjE1bcGy5aKMbMarUF3CAa5QeyXSAWnoJiMzW7dHirkw2oqLeLraWZTe2TYg",
+        "signature": "33yFoqNDDHCjf7nijSqskCx7k4QXjE1bcGy5aKMbMarUF3CAa5QeyXSAWnoJiMzW7dHirkw2oqLeLraWZTe2TYg",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129613,
+      "created_at": "2026-10-13T01:46:31Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "59sag6gegcghrnpun3spvawv8fz9bm2nugfhpay5ifj4",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/59sag6gegcghrnpun3spvawv8fz9bm2nugfhpay5ifj4",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=Sfe4MEPLbAA2fGy7mYN3SHgeidZ1kmpT4226drQ4eJ7KkCUEJ8wZKS9ST3uHAD4KBYDWNoKhrXvP5uzytXMyH2G",
+        "signature": "Sfe4MEPLbAA2fGy7mYN3SHgeidZ1kmpT4226drQ4eJ7KkCUEJ8wZKS9ST3uHAD4KBYDWNoKhrXvP5uzytXMyH2G",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129612,
+      "created_at": "2026-10-13T01:46:31Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "2jg2qt4p7rkkew5dqxggxvlzsv2l4vfxf3ad8bvtzaqf",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/2jg2qt4p7rkkew5dqxggxvlzsv2l4vfxf3ad8bvtzaqf",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=Sfe4MEPLbAA2fGy7mYN3SHgeidZ1kmpT4226drQ4eJ7KkCUEJ8wZKS9ST3uHAD4KBYDWNoKhrXvP5uzytXMyH2G",
+        "signature": "Sfe4MEPLbAA2fGy7mYN3SHgeidZ1kmpT4226drQ4eJ7KkCUEJ8wZKS9ST3uHAD4KBYDWNoKhrXvP5uzytXMyH2G",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129611,
+      "created_at": "2026-10-13T01:46:27Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "cnatrehexuibzkww8s5cbljq5ugzvmgt9eulehhgbtsb",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/cnatrehexuibzkww8s5cbljq5ugzvmgt9eulehhgbtsb",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=4A7dzJ1fqpxvYJ7PMDo98iMPWUnJKWjxdtDzbx7Sz16gyWi8Gno5FMwbvw97rHnwrFfc8xzdxSVumvWBgRGkrHM2",
+        "signature": "4A7dzJ1fqpxvYJ7PMDo98iMPWUnJKWjxdtDzbx7Sz16gyWi8Gno5FMwbvw97rHnwrFfc8xzdxSVumvWBgRGkrHM2",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129610,
+      "created_at": "2026-10-13T01:46:27Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "8vtc9999ygs9dqm6s17jmyhxt9euyzup83cdp8hhes6k",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/8vtc9999ygs9dqm6s17jmyhxt9euyzup83cdp8hhes6k",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=28g4zQGJonAFc41hTVkzxBtHb31XhAKH8s4urxt7xmvK3QcG7VayxxWyAorFqkv8ZptwgvD6jknNBkfC2p1NBhwB",
+        "signature": "28g4zQGJonAFc41hTVkzxBtHb31XhAKH8s4urxt7xmvK3QcG7VayxxWyAorFqkv8ZptwgvD6jknNBkfC2p1NBhwB",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129609,
+      "created_at": "2026-10-13T01:46:27Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "dbqy1hpjekwa1actbesx7bhxwmh5xgtrajqn81yyt5nj",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/dbqy1hpjekwa1actbesx7bhxwmh5xgtrajqn81yyt5nj",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=2ZXiuL8QDQ38hx7mRLi8XNNwkNcLSeoUMWrvbd8KnvDUkSsDWXbQqmghyVtjvWwe3wpzEfCun6XFih2xBq28Bg9W",
+        "signature": "2ZXiuL8QDQ38hx7mRLi8XNNwkNcLSeoUMWrvbd8KnvDUkSsDWXbQqmghyVtjvWwe3wpzEfCun6XFih2xBq28Bg9W",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129608,
+      "created_at": "2026-10-13T01:46:26Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "cctitifinrp2kbwgwqdsinxxy5ezrj667v33vdrdoyt4",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/cctitifinrp2kbwgwqdsinxxy5ezrj667v33vdrdoyt4",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=5ESNvxQbcucndMYvE1cQNfAUZezD4LAMZxRxotLomvUJSt3Vx7552ZwxvRaNNwqnVaXvxQp1U4PA2ZSBdv1j73qC",
+        "signature": "5ESNvxQbcucndMYvE1cQNfAUZezD4LAMZxRxotLomvUJSt3Vx7552ZwxvRaNNwqnVaXvxQp1U4PA2ZSBdv1j73qC",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129607,
+      "created_at": "2026-10-13T01:46:24Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "4kpne258q5krexrpscq4rhenune8pe7sshxz19qp7foq",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/4kpne258q5krexrpscq4rhenune8pe7sshxz19qp7foq",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=35sCAVPdNAQasF5ZE3G6BWYJsvmeJuXDjadA3jAPqEYTb8stg5kELYA98jpZqJMGL7k8DobJbo5JXpC4y9m7zx3P",
+        "signature": "35sCAVPdNAQasF5ZE3G6BWYJsvmeJuXDjadA3jAPqEYTb8stg5kELYA98jpZqJMGL7k8DobJbo5JXpC4y9m7zx3P",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129606,
+      "created_at": "2026-10-13T01:46:22Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "hr4xstayhwpq5ckpcbrl1cz7nydbyf9ughrwqdgckn1h",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/hr4xstayhwpq5ckpcbrl1cz7nydbyf9ughrwqdgckn1h",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=3wjhZyfAgSsLW9QZjq9szYccBouPTustsEZrvyDTcpLRPpHJ2MjcFuXqFNrf6M7KmxS2PYZxh7U1tKWcqo7ACMpF",
+        "signature": "3wjhZyfAgSsLW9QZjq9szYccBouPTustsEZrvyDTcpLRPpHJ2MjcFuXqFNrf6M7KmxS2PYZxh7U1tKWcqo7ACMpF",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129605,
+      "created_at": "2026-10-13T01:46:22Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "717d5ge8qg5fctqcjjdcjwqbr3bzuma2angejyuhiqs7",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/717d5ge8qg5fctqcjjdcjwqbr3bzuma2angejyuhiqs7",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=2i47CP4Kb78cfao1Va9yMSFc1TNdhGqUG5qPeU2pukJ4kMcHAgTiBx5smCmEJ5EzD27WQiW9Sdan4i3FyRTXtTZA",
+        "signature": "2i47CP4Kb78cfao1Va9yMSFc1TNdhGqUG5qPeU2pukJ4kMcHAgTiBx5smCmEJ5EzD27WQiW9Sdan4i3FyRTXtTZA",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129604,
+      "created_at": "2026-10-13T01:46:22Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "4qdcpubwsihknhvwmphu4ya7zsgpudqhby2d4qnp2phq",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/4qdcpubwsihknhvwmphu4ya7zsgpudqhby2d4qnp2phq",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=5VzUqUCb1XztnCcR67Bf89QjyUxEhJaWP7K7N4kdHcMKDMmXTRjcjHWBgTra7vXLV5a6npeiScBm3eTAmBiVvbKB",
+        "signature": "5VzUqUCb1XztnCcR67Bf89QjyUxEhJaWP7K7N4kdHcMKDMmXTRjcjHWBgTra7vXLV5a6npeiScBm3eTAmBiVvbKB",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129603,
+      "created_at": "2026-10-13T01:46:22Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "3cr48y9vankds9t3hrlatuo2puhnuj5r5tttrh1w7nwm",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/3cr48y9vankds9t3hrlatuo2puhnuj5r5tttrh1w7nwm",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=5jQg9YBFC8NygG9yAYdRJkjReu8ayJDe399PiAJeNJVW6EC9tSTVuyLVttYk4EfdCVb4tpp7CD77Aw8zvDdgWGXm",
+        "signature": "5jQg9YBFC8NygG9yAYdRJkjReu8ayJDe399PiAJeNJVW6EC9tSTVuyLVttYk4EfdCVb4tpp7CD77Aw8zvDdgWGXm",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129602,
+      "created_at": "2026-10-13T01:46:21Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "gvqtptneav2x7bejaf6azrley4coetnw4b3ujuhl9eqt",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/gvqtptneav2x7bejaf6azrley4coetnw4b3ujuhl9eqt",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=3gAtJY5op62vaTHAEiPBYAxv7PMUGtdqyiHCNN4f8XxFR5FUQmxDX9EYUgnxCLUbowQYXaGym9mYE2uq1EtDNGpe",
+        "signature": "3gAtJY5op62vaTHAEiPBYAxv7PMUGtdqyiHCNN4f8XxFR5FUQmxDX9EYUgnxCLUbowQYXaGym9mYE2uq1EtDNGpe",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129601,
+      "created_at": "2026-10-13T01:46:21Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "9wrpyb5alsjjg15ntfutgrqypjab7a3hlggot67zvh79",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/9wrpyb5alsjjg15ntfutgrqypjab7a3hlggot67zvh79",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=32UYfMcCy68tePJ2mL7SNHcQWHtgUS6Wtc5JaFmfr8EvGhWLyZzMPKCiEUHuC4iB1qxY84TMzCbkTJxrAEKNkxYx",
+        "signature": "32UYfMcCy68tePJ2mL7SNHcQWHtgUS6Wtc5JaFmfr8EvGhWLyZzMPKCiEUHuC4iB1qxY84TMzCbkTJxrAEKNkxYx",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129600,
+      "created_at": "2026-10-13T01:46:21Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "bcwrb2hjr6jjvggd39pkehufrmb18yva7r5h4kgsqr8b",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/bcwrb2hjr6jjvggd39pkehufrmb18yva7r5h4kgsqr8b",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=5LmaHTBVi5p6NpzGv4pkxyUjkQ2DnDbwSwFZb7CxEmpe4a5RkYQfpdm99chyR1p76kbN7WSH93UPtNH2NbweR16H",
+        "signature": "5LmaHTBVi5p6NpzGv4pkxyUjkQ2DnDbwSwFZb7CxEmpe4a5RkYQfpdm99chyR1p76kbN7WSH93UPtNH2NbweR16H",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129599,
+      "created_at": "2026-10-13T01:46:19Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "1xv9coi7lbt3zfzjuzfdrhoqostmwvr7z6sulscmvyua",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/1xv9coi7lbt3zfzjuzfdrhoqostmwvr7z6sulscmvyua",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=3mY8QsJ4shi83QZZ2F4XhHXvBomx22CQTPwvB7BnpAdifE6rRoPnBGhihKTjSm1Jb2cXCqYnqjFQVAC7ycPYqymy",
+        "signature": "3mY8QsJ4shi83QZZ2F4XhHXvBomx22CQTPwvB7BnpAdifE6rRoPnBGhihKTjSm1Jb2cXCqYnqjFQVAC7ycPYqymy",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129598,
+      "created_at": "2026-10-13T01:46:17Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "3ljkysjhnrtgdtu4k5i9af68opnq3dxoc2fggsnszgks",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/3ljkysjhnrtgdtu4k5i9af68opnq3dxoc2fggsnszgks",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=ZhEtwNQAPgRe5BAPYvaWgHENaLkYhoB3DE78ZLvJjbPtsxmsmF2RMvdks3hKNv3yKPxaHT3CEHSS2g7eFLF26Le",
+        "signature": "ZhEtwNQAPgRe5BAPYvaWgHENaLkYhoB3DE78ZLvJjbPtsxmsmF2RMvdks3hKNv3yKPxaHT3CEHSS2g7eFLF26Le",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129597,
+      "created_at": "2026-10-13T01:46:16Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "2mdqqnttkzcmhlmksqz3lua8bpkoe68qvjayfrmwiga7",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/2mdqqnttkzcmhlmksqz3lua8bpkoe68qvjayfrmwiga7",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=2iTUYRwoS6GtNduo1nf8beKeR4PmeJbAmcKMxLiGhPt1R1z8GJHdJWuCuTx5Hsss3emwA3SJi3dAsDrtx7NuMSXt",
+        "signature": "2iTUYRwoS6GtNduo1nf8beKeR4PmeJbAmcKMxLiGhPt1R1z8GJHdJWuCuTx5Hsss3emwA3SJi3dAsDrtx7NuMSXt",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129596,
+      "created_at": "2026-10-13T01:46:12Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "b8v13wuctxgqekffo8zfrcuvupda5njykcjcuyzgxji7",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/b8v13wuctxgqekffo8zfrcuvupda5njykcjcuyzgxji7",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=3Ba5wZfmdYeWJ2FfjzAWkaRRX5yvEbFEyXv2etHQqAdTfoBVhcDT7AJVCgrDV1cFMzsjRdpoXmSk5Y53EhMFakqU",
+        "signature": "3Ba5wZfmdYeWJ2FfjzAWkaRRX5yvEbFEyXv2etHQqAdTfoBVhcDT7AJVCgrDV1cFMzsjRdpoXmSk5Y53EhMFakqU",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129595,
+      "created_at": "2026-10-13T01:46:12Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "3fhzzyzhpembwd9rajyhmo8t7tfdt9d7luiztuw8qsh1",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/3fhzzyzhpembwd9rajyhmo8t7tfdt9d7luiztuw8qsh1",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=2jg7wKHRUnGJKKx2o9n1p5hon2cQ688Dh99c98D78a9rUECPHqww9Lpe5w6mvJfRsGWfhnRrYvC91gB99aHoRkvY",
+        "signature": "2jg7wKHRUnGJKKx2o9n1p5hon2cQ688Dh99c98D78a9rUECPHqww9Lpe5w6mvJfRsGWfhnRrYvC91gB99aHoRkvY",
+        "source": "helius"
+      }
+    },
+    {
+      "id": 129594,
+      "created_at": "2026-10-13T01:46:11Z",
+      "type": "new_listing",
+      "chain_id": "solana",
+      "token_address": "65zxww5fcphv6ney6tb5uf63p2ca74bbismvyeg9dm1u",
+      "pair_address": null,
+      "severity": "info",
+      "message": "helius new mint hint: solana/65zxww5fcphv6ney6tb5uf63p2ca74bbismvyeg9dm1u",
+      "delivered": 0,
+      "payload": {
+        "description": "helius logsSubscribe hint sig=5FWothvkjJuDwoWEq35rTQQwzYj9atyUVyJJVzNv8jQGGAPZZefFtqjgoPrEHLKQrh3X27fkskmpgvwKEeZAAwtm",
+        "signature": "5FWothvkjJuDwoWEq35rTQQwzYj9atyUVyJJVzNv8jQGGAPZZefFtqjgoPrEHLKQrh3X27fkskmpgvwKEeZAAwtm",
+        "source": "helius"
+      }
+    }
+  ],
+  "incremental_since": "2026-10-12T09:52:03Z",
+  "incremental": true
+}

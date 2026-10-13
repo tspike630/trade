@@ -30,6 +30,13 @@ _INDICATOR_COLS = (
     "tier",
     "primary_pair_address",
     "updated_at",
+    # 3-3: technical columns. Missing columns are dropped by _available_cols.
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "boll_mid",
+    "boll_up",
+    "boll_low",
 )
 
 
@@ -101,6 +108,19 @@ class IndicatorDataAdapter:
         ).fetchone()
         return row is not None
 
+    def _available_cols(self, table: str) -> tuple[str, ...]:
+        """PRAGMA filter: only columns that actually exist on the table."""
+        if not self._table_exists(table):
+            return ()
+        try:
+            cols = {
+                str(r["name"])
+                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+        except sqlite3.OperationalError:
+            return ()
+        return tuple(c for c in _INDICATOR_COLS if c in cols)
+
     def count_indicators(self) -> int:
         if not self._table_exists("token_indicators"):
             return 0
@@ -115,7 +135,10 @@ class IndicatorDataAdapter:
         if not self._table_exists("token_indicators"):
             log.warning("token_indicators table missing")
             return []
-        cols = ", ".join(_INDICATOR_COLS)
+        cols = ", ".join(self._available_cols("token_indicators"))
+        if not cols:
+            log.warning("token_indicators has no usable columns")
+            return []
         limit = max(1, int(limit))
         sql_hot = f"""
             SELECT {cols}
@@ -141,7 +164,9 @@ class IndicatorDataAdapter:
     def get_indicators(self, chain_id: str, token_address: str) -> dict[str, Any] | None:
         if not self._table_exists("token_indicators"):
             return None
-        cols = ", ".join(_INDICATOR_COLS)
+        cols = ", ".join(self._available_cols("token_indicators"))
+        if not cols:
+            return None
         row = self.conn.execute(
             f"SELECT {cols} FROM token_indicators WHERE chain_id=? AND token_address=? LIMIT 1",
             (chain_id, token_address),

@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from dashboard.data import DataStore
+from dashboard.panels.evolution import render_evolution
 from dashboard.panels.execution import render_execution
 from dashboard.panels.market import render_market
 from dashboard.panels.positions import render_positions
@@ -30,4 +31,5 @@ PANELS: tuple[PanelSpec, ...] = (
     PanelSpec("signals", "信号流", render_signals),
     PanelSpec("execution", "执行记录", render_execution),
     PanelSpec("market", "链上行情", render_market),
+    PanelSpec("evolution", "进化建议", render_evolution),
 )

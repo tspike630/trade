@@ -39,7 +39,10 @@ def build_strategies(args: argparse.Namespace) -> list:
 
     out = []
     for sid in ids:
-        if sid == "jev_strength_v1":
+        # factor_* twins take the same CLI thresholds as the legacy id.
+        # Default strategy stays jev_strength_v1; this only applies when the
+        # caller names the strategy (or --all).
+        if sid in ("jev_strength_v1", "factor_jev_strength_v1"):
             out.append(
                 get_strategy(
                     sid,
