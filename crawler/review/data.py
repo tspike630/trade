@@ -49,11 +49,12 @@ class SignalChainRow:
     executed: Optional[int]
     executor: Optional[str]
     receipt: dict[str, Any]
-    # 成交（开闸前全 None）
-    position_id: Optional[int]
+    # 成交（无匹配时全 None）。paper positions.id 是 TEXT UUID，不要 int()。
+    position_id: Optional[str]
     fill_side: Optional[str]
     fill_price: Optional[float]
     pnl_usd: Optional[float]
+    position_status: Optional[str] = None  # open | closed | None
     # 前向（信号层）
     fwd_1h: Optional[float] = None
     fwd_4h: Optional[float] = None
@@ -112,6 +113,72 @@ def _parse_json(text: Optional[str]) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         return {}
     return obj if isinstance(obj, dict) else {}
+
+
+_INT_ID_RE = re.compile(r"-?\d+")
+
+
+def parse_decision_log_id(value: Any) -> Optional[int]:
+    """Integer decision_log id. Skip missing, bool, and non-integral meta."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str) and _INT_ID_RE.fullmatch(value.strip()):
+        return int(value.strip())
+    return None
+
+
+def position_id_text(value: Any) -> Optional[str]:
+    """Paper position ids are UUID strings. Keep numeric ids as text too."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def validation_error_bucket_key(err: Optional[str]) -> Optional[str]:
+    """First validation error code.
+
+    ``execution_log.validation_errors`` is a JSON array
+    (``json.dumps(list[str])``). Older rows may be ``;`` or newline separated.
+    Empty array / blank → None. First code is clipped to 80 characters.
+    """
+    text = (err or "").strip()
+    if not text:
+        return None
+    first: Optional[str] = None
+    if text[0] == "[":
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            for item in parsed:
+                piece = str(item).strip()
+                if piece:
+                    first = piece
+                    break
+            if first is None:
+                return None
+    if first is None:
+        first = text.split(";")[0].split("\n")[0].strip()
+    if len(first) >= 2 and first[0] == first[-1] == '"':
+        try:
+            loaded = json.loads(first)
+        except json.JSONDecodeError:
+            loaded = first[1:-1]
+        if isinstance(loaded, str):
+            first = loaded.strip()
+    if not first:
+        return None
+    if len(first) > 80:
+        return first[:77] + "..."
+    return first
 
 
 def _extract_jev_strength(raw: dict[str, Any], reason: Optional[str]) -> Optional[float]:
@@ -215,19 +282,25 @@ def load_signal_chain(
     try:
         paper = connect_ro(paths.paper)
         try:
+            colnames = {
+                str(row[1])
+                for row in paper.execute("PRAGMA table_info(positions)").fetchall()
+            }
+            status_col = "status" in colnames
+            select_cols = "id, pnl_usd, meta_json, entry_price"
+            if status_col:
+                select_cols += ", status"
             pos_rows = paper.execute(
-                """
-                SELECT id, pnl_usd, meta_json, entry_price
+                f"""
+                SELECT {select_cols}
                 FROM positions
                 WHERE json_extract(meta_json, '$.decision_log_id') IS NOT NULL
                 """
             ).fetchall()
             for pr in pos_rows:
                 meta = _parse_json(pr["meta_json"])
-                did = meta.get("decision_log_id")
-                try:
-                    did_i = int(did)
-                except (TypeError, ValueError):
+                did_i = parse_decision_log_id(meta.get("decision_log_id"))
+                if did_i is None:
                     continue
                 fill = paper.execute(
                     """
@@ -237,8 +310,12 @@ def load_signal_chain(
                     """,
                     (pr["id"],),
                 ).fetchone()
+                status = None
+                if status_col and pr["status"] is not None:
+                    status = str(pr["status"])
                 pos_by_dec[did_i] = {
-                    "position_id": int(pr["id"]),
+                    "position_id": position_id_text(pr["id"]),
+                    "position_status": status,
                     "pnl_usd": safe_float(pr["pnl_usd"]),
                     "fill_side": fill["side"] if fill else None,
                     "fill_price": (
@@ -294,6 +371,7 @@ def load_signal_chain(
                 fill_side=pos.get("fill_side"),
                 fill_price=pos.get("fill_price"),
                 pnl_usd=pos.get("pnl_usd"),
+                position_status=pos.get("position_status"),
                 exec_dup=int(d["id"]) in exec_dup_ids,
             )
         )
@@ -865,10 +943,12 @@ def summarize_execution(rows: list[SignalChainRow]) -> dict[str, Any]:
             if r.validation_ok != 1:
                 err_buckets["(empty)"] += 1
             continue
-        # 粗分桶：取首段 / 首个错误码
-        key = err.split(";")[0].split("\n")[0].strip()
-        if len(key) > 80:
-            key = key[:77] + "..."
+        # JSON array (ledger) or legacy ";"/newline text. First code only.
+        key = validation_error_bucket_key(err)
+        if not key:
+            if r.validation_ok != 1:
+                err_buckets["(empty)"] += 1
+            continue
         err_buckets[key] += 1
 
     return {

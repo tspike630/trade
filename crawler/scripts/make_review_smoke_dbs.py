@@ -2,6 +2,8 @@
 import json
 import sqlite3
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path("/tmp/review_smoke")
@@ -76,17 +78,66 @@ for i in range(40):
                (i + 1, ts, i + 1, "jev_strength_v1", "buy", "solana", f"TOKEN{i:02d}",
                 pairs[i], 0.05, "jev_strength=0.15", "dry_run", 1, None, 0,
                 "step_a_noop", json.dumps({"validated": True})))
+ex.execute(
+    "UPDATE execution_log SET validation_ok=0, validation_errors=? WHERE id=1",
+    (json.dumps(["liq_too_low", "wide_spread"]),),
+)
+ex.execute(
+    "UPDATE execution_log SET validation_ok=0, validation_errors=? WHERE id=2",
+    ("legacy_code; other",),
+)
 ex.commit()
 ex.close()
 
-# ---- 纸面库（0 持仓） ----
+# ---- 纸面库：positions.id 为 TEXT UUID，不是 INTEGER ----
+CLOSED_POS = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+OPEN_POS = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+BAD_POS = "cccccccc-dddd-4eee-8fff-000000000000"
 paper = sqlite3.connect(ROOT / "paper_trading.db")
 paper.execute("CREATE TABLE account (id INTEGER PRIMARY KEY, cash_usd REAL, updated_at TEXT)")
 paper.execute("INSERT INTO account VALUES (1, 10000.0, '2026-10-10T00:00:00Z')")
-paper.execute("CREATE TABLE positions (id INTEGER PRIMARY KEY, chain_id TEXT, pair_address TEXT, "
-              "token_address TEXT, size_usd REAL, entry_price REAL, open_ts TEXT, "
-              "tp_pct REAL, sl_pct REAL, max_hold_min REAL, status TEXT, "
-              "meta_json TEXT, pnl_usd REAL)")
+paper.execute(
+    "CREATE TABLE positions ("
+    "id TEXT PRIMARY KEY, chain_id TEXT, pair_address TEXT, token_address TEXT, "
+    "size_usd REAL, entry_price REAL, open_ts TEXT, tp_pct REAL, sl_pct REAL, "
+    "max_hold_min REAL, status TEXT, meta_json TEXT, pnl_usd REAL)"
+)
+paper.execute(
+    "CREATE TABLE fills ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, position_id TEXT, side TEXT, price REAL)"
+)
+paper.execute(
+    "INSERT INTO positions (id, chain_id, pair_address, token_address, size_usd, "
+    "entry_price, status, meta_json, pnl_usd) VALUES (?,?,?,?,?,?,?,?,?)",
+    (
+        CLOSED_POS, "solana", "PAIR00", "TOKEN00", 100.0, 1.0, "closed",
+        json.dumps({"decision_log_id": 1}), 1.25,
+    ),
+)
+paper.execute(
+    "INSERT INTO fills (position_id, side, price) VALUES (?,?,?)",
+    (CLOSED_POS, "sell", 1.1),
+)
+paper.execute(
+    "INSERT INTO positions (id, chain_id, pair_address, token_address, size_usd, "
+    "entry_price, status, meta_json, pnl_usd) VALUES (?,?,?,?,?,?,?,?,?)",
+    (
+        OPEN_POS, "solana", "PAIR01", "TOKEN01", 100.0, 1.0, "open",
+        json.dumps({"decision_log_id": "2"}), 9.5,
+    ),
+)
+paper.execute(
+    "INSERT INTO fills (position_id, side, price) VALUES (?,?,?)",
+    (OPEN_POS, "buy", 1.0),
+)
+paper.execute(
+    "INSERT INTO positions (id, chain_id, pair_address, token_address, size_usd, "
+    "entry_price, status, meta_json, pnl_usd) VALUES (?,?,?,?,?,?,?,?,?)",
+    (
+        BAD_POS, "solana", "PAIR02", "TOKEN02", 50.0, 1.0, "closed",
+        json.dumps({"decision_log_id": "not-a-number"}), 3.0,
+    ),
+)
 paper.commit()
 paper.close()
 
@@ -97,3 +148,67 @@ bt.commit()
 bt.close()
 
 print("smoke dbs ready at", ROOT)
+
+_CHECK = r"""
+import json
+from pathlib import Path
+from review.attribution import fill_attribution
+from review.data import (
+    DbPaths,
+    load_signal_chain,
+    parse_decision_log_id,
+    summarize_execution,
+    validation_error_bucket_key,
+)
+from review.factor_loop import GATE_UP_1H_DEGRADE, gate_candidate
+from review.gates import UP_1H_DEGRADE
+from review.run import _normalize_iso
+
+root = Path("/tmp/review_smoke")
+rows = load_signal_chain(DbPaths(
+    main=str(root / "dexscreener.db"),
+    execution=str(root / "execution_ledger.db"),
+    paper=str(root / "paper_trading.db"),
+    backtest=str(root / "backtest_ledger.db"),
+))
+by_id = {r.decision_id: r for r in rows}
+uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+assert by_id[1].position_id == uuid, by_id[1].position_id
+assert isinstance(by_id[1].position_id, str)
+assert by_id[1].position_status == "closed"
+assert by_id[2].position_id == "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+assert by_id[2].position_status == "open"
+assert all(r.position_id != "cccccccc-dddd-4eee-8fff-000000000000" for r in rows)
+assert parse_decision_log_id("nope") is None
+assert parse_decision_log_id("12") == 12
+assert parse_decision_log_id(1.5) is None
+assert parse_decision_log_id(True) is None
+assert validation_error_bucket_key(json.dumps(["liq_too_low", "wide_spread"])) == "liq_too_low"
+assert validation_error_bucket_key("legacy_code; other") == "legacy_code"
+summary = summarize_execution(rows)
+assert summary["validation_error_buckets"].get("liq_too_low") == 1
+assert summary["validation_error_buckets"].get("legacy_code") == 1
+assert _normalize_iso("2026-10-09T08:00:00+08:00") == "2026-10-09T00:00:00Z"
+assert _normalize_iso("2026-10-09") == "2026-10-09T00:00:00Z"
+assert _normalize_iso("2026-10-09T00:00:00+00:00") == "2026-10-09T00:00:00Z"
+low = gate_candidate({"n_raw": 20, "unique_token": 12, "up_1h": 0.42}, week="2026-W41")
+mid = gate_candidate({"n_raw": 20, "unique_token": 12, "up_1h": 0.52}, week="2026-W41")
+high = gate_candidate({"n_raw": 20, "unique_token": 12, "up_1h": 0.60}, week="2026-W41")
+assert low["status"] == "rejected", low
+assert mid["status"] == "pending", mid
+assert high["status"] == "accepted", high
+assert "activated" not in high["status"]
+assert GATE_UP_1H_DEGRADE == UP_1H_DEGRADE == 0.50
+fa = fill_attribution(rows)
+assert fa["realized_pnl_usd"] == 1.25, fa
+assert fa["mtm_pnl_usd"] == 9.5, fa
+assert fa["pnl_basis"] == "realized"
+assert fa["total_pnl_usd"] == fa["realized_pnl_usd"]
+print("uuid position_id ok")
+"""
+
+_REPO = Path(__file__).resolve().parents[2]
+_CRAWLER = Path(__file__).resolve().parents[1]
+for tree in (_REPO, _CRAWLER):
+    subprocess.check_call([sys.executable, "-c", _CHECK], cwd=str(tree))
+    print("checked", tree)

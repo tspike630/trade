@@ -33,6 +33,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from review.gates import (
+    CONSECUTIVE_WEEKS,
+    GATE_HARD_N,
+    GATE_UNIQUE,
+    GATE_UP_1H,
+    GATE_UP_1H_DEGRADE,
+    SAMPLE_NOTE,
+)
+
 try:
     from config import DB_PATH as _CONFIG_DB_PATH
 except ImportError:
@@ -63,13 +72,7 @@ def _reports_dir() -> Path:
 
 REPORTS = _reports_dir()
 
-# ---- 门槛（沿用已定决策表，勿调） ----
-GATE_HARD_N = 15          # raw n 硬门槛
-GATE_UNIQUE = 10          # unique_token 硬门槛
-GATE_UP_1H = 0.55         # 过滤后 1h 上涨率有效门槛（连续两周达标才激活）
-GATE_UP_1H_RETRY = 0.40   # 40%~55% -> need_retest
-
-# ---- 防冗余：同方向连续失败 N 周 -> 换方向（简化 bandit，只约束 LLM prompt） ----
+# Bandit direction switch. Not the weekly-check consecutive-week gate.
 MAX_CONSECUTIVE_FAIL_WEEKS = 3
 
 # jev_validity.py CLI defaults (min_price / tol). Not a new definition.
@@ -517,6 +520,8 @@ def backtest_candidate(
     decision_line、趋势 CSV 的 up_1h_rate / median_1h 同一套样本。
     n_1h 是 decision_line 对比 MIN_RAW_N 的样本数（st1.n），单独记录，
     门槛函数仍按计划读 n_raw。
+    n_raw 是本候选参数扫描计数，不是周检 decision_log 信号样本；
+    激活仍走周检口径（见 review.gates.SAMPLE_NOTE）。
     """
     params = cand.get("params") or {}
     try:
@@ -655,20 +660,30 @@ def gate_candidate(metrics: dict[str, Any], *, week: str) -> dict[str, Any]:
             "status": "rejected",
         }
     if up1h >= GATE_UP_1H:
-        eva = f"过滤后 1h 上涨率 {up1h:.1%}≥{GATE_UP_1H:.0%}（首次达标；连续两周达标才激活）"
+        eva = (
+            f"过滤后 1h 上涨率 {up1h:.1%}≥{GATE_UP_1H:.0%}"
+            f"（首次达标；连续 {CONSECUTIVE_WEEKS} 周达标才考虑激活，"
+            "本循环 status 最高 accepted）"
+        )
         return {
             "gate_result": "pass",
-            "gate_reason": f"观察:{obs}; 评估:{eva}; 判定:候选有效，待连续两周确认",
+            "gate_reason": (
+                f"观察:{obs}; 评估:{eva}; "
+                f"判定:候选有效，待连续 {CONSECUTIVE_WEEKS} 周确认，不自动激活"
+            ),
             "status": "accepted",
         }
-    if up1h >= GATE_UP_1H_RETRY:
-        eva = f"过滤后 1h 上涨率 {up1h:.1%} 在 {GATE_UP_1H_RETRY:.0%}~{GATE_UP_1H:.0%} 之间"
+    if up1h >= GATE_UP_1H_DEGRADE:
+        eva = (
+            f"过滤后 1h 上涨率 {up1h:.1%} 在 "
+            f"{GATE_UP_1H_DEGRADE:.0%}~{GATE_UP_1H:.0%} 之间"
+        )
         return {
             "gate_result": "need_retest",
             "gate_reason": f"观察:{obs}; 评估:{eva}; 判定:下周复验",
             "status": "pending",
         }
-    eva = f"过滤后 1h 上涨率 {up1h:.1%}<{GATE_UP_1H_RETRY:.0%}"
+    eva = f"过滤后 1h 上涨率 {up1h:.1%}<{GATE_UP_1H_DEGRADE:.0%}"
     return {
         "gate_result": "fail",
         "gate_reason": f"观察:{obs}; 评估:{eva}; 判定:无预测力，记录教训",
@@ -719,10 +734,25 @@ def store_candidate(
         conn.close()
 
 
-def _write_report(week: str, rows: list[dict[str, Any]]) -> Path:
-    REPORTS.mkdir(parents=True, exist_ok=True)
-    rep = REPORTS / f"factor_loop_{week.replace('-', '')}.md"
+def _write_report(
+    week: str,
+    rows: list[dict[str, Any]],
+    *,
+    dry_run: bool = False,
+) -> Path:
+    """Write the factor-loop markdown. dry-run never touches the production path."""
+    base = REPORTS / "dry-run" if dry_run else REPORTS
+    base.mkdir(parents=True, exist_ok=True)
+    rep = base / f"factor_loop_{week.replace('-', '')}.md"
     lines = [f"# 因子进化周报 {week}", ""]
+    if dry_run:
+        lines.append(
+            "> dry-run：不插入 factor_candidates，不覆盖 "
+            "`exports/reports/factor_loop_*.md`。"
+        )
+        lines.append("")
+    lines.append(SAMPLE_NOTE)
+    lines.append("")
     lines.append("过门槛仅 status=accepted（待激活）。本循环不自动启用策略、不自动调参。")
     lines.append("")
     for row in rows:
@@ -745,7 +775,11 @@ def _write_report(week: str, rows: list[dict[str, Any]]) -> Path:
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="JEV 因子进化循环（RD-Agent 式）")
     ap.add_argument("--week", required=True, help="ISO 周，如 2026-W42")
-    ap.add_argument("--dry-run", action="store_true", help="只出候选与判定，不写库")
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="候选与判定只写 dry-run 报告；不插入 factor_candidates，不覆盖正式周报",
+    )
     ap.add_argument("--with-backtest", action="store_true", help="叠加回测框架出 win_rate/pnl")
     ap.add_argument("--llm", action="store_true", help="启用 LLM 提因子（需 JEV_LOOP_LLM_ENABLED=1）")
     args = ap.parse_args(argv)
@@ -782,8 +816,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         "dry_run": args.dry_run,
         "auto_activate": False,
     }
+    report_path = _write_report(args.week, rows, dry_run=bool(args.dry_run))
+    out["report"] = str(report_path)
     print(json.dumps(out, default=str, indent=2))
-    _write_report(args.week, rows)
     return 0
 
 
