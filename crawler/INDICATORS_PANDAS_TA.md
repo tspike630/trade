@@ -3,13 +3,14 @@
 > 日期：2026-10-10（HK）  
 > 仓库：`/workspace/dexscreener-crawler`  
 > 共识：在既有 `change_*` / `volatility_24h` / `volume_strength` **之上追加** RSI/MACD/BOLL，**不替换**旧口径；composite 权重仍为 0。
+> V2 增量（2026-10-13）：`technical_lib` 另算 **atr_14 / adx_14（只算不落库）**。
 
 ## 1. 做了什么
 
 | 项 | 说明 |
 |----|------|
 | 依赖 | `.venv` 安装 `pandas-ta-classic`（import 名：`pandas_ta_classic`） |
-| 新增 | `indicators/technical_lib.py` — 薄封装，仅算 RSI/MACD/BOLL |
+| 新增 | `indicators/technical_lib.py` — 薄封装：RSI/MACD/BOLL（落库）+ ATR/ADX（只算） |
 | 扩展 | `indicators/technical.py` · `compute_one` **额外**写入新列；旧字段逻辑原样保留 |
 | 表结构 | `token_indicators` + `indicator_history` 增加可空列；`base.py` ALTER 迁移 |
 | 校验 | `scripts/compare_indicators.py` — 旧字段可算 + 新字段范围 sanity |
@@ -71,3 +72,39 @@ cd /workspace/dexscreener-crawler
 
 重启：仅 `indicators.run` → PID 2299758（`main.py` / `sources.jev` 未动）。  
 推送：`tspike630/trade` commit `d2a2bd0`（`crawler/`，无 secrets）。
+
+## 8. V2 增量 · ATR / ADX（只算不落库）
+
+> 日期：2026-10-13（HK）  
+> 相对教程《方案1 V2》：教程要求整文件覆盖 + `import pandas_ta` —— **本仓库禁止照做**。  
+> 实际做法：在既有 `pandas_ta_classic` 旁路之上增量补 ATR/ADX。
+
+| 项 | 说明 |
+|----|------|
+| 计算 | `indicators/technical_lib.py` · `compute_pandas_ta` 增加 `atr_14` / `adx_14` |
+| 参数 | `ta.atr(hi,lo,close,length=14)` · `ta.adx(...)`；列名按前缀映射（`ATR*` / `ADX_`） |
+| 落库 | **否**。不改 `indicator_tables.sql`、`TOKEN_INDICATOR_COLS`、不 ALTER、不写 `token_indicators` |
+| 写库隔离 | `technical.py` 的 `PANDAS_TA_FIELDS` 仍仅 rsi/macd/boll；`base.py` upsert 只认 TOKEN_INDICATOR_COLS |
+| OHLC 局限 | pair_history 无真 high/low → 缺省 H=L=close；ATR/ADX 可用但保真度有限 |
+| 权重 | 未改，仍为 0 |
+
+### 验收
+
+```bash
+cd /workspace/dexscreener-crawler
+.venv/bin/python -m py_compile indicators/technical_lib.py scripts/compare_indicators.py
+.venv/bin/python scripts/compare_indicators.py --limit 5
+# 输出应含 atr_14=… adx_14=…；短历史可为 None；有值则 atr≥0、adx 约 0–100
+```
+
+假序列自测（len≥50 应出数）：
+
+```bash
+.venv/bin/python -c "
+from indicators.technical_lib import compute_pandas_ta
+closes=[100+i*0.1+(i%7)*0.3 for i in range(60)]
+r=compute_pandas_ta(closes)
+print({k:r[k] for k in ('atr_14','adx_14','rsi_14')})
+print('short', compute_pandas_ta(closes[:5])['atr_14'])
+"
+```
