@@ -3,6 +3,7 @@
 Step A (default): validate + ledger receipt only (executed=0).
 Step B: when EXECUTION_PAPER_ENABLED / paper_enabled, validated buy/sell → PaperExecutor.
 Step C: PositionManager after validation, before executor (PM_ENABLED=0 → pass-through).
+Pre-trade risk (EXECUTION_RISK_ENABLED=0 default) runs after PM and before the executor.
 Never calls LiveExecutor. Main decision DB is read-only.
 """
 
@@ -17,7 +18,15 @@ from typing import Any
 
 from logging_setup import get_logger
 
+from execution.config import (
+    EXECUTION_EVENTS_ENABLED,
+    EXECUTION_MAX_OPEN,
+    EXECUTION_RISK_ENABLED,
+)
 from execution.ledger import ExecutionLedger, _utc
+from execution.order_events import init_events, record_event
+from execution.risk import run_all
+import execution.risk.limits  # noqa: F401 — register checkers on import
 
 log = get_logger("execution.gateway")
 
@@ -175,6 +184,9 @@ class ExecutionGateway:
         self.pm_enabled = bool(pm_enabled)
         self._position_manager = position_manager
         self._owns_pm = False
+        # Order-event table lives on the execution ledger only. Flag off → no write.
+        if EXECUTION_EVENTS_ENABLED:
+            init_events(self.ledger.path)
 
     def _get_paper(self) -> Any:
         if self._paper_executor is not None:
@@ -254,6 +266,138 @@ class ExecutionGateway:
         finally:
             conn.close()
 
+    def _risk_ledger(self, pm: Any) -> Any | None:
+        """Paper book for pre-trade checks. Does not create a DB when no path is set."""
+        if self._paper_executor is not None:
+            return getattr(self._paper_executor, "ledger", None)
+        if self.paper_enabled:
+            paper = self._get_paper()
+            if paper is not None:
+                return getattr(paper, "ledger", None)
+        ledger = getattr(pm, "ledger", None)
+        if ledger is not None:
+            return ledger
+        ensure = getattr(pm, "_ensure_ledger", None)
+        if callable(ensure):
+            return ensure()
+        return None
+
+    def _pretrade_risk(self, pm: Any, sig: dict[str, Any]) -> list[dict[str, Any]]:
+        """After position_manager, before executor. Default off → no behavior change."""
+        if not EXECUTION_RISK_ENABLED:
+            return []
+        ledger = self._risk_ledger(pm)
+        if ledger is None:
+            return []
+        return run_all(
+            ledger,
+            sig,
+            max_open_per_strategy=EXECUTION_MAX_OPEN,
+        )
+
+    def _emit_order_events(
+        self,
+        log_id: int,
+        *,
+        sig: dict[str, Any],
+        ok: bool,
+        errors: list[str],
+        executed: int,
+        executor: str | None,
+        exec_error: str | None,
+        risk_reasons: list[dict[str, Any]] | None,
+        submitted: bool,
+        fill_receipt: dict[str, Any] | None,
+        event_ts: str,
+    ) -> None:
+        """Append the status chain after execution_log has an id.
+
+        log_id exists only after INSERT, so `new` is written first in the
+        chain even though validation already ran. event_ts is the same UTC
+        stamp as status_updated_at. step_a_noop is not a submission.
+        """
+        if not EXECUTION_EVENTS_ENABLED:
+            return
+        db = self.ledger.path
+        if EXECUTION_EVENTS_ENABLED:
+            record_event(
+                db,
+                log_id,
+                "new",
+                {"decision_log_id": sig["decision_log_id"]},
+                event_ts=event_ts,
+            )
+        if not ok:
+            if EXECUTION_EVENTS_ENABLED:
+                record_event(
+                    db,
+                    log_id,
+                    "rejected",
+                    {"stage": "validation", "error": ";".join(errors)},
+                    event_ts=event_ts,
+                )
+            return
+        if EXECUTION_EVENTS_ENABLED:
+            record_event(
+                db,
+                log_id,
+                "validated",
+                {"validation_ok": True},
+                event_ts=event_ts,
+            )
+        if risk_reasons:
+            if EXECUTION_EVENTS_ENABLED:
+                record_event(
+                    db,
+                    log_id,
+                    "rejected",
+                    {
+                        "stage": "risk",
+                        "reason": ";".join(
+                            str(r.get("reason") or "") for r in risk_reasons
+                        ),
+                    },
+                    event_ts=event_ts,
+                )
+            return
+        if executor == PM_GATE and exec_error:
+            if EXECUTION_EVENTS_ENABLED:
+                record_event(
+                    db,
+                    log_id,
+                    "rejected",
+                    {"stage": "position_manager", "reason": exec_error},
+                    event_ts=event_ts,
+                )
+            return
+        if submitted and executor is not None:
+            if EXECUTION_EVENTS_ENABLED:
+                record_event(
+                    db,
+                    log_id,
+                    "submitted",
+                    {"executor": executor},
+                    event_ts=event_ts,
+                )
+            if executed == 1:
+                if EXECUTION_EVENTS_ENABLED:
+                    record_event(
+                        db,
+                        log_id,
+                        "filled",
+                        {"receipt": fill_receipt},
+                        event_ts=event_ts,
+                    )
+            elif exec_error:
+                if EXECUTION_EVENTS_ENABLED:
+                    record_event(
+                        db,
+                        log_id,
+                        "rejected",
+                        {"stage": "executor", "error": exec_error},
+                        event_ts=event_ts,
+                    )
+
     def process_one(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         sig = parse_decision_row(row)
         errors = validate_signal(sig)
@@ -275,6 +419,8 @@ class ExecutionGateway:
         executor = STEP_A_EXECUTOR
         exec_result: dict[str, Any] | None = None
         exec_error: str | None = None
+        risk_reasons: list[dict[str, Any]] | None = None
+        submitted_to_executor = False
 
         step_label = "A"
         if self.paper_enabled:
@@ -312,35 +458,57 @@ class ExecutionGateway:
                 receipt_body["status"] = "pm_rejected"
                 receipt_body["note"] = "PositionManager denied; not executed"
                 receipt_body["error"] = exec_error
-            elif self.paper_enabled and action in ALLOWED_ACTIONS:
-                paper = self._get_paper()
-                assert paper is not None
-                executor = PAPER_EXECUTOR
-                exec_result = paper.execute(sig)
-                if exec_result.get("ok"):
-                    executed = 1
-                    receipt_body["status"] = "paper_executed"
-                    receipt_body["note"] = "PaperExecutor ok"
-                else:
-                    executed = 0
-                    exec_error = str(exec_result.get("error") or "paper_failed")
-                    receipt_body["status"] = "paper_failed"
-                    receipt_body["note"] = "PaperExecutor returned ok=false; no retry"
-                    receipt_body["error"] = exec_error
-                receipt_body["exec_result"] = exec_result
             else:
-                # Step A path (or paper off)
-                executor = STEP_A_EXECUTOR
-                executed = 0
-                if mode == "dry_run":
-                    receipt_body["status"] = "dry_run_acked"
+                risk_rejected = self._pretrade_risk(pm, sig)
+                risk_reasons = risk_rejected or None
+                if risk_rejected:
+                    executed = 0
+                    executor = "risk"
+                    exec_error = ";".join(
+                        str(r.get("reason") or "") for r in risk_rejected
+                    )
+                    receipt_body["status"] = "risk_rejected"
+                    receipt_body["note"] = "pre-trade risk denied; not executed"
+                    receipt_body["error"] = exec_error
+                    receipt_body["risk"] = risk_rejected
+                elif self.paper_enabled and action in ALLOWED_ACTIONS:
+                    paper = self._get_paper()
+                    assert paper is not None
+                    executor = PAPER_EXECUTOR
+                    submitted_to_executor = True
+                    exec_result = paper.execute(sig)
+                    if exec_result.get("ok"):
+                        executed = 1
+                        receipt_body["status"] = "paper_executed"
+                        receipt_body["note"] = "PaperExecutor ok"
+                    else:
+                        executed = 0
+                        exec_error = str(exec_result.get("error") or "paper_failed")
+                        receipt_body["status"] = "paper_failed"
+                        receipt_body["note"] = "PaperExecutor returned ok=false; no retry"
+                        receipt_body["error"] = exec_error
+                    receipt_body["exec_result"] = exec_result
                 else:
-                    receipt_body["status"] = "validated_not_executed"
-                receipt_body["note"] = (
-                    "validate_and_ledger_only; PaperExecutor gated off"
-                    if not self.paper_enabled
-                    else "validated; action not buy/sell"
-                )
+                    # Step A path (or paper off)
+                    executor = STEP_A_EXECUTOR
+                    executed = 0
+                    if mode == "dry_run":
+                        receipt_body["status"] = "dry_run_acked"
+                    else:
+                        receipt_body["status"] = "validated_not_executed"
+                    receipt_body["note"] = (
+                        "validate_and_ledger_only; PaperExecutor gated off"
+                        if not self.paper_enabled
+                        else "validated; action not buy/sell"
+                    )
+
+        if ok:
+            order_status = "executed" if executed == 1 else "validated"
+        else:
+            order_status = "rejected"
+        if exec_error:
+            order_status = "rejected"
+        status_updated_at = _utc()
 
         exec_id = self.ledger.append_receipt(
             decision_log_id=sig["decision_log_id"],
@@ -358,8 +526,23 @@ class ExecutionGateway:
             executor=executor,
             receipt=receipt_body,
             ts=_utc(),
+            status=order_status,
+            status_updated_at=status_updated_at,
         )
         self.ledger.set_last_processed_id(sig["decision_log_id"])
+        self._emit_order_events(
+            exec_id,
+            sig=sig,
+            ok=ok,
+            errors=errors,
+            executed=executed,
+            executor=executor,
+            exec_error=exec_error,
+            risk_reasons=risk_reasons,
+            submitted=submitted_to_executor,
+            fill_receipt=exec_result,
+            event_ts=status_updated_at,
+        )
 
         out = {
             "execution_log_id": exec_id,
@@ -370,6 +553,8 @@ class ExecutionGateway:
             "executed": executed,
             "executor": executor,
             "error": exec_error,
+            "status": order_status,
+            "status_updated_at": status_updated_at,
             "exec_result": exec_result,
             "pm_check": pm_result,
             "mode": sig.get("mode"),
