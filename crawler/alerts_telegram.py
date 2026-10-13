@@ -3,6 +3,8 @@
 Detection/cooldown stay in alerts.py. This module:
 - Parses Telegram retry_after on 429; sleeps capped; max TG_MAX_RETRIES then drop
 - Per-chat rate limits (~1 msg/s, ~20/min) + ban_until from long retry_after
+- ban_until is wall-clock and stored in a sidecar sqlite (TG_BAN_DB or tg_ban.sqlite)
+  so restarts and other processes, including always-push and direct send_message, share it
 - Priority queue: high (new_listing/cto/admin system) preferred; drop/merge low when full
 - First failure WARN; escalate ERROR only on repeated fail for same alert key
 - Push policy: TELEGRAM_PUSH_EXCLUDE_TYPES / MIN_SEVERITY (see TG_PUSH_THROTTLE.md)
@@ -11,7 +13,9 @@ Detection/cooldown stay in alerts.py. This module:
 from __future__ import annotations
 
 import json
+import os
 import re
+import sqlite3
 import threading
 import time
 from collections import deque
@@ -19,11 +23,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import escape
 from heapq import heappop, heappush
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from config import (
+    DB_PATH,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     TELEGRAM_CHAT_ID_ADMIN,
@@ -42,6 +48,69 @@ from config import (
 from logging_setup import get_logger
 
 log = get_logger("alerts.telegram")
+
+
+def default_tg_ban_path() -> Path:
+    override = os.environ.get("TG_BAN_DB", "").strip()
+    if override:
+        return Path(override)
+    return Path(DB_PATH).with_name("tg_ban.sqlite")
+
+
+class _TgBanStore:
+    """Shared ban_until (unix epoch) keyed by chat_id."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(path, timeout=5.0, check_same_thread=False)
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        if path != ":memory:":
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tg_chat_ban (
+                chat_id TEXT PRIMARY KEY,
+                ban_until_epoch REAL NOT NULL
+            )
+            """
+        )
+        self._conn.commit()
+
+    def upsert(self, chat_id: str, epoch: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO tg_chat_ban (chat_id, ban_until_epoch) VALUES (?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    ban_until_epoch = MAX(tg_chat_ban.ban_until_epoch, excluded.ban_until_epoch)
+                """,
+                (chat_id, float(epoch)),
+            )
+            self._conn.commit()
+
+    def get(self, chat_id: str) -> float | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ban_until_epoch FROM tg_chat_ban WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        return float(row[0]) if row else None
+
+    def delete(self, chat_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM tg_chat_ban WHERE chat_id = ?", (chat_id,))
+            self._conn.commit()
+
+    def load_active(self, now: float) -> list[tuple[str, float]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT chat_id, ban_until_epoch FROM tg_chat_ban WHERE ban_until_epoch > ?",
+                (now,),
+            ).fetchall()
+        return [(str(row[0]), float(row[1])) for row in rows]
 
 # Routing buckets
 _MAIN_TYPES = frozenset({"new_listing", "cto_new"})
@@ -303,6 +372,7 @@ class _ChatGate:
     """Per-chat ban + sliding-window rate limit."""
 
     ban_until: float = 0.0  # time.monotonic()
+    ban_until_epoch: float = 0.0  # wall clock, shared across processes
     last_send: float = 0.0
     send_times: deque = field(default_factory=deque)  # monotonic timestamps in last 60s
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -314,15 +384,19 @@ class _ChatGate:
     ban_was_active: bool = False  # for ban-clear INFO
 
     def banned_remaining(self) -> float:
-        return max(0.0, self.ban_until - time.monotonic())
+        mono = max(0.0, self.ban_until - time.monotonic())
+        wall = max(0.0, self.ban_until_epoch - time.time())
+        return max(mono, wall)
 
-    def set_ban(self, retry_after_sec: float) -> None:
+    def set_ban(self, retry_after_sec: float) -> float:
         # Cap stored ban to avoid overflow weirdness but honor long Telegram bans
         # (we skip sends until ban clears — we do NOT sleep the whole duration).
         wait = max(0.0, float(retry_after_sec))
         self.ban_until = max(self.ban_until, time.monotonic() + wait)
+        self.ban_until_epoch = max(self.ban_until_epoch, time.time() + wait)
         self.ban_retry_after = max(self.ban_retry_after, wait)
         self.ban_was_active = True
+        return self.ban_until_epoch
 
     def wait_for_slot(self, *, max_wait: float = 5.0) -> bool:
         """
@@ -381,11 +455,20 @@ class TelegramAlerter:
         timeout: float = TELEGRAM_TIMEOUT_SEC,
         transport: httpx.BaseTransport | None = None,
         sleep_fn=time.sleep,
+        ban_db: str | None = None,
     ):
         self.token = token if token is not None else TELEGRAM_BOT_TOKEN
         self.timeout = timeout
         self._transport = transport  # for unit tests / demos
         self._sleep = sleep_fn
+        if ban_db is not None:
+            ban_path = ban_db
+        elif transport is not None:
+            # Injected transport is the demo/test path: keep bans in-process.
+            ban_path = ":memory:"
+        else:
+            ban_path = str(default_tg_ban_path())
+        self._ban_store = _TgBanStore(ban_path)
         self._admin_fail_notified = False
         self._gates: dict[str, _ChatGate] = {}
         self._gates_lock = threading.Lock()
@@ -402,6 +485,51 @@ class TelegramAlerter:
             "dropped_queue": 0,
             "retries": 0,
         }
+        self._load_persisted_bans()
+
+    def _load_persisted_bans(self) -> None:
+        now = time.time()
+        for chat_id, epoch in self._ban_store.load_active(now):
+            gate = self._gate(chat_id)
+            remain = epoch - now
+            gate.ban_until_epoch = max(gate.ban_until_epoch, epoch)
+            if remain > 0:
+                gate.ban_until = max(gate.ban_until, time.monotonic() + remain)
+                gate.ban_was_active = True
+
+    def _sync_ban(self, chat_id: str, gate: _ChatGate) -> None:
+        epoch = self._ban_store.get(chat_id)
+        if epoch is None:
+            return
+        if epoch > gate.ban_until_epoch:
+            gate.ban_until_epoch = epoch
+            remain = epoch - time.time()
+            if remain > 0:
+                gate.ban_until = max(gate.ban_until, time.monotonic() + remain)
+                gate.ban_was_active = True
+
+    def _persist_ban(self, chat_id: str, gate: _ChatGate) -> None:
+        if gate.ban_until_epoch > time.time():
+            self._ban_store.upsert(chat_id, gate.ban_until_epoch)
+
+    def _clear_short_ban(self, chat_id: str, gate: _ChatGate, honored_epoch: float) -> None:
+        """After a short wait, drop the ban we just honored.
+
+        A newer, longer ban written by another process (stored epoch past the
+        one we slept for) is kept.
+        """
+        stored = self._ban_store.get(chat_id)
+        if stored is not None and stored > honored_epoch + 0.5:
+            gate.ban_until_epoch = stored
+            remain = stored - time.time()
+            if remain > 0:
+                gate.ban_until = max(gate.ban_until, time.monotonic() + remain)
+            return
+        now = time.time()
+        with gate.lock:
+            gate.ban_until = min(gate.ban_until, time.monotonic())
+            gate.ban_until_epoch = min(gate.ban_until_epoch, now)
+        self._ban_store.delete(chat_id)
 
     @property
     def enabled(self) -> bool:
@@ -639,6 +767,7 @@ class TelegramAlerter:
         max_attempts = max(1, TG_MAX_RETRIES)
 
         for attempt in range(1, max_attempts + 1):
+            self._sync_ban(chat_id, gate)
             banned = gate.banned_remaining()
             if banned > TG_429_SLEEP_CAP_SEC:
                 self._stats["dropped_ban"] += 1
@@ -651,11 +780,11 @@ class TelegramAlerter:
                 )
                 return None  # expected skip — no outer WARN
             if banned > 0:
+                honored_epoch = gate.ban_until_epoch
                 self._sleep(min(banned, TG_429_SLEEP_CAP_SEC))
                 # Honored short ban wait — clear so this attempt can proceed
                 # (monotonic advances in prod; tests stub sleep).
-                with gate.lock:
-                    gate.ban_until = min(gate.ban_until, time.monotonic())
+                self._clear_short_ban(chat_id, gate, honored_epoch)
 
             slot_wait = max(0.5, min(5.0, max(TG_RATE_MIN_INTERVAL_SEC * 3, 0.5)))
             if not gate.wait_for_slot(max_wait=slot_wait):
@@ -683,6 +812,7 @@ class TelegramAlerter:
             if status == 429:
                 ra = retry_after if retry_after is not None else 1.0
                 gate.set_ban(ra)
+                self._persist_ban(chat_id, gate)
                 self._stats["retries"] += 1
                 # Long flood-wait (hours): do NOT sleep/retry — set ban and drop now.
                 # Short retry_after: sleep capped, retry up to TG_MAX_RETRIES.
@@ -785,7 +915,9 @@ class TelegramAlerter:
         if not admin or not self.token:
             return
         # Don't notify admin if that chat is banned — would worsen 429
-        if self._gate(admin).banned_remaining() > 0:
+        admin_gate = self._gate(admin)
+        self._sync_ban(admin, admin_gate)
+        if admin_gate.banned_remaining() > 0:
             return
         self._admin_fail_notified = True
         msg = (
@@ -800,11 +932,12 @@ class TelegramAlerter:
             pass
 
     def stats(self) -> dict[str, Any]:
-        bans = {
-            cid: round(g.banned_remaining(), 1)
-            for cid, g in self._gates.items()
-            if g.banned_remaining() > 0
-        }
+        bans = {}
+        for cid, gate in list(self._gates.items()):
+            self._sync_ban(cid, gate)
+            remaining = gate.banned_remaining()
+            if remaining > 0:
+                bans[cid] = round(remaining, 1)
         return {
             **self._stats,
             "queue_len": len(self._queue),

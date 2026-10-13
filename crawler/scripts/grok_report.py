@@ -166,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     state = _load_state(state_path)
     since = state.get("last_export_at") if args.incremental else None
 
-    with Store(args.db) as store:
+    with Store.open_ro(args.db) as store:
         ctx = build_context(store, top_n=20 if args.mode == "daily" else 12, alerts_n=40)
     if args.incremental:
         ctx = _filter_incremental(ctx, since)

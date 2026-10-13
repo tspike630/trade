@@ -13,8 +13,9 @@ routes return 503. Prefer firewall IP allowlist in front of this service.
 
 from __future__ import annotations
 
+import hmac
 import json
-import secrets as pysecrets
+import os
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -46,18 +47,37 @@ app = FastAPI(
     description="Read-only API + admin UI (P2). Data routes require X-API-Key when API_SECRET is set.",
 )
 
+# Wildcard origins cannot be combined with credentials (they reflect any Origin).
+_cors_raw = os.environ.get("API_CORS_ORIGINS", "").strip()
+if _cors_raw:
+    _cors_origins = [item.strip() for item in _cors_raw.split(",") if item.strip()]
+    _cors_credentials = True
+else:
+    _cors_origins = ["*"]
+    _cors_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+def api_keys_match(provided: str | None, secret: str) -> bool:
+    """Constant-time compare on UTF-8 bytes. Non-ASCII keys must not raise."""
+    if not provided or not secret:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), secret.encode("utf-8"))
+
+
 @contextmanager
 def _store() -> Iterator[Store]:
-    st = Store(DB_PATH)
+    try:
+        st = Store.open_ro(DB_PATH)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail="database not found") from exc
     try:
         yield st
     finally:
@@ -74,7 +94,7 @@ async def require_api_key(
     - else → 503 with setup message
     """
     if API_SECRET:
-        if not x_api_key or not pysecrets.compare_digest(x_api_key, API_SECRET):
+        if not api_keys_match(x_api_key, API_SECRET):
             raise HTTPException(
                 status_code=401,
                 detail="invalid or missing X-API-Key",

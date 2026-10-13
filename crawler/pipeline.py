@@ -25,6 +25,7 @@ from config import (
     ASYNC_MAX_CONCURRENCY,
     BATCH_SIZE,
     DB_PATH,
+    PENDING_ENRICH_LOAD_CAP,
     HOT_ENRICH_MIN_INTERVAL_SEC,
     HOT_SEEN_WINDOW_SEC,
     PROFILE_POLL_INTERVAL_SEC,
@@ -474,8 +475,9 @@ def _build_queues(
     new_by_chain: dict[str, list[str]],
     summary: dict[str, Any],
 ) -> dict[str, list[str]]:
-    pending_map = store.list_pending_enrich()
+    pending_map = store.list_pending_enrich(limit=PENDING_ENRICH_LOAD_CAP)
     summary["enrich_from_pending"] = store.count_pending_enrich()
+    summary["enrich_pending_loaded"] = sum(len(v) for v in pending_map.values())
     queues: dict[str, list[str]] = {}
     all_chains = set(pending_map) | set(new_by_chain)
     for chain_id in sorted(all_chains):
@@ -484,13 +486,18 @@ def _build_queues(
                 pending_map.get(chain_id, [])
             ) + len(new_by_chain.get(chain_id, []))
             continue
+        seen: set[str] = set()
         merged: list[str] = []
         for addr in pending_map.get(chain_id, []):
-            if addr not in merged:
-                merged.append(addr)
+            if addr in seen:
+                continue
+            seen.add(addr)
+            merged.append(addr)
         for addr in new_by_chain.get(chain_id, []):
-            if addr not in merged:
-                merged.append(addr)
+            if addr in seen:
+                continue
+            seen.add(addr)
+            merged.append(addr)
         queues[chain_id] = merged
     summary["enrich_candidates"] = sum(len(v) for v in queues.values())
     return queues
@@ -878,7 +885,13 @@ async def _run_extra_sources(
                 if not chain_enabled(chain_id):
                     summary["tokens_skipped_chain"] = summary.get("tokens_skipped_chain", 0) + 1
                     continue
-                store.upsert_token(chain_id, token_address, cleaned, tag)
+                store.upsert_token(
+                    chain_id,
+                    token_address,
+                    cleaned,
+                    tag,
+                    clue=tag.startswith("source:"),
+                )
                 summary["sources_tokens_upserted"] += 1
             for pair in result.pairs:
                 cleaned_p, reason = validate_pair(pair)

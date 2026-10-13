@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import re
 import threading
 from typing import Any, Callable
@@ -29,7 +30,7 @@ from config import (
     HELIUS_RECONNECT_MAX_SEC,
     HELIUS_WS_URL,
 )
-from logging_setup import get_logger
+from logging_setup import get_logger, redact_secrets
 from sources.base import SourceResult, TokenSource
 
 log = get_logger("sources.helius")
@@ -54,8 +55,11 @@ DEFAULT_HELIUS_PROGRAM_IDS: list[tuple[str, str]] = [
     ("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", "Orca Whirlpool"),
 ]
 
-# Solana base58 pubkey-ish (32–44 chars, no 0/O/I/l)
-_BASE58_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
+# Explicit mint fields only. A bare pubkey on an "initialize" line is not a mint.
+_MINT_FIELD_RE = re.compile(
+    r"(?i)(?:\b(?:base|quote|token)[_ ]?mint\b|\bmint\b)"
+    r"[\"'\s:=]+([1-9A-HJ-NP-Za-km-z]{32,44})"
+)
 _SYSTEMISH = {
     "11111111111111111111111111111111",
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -137,30 +141,50 @@ def parse_logs_notification(message: dict[str, Any]) -> dict[str, Any] | None:
 
 def extract_mints_from_logs(logs: list[str], *, program_ids: list[str] | None = None) -> list[str]:
     """
-    Best-effort mint hints from log lines.
-    Looks for base58 pubkeys that are not system/token programs or subscribed program IDs.
+    Fallback mint hints from log text.
+
+    Requires a whitelisted program id somewhere in the batch, then only
+    addresses that sit in an explicit mint field (mint / baseMint / quoteMint).
+    Random pubkeys on initialize/pool lines are ignored.
     """
+    text_lines = [line for line in logs if isinstance(line, str)]
+    if program_ids:
+        blob = "\n".join(text_lines)
+        if not any(pid in blob for pid in program_ids):
+            return []
     skip = set(_SYSTEMISH)
     if program_ids:
         skip.update(program_ids)
     found: list[str] = []
     seen: set[str] = set()
-    for line in logs:
-        if not isinstance(line, str):
-            continue
-        # Prefer lines that look like create/initialize
-        interesting = any(
-            k in line.lower()
-            for k in ("initialize", "create", "mint", "pool", "bonding")
-        )
-        for m in _BASE58_RE.findall(line):
-            if m in skip or m in seen:
+    for line in text_lines:
+        for mint in _MINT_FIELD_RE.findall(line):
+            if mint in skip or mint in seen:
                 continue
-            # Heuristic: keep interesting-line candidates first; still collect others
-            if interesting or "Program log" in line:
-                seen.add(m)
-                found.append(m)
+            seen.add(mint)
+            found.append(mint)
     return found
+
+
+def format_get_tx_failure(exc: BaseException) -> str:
+    """Safe getTransaction error text: status or type name, never the URL."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"status={exc.response.status_code}"
+    return type(exc).__name__
+
+
+def choose_mint_hints(
+    tx_mints: list[str] | None,
+    log_mints: list[str] | None,
+) -> tuple[list[str], bool]:
+    """Prefer getTransaction mints. Log-regex hits do not emit new_listing."""
+    confirmed = list(tx_mints or [])
+    if confirmed:
+        return confirmed[:5], True
+    hints = list(log_mints or [])
+    if hints:
+        return hints[:5], False
+    return [], False
 
 
 def extract_mints_from_transaction(tx: dict[str, Any]) -> list[str]:
@@ -261,7 +285,7 @@ def enqueue_solana_mints(
             "description": f"helius logsSubscribe hint sig={signature or '-'}",
             "source_hint": "helius",
         }
-        result = store.upsert_token("solana", addr, raw, "source:helius")
+        result = store.upsert_token("solana", addr, raw, "source:helius", clue=True)
         store.add_pending_enrich("solana", addr)
         if result == "inserted":
             inserted += 1
@@ -285,7 +309,7 @@ def enqueue_solana_mints(
                         cycle_id=cycle_id,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    log.error("helius new_listing alert failed: %s", exc)
+                    log.error("helius new_listing alert failed: %s", type(exc).__name__)
     return inserted
 
 
@@ -336,8 +360,11 @@ class HeliusListener:
         self.program_ids = resolve_program_ids()
         self._fail_streak = 0
         self._thread: threading.Thread | None = None
+        self._writer: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = threading.Event()
+        # DB writes leave the WS receive loop. One writer thread owns Store.
+        self._jobs: queue.Queue[tuple[Any, ...] | None] = queue.Queue(maxsize=1000)
 
     def start_background(self) -> None:
         if not self.api_key:
@@ -346,6 +373,11 @@ class HeliusListener:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        if self._writer is None or not self._writer.is_alive():
+            self._writer = threading.Thread(
+                target=self._writer_loop, name="helius-writer", daemon=True
+            )
+            self._writer.start()
         self._thread = threading.Thread(
             target=self._thread_main, name="helius-listener", daemon=True
         )
@@ -358,6 +390,12 @@ class HeliusListener:
             self._loop.call_soon_threadsafe(lambda: None)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10.0)
+        try:
+            self._jobs.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._writer and self._writer.is_alive():
+            self._writer.join(timeout=10.0)
 
     def _should_stop(self) -> bool:
         if self._stop.is_set():
@@ -383,44 +421,100 @@ class HeliusListener:
                 self._fail_streak = 0
             except Exception as exc:  # noqa: BLE001
                 self._fail_streak += 1
+                safe = redact_secrets(str(exc))
                 log.error(
                     "helius session error streak=%s err=%s",
                     self._fail_streak,
-                    exc,
+                    safe,
                 )
                 if self._fail_streak >= HELIUS_DISCONNECT_ALERT_AFTER:
-                    self._admin_alert_disconnect(str(exc))
+                    self._submit(("admin", safe[:400]))
                 await asyncio.sleep(min(backoff, HELIUS_RECONNECT_MAX_SEC))
                 backoff = min(backoff * 2, HELIUS_RECONNECT_MAX_SEC)
 
-    def _admin_alert_disconnect(self, err: str) -> None:
+    def _submit(self, job: tuple[Any, ...]) -> None:
+        try:
+            self._jobs.put_nowait(job)
+        except queue.Full:
+            log.warning("helius write queue full; dropped %s", job[0])
+
+    def _writer_loop(self) -> None:
+        from store import Store
+
+        store: Store | None = None
+        try:
+            while True:
+                if self._stop.is_set() and self._jobs.empty():
+                    break
+                try:
+                    job = self._jobs.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if job is None:
+                    break
+                try:
+                    if store is None:
+                        store = Store(self.db_path)
+                    self._apply_job(store, job)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("helius writer failed err=%s", type(exc).__name__)
+                    if store is not None:
+                        try:
+                            store.close()
+                        except Exception:
+                            pass
+                        store = None
+        finally:
+            if store is not None:
+                store.close()
+
+    def _apply_job(self, store: Any, job: tuple[Any, ...]) -> None:
+        kind = job[0]
+        if kind == "mints":
+            _, mints, sig, emit = job
+            n = enqueue_solana_mints(
+                store, mints, signature=sig, emit_new_listing=emit, cycle_id="helius-listen"
+            )
+            log.info(
+                "helius enqueued sig=%s mints=%s newly_inserted=%s emit_new_listing=%s",
+                str(sig)[:16],
+                len(mints),
+                n,
+                emit,
+            )
+            return
+        if kind == "admin":
+            self._emit_admin_alert(store, str(job[1]))
+            return
+        log.warning("helius writer ignored job %s", kind)
+
+    def _emit_admin_alert(self, store: Any, err: str) -> None:
         try:
             from alerts_telegram import telegram_enabled
-            from store import Store
 
             if not telegram_enabled():
                 return
-            with Store(self.db_path) as store:
-                from alerts import emit_alert
+            from alerts import emit_alert
 
-                emit_alert(
-                    store,
-                    {
-                        "type": "system_error",
-                        "severity": "high",
-                        "chain_id": "solana",
-                        "token_address": "",
-                        "pair_address": "",
-                        "message": (
-                            f"Helius WS disconnect/reconnect failures "
-                            f"streak={self._fail_streak}: {err[:400]}"
-                        ),
-                        "payload": {"component": "helius_listener"},
-                    },
-                    cycle_id="helius-listener",
-                )
+            safe = redact_secrets(err)[:400]
+            emit_alert(
+                store,
+                {
+                    "type": "system_error",
+                    "severity": "high",
+                    "chain_id": "solana",
+                    "token_address": "",
+                    "pair_address": "",
+                    "message": (
+                        f"Helius WS disconnect/reconnect failures "
+                        f"streak={self._fail_streak}: {safe}"
+                    ),
+                    "payload": {"component": "helius_listener"},
+                },
+                cycle_id="helius-listener",
+            )
         except Exception as exc:  # noqa: BLE001
-            log.error("helius admin alert failed: %s", exc)
+            log.error("helius admin alert failed: %s", type(exc).__name__)
 
     async def _session(self) -> None:
         try:
@@ -471,39 +565,45 @@ class HeliusListener:
                 await self._handle_notification(msg)
 
     async def _handle_notification(self, msg: dict[str, Any]) -> None:
-        from store import Store
-
         parsed = parse_logs_notification(msg)
         if not parsed or parsed.get("err"):
             return
         sig = parsed["signature"]
         logs = parsed.get("logs") or []
-        mints = extract_mints_from_logs(logs, program_ids=self.program_ids)
+        tx_mints: list[str] = []
+        try:
+            tx = await rpc_get_transaction(sig, http_url=default_http_url(self.api_key))
+            if tx:
+                tx_mints = extract_mints_from_transaction(tx)
+        except httpx.HTTPStatusError as exc:
+            log.warning(
+                "helius getTransaction failed sig=%s %s",
+                sig[:16],
+                format_get_tx_failure(exc),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "helius getTransaction failed sig=%s err=%s",
+                sig[:16],
+                format_get_tx_failure(exc),
+            )
 
-        if not mints:
-            try:
-                tx = await rpc_get_transaction(sig, http_url=default_http_url(self.api_key))
-                if tx:
-                    mints = extract_mints_from_transaction(tx)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("helius getTransaction failed sig=%s err=%s", sig[:16], exc)
-
+        log_mints = (
+            []
+            if tx_mints
+            else extract_mints_from_logs(logs, program_ids=self.program_ids)
+        )
+        mints, emit = choose_mint_hints(tx_mints, log_mints)
         if not mints:
             log.debug("helius no mints for sig=%s", sig[:16])
             return
-
-        # Cap noise: at most a few mints per tx
-        mints = mints[:5]
-        with Store(self.db_path) as store:
-            n = enqueue_solana_mints(
-                store, mints, signature=sig, cycle_id="helius-listen"
+        if not emit:
+            log.debug(
+                "helius log-regex mint hints downgraded sig=%s n=%s",
+                sig[:16],
+                len(mints),
             )
-        log.info(
-            "helius enqueued sig=%s mints=%s newly_inserted=%s",
-            sig[:16],
-            len(mints),
-            n,
-        )
+        self._submit(("mints", mints, sig, emit))
 
 
 def start_helius_listener_background(
