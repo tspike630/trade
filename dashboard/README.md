@@ -27,7 +27,7 @@ python -m dashboard.app
 - 模块标签：DASHBOARD / MARKETS / AI CHAT。`/chat` 是同一套鉴权下的 AI CHAT。
 - DASHBOARD 内子标签：OVERVIEW（风险 + 持仓）、SIGNALS、EXECUTION。注册表里新增的面板默认落在 OVERVIEW。
 - 底栏：会话时长、库文件就绪数、进程心跳、距上次刷新的秒数。
-- MARKETS 读 `token_indicators`，流动性取 `primary_pair_address` 在 `pair_history` 的最新值，覆盖率沿用信号流的口径。列只有 change_*、流动性、JEV、覆盖、档。不展示 RSI、MACD、BOLL。
+- MARKETS 读 `token_indicators`，流动性取 `primary_pair_address` 在 `pair_history` 的最新值，覆盖率沿用信号流的口径。列有 change_*、流动性、JEV、覆盖、档，以及技术时间。有 `tech_updated_at` 时用它，空值降级 `updated_at`；超过 `HEARTBEAT_STALE_SEC` 标「陈旧」。没有时间戳显示「—」，不补造。不展示 RSI、MACD、BOLL。
 - 本仓库没有 `dashboard.chat` 时，AI CHAT 只显示未挂载说明，不调用模型，不写 `dashboard_state.db`。挂上模块并提供 `render(store)` 后，同一页会调用它。
 
 单库路径沿用爬虫里已有的环境变量，也可以单独覆盖：
@@ -59,7 +59,7 @@ python -m dashboard.app
 - **信号流**：`decision_log` 最近 50 条。`jev_strength` 顺序与 `review.data` 相同（`raw_json.extras`、`raw_json`、原因里的 `jev_strength=`），再回退 `indicator_history`。覆盖率优先 `jev_signals.coverage_pct`，否则 `token_indicators.jev_confidence * 100`，再否则 raw。流动性优先该交易对最新 `pair_history.liquidity_usd`。同一决策多条 execution 时取 `ts`、`id` 最新的一条。
 - **执行记录**：最近 50 条，回执只显示摘要。`api_key`、`secret`、`password`、`private_key` 等字段会丢掉。近 7 日拒绝包含校验失败，以及 `status = rejected` 或回执状态 `pm_rejected` / `risk_rejected` / `paper_failed` / `validation_failed`。`validation_errors` 先按 JSON 数组取第一项，解析失败再按 `;` 或换行切。
 
-进程心跳来自主库，不是猜进程名：`run_checkpoint.updated_at`（主爬虫）、`indicator_history.recorded_at`（指标）、`jev_signals.fetched_at`（JEV）、`decision_log.ts`（决策引擎）。这四项超过 `HEARTBEAT_STALE_SEC`（默认 900 秒）标「停滞」。执行网关看 `execution_log.ts`，窗口是 `GATEWAY_HEARTBEAT_STALE_SEC`（默认 120 秒，与 API 心跳一致），不跟 900 秒走。没有时间戳标「未知」。
+进程心跳来自主库，不是猜进程名：`run_checkpoint.updated_at`（主爬虫）、指标新鲜度、`jev_signals.fetched_at`（JEV）、`decision_log.ts`（决策引擎）。指标在 `token_indicators` 有 `tech_updated_at` 时只认该列（技术真重算，跟指标 #32）；整列为空是「未知」，不用 funding/sentiment 共用的 `updated_at` 或 `indicator_history.recorded_at` 当成技术还活着。没有这一列时，仍用 `indicator_history.recorded_at`，再没有才用 `token_indicators.updated_at`。这几项超过 `HEARTBEAT_STALE_SEC`（默认 900 秒）标「停滞」。执行网关看 `execution_log.ts`，窗口是 `GATEWAY_HEARTBEAT_STALE_SEC`（默认 120 秒，与 API 心跳一致），不跟 900 秒走。没有时间戳标「未知」。
 
 日志里的 `SecretFilter` 挂在 handler 上。子 logger 传上来的记录不会经过 root logger 的 filter。
 

@@ -12,6 +12,7 @@ from dashboard.panels.common import (
     col,
     data_table,
     empty_state,
+    indicator_fresh_cell,
     panel_box,
     retry_button,
     show_unavailable,
@@ -36,7 +37,11 @@ def render_markets(
     on_retry: Callable[[], None] | None = None,
 ) -> None:
     selected = chain if chain in _CHAINS else "all"
-    with panel_box("链上行情", "token_indicators 只读。change_* 已是百分数，不再乘 100。"):
+    with panel_box(
+        "链上行情",
+        "token_indicators 只读。change_* 已是百分数，不再乘 100。"
+        "技术时间优先 tech_updated_at，空值用 updated_at；超过 HEARTBEAT 标陈旧。",
+    ):
         if on_chain is not None:
             ui.select(
                 list(_CHAINS),
@@ -69,10 +74,11 @@ def render_markets(
                 col("jev", "JEV", "right"),
                 col("coverage", "覆盖", "right"),
                 col("tier", "档"),
+                col("tech", "技术"),
             ],
             table_rows,
             row_key="token",
-            color_fields=tuple(name for name, _label in _CHANGE_FIELDS),
+            color_fields=(*tuple(name for name, _label in _CHANGE_FIELDS), "tech"),
         )
 
 
@@ -85,6 +91,9 @@ def _row(item: MarketRow) -> dict[str, object]:
         "coverage": fmt_coverage(item.coverage),
         "tier": item.tier or "—",
     }
+    tech_text, tech_class = indicator_fresh_cell(item.fresh_at, item.fresh_state)
+    payload["tech"] = tech_text
+    payload["tech_class"] = tech_class
     changes = {
         "change_5m": item.change_5m,
         "change_15m": item.change_15m,

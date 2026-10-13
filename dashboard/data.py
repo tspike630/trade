@@ -221,6 +221,11 @@ class MarketRow:
     symbol: str = ""
     change_15m: float | None = None
     change_24h: float | None = None
+    # tech_updated_at when present and non-blank; empty if the column or value is missing.
+    tech_at: str = ""
+    # Clock used for sort and staleness: tech_at, else updated_at / recorded_at. Never invented.
+    fresh_at: str = ""
+    fresh_state: Liveness = "unknown"
 
 
 @dataclass(frozen=True)
@@ -767,9 +772,7 @@ class DataStore:
         try:
             with ro_connect(path) as conn:
                 crawler = _probe_checkpoint(conn, now)
-                indicator = _probe_max(conn, "indicator_history", "recorded_at", "指标", now)
-                if indicator.state == "unknown":
-                    indicator = _probe_max(conn, "token_indicators", "updated_at", "指标", now)
+                indicator = _probe_indicator(conn, now)
                 jev = _probe_max(conn, "jev_signals", "fetched_at", "JEV", now)
                 if jev.state == "unknown":
                     jev = _probe_max(conn, "jev_signals", "analyzed_at", "JEV", now)
@@ -1326,15 +1329,15 @@ class DataStore:
                 if miss:
                     return _unavail(miss, started)
                 ti_cols = _columns(conn, "token_indicators")
-                ts_col = "updated_at" if "updated_at" in ti_cols else ("recorded_at" if "recorded_at" in ti_cols else None)
-                if not ts_col:
+                clock = _indicator_clock_expr(ti_cols)
+                if not clock:
                     return _unavail("token_indicators 缺少 updated_at/recorded_at", started)
                 where = ""
                 params: list[Any] = []
                 if chain and chain.lower() not in ("all", "*", "any"):
                     where = "WHERE chain_id = ?"
                     params.append(chain)
-                order = f"ORDER BY CASE WHEN tier = 'hot' THEN 0 ELSE 1 END, {ts_col} DESC"
+                order = f"ORDER BY CASE WHEN tier = 'hot' THEN 0 ELSE 1 END, {clock} DESC"
                 sql = f"SELECT * FROM token_indicators {where} {order} LIMIT ?"
                 params.append(limit)
                 rows = _exec(conn, sql, tuple(params)).fetchall()
@@ -1350,6 +1353,7 @@ class DataStore:
                 quotes = _load_quotes(conn, pair_keys) if _table_exists(conn, "pair_history") else {}
                 cov = _load_coverage(conn, token_keys) if _table_exists(conn, "jev_signals") else {}
                 symbols = _load_symbols(conn, token_keys) if _table_exists(conn, "tokens") else {}
+                now = datetime.now(timezone.utc)
                 out: list[MarketRow] = []
                 for row in rows:
                     ch = str(_cell(row, "chain_id") or "")
@@ -1377,6 +1381,7 @@ class DataStore:
                         val = safe_float(_cell(row, key))
                         if val is not None:
                             sent_parts.append(f"{key}={val:.4g}")
+                    tech_at, fresh_at, fresh_state = _indicator_freshness(row, ti_cols, now)
                     out.append(
                         MarketRow(
                             chain_id=ch,
@@ -1395,6 +1400,9 @@ class DataStore:
                             symbol=symbols.get((ch, tok), "") or str(_cell(row, "symbol") or ""),
                             change_15m=safe_float(_cell(row, "change_15m")),
                             change_24h=safe_float(_cell(row, "change_24h")),
+                            tech_at=tech_at,
+                            fresh_at=fresh_at,
+                            fresh_state=fresh_state,
                         )
                     )
                 return _ok(out, started)
@@ -1855,6 +1863,84 @@ def _strength_fallback(
         if value is not None:
             found[(chain, token)] = value
     return found
+
+
+def _text_stamp(row: sqlite3.Row, name: str) -> str:
+    if name not in row.keys():
+        return ""
+    return str(row[name] or "").strip()
+
+
+def _null_if_blank(column: str) -> str:
+    _ident(column)
+    return f"NULLIF(TRIM({column}), '')"
+
+
+def _indicator_clock_expr(cols: set[str]) -> str | None:
+    """SQL clock for token_indicators sort and staleness.
+
+    Indicator #32 keeps technical freshness on tech_updated_at. When PRAGMA
+    shows that column, it wins. A NULL or blank value falls back to updated_at,
+    then recorded_at — the same degrade as decision #31's reader when the
+    technical column is absent. No stamp is synthesized.
+    """
+    fallbacks = [name for name in ("updated_at", "recorded_at") if name in cols]
+    parts: list[str] = []
+    if "tech_updated_at" in cols:
+        parts.append(_null_if_blank("tech_updated_at"))
+    parts.extend(_null_if_blank(name) for name in fallbacks)
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return "COALESCE(" + ", ".join(parts) + ")"
+
+
+def _indicator_freshness(
+    row: sqlite3.Row,
+    cols: set[str],
+    now: datetime,
+) -> tuple[str, str, Liveness]:
+    """Return (tech_at, fresh_at, state) for one token_indicators row.
+
+    tech_at stays empty when the column is missing or the value is NULL/blank.
+    fresh_at is that tech stamp, otherwise updated_at / recorded_at. Both empty
+    means unknown — the caller must not invent a time.
+    """
+    tech = _text_stamp(row, "tech_updated_at") if "tech_updated_at" in cols else ""
+    fallback = ""
+    if not tech:
+        for name in ("updated_at", "recorded_at"):
+            if name not in cols:
+                continue
+            fallback = _text_stamp(row, name)
+            if fallback:
+                break
+    chosen = tech or fallback
+    if not chosen:
+        return "", "", "unknown"
+    return tech, chosen, _liveness(_age_seconds(chosen, now))
+
+
+def _probe_indicator(conn: sqlite3.Connection, now: datetime) -> ProcessProbe:
+    """Indicator heartbeat. Technical life is tech_updated_at when the column exists.
+
+    Funding, sentiment, and composite bump token_indicators.updated_at and can
+    also append indicator_history.recorded_at. Once tech_updated_at is present,
+    MAX of that column is the pulse, including when it is stale or entirely
+    NULL. Those shared clocks must not report the technical pass as alive.
+    Without the column, fall back to indicator_history.recorded_at, then
+    token_indicators.updated_at.
+    """
+    if _table_exists(conn, "token_indicators"):
+        cols = _columns(conn, "token_indicators")
+        if "tech_updated_at" in cols:
+            found = _probe_max(conn, "token_indicators", "tech_updated_at", "指标", now)
+            return ProcessProbe(found.name, found.state, found.age_seconds, "tech_updated_at")
+    history = _probe_max(conn, "indicator_history", "recorded_at", "指标", now)
+    if history.state != "unknown":
+        return history
+    return _probe_max(conn, "token_indicators", "updated_at", "指标", now)
 
 
 def _probe_checkpoint(conn: sqlite3.Connection, now: datetime) -> ProcessProbe:
