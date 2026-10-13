@@ -166,6 +166,7 @@ class BacktestEngine:
                 sid = strat.strategy_id
                 # exits first
                 self._manage_exits(sid, snap.bar_ts, snap.prices)
+                data["open_positions"] = self.ledger.list_open(sid)
                 try:
                     signals = strat.on_tick(data) or []
                 except Exception as exc:  # noqa: BLE001
