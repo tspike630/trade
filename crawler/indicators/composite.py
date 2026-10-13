@@ -180,6 +180,7 @@ class CompositeIndicators:
             "token_address": token_address,
             "composite_score": score,
             "composite_updated_at": utc_now_iso(),
+            # Shared row clock only. tech_updated_at stays with the technical writer.
             "updated_at": utc_now_iso(),
         }
 

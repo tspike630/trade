@@ -2,10 +2,12 @@
 # -*- coding: utf-8 -*-
 """prior_ingest.py — 新币先验数据集清洗入库（Step1）
 
-用法: python3 scripts/prior_ingest.py
+用法: python3 scripts/prior_ingest.py [--rebuild]
 输入: data/prior/raw/redpump/unpacked/**/*.{csv,csv.gz}, data/prior/raw/solrpds/dataset/CSV/*.csv
 输出: data/prior/db/prior.db (token_outcomes / provenance)
 原则: 只读旁路数据, 不碰业务库; 字段不匹配就报错, 不静默。
+默认增量: 只删 source in (solrpds, redpump) 的 token_outcomes / provenance 再导入。
+--rebuild 才把整个 prior.db 备份后换新文件（会清掉 cex / tags / baseline 等其他表）。
 
 实测 zip 结构 (2026-10-10):
   结局主表 = 04_frozen_inputs/red_pump_2026_v1_outcomes.csv.gz
@@ -230,14 +232,79 @@ def ingest_redpump(conn):
     print(f"[redpump] 入库 {n} 行（跳过畸形/空 outcome {skipped}）")
 
 
-def main():
+INGEST_SOURCES = ("solrpds", "redpump")
+
+
+def _schema_path() -> str:
+    return os.path.join(BASE, "..", "..", "models", "prior_tables.sql")
+
+
+def backup_and_remove_db(db_path: str) -> str:
+    """Copy ``db_path`` to a sibling .bak file, then delete the live file.
+
+    Other prior tables live in this database. Callers use this only for an
+    explicit rebuild. If the backup fails, the original file is left in place.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    bak = f"{db_path}.bak-{stamp}"
+    src = sqlite3.connect(db_path)
+    try:
+        dst = sqlite3.connect(bak)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    os.remove(db_path)
+    for suffix in ("-wal", "-shm"):
+        side = db_path + suffix
+        if os.path.exists(side):
+            os.remove(side)
+    return bak
+
+
+def prepare_prior_connection(db_path: str, schema_path: str, *, rebuild: bool) -> sqlite3.Connection:
+    """Open prior.db and apply schema.
+
+    Default (rebuild=False) deletes only solrpds/redpump outcome and provenance
+    rows so cex snapshots, decision_prior_tags, and baseline_history stay.
+    rebuild=True backs up the file and starts a new database.
+    """
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if rebuild and os.path.exists(db_path):
+        bak = backup_and_remove_db(db_path)
+        print(f"[rebuild] backed up {db_path} -> {bak}")
+    elif os.path.exists(db_path):
+        print("[incremental] keeping prior.db; replacing solrpds/redpump rows only")
+    conn = sqlite3.connect(db_path)
+    with open(schema_path, encoding="utf-8") as schema_file:
+        conn.executescript(schema_file.read())
+    if not rebuild:
+        marks = ",".join("?" for _ in INGEST_SOURCES)
+        conn.execute(
+            f"DELETE FROM token_outcomes WHERE source IN ({marks})",
+            INGEST_SOURCES,
+        )
+        conn.execute(
+            f"DELETE FROM provenance WHERE source IN ({marks})",
+            INGEST_SOURCES,
+        )
+        conn.commit()
+    return conn
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    rebuild = "--rebuild" in args
+    unknown = [a for a in args if a != "--rebuild"]
+    if unknown:
+        sys.exit(f"[FAIL] unknown args {unknown}; only --rebuild is supported")
     if not os.path.isdir(os.path.join(RAW, "solrpds")) and not os.path.isdir(os.path.join(RAW, "redpump")):
         sys.exit("[FAIL] raw/ 下没有数据目录, 先跑 §2 下载")
-    # 重建旁路库（不碰业务库）
-    if os.path.exists(DB):
-        os.remove(DB)
-    conn = sqlite3.connect(DB)
-    conn.executescript(open(os.path.join(BASE, "..", "..", "models", "prior_tables.sql")).read())
+    conn = prepare_prior_connection(DB, _schema_path(), rebuild=rebuild)
     ingest_solrpds(conn)
     ingest_redpump(conn)
     # provenance

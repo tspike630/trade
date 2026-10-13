@@ -22,6 +22,7 @@ from config import (  # noqa: E402
     DB_PATH,
     INDICATORS_COLD_INTERVAL_SEC,
     INDICATORS_ENABLED,
+    INDICATORS_HISTORY_RETENTION_DAYS,
     INDICATORS_HOT_INTERVAL_SEC,
     INDICATORS_LOOP_INTERVAL_SEC,
     INDICATORS_VOLATILITY_WINDOW_SEC,
@@ -88,6 +89,20 @@ def run_pass(
     except Exception as exc:  # noqa: BLE001
         log.debug("on_indicator hook skipped: %s", exc)
     return stats
+
+
+def _purge_indicator_history(store: IndicatorStore) -> None:
+    """Drop expired indicator_history. Never raises into the loop."""
+    try:
+        removed = store.purge_old_indicator_history(INDICATORS_HISTORY_RETENTION_DAYS)
+        if removed:
+            log.info(
+                "indicator_history purge removed=%s retention_days=%s",
+                removed,
+                INDICATORS_HISTORY_RETENTION_DAYS,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("indicator_history purge skipped: %s", exc)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -172,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
                     stats["err"],
                     stats["seen"],
                 )
+                _purge_indicator_history(store)
             except Exception as exc:  # noqa: BLE001 — never kill outer process silently
                 log.exception("indicators pass crashed: %s", exc)
             time.sleep(max(5, int(interval)))

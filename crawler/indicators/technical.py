@@ -14,7 +14,8 @@ from typing import Any
 from history import history_tier_for_token
 from logging_setup import get_logger
 
-from indicators.base import INTERVAL_SEC, IndicatorStore, parse_iso, to_epoch, utc_now_iso
+from indicators.base import INTERVAL_SEC, IndicatorStore, to_epoch, utc_now_iso
+from indicators.library_apply import apply_library_fields, technical_refresh_due
 from indicators import technical_lib
 
 log = get_logger("indicators.technical")
@@ -53,19 +54,6 @@ TIER_FIELDS: dict[str, frozenset[str]] = {
         }
     ),
 }
-
-# ADD-ON library fields (weight 0 in composite; not part of TIER_FIELDS gating).
-# Filled whenever history is long enough; short history → None.
-PANDAS_TA_FIELDS: tuple[str, ...] = (
-    "rsi_14",
-    "macd",
-    "macd_signal",
-    "macd_hist",
-    "boll_upper",
-    "boll_mid",
-    "boll_lower",
-)
-
 
 def _num(v: Any) -> float | None:
     if v is None or v == "":
@@ -319,21 +307,16 @@ class TechnicalIndicators:
                 out[key] = None
 
         # --- ADD-ON: pandas-ta RSI / MACD / BOLL (does not touch fields above) ---
+        # Kept-old values must not refresh tech_updated_at (P1-08). MACD is one set (P2-13).
         closes: list[float] = []
         for row in series:
             p = _num(row.get("price_usd"))
             if p is not None and p > 0:
                 closes.append(p)
         lib = technical_lib.compute_pandas_ta(closes) if closes else {}
-        for key in PANDAS_TA_FIELDS:
-            val = lib.get(key) if lib else None
-            if val is not None:
-                out[key] = val
-            elif prev is not None and prev.get(key) is not None:
-                # Preserve prior library value if this pass lacked enough bars
-                out[key] = prev.get(key)
-            else:
-                out[key] = None
+        lib_fields, lib_fresh = apply_library_fields(prev, lib)
+        out.update(lib_fields)
+        out["_lib_fresh"] = lib_fresh
 
         return out
 
@@ -350,10 +333,21 @@ class TechnicalIndicators:
         )
         if not row:
             return None
-        self.store.upsert_token_indicators(row)
-        if self.write_history_for_hot and row.get("tier") == "hot":
+        lib_fresh = bool(row.pop("_lib_fresh", True))
+        if lib_fresh:
+            now = row.get("updated_at") or utc_now_iso()
+            row["updated_at"] = now
+            row["tech_updated_at"] = now
+        else:
+            # Preserved RSI/MACD/BOLL. Do not pretend this pass refreshed them.
+            row.pop("updated_at", None)
+            row.pop("tech_updated_at", None)
+        self.store.upsert_token_indicators(row, touch_updated_at=lib_fresh)
+        if lib_fresh and self.write_history_for_hot and row.get("tier") == "hot":
             try:
-                self.store.insert_indicator_history({**row, "recorded_at": row["updated_at"]})
+                self.store.insert_indicator_history(
+                    {**row, "recorded_at": row["updated_at"]}
+                )
             except Exception as exc:  # noqa: BLE001
                 log.warning("indicator_history write failed: %s", exc)
         return row
@@ -369,7 +363,9 @@ class TechnicalIndicators:
     ) -> dict[str, int]:
         """
         Process all tokens that have pair_history.
-        only_due: skip tokens whose indicator updated_at is within tier interval.
+        only_due: skip tokens whose tech_updated_at is within the tier interval.
+        Shared updated_at is not consulted (funding/sentiment bump it every pass).
+        NULL tech_updated_at is due.
         """
         stats = {"seen": 0, "ok": 0, "skip": 0, "err": 0, "hot": 0, "warm": 0, "cold": 0}
         tokens = self.store.list_tokens_with_history()
@@ -384,19 +380,17 @@ class TechnicalIndicators:
                 stats[tier] = stats.get(tier, 0) + 1
 
                 if only_due and not force_full:
-                    last = self.store.get_indicator_updated_at(chain_id, token_address)
-                    last_dt = parse_iso(last)
-                    if last_dt is not None:
-                        age = (now - last_dt).total_seconds()
-                        if tier == "hot":
-                            need = hot_interval_sec
-                        elif tier == "cold":
-                            need = cold_interval_sec
-                        else:
-                            need = warm_interval_sec
-                        if age < need:
-                            stats["skip"] += 1
-                            continue
+                    last = self.store.get_tech_updated_at(chain_id, token_address)
+                    if not technical_refresh_due(
+                        last,
+                        tier=tier,
+                        now=now,
+                        hot_interval_sec=hot_interval_sec,
+                        warm_interval_sec=warm_interval_sec,
+                        cold_interval_sec=cold_interval_sec,
+                    ):
+                        stats["skip"] += 1
+                        continue
 
                 row = self.upsert_one(
                     chain_id, token_address, tier=tier, force_full=force_full

@@ -151,6 +151,7 @@ class FundingIndicators:
             "chain_id": chain_id,
             "token_address": token_address,
             **fields,
+            # Shared row clock only. tech_updated_at stays with the technical writer.
             "updated_at": utc_now_iso(),
         }
 

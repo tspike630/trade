@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +12,10 @@ from logging_setup import get_logger
 from store import norm_address, norm_chain
 
 log = get_logger("indicators.base")
+
+# How long this connection waits for a SQLite lock. Matches Store
+# (store.py PRAGMA busy_timeout=30000). It is not how long the lock is held.
+INDICATOR_BUSY_TIMEOUT_MS = 30000
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SQL_PATH = _ROOT / "models" / "indicator_tables.sql"
@@ -65,7 +69,38 @@ TOKEN_INDICATOR_COLS = [
     "tier",
     "primary_pair_address",
     "sample_count",
+    "tech_updated_at",
 ]
+
+# History columns filled from the live row when the writer omits them.
+# Explicit None in the writer payload is kept (not replaced).
+_HISTORY_FILL_IF_ABSENT = (
+    "change_5m",
+    "change_15m",
+    "change_1h",
+    "change_4h",
+    "change_24h",
+    "volatility_24h",
+    "volume_strength",
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "boll_upper",
+    "boll_mid",
+    "boll_lower",
+    "jev_score",
+    "jev_strength",
+    "sentiment_score",
+    "sentiment_mentions_1h",
+    "sentiment_heat_score",
+    "sentiment_polarity",
+    "spike_ratio",
+    "spike",
+    "composite_score",
+    "tier",
+    "primary_pair_address",
+)
 
 # Columns added after Step 1 — ALTER on existing DBs
 _MIGRATE_TOKEN_INDICATORS = [
@@ -91,6 +126,8 @@ _MIGRATE_TOKEN_INDICATORS = [
     ("sentiment_polarity", "REAL"),
     ("spike_ratio", "REAL"),
     ("spike", "INTEGER"),
+    # Technical freshness. Funding/sentiment/composite must not write this.
+    ("tech_updated_at", "TEXT"),
 ]
 _MIGRATE_INDICATOR_HISTORY = [
     ("rsi_14", "REAL"),
@@ -141,7 +178,7 @@ class IndicatorStore:
         self.db_path = Path(db_path)
         self._conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute(f"PRAGMA busy_timeout = {INDICATOR_BUSY_TIMEOUT_MS}")
         self._ensure_schema()
         # (chain, token) -> (monotonic_ts, row dict) short TTL cache
         self._cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
@@ -332,6 +369,10 @@ class IndicatorStore:
         """
         Closest indicator_history row near (now - lookback_sec).
         Used for sentiment growth baselines. READ only.
+
+        Same-timestamp ties prefer a row with rsi_14 set, then the newest id,
+        so a funding tick that stored NULL technicals does not hide the
+        technical tick from the same second.
         """
         from datetime import datetime, timezone, timedelta
 
@@ -351,9 +392,10 @@ class IndicatorStore:
                 SELECT * FROM indicator_history
                 WHERE chain_id = ? AND token_address = ?
                   AND recorded_at >= ? AND recorded_at <= ?
-                ORDER BY ABS(
-                    strftime('%s', recorded_at) - strftime('%s', ?)
-                ) ASC
+                ORDER BY
+                    ABS(strftime('%s', recorded_at) - strftime('%s', ?)) ASC,
+                    (rsi_14 IS NULL) ASC,
+                    id DESC
                 LIMIT 1
                 """,
                 (chain_id, token_address, lo, hi, target_iso),
@@ -365,23 +407,35 @@ class IndicatorStore:
     def pick_primary_pair(
         self, chain_id: str, token_address: str
     ) -> str | None:
-        """Prefer pair with highest latest liquidity, then most snapshots."""
+        """Latest snapshot liquidity, then snapshot count.
+
+        Historical peak liquidity is not used: a drained pool can still hold
+        the max liquidity_usd ever recorded.
+        """
         chain_id = norm_chain(chain_id)
         token_address = norm_address(token_address)
         row = self._conn.execute(
             """
-            SELECT pair_address,
-                   COUNT(*) AS n,
-                   MAX(recorded_at) AS last_at,
-                   MAX(liquidity_usd) AS max_liq
-            FROM pair_history
-            WHERE chain_id = ? AND token_address = ?
-            GROUP BY pair_address
+            WITH ranked AS (
+                SELECT pair_address,
+                       liquidity_usd,
+                       recorded_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY pair_address
+                           ORDER BY recorded_at DESC, id DESC
+                       ) AS rn,
+                       COUNT(*) OVER (PARTITION BY pair_address) AS n
+                FROM pair_history
+                WHERE chain_id = ? AND token_address = ?
+            )
+            SELECT pair_address
+            FROM ranked
+            WHERE rn = 1
             ORDER BY
-                CASE WHEN max_liq IS NULL THEN 0 ELSE 1 END DESC,
-                max_liq DESC,
+                CASE WHEN liquidity_usd IS NULL THEN 1 ELSE 0 END,
+                liquidity_usd DESC,
                 n DESC,
-                last_at DESC
+                recorded_at DESC
             LIMIT 1
             """,
             (chain_id, token_address),
@@ -441,10 +495,16 @@ class IndicatorStore:
 
     # --- write helpers (indicator tables only) ---
 
-    def upsert_token_indicators(self, row: dict[str, Any]) -> None:
+    def upsert_token_indicators(
+        self, row: dict[str, Any], *, touch_updated_at: bool = True
+    ) -> None:
         """
         Partial upsert: only columns present as keys in `row` are written.
         Technical and funding can update independently without wiping each other.
+
+        ``touch_updated_at=False`` leaves the shared updated_at clock alone.
+        ``tech_updated_at`` is written only when the caller puts it in ``row``
+        (technical passes that do not recompute RSI/MACD/BOLL omit it).
         """
         chain_id = norm_chain(row["chain_id"])
         token_address = norm_address(row["token_address"])
@@ -453,7 +513,9 @@ class IndicatorStore:
         if cols:
             placeholders = ", ".join("?" for _ in cols)
             insert_cols = ", ".join(cols)
-            updates = ", ".join(f"{c}=excluded.{c}" for c in cols)
+            assignments = ", ".join(f"{c}=excluded.{c}" for c in cols)
+            if touch_updated_at:
+                assignments = f"{assignments}, updated_at=excluded.updated_at"
             values = [row.get(c) for c in cols]
             self._conn.execute(
                 f"""
@@ -461,12 +523,11 @@ class IndicatorStore:
                     chain_id, token_address, {insert_cols}, updated_at
                 ) VALUES (?, ?, {placeholders}, ?)
                 ON CONFLICT(chain_id, token_address) DO UPDATE SET
-                    {updates},
-                    updated_at=excluded.updated_at
+                    {assignments}
                 """,
                 (chain_id, token_address, *values, updated_at),
             )
-        else:
+        elif touch_updated_at:
             self._conn.execute(
                 """
                 INSERT INTO token_indicators (chain_id, token_address, updated_at)
@@ -478,7 +539,7 @@ class IndicatorStore:
             )
         self._conn.commit()
         key = (chain_id, token_address)
-        prev = {}
+        prev: dict[str, Any] = {}
         if key in self._cache:
             prev = dict(self._cache[key][1])
         else:
@@ -487,15 +548,34 @@ class IndicatorStore:
             )
             if existing:
                 prev = existing
-        merged = {**prev, **{c: row.get(c) for c in cols},
-                  "chain_id": chain_id, "token_address": token_address,
-                  "updated_at": updated_at}
+        merged = {
+            **prev,
+            **{c: row.get(c) for c in cols},
+            "chain_id": chain_id,
+            "token_address": token_address,
+        }
+        if touch_updated_at:
+            merged["updated_at"] = updated_at
+        elif prev.get("updated_at"):
+            merged["updated_at"] = prev["updated_at"]
         self._cache[key] = (time.monotonic(), merged)
 
     def insert_indicator_history(self, row: dict[str, Any]) -> None:
+        """Append one history row.
+
+        Keys absent from ``row`` are filled from the live token_indicators row
+        when that value is non-null. Funding/sentiment/composite omit RSI/MACD/BOLL;
+        without this fill their rows stored NULL and same-second readers kept
+        the incomplete tick. Explicit None is preserved (the caller computed it).
+        """
         chain_id = norm_chain(row["chain_id"])
         token_address = norm_address(row["token_address"])
         recorded_at = row.get("recorded_at") or utc_now_iso()
+        payload = dict(row)
+        live = self.get_token_indicators(chain_id, token_address, use_cache=True) or {}
+        for col in _HISTORY_FILL_IF_ABSENT:
+            if col not in payload and live.get(col) is not None:
+                payload[col] = live[col]
         self._conn.execute(
             """
             INSERT INTO indicator_history (
@@ -516,34 +596,50 @@ class IndicatorStore:
                 chain_id,
                 token_address,
                 recorded_at,
-                row.get("change_5m"),
-                row.get("change_15m"),
-                row.get("change_1h"),
-                row.get("change_4h"),
-                row.get("change_24h"),
-                row.get("volatility_24h"),
-                row.get("volume_strength"),
-                row.get("rsi_14"),
-                row.get("macd"),
-                row.get("macd_signal"),
-                row.get("macd_hist"),
-                row.get("boll_upper"),
-                row.get("boll_mid"),
-                row.get("boll_lower"),
-                row.get("jev_score"),
-                row.get("jev_strength"),
-                row.get("sentiment_score"),
-                row.get("sentiment_mentions_1h"),
-                row.get("sentiment_heat_score"),
-                row.get("sentiment_polarity"),
-                row.get("spike_ratio"),
-                row.get("spike"),
-                row.get("composite_score"),
-                row.get("tier"),
-                row.get("primary_pair_address"),
+                payload.get("change_5m"),
+                payload.get("change_15m"),
+                payload.get("change_1h"),
+                payload.get("change_4h"),
+                payload.get("change_24h"),
+                payload.get("volatility_24h"),
+                payload.get("volume_strength"),
+                payload.get("rsi_14"),
+                payload.get("macd"),
+                payload.get("macd_signal"),
+                payload.get("macd_hist"),
+                payload.get("boll_upper"),
+                payload.get("boll_mid"),
+                payload.get("boll_lower"),
+                payload.get("jev_score"),
+                payload.get("jev_strength"),
+                payload.get("sentiment_score"),
+                payload.get("sentiment_mentions_1h"),
+                payload.get("sentiment_heat_score"),
+                payload.get("sentiment_polarity"),
+                payload.get("spike_ratio"),
+                payload.get("spike"),
+                payload.get("composite_score"),
+                payload.get("tier"),
+                payload.get("primary_pair_address"),
             ),
         )
         self._conn.commit()
+
+    def purge_old_indicator_history(self, retention_days: int) -> int:
+        """Delete indicator_history rows older than ``retention_days``.
+
+        Same cutoff shape as Store.purge_old_pair_history. ``retention_days``
+        is clamped to at least 1 so a zero/negative setting cannot wipe the table.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max(1, int(retention_days)))
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cur = self._conn.execute(
+            "DELETE FROM indicator_history WHERE recorded_at < ?",
+            (cutoff,),
+        )
+        self._conn.commit()
+        return int(cur.rowcount)
 
     def get_token_indicators(
         self, chain_id: str, token_address: str, *, use_cache: bool = True
@@ -616,6 +712,7 @@ class IndicatorStore:
     def get_indicator_updated_at(
         self, chain_id: str, token_address: str
     ) -> str | None:
+        """Shared row clock. Technical due-checks must use get_tech_updated_at."""
         row = self._conn.execute(
             """
             SELECT updated_at FROM token_indicators
@@ -624,3 +721,22 @@ class IndicatorStore:
             (norm_chain(chain_id), norm_address(token_address)),
         ).fetchone()
         return row["updated_at"] if row else None
+
+    def get_tech_updated_at(
+        self, chain_id: str, token_address: str
+    ) -> str | None:
+        """When RSI/MACD/BOLL (and the rest of the technical pass) were last recomputed.
+
+        NULL means technical has not completed a fresh pass. Callers must not
+        substitute updated_at — funding and sentiment bump that column every round.
+        """
+        row = self._conn.execute(
+            """
+            SELECT tech_updated_at FROM token_indicators
+            WHERE chain_id = ? AND token_address = ?
+            """,
+            (norm_chain(chain_id), norm_address(token_address)),
+        ).fetchone()
+        if not row:
+            return None
+        return row["tech_updated_at"]

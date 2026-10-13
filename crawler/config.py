@@ -252,6 +252,14 @@ INDICATORS_VOLATILITY_WINDOW_SEC = int(
 INDICATORS_WRITE_HISTORY_HOT = os.environ.get(
     "INDICATORS_WRITE_HISTORY_HOT", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
+# indicator_history retention. Default matches pair_history HISTORY_RETENTION_DAYS.
+# Purged from `indicators.run --loop` only; a purge error does not stop the loop.
+INDICATORS_HISTORY_RETENTION_DAYS = int(
+    os.environ.get(
+        "INDICATORS_HISTORY_RETENTION_DAYS",
+        str(HISTORY_RETENTION_DAYS),
+    )
+)
 # Composite weights — ALL default 0 so composite/scoring/alerts stay off.
 # Skeleton in indicators/composite.py only writes when sum(weights) > 0.
 INDICATORS_WEIGHT_TECHNICAL = float(os.environ.get("INDICATORS_WEIGHT_TECHNICAL", "0"))
