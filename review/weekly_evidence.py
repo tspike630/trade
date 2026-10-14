@@ -1,13 +1,15 @@
-"""10-19 weekly evidence from closed paper trades and execution exports.
+"""10-19 weekly evidence from paper closes and execution exports.
 
 Observation only. Does not change JEV gates, min_liq, cooldown, weights,
-or position-manager / circuit-breaker wiring.
+exit defaults, or circuit-breaker / PM wiring.
 
-Stop-loss loss share is the fraction of *negative* realized PnL that came
-from ``exit_reason=stop_loss``. F-1 matches the dashboard streak definition
-(``pnl_usd > 0`` is a win; anything else is a loss) when no ``streak_observe``
-export is present. Peak prices and ruin counts are reported only when the
-fields are actually stored.
+Stop-loss share matches dashboard / ``scripts.weekly_side_evidence``:
+``min(1, |Σ stop_loss pnl| / |net pnl|)`` when the book is net-negative.
+Daily opens use the Asia/Hong_Kong calendar on ``opened_at`` only.
+F-1 is two lines that are never combined: decision ``up_1h`` and the
+realized-PnL ledger from ``python -m execution.f1_streak_report``.
+C3 prefers ``order_events`` ``shadow_c3``, then the ``shadow_c3`` table.
+G-3 prefers a stored ruin count, then ``python -m execution.risk.bankruptcy``.
 """
 
 from __future__ import annotations
@@ -21,11 +23,21 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from execution.f1_streak_report import load_ledger_groups
+from execution.risk.bankruptcy import bankruptcy_report
+from execution.streak import summarize_groups
 from review.data import DbPaths, connect_ro, parse_ts, safe_float
 
 # Observation thresholds for the Step2 veto line. Not JEV validity gates.
+# Same cutoffs as scripts.weekly_side_evidence (PR #71). Do not import that
+# module's constants into review.gates.
 STOP_LOSS_SHARE_VETO = 0.50
 DAILY_OPEN_PEAK_VETO = 20
+STOP_LOSS_SHARE_FORMULA = (
+    "min(1, |Σ pnl where exit_reason=stop_loss| / |Σ pnl|) when net realized "
+    "PnL is negative and at least one stop_loss close exists; otherwise null. "
+    "Dashboard stop_loss_share. A net-positive book does not flag."
+)
 
 LABEL = "不算有效性 / R2旁证"
 
@@ -73,11 +85,13 @@ def compute_weekly_evidence(
     period_end: str,
     strategy_id: Optional[str] = None,
     export_roots: Optional[list[Path]] = None,
+    up_1h_rows: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Compute the 10-19 evidence block for one report window.
 
-    ``period_end`` is exclusive. Timestamps are interpreted as UTC and
-    bucketed onto the Asia/Hong_Kong calendar when a zone is available.
+    ``period_end`` is exclusive. Open timestamps are bucketed on the
+    Asia/Hong_Kong calendar. ``up_1h_rows`` are decision/signal rows
+    (``fwd_1h``); they are not mixed into the realized-PnL streak.
     """
     start = parse_ts(period_start)
     end = parse_ts(period_end)
@@ -86,16 +100,13 @@ def compute_weekly_evidence(
     )
     exports = _load_exports(paths.execution, export_roots or [])
     stop = _stop_loss_share(closes)
-    daily = _daily_open_peak(
-        paths,
-        opens,
-        schema,
-        start,
-        end,
+    daily = _daily_open_peak(opens, schema)
+    streak = _f1_lines(
+        up_1h_rows or [],
+        paths.execution,
         strategy_id=strategy_id,
     )
-    streak = _f1_streak(closes, exports, strategy_id=strategy_id)
-    shadow = _c3_shadow(closes, schema)
+    shadow = _c3_shadow(paths.execution)
     ruin = _g3_ruin(exports)
     veto = _step2_veto(stop, daily)
     return {
@@ -294,12 +305,24 @@ def _field_from_row(
 
 
 def _stop_loss_share(closes: list[_Close]) -> dict[str, Any]:
-    negative = [row for row in closes if row.pnl_usd is not None and row.pnl_usd < 0]
-    neg_sum = sum(row.pnl_usd or 0.0 for row in negative)
-    sl_neg = [row for row in negative if row.exit_reason == "stop_loss"]
-    sl_sum = sum(row.pnl_usd or 0.0 for row in sl_neg)
-    share = (sl_sum / neg_sum) if neg_sum < 0 else None
-    stops = [row for row in closes if row.exit_reason == "stop_loss" and row.pnl_usd is not None]
+    """Dashboard / decision PR #71 share. Null unless the book is net-negative."""
+    total = 0.0
+    stop_net = 0.0
+    n_pnl = 0
+    saw_stop = False
+    stops: list[_Close] = []
+    for row in closes:
+        if row.pnl_usd is None:
+            continue
+        n_pnl += 1
+        total += row.pnl_usd
+        if row.exit_reason == "stop_loss":
+            stop_net += row.pnl_usd
+            saw_stop = True
+            stops.append(row)
+    share: Optional[float] = None
+    if saw_stop and total < 0 and abs(total) > 1e-9:
+        share = min(1.0, abs(stop_net) / abs(total))
     worst: Optional[dict[str, Any]] = None
     if stops:
         worst_row = min(stops, key=lambda row: (row.pnl_usd or 0.0, row.closed_at, row.position_id))
@@ -314,34 +337,24 @@ def _stop_loss_share(closes: list[_Close]) -> dict[str, Any]:
     if not closes:
         note = "no closed paper trades in window"
     elif share is None:
-        note = "no negative realized pnl"
+        note = "net realized pnl is not negative, or no stop_loss close"
     return {
-        "n_closed": len(closes),
-        "n_negative": len(negative),
-        "negative_pnl_usd": neg_sum if negative else None,
-        "stop_loss_negative_pnl_usd": sl_sum if sl_neg else (0.0 if negative else None),
+        "n_closed": n_pnl,
+        "total_pnl_usd": total if n_pnl else None,
+        "stop_loss_pnl_usd": stop_net if saw_stop else None,
         "loss_share": share,
         "worst_stop": worst,
-        "definition": (
-            "abs(sum of pnl<0 on exit_reason=stop_loss) / abs(sum of all pnl<0)"
-        ),
+        "definition": STOP_LOSS_SHARE_FORMULA,
         "note": note,
     }
 
 
 def _daily_open_peak(
-    paths: DbPaths,
     opens: list[tuple[str, str]],
     schema: dict[str, bool],
-    start: datetime,
-    end: datetime,
-    *,
-    strategy_id: Optional[str],
 ) -> dict[str, Any]:
-    if schema.get("paper_ok") and schema.get("has_opened_at"):
-        return _peak_from_days(opens, source="paper.positions.opened_at")
-    executed = _executed_entries(paths.execution, start, end, strategy_id=strategy_id)
-    if executed is None:
+    """Peak opens on one Asia/Hong_Kong date. Source is ``opened_at`` only."""
+    if not (schema.get("paper_ok") and schema.get("has_opened_at")):
         return {
             "source": "data_gap",
             "peak": None,
@@ -349,14 +362,9 @@ def _daily_open_peak(
             "tz": HK_TZ_NAME,
             "n_opens": None,
             "by_day": {},
-            "note": "paper opened_at missing and execution executed entries unavailable",
+            "note": "opened_at missing; daily opens are not counted from a UTC date prefix",
         }
-    payload = _peak_from_days(executed, source="execution_log.executed")
-    if not schema.get("paper_ok"):
-        payload["note"] = "paper db unread; counted executed entries"
-    else:
-        payload["note"] = "opened_at column missing; counted executed entries"
-    return payload
+    return _peak_from_days(opens, source="paper.positions.opened_at")
 
 
 def _peak_from_days(pairs: list[tuple[str, str]], *, source: str) -> dict[str, Any]:
@@ -373,11 +381,11 @@ def _peak_from_days(pairs: list[tuple[str, str]], *, source: str) -> dict[str, A
             "by_day": {},
             "note": None,
         }
-    peak = max(by_day.values())
-    peak_day = min(day for day, count in by_day.items() if count == peak)
+    # Same tie-break as scripts.weekly_side_evidence.max_daily_opens: later day wins.
+    peak_day = max(by_day, key=lambda day: (by_day[day], day))
     return {
         "source": source,
-        "peak": peak,
+        "peak": by_day[peak_day],
         "peak_day": peak_day,
         "tz": HK_TZ_NAME,
         "n_opens": sum(by_day.values()),
@@ -386,210 +394,147 @@ def _peak_from_days(pairs: list[tuple[str, str]], *, source: str) -> dict[str, A
     }
 
 
-def _executed_entries(
-    path: str,
-    start: datetime,
-    end: datetime,
+def _f1_lines(
+    up_1h_rows: list[dict[str, Any]],
+    execution_path: str,
     *,
     strategy_id: Optional[str],
-) -> Optional[list[tuple[str, str]]]:
-    try:
-        conn = connect_ro(path)
-    except (FileNotFoundError, sqlite3.Error):
-        return None
-    try:
-        if "execution_log" not in _table_names(conn):
-            return None
-        cols = _columns(conn, "execution_log")
-        if "ts" not in cols or "executed" not in cols:
-            return None
-        selected = ["ts", "executed"]
-        if "strategy_id" in cols:
-            selected.append("strategy_id")
-        rows = conn.execute(
-            f"SELECT {', '.join(selected)} FROM execution_log WHERE executed = 1"
-        ).fetchall()
-    except sqlite3.Error:
-        return None
-    finally:
-        conn.close()
-    out: list[tuple[str, str]] = []
-    for row in rows:
-        ts = str(row["ts"] or "")
-        if not _in_window(ts, start, end):
-            continue
-        sid = "(unknown)"
-        if "strategy_id" in row.keys() and row["strategy_id"]:
-            sid = str(row["strategy_id"])
-        if strategy_id and sid != strategy_id:
-            continue
-        day = _hk_day(ts)
-        if day:
-            out.append((day, sid))
-    return out
-
-
-def _is_loss(pnl: Optional[float]) -> bool:
-    """Dashboard F-1: a win is pnl_usd > 0. Zero and missing count as losses."""
-    return not (pnl is not None and pnl > 0)
-
-
-def _streak_from_pnls(pnls: list[Optional[float]]) -> dict[str, Any]:
-    bits = [0 if _is_loss(pnl) else 1 for pnl in pnls]
-    after: list[int] = []
-    for index in range(len(bits) - 2):
-        if bits[index] == 0 and bits[index + 1] == 0:
-            after.append(bits[index + 2])
-    n_third = sum(1 for bit in after if bit == 0)
-    n_given = len(after)
+) -> dict[str, Any]:
+    """Two F-1 lines. No combined P(3|2)."""
     return {
-        "n_closed": len(pnls),
-        "n_given_two_loss": n_given,
-        "n_third_loss": n_third,
-        "p_third_loss_given_two_loss": (n_third / n_given) if n_given else None,
+        "up_1h": _f1_up_1h(up_1h_rows, strategy_id=strategy_id),
+        "realized_pnl": _f1_realized(execution_path, strategy_id=strategy_id),
     }
 
 
-def _close_sort_key(row: _Close) -> tuple[datetime, str]:
-    try:
-        closed = parse_ts(row.closed_at)
-    except (TypeError, ValueError):
-        closed = datetime.min.replace(tzinfo=timezone.utc)
-    return closed, row.position_id
+def _sid_text(value: Any) -> str:
+    text = str(value or "").strip()
+    return text or "(unknown)"
 
 
-def _f1_from_closes(closes: list[_Close]) -> dict[str, Any]:
-    grouped: dict[str, list[_Close]] = {}
-    for row in closes:
-        grouped.setdefault(row.strategy_id, []).append(row)
-    by_strategy: dict[str, Any] = {}
-    for sid, rows in sorted(grouped.items()):
-        ordered = sorted(rows, key=_close_sort_key)
-        by_strategy[sid] = _streak_from_pnls([row.pnl_usd for row in ordered])
+def _up_1h_flag(row: dict[str, Any]) -> Optional[bool]:
+    """Decision loss on ``fwd_1h`` only. Flat 0 is not a loss. Missing breaks the streak."""
+    if "fwd_1h" not in row or row.get("fwd_1h") is None:
+        return None
+    value = safe_float(row.get("fwd_1h"))
+    if value is None:
+        return None
+    return value < 0
+
+
+def _decision_streak(flags: list[Optional[bool]]) -> dict[str, Any]:
+    """Match ``scripts.weekly_side_evidence.streak_stats`` without mixing in realized pnl."""
+    max_streak = 0
+    current = 0
+    trials = 0
+    third_losses = 0
+    for index, flag in enumerate(flags):
+        if flag is None:
+            current = 0
+            continue
+        if flag:
+            current += 1
+            if current > max_streak:
+                max_streak = current
+        else:
+            current = 0
+        if index >= 2 and flags[index - 2] is True and flags[index - 1] is True:
+            trials += 1
+            if flag:
+                third_losses += 1
     return {
-        "source": "closed_trades",
-        "note": "no streak_observe export; pnl>0 is a win, else a loss (dashboard F-1)",
+        "n_closed": len(flags),
+        "n_resolved": sum(1 for flag in flags if flag is not None),
+        "n_given_two_loss": trials,
+        "n_third_loss": third_losses,
+        "p_third_loss_given_two_loss": (third_losses / trials) if trials else None,
+        "max_streak": max_streak,
+    }
+
+
+def _f1_up_1h(
+    rows: list[dict[str, Any]],
+    *,
+    strategy_id: Optional[str],
+) -> dict[str, Any]:
+    scoped = [
+        row
+        for row in rows
+        if isinstance(row, dict) and (strategy_id is None or _sid_text(row.get("strategy_id")) == strategy_id)
+    ]
+    resolved = any(_up_1h_flag(row) is not None for row in scoped)
+    if not resolved:
+        return {
+            "status": "data_gap",
+            "source": "decision_up_1h",
+            "note": "up_1h unavailable",
+            "by_strategy": {},
+        }
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in scoped:
+        grouped.setdefault(_sid_text(row.get("strategy_id")), []).append(row)
+    by_strategy: dict[str, Any] = {}
+    for sid in sorted(grouped):
+        ordered = sorted(
+            grouped[sid],
+            key=lambda row: (
+                str(row.get("ts") or ""),
+                row.get("decision_id") if isinstance(row.get("decision_id"), int) else 0,
+                str(row.get("decision_id") or ""),
+            ),
+        )
+        by_strategy[sid] = _decision_streak([_up_1h_flag(row) for row in ordered])
+    return {
+        "status": "ok",
+        "source": "decision_up_1h",
+        "note": (
+            "up_1h<0 is a loss; flat 0 is not a loss; missing fwd_1h breaks the streak. "
+            "Realized pnl is not mixed into this line."
+        ),
         "by_strategy": by_strategy,
     }
 
 
-def _f1_streak(
-    closes: list[_Close],
-    exports: list[dict[str, Any]],
-    *,
-    strategy_id: Optional[str],
-) -> dict[str, Any]:
-    stats_payloads: list[tuple[str, dict[str, Any]]] = []
-    event_rows: list[dict[str, Any]] = []
-    for item in exports:
-        for payload in _streak_payloads(item["obj"]):
-            kind, body = _classify_streak(payload)
-            if kind == "stats" and isinstance(body, dict):
-                stats_payloads.append((str(item.get("sort") or ""), body))
-            elif kind == "events" and isinstance(body, list):
-                event_rows.extend(body)
-    if stats_payloads:
-        _sort_key, stats = max(stats_payloads, key=lambda pair: pair[0])
-        if strategy_id:
-            stats = {sid: row for sid, row in stats.items() if sid == strategy_id}
-        return {
-            "source": "streak_observe",
-            "note": "read from execution/dashboard export or order event",
-            "by_strategy": stats,
-        }
-    if event_rows:
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for row in event_rows:
-            sid = str(row.get("strategy_id") or "(unknown)")
-            if strategy_id and sid != strategy_id:
-                continue
-            grouped.setdefault(sid, []).append(row)
-        by_strategy = {}
-        for sid, rows in sorted(grouped.items()):
-            ordered = sorted(rows, key=lambda row: (str(row.get("closed_at") or row.get("ts") or ""), str(row.get("position_id") or "")))
-            pnls = [_event_pnl(row) for row in ordered]
-            by_strategy[sid] = _streak_from_pnls(pnls)
-        return {
-            "source": "streak_observe",
-            "note": "computed from streak_observe trade rows",
-            "by_strategy": by_strategy,
-        }
-    computed = _f1_from_closes(closes)
-    if strategy_id:
-        computed["by_strategy"] = {
-            sid: row
-            for sid, row in computed["by_strategy"].items()
-            if sid == strategy_id
-        }
-    return computed
-
-
-def _event_pnl(row: dict[str, Any]) -> Optional[float]:
-    if "is_loss" in row and "pnl_usd" not in row:
-        return -1.0 if bool(row.get("is_loss")) else 1.0
-    return safe_float(row.get("pnl_usd"))
-
-
-def _classify_streak(payload: Any) -> tuple[str, Any]:
-    if isinstance(payload, dict) and isinstance(payload.get("by_strategy"), dict):
-        payload = payload["by_strategy"]
-    if isinstance(payload, list):
-        if payload and all(isinstance(item, dict) for item in payload):
-            if any("pnl_usd" in item or "is_loss" in item for item in payload):
-                return "events", payload
-            stats: dict[str, Any] = {}
-            for item in payload:
-                sid = str(item.get("strategy_id") or "").strip()
-                if sid:
-                    stats[sid] = _normalize_streak_stat(item)
-            if stats:
-                return "stats", stats
-        return "none", None
-    if isinstance(payload, dict):
-        stats = {}
-        for sid, item in payload.items():
-            if sid in {"source", "note", "as_of", "ts"}:
-                continue
-            if isinstance(item, dict):
-                stats[str(sid)] = _normalize_streak_stat(item)
-        if stats:
-            return "stats", stats
-    return "none", None
-
-
-def _normalize_streak_stat(item: dict[str, Any]) -> dict[str, Any]:
-    n_given = _first_num(item, ("n_given_two_loss", "cond_n", "n_opportunities", "n"))
-    n_third = _first_num(item, ("n_third_loss", "third_losses"))
-    prob = _first_num(
-        item,
-        ("p_third_loss_given_two_loss", "cond_third_loss_rate", "p", "probability"),
-    )
-    n_closed = _first_num(item, ("n_closed", "closed"))
-    n_given_i = int(n_given) if n_given is not None else None
-    n_third_i = int(n_third) if n_third is not None else None
-    if prob is None and n_given_i and n_third_i is not None and n_given_i > 0:
-        prob = n_third_i / n_given_i
-    return {
-        "n_closed": int(n_closed) if n_closed is not None else None,
-        "n_given_two_loss": n_given_i,
-        "n_third_loss": n_third_i,
-        "p_third_loss_given_two_loss": prob,
+def _f1_realized(execution_path: str, *, strategy_id: Optional[str]) -> dict[str, Any]:
+    """``streak_events`` via ``load_ledger_groups``. Empty ledger is a data gap, not a paper replay."""
+    gap = {
+        "status": "data_gap",
+        "source": "execution.f1_streak_report",
+        "note": "streak_events missing or empty; realized PnL is not replayed from paper closes or up_1h",
+        "by_strategy": {},
     }
-
-
-def _first_num(item: dict[str, Any], keys: tuple[str, ...]) -> Optional[float]:
-    for key in keys:
-        if key in item:
-            return safe_float(item.get(key))
-    return None
-
-
-def _streak_payloads(obj: Any) -> list[Any]:
-    found: list[Any] = []
-    for blob in _iter_dicts(obj):
-        if "streak_observe" in blob:
-            found.append(blob["streak_observe"])
-    return found
+    try:
+        groups = load_ledger_groups(Path(execution_path))
+    except sqlite3.Error:
+        return gap
+    if not groups:
+        return gap
+    if strategy_id:
+        groups = {sid: pnls for sid, pnls in groups.items() if sid == strategy_id}
+        if not groups:
+            gap["note"] = f"no streak_events for strategy_id={strategy_id}"
+            return gap
+    summary = summarize_groups(groups)
+    by_strategy: dict[str, Any] = {}
+    for row in summary["by_strategy"]:
+        by_strategy[str(row["strategy_id"])] = {
+            "n_closed": row["n"],
+            "n_resolved": row["n"],
+            "n_given_two_loss": row["cond_n"],
+            "n_third_loss": row["cond_hits"],
+            "p_third_loss_given_two_loss": row["p_third_loss_given_streak_ge2"],
+            "max_streak": row["max_streak"],
+        }
+    return {
+        "status": "ok",
+        "source": "execution.f1_streak_report",
+        "note": (
+            "streak_events in id order, same as python -m execution.f1_streak_report. "
+            "pnl<0 is a loss; pnl==0 neither extends nor clears the streak and is not a third-loss hit. "
+            "Per strategy only; the pooled micro-average is not reported."
+        ),
+        "by_strategy": by_strategy,
+    }
 
 
 def _iter_dicts(obj: Any, depth: int = 0) -> Iterator[dict[str, Any]]:
@@ -605,80 +550,140 @@ def _iter_dicts(obj: Any, depth: int = 0) -> Iterator[dict[str, Any]]:
             yield from _iter_dicts(item, depth + 1)
 
 
-def _peak_mfe_usd(row: _Close) -> Optional[float]:
-    if row.peak_price is None or row.entry_price is None or row.entry_price <= 0:
-        return None
-    if row.size_usd is not None:
-        return (row.peak_price - row.entry_price) / row.entry_price * row.size_usd
-    if row.qty is not None:
-        return (row.peak_price - row.entry_price) * row.qty
-    return None
-
-
-def _giveback_usd(row: _Close, mfe: Optional[float]) -> Optional[float]:
-    if row.giveback_usd is not None:
-        return row.giveback_usd
-    if mfe is not None and row.pnl_usd is not None:
-        return mfe - row.pnl_usd
-    return None
-
-
-def _cohort(rows: list[_Close]) -> dict[str, Any]:
-    mfes: list[float] = []
-    pnls: list[float] = []
-    givebacks: list[float] = []
-    for row in rows:
-        mfe = _peak_mfe_usd(row)
-        if mfe is not None:
-            mfes.append(mfe)
-        if row.pnl_usd is not None:
-            pnls.append(row.pnl_usd)
-        giveback = _giveback_usd(row, mfe)
-        if giveback is not None and (row.giveback_usd is not None or mfe is not None):
-            givebacks.append(giveback)
+def _c3_shadow(execution_path: str) -> dict[str, Any]:
+    """Prefer ``order_events`` shadow_c3, else the ``shadow_c3`` table. Never invent peaks."""
+    event_rows = _c3_from_order_events(execution_path)
+    if event_rows:
+        return _c3_payload(event_rows, source="order_events.shadow_c3")
+    table_rows = _c3_from_table(execution_path)
+    if table_rows:
+        return _c3_payload(
+            table_rows,
+            source="shadow_c3",
+            note="order_events has no shadow_c3; read the shadow_c3 table",
+        )
     return {
-        "n": len(rows),
-        "n_with_peak_mfe": len(mfes),
-        "n_with_giveback": len(givebacks),
-        "peak_mfe_usd_sum": sum(mfes) if mfes else None,
-        "exit_pnl_usd_sum": sum(pnls) if pnls else None,
-        "giveback_usd_sum": sum(givebacks) if givebacks else None,
+        "status": "data_gap",
+        "source": None,
+        "note": (
+            "order_events shadow_c3 and the shadow_c3 table are empty; "
+            "peaks not invented from paper closes"
+        ),
+        "n_rows": 0,
+        "all": None,
+        "max_hold": None,
     }
 
 
-def _c3_shadow(closes: list[_Close], schema: dict[str, bool]) -> dict[str, Any]:
-    usable = [
-        row
-        for row in closes
-        if _peak_mfe_usd(row) is not None or row.giveback_usd is not None
-    ]
-    present = bool(schema.get("peak_field_present") or schema.get("giveback_field_present"))
-    if not usable:
-        if present:
-            note = "peak_price / shadow giveback present but empty; peaks not invented"
-        else:
-            note = "peak_price / shadow giveback fields missing on closes; peaks not invented"
-        return {
-            "status": "data_gap",
-            "note": note,
-            "n_closed": len(closes),
-            "all": None,
-            "max_hold": None,
-        }
-    max_hold = [row for row in usable if row.exit_reason == "max_hold"]
-    basis = "shadow_field" if any(row.giveback_usd is not None for row in usable) else "peak_mfe_minus_exit_pnl"
-    if any(row.giveback_usd is not None for row in usable) and any(
-        row.peak_price is not None and row.giveback_usd is None for row in usable
-    ):
-        basis = "mixed"
+def _looks_like_shadow(item: dict[str, Any]) -> bool:
+    return any(key in item for key in ("peak_pnl_pct", "giveback_from_peak_pct", "actual_pnl_usd"))
+
+
+def _shadow_rows_from_obj(obj: Any, *, event: str) -> list[dict[str, Any]]:
+    if isinstance(obj, list):
+        found: list[dict[str, Any]] = []
+        for item in obj:
+            found.extend(_shadow_rows_from_obj(item, event=event))
+        return found
+    if not isinstance(obj, dict):
+        return []
+    nested = obj.get("shadow_c3")
+    if isinstance(nested, list):
+        return [item for item in nested if isinstance(item, dict) and _looks_like_shadow(item)]
+    if isinstance(nested, dict) and _looks_like_shadow(nested):
+        return [nested]
+    if event == "shadow_c3" and _looks_like_shadow(obj):
+        return [obj]
+    return []
+
+
+def _c3_from_order_events(path: str) -> list[dict[str, Any]]:
+    try:
+        conn = connect_ro(path)
+    except (FileNotFoundError, sqlite3.Error):
+        return []
+    try:
+        if "order_events" not in _table_names(conn):
+            return []
+        cols = _columns(conn, "order_events")
+        if "detail_json" not in cols:
+            return []
+        has_event = "event" in cols
+        selected = "event, detail_json" if has_event else "detail_json"
+        where = (
+            "detail_json LIKE '%shadow_c3%' "
+            "OR detail_json LIKE '%giveback_from_peak_pct%' "
+            "OR detail_json LIKE '%peak_pnl_pct%'"
+        )
+        if has_event:
+            where = f"event = 'shadow_c3' OR ({where})"
+        try:
+            rows = conn.execute(f"SELECT {selected} FROM order_events WHERE {where}").fetchall()
+        except sqlite3.Error:
+            return []
+    finally:
+        conn.close()
+    found: list[dict[str, Any]] = []
+    for row in rows:
+        event = str(row["event"]) if has_event and row["event"] is not None else ""
+        found.extend(_shadow_rows_from_obj(_maybe_json(row["detail_json"]), event=event))
+    return found
+
+
+def _c3_from_table(path: str) -> list[dict[str, Any]]:
+    try:
+        conn = connect_ro(path)
+    except (FileNotFoundError, sqlite3.Error):
+        return []
+    try:
+        if "shadow_c3" not in _table_names(conn):
+            return []
+        try:
+            rows = conn.execute(
+                """
+                SELECT strategy_id, peak_pnl_pct, giveback_from_peak_pct,
+                       actual_pnl_usd, actual_reason
+                FROM shadow_c3
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def _mean_key(rows: list[dict[str, Any]], key: str) -> Optional[float]:
+    values = [value for value in (safe_float(row.get(key)) for row in rows) if value is not None]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _c3_cohort(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "n": len(rows),
+        "mean_peak_pnl_pct": _mean_key(rows, "peak_pnl_pct"),
+        "mean_giveback_from_peak_pct": _mean_key(rows, "giveback_from_peak_pct"),
+        "mean_actual_pnl_usd": _mean_key(rows, "actual_pnl_usd"),
+    }
+
+
+def _c3_payload(
+    rows: list[dict[str, Any]],
+    *,
+    source: str,
+    note: Optional[str] = None,
+) -> dict[str, Any]:
+    hold = [row for row in rows if str(row.get("actual_reason") or "") == "max_hold"]
     return {
         "status": "ok",
-        "note": None,
-        "giveback_basis": basis,
-        "n_closed": len(closes),
-        "n_with_shadow": len(usable),
-        "all": _cohort(usable),
-        "max_hold": _cohort(max_hold),
+        "source": source,
+        "note": note,
+        "n_rows": len(rows),
+        "all": _c3_cohort(rows),
+        "max_hold": _c3_cohort(hold),
     }
 
 
@@ -691,29 +696,57 @@ def _g3_ruin(exports: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
             found.append((str(item.get("sort") or ""), ruin, str(item.get("source") or "")))
             break
-    if not found:
+    if found:
+        _sort_key, ruin, source = max(found, key=lambda item: (item[0], item[2]))
+        return {
+            "status": "ok",
+            "kind": "export",
+            "ruin_count": ruin,
+            "source": source,
+            "n_observations": len(found),
+            "formula": "floor(cash/per_trade_risk)",
+            "note": None,
+            "line": f"G-3 ruin count: floor(cash/per_trade_risk)={ruin}（{source}）",
+        }
+    return _g3_cli()
+
+
+def _g3_cli() -> dict[str, Any]:
+    """Theoretical CLI defaults. Not an observed book count, and not a changed risk gate."""
+    try:
+        row = bankruptcy_report()
+    except (TypeError, ValueError):
         return {
             "status": "data_gap",
+            "kind": "data_gap",
             "ruin_count": None,
             "source": None,
             "n_observations": 0,
-            "note": "execution export floor(cash/per_trade_risk) not present",
-            "line": "G-3 ruin count: data gap — execution 未导出 floor(cash/per_trade_risk)",
+            "note": "execution.risk.bankruptcy report failed",
+            "line": "G-3 ruin count: data gap — bankruptcy CLI failed",
         }
-    _sort_key, ruin, source = max(found, key=lambda item: (item[0], item[2]))
+    ruin = int(row["max_sequential_losses"])
     return {
         "status": "ok",
+        "kind": "cli_defaults",
         "ruin_count": ruin,
-        "source": source,
-        "n_observations": len(found),
-        "formula": "floor(cash/per_trade_risk)",
-        "note": None,
-        "line": f"G-3 ruin count: floor(cash/per_trade_risk)={ruin}（{source}）",
+        "source": "execution.risk.bankruptcy",
+        "n_observations": 0,
+        "formula": "floor(capital/per_trade_risk); per_trade_risk=size_usd*(sl_pct/100)",
+        "capital": row["capital"],
+        "size_usd": row["size_usd"],
+        "sl_pct": row["sl_pct"],
+        "per_trade_risk": row["per_trade_risk"],
+        "note": "theoretical CLI defaults, not an observed book count",
+        "line": (
+            f"G-3 ruin count: floor(capital/per_trade_risk)={ruin} "
+            f"（execution.risk.bankruptcy CLI defaults; not an observed book）"
+        ),
     }
 
 
 def _ruin_from_dict(blob: dict[str, Any]) -> Optional[int]:
-    for key in ("floor_cash_per_trade_risk", "g3_ruin_count"):
+    for key in ("max_sequential_losses", "floor_cash_per_trade_risk", "g3_ruin_count"):
         if key in blob:
             value = safe_float(blob.get(key))
             if value is not None:
@@ -818,7 +851,8 @@ def _load_execution_blobs(path: str) -> list[dict[str, Any]]:
                         "WHERE detail_json LIKE '%streak_observe%' "
                         "OR detail_json LIKE '%per_trade_risk%' "
                         "OR detail_json LIKE '%floor_cash_per_trade_risk%' "
-                        "OR detail_json LIKE '%g3_ruin_count%'"
+                        "OR detail_json LIKE '%g3_ruin_count%' "
+                        "OR detail_json LIKE '%max_sequential_losses%'"
                     ).fetchall()
                 except sqlite3.Error:
                     rows = []
@@ -845,7 +879,8 @@ def _load_execution_blobs(path: str) -> list[dict[str, Any]]:
                         "WHERE receipt_json LIKE '%streak_observe%' "
                         "OR receipt_json LIKE '%per_trade_risk%' "
                         "OR receipt_json LIKE '%floor_cash_per_trade_risk%' "
-                        "OR receipt_json LIKE '%g3_ruin_count%'"
+                        "OR receipt_json LIKE '%g3_ruin_count%' "
+                        "OR receipt_json LIKE '%max_sequential_losses%'"
                     ).fetchall()
                 except sqlite3.Error:
                     rows = []
@@ -891,6 +926,7 @@ def _load_export_files(roots: list[Path]) -> list[dict[str, Any]]:
                     "per_trade_risk",
                     "floor_cash_per_trade_risk",
                     "g3_ruin_count",
+                    "max_sequential_losses",
                 )
             ):
                 continue

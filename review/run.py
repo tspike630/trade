@@ -256,12 +256,22 @@ def main(argv: Optional[list[str]] = None) -> int:
             jev_metrics = {k: v for k, v in jev_metrics.items() if k != "by_strategy"}
         attr = signal_attribution(chain, baseline=baseline)
         fill_attr = fill_attribution(chain)
+        up_1h_rows = [
+            {
+                "strategy_id": row.strategy_id,
+                "ts": row.ts,
+                "decision_id": row.decision_id,
+                "fwd_1h": row.fwd_1h,
+            }
+            for row in chain
+        ]
         weekly_evidence = compute_weekly_evidence(
             paths,
             period_start=period_start,
             period_end=period_end,
             strategy_id=args.strategy,
             export_roots=_evidence_export_roots(db_root),
+            up_1h_rows=up_1h_rows,
         )
         fill_attr["evidence_1019"] = weekly_evidence
         bt_summary = load_backtest_summary(paths)
@@ -289,9 +299,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     ev_stop = (weekly_evidence.get("stop_loss") or {}).get("loss_share")
     ev_peak = (weekly_evidence.get("daily_open_peak") or {}).get("peak")
     ev_veto = (weekly_evidence.get("step2_veto") or {}).get("triggered")
+    f1 = weekly_evidence.get("f1_streak") or {}
+    f1_up = (f1.get("up_1h") or {}).get("status")
+    f1_realized = (f1.get("realized_pnl") or {}).get("status")
     print(
         f"evidence_1019: stop_loss_loss_share={ev_stop} "
-        f"daily_open_peak={ev_peak} step2_veto={ev_veto}"
+        f"daily_open_peak={ev_peak} step2_veto={ev_veto} "
+        f"f1_up_1h={f1_up} f1_realized={f1_realized}"
     )
 
     opt_result = None

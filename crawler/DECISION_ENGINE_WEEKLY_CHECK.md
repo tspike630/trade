@@ -157,11 +157,11 @@ Foresight Arena 的功效量级（已结算二元预测；相对市场共识的 
 
 | 交付 | 怎么算 |
 |------|--------|
-| 止损亏损占比 | 已平仓负已实现 PnL 里 `stop_loss` 的占比，并列最差一笔止损 |
-| 单日开仓峰值 | 窗口内香港日历日的开仓数峰值（没有 `opened_at` 时用 executed entries） |
-| F-1 | 有 `streak_observe`（execution/dashboard 导出或 order events）则读；否则按策略、平仓时间算 P(第3笔亏 \| 连亏2笔) |
-| C3 shadow | 平仓上有 `peak_price` / giveback 才报 peak MFE、出场 PnL、`max_hold` cohort；没有就 data gap，不编峰值 |
-| G-3 | execution 导出了 `floor(cash/per_trade_risk)` 才记一行；否则 data gap |
+| 止损亏损占比 | 与看板相同：净已实现 PnL 为负且有 `stop_loss` 时 `min(1, \|Σ stop_loss pnl\| / \|Σ pnl\|)`，并列最差一笔止损。净正或无止损则为空 |
+| 单日开仓峰值 | 只按 `opened_at` 的 Asia/Hong_Kong 日历日。没有 `opened_at` 记 data gap，不用 UTC 日期前缀，也不用 executed entries |
+| F-1（两行，不合并） | (a) 有 `up_1h` 时 `up_1h<0` 为亏，0 不是亏，缺失打断连亏；(b) `python -m execution.f1_streak_report` 的 `streak_events`，`pnl<0` 为亏。各自的 P，不合成一个数 |
+| C3 shadow | 优先 `order_events` 的 `shadow_c3`；否则 `shadow_c3` 表（peak / giveback / actual exit，含 `max_hold`）。都没有则 data gap，不从纸面 peak 编造 |
+| G-3 | 有 `max_sequential_losses` 或 `floor(cash/per_trade_risk)` 导出则用该数；否则 `python -m execution.risk.bankruptcy` 的默认理论值（不是账本观察） |
 | Step2 veto 旁证 | 止损占比≥50% 或单日开仓≥20 时写明：即使 1h≥55% 也不据此启动 Step2 |
 
 ## 背景（保留）

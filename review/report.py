@@ -105,6 +105,34 @@ def _render_dim_table(dim_name: str, dim: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _render_f1_line(title: str, block: dict[str, Any]) -> list[str]:
+    """One F-1 line. The two lines are rendered separately and never averaged."""
+    source = block.get("source")
+    note = f" {block.get('note')}" if block.get("note") else ""
+    by_strategy = block.get("by_strategy") or {}
+    if block.get("status") != "ok" or not by_strategy:
+        return [
+            f"- **{title}：** data gap — {block.get('note') or 'unavailable'}"
+            f"（source=`{source}`）。"
+        ]
+    lines = [
+        f"- **{title}** P(第3笔亏 | 连亏2笔)，source=`{source}`。{note}",
+        "",
+        "| strategy_id | n | resolved | 条件样本 | 第3笔仍亏 | P |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for sid, row in by_strategy.items():
+        lines.append(
+            f"| `{sid}` | {row.get('n_closed') if row.get('n_closed') is not None else '—'} | "
+            f"{row.get('n_resolved') if row.get('n_resolved') is not None else '—'} | "
+            f"{row.get('n_given_two_loss') if row.get('n_given_two_loss') is not None else '—'} | "
+            f"{row.get('n_third_loss') if row.get('n_third_loss') is not None else '—'} | "
+            f"{_pct(row.get('p_third_loss_given_two_loss'))} |"
+        )
+    lines.append("")
+    return lines
+
+
 def _render_weekly_evidence(evidence: Optional[dict[str, Any]]) -> list[str]:
     """10-19 hard evidence. None keeps older reports unchanged."""
     if not evidence:
@@ -128,8 +156,8 @@ def _render_weekly_evidence(evidence: Optional[dict[str, Any]]) -> list[str]:
         )
     lines.append(
         f"- **止损亏损占比：** {_pct(share) if isinstance(share, (int, float)) else '—'} "
-        f"（负已实现 PnL {_num(stop.get('negative_pnl_usd'))}，"
-        f"其中 stop_loss {_num(stop.get('stop_loss_negative_pnl_usd'))}；"
+        f"（净已实现 PnL {_num(stop.get('total_pnl_usd'))}，"
+        f"stop_loss 净额 {_num(stop.get('stop_loss_pnl_usd'))}；"
         f"n_closed={stop.get('n_closed', 0)}）。最差止损：{worst_bit}。"
         + (f" {stop.get('note')}" if stop.get("note") else "")
     )
@@ -141,28 +169,18 @@ def _render_weekly_evidence(evidence: Optional[dict[str, Any]]) -> list[str]:
         + (f" {daily.get('note')}" if daily.get("note") else "")
     )
     streak = evidence.get("f1_streak") or {}
-    by_strategy = streak.get("by_strategy") or {}
-    if not by_strategy:
-        lines.append(
-            f"- **F-1：** 无策略样本（source=`{streak.get('source')}`）。"
-            + (f" {streak.get('note')}" if streak.get("note") else "")
+    lines.extend(
+        _render_f1_line(
+            "F-1（a）up_1h / 决策口径",
+            streak.get("up_1h") if isinstance(streak.get("up_1h"), dict) else {},
         )
-    else:
-        lines.append(
-            f"- **F-1** P(第3笔亏 | 连亏2笔)，source=`{streak.get('source')}`。"
-            + (f" {streak.get('note')}" if streak.get("note") else "")
+    )
+    lines.extend(
+        _render_f1_line(
+            "F-1（b）已实现 PnL",
+            streak.get("realized_pnl") if isinstance(streak.get("realized_pnl"), dict) else {},
         )
-        lines.append("")
-        lines.append("| strategy_id | n_closed | 条件样本 | 第3笔仍亏 | P |")
-        lines.append("|---|---:|---:|---:|---:|")
-        for sid, row in by_strategy.items():
-            lines.append(
-                f"| `{sid}` | {row.get('n_closed') if row.get('n_closed') is not None else '—'} | "
-                f"{row.get('n_given_two_loss') if row.get('n_given_two_loss') is not None else '—'} | "
-                f"{row.get('n_third_loss') if row.get('n_third_loss') is not None else '—'} | "
-                f"{_pct(row.get('p_third_loss_given_two_loss'))} |"
-            )
-        lines.append("")
+    )
     shadow = evidence.get("c3_shadow") or {}
     if shadow.get("status") != "ok":
         lines.append(
@@ -172,20 +190,20 @@ def _render_weekly_evidence(evidence: Optional[dict[str, Any]]) -> list[str]:
         all_row = shadow.get("all") or {}
         hold = shadow.get("max_hold") or {}
         lines.append(
-            "- **C3 shadow：** peak MFE vs 出场 PnL vs `max_hold` "
-            f"（basis=`{shadow.get('giveback_basis')}`，"
-            f"n_with_shadow={shadow.get('n_with_shadow')} / n_closed={shadow.get('n_closed')}）。"
+            "- **C3 shadow：** peak_pnl_pct vs giveback_from_peak_pct vs actual exit，"
+            f"`max_hold` cohort（source=`{shadow.get('source')}`，n={shadow.get('n_rows')}）。"
+            + (f" {shadow.get('note')}" if shadow.get("note") else "")
         )
         lines.append("")
-        lines.append("| cohort | n | peak_mfe_usd | exit_pnl_usd | giveback_usd |")
+        lines.append("| cohort | n | mean_peak_pnl_pct | mean_giveback_from_peak_pct | mean_actual_pnl_usd |")
         lines.append("|---|---:|---:|---:|---:|")
         lines.append(
-            f"| all | {all_row.get('n', 0)} | {_num(all_row.get('peak_mfe_usd_sum'))} | "
-            f"{_num(all_row.get('exit_pnl_usd_sum'))} | {_num(all_row.get('giveback_usd_sum'))} |"
+            f"| all | {all_row.get('n', 0)} | {_num(all_row.get('mean_peak_pnl_pct'))} | "
+            f"{_num(all_row.get('mean_giveback_from_peak_pct'))} | {_num(all_row.get('mean_actual_pnl_usd'))} |"
         )
         lines.append(
-            f"| max_hold | {hold.get('n', 0)} | {_num(hold.get('peak_mfe_usd_sum'))} | "
-            f"{_num(hold.get('exit_pnl_usd_sum'))} | {_num(hold.get('giveback_usd_sum'))} |"
+            f"| max_hold | {hold.get('n', 0)} | {_num(hold.get('mean_peak_pnl_pct'))} | "
+            f"{_num(hold.get('mean_giveback_from_peak_pct'))} | {_num(hold.get('mean_actual_pnl_usd'))} |"
         )
         lines.append("")
     ruin = evidence.get("g3_ruin") or {}
