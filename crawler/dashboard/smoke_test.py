@@ -513,6 +513,9 @@ class DashboardSmokeTest(unittest.TestCase):
             empty.recent_executions(),
             empty.rejection_buckets(),
             empty.paper_closed_buckets(),
+            empty.intel_holder_observe(),
+            empty.intel_slippage_observe(),
+            empty.intel_crowding_note(),
             empty.latest_backtest(),
             empty.latest_news(),
             empty.process_liveness(),
@@ -1633,6 +1636,323 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn('("进化", "建议")', app_text)
         self.assertIn("span-12", app_text)
         self.assertIn("render_evolution_body", app_text)
+
+    def test_intel_observe_cards_gap_and_numbers(self) -> None:
+        missing = DataStore(
+            DbPaths(
+                main=self.root / "missing-main.db",
+                execution=self.root / "missing-exec.db",
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        for result in (
+            missing.intel_holder_observe(),
+            missing.intel_slippage_observe(),
+            missing.intel_crowding_note(),
+        ):
+            self.assertFalse(result.available, result.reason)
+            self.assertIn("数据库文件不存在", result.reason)
+
+        bare = self.root / "bare-intel.db"
+        sqlite3.connect(bare).close()
+        bare_store = DataStore(
+            DbPaths(main=bare, execution=bare, paper=bare, backtest=bare, news=bare)
+        )
+        holder_gap = bare_store.intel_holder_observe()
+        self.assertFalse(holder_gap.available, holder_gap.reason)
+        self.assertIn("缺少数据表", holder_gap.reason)
+        slip_gap = bare_store.intel_slippage_observe()
+        self.assertFalse(slip_gap.available, slip_gap.reason)
+        self.assertIn("缺少数据表", slip_gap.reason)
+        self.assertNotIn("store", sys.modules)
+
+        empty_main = self.root / "empty-main.db"
+        empty_paper = self.root / "empty-paper.db"
+        empty_exec = self.root / "empty-exec.db"
+        with sqlite3.connect(empty_main) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE token_holder_snapshots (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    snapshot_id TEXT,
+                    recorded_at TEXT,
+                    rank INTEGER,
+                    holder_address TEXT,
+                    amount_ui REAL,
+                    pct_of_supply REAL,
+                    total_supply_ui REAL
+                );
+                CREATE TABLE address_labels (
+                    chain_id TEXT,
+                    address TEXT,
+                    label_type TEXT,
+                    token_mint TEXT
+                );
+                CREATE TABLE token_transfer_edges (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    from_address TEXT,
+                    to_address TEXT,
+                    amount_ui REAL,
+                    recorded_at TEXT
+                );
+                CREATE TABLE bot_fill_observations (
+                    chain_id TEXT,
+                    signature TEXT,
+                    wallet TEXT,
+                    token_address TEXT,
+                    recorded_at TEXT,
+                    bot_reason TEXT
+                );
+                CREATE TABLE decision_log (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT,
+                    strategy_id TEXT,
+                    action TEXT,
+                    purpose TEXT,
+                    chain_id TEXT,
+                    token_address TEXT
+                );
+                """
+            )
+        with sqlite3.connect(empty_paper) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE positions (id TEXT PRIMARY KEY, meta_json TEXT, status TEXT);
+                CREATE TABLE fills (
+                    id INTEGER PRIMARY KEY,
+                    position_id TEXT,
+                    side TEXT,
+                    price REAL,
+                    created_at TEXT,
+                    note TEXT
+                );
+                """
+            )
+        with sqlite3.connect(empty_exec) as conn:
+            conn.execute(
+                """
+                CREATE TABLE execution_log (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT,
+                    decision_log_id TEXT,
+                    action TEXT,
+                    executed INTEGER,
+                    receipt_json TEXT
+                )
+                """
+            )
+        empty_store = DataStore(
+            DbPaths(
+                main=empty_main,
+                execution=empty_exec,
+                paper=empty_paper,
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        empty_holder = empty_store.intel_holder_observe()
+        self.assertTrue(empty_holder.available, empty_holder.reason)
+        self.assertEqual(empty_holder.data.snapshot_n, 0)
+        self.assertEqual(empty_holder.data.non_null_share_n, 0)
+        self.assertEqual(empty_holder.data.non_null_delta_n, 0)
+        self.assertEqual(empty_holder.data.weight, 0.0)
+        self.assertFalse(empty_holder.data.wired)
+        self.assertEqual(empty_holder.data.gap, "empty")
+        self.assertEqual(empty_holder.data.latest, ())
+        empty_slip = empty_store.intel_slippage_observe()
+        self.assertTrue(empty_slip.available, empty_slip.reason)
+        self.assertEqual(empty_slip.data.slippage_n, 0)
+        self.assertIsNone(empty_slip.data.mean)
+        self.assertIsNone(empty_slip.data.bot_share)
+        self.assertFalse(empty_slip.data.high_bot_skip_wired)
+        self.assertEqual(empty_slip.data.gap, "both")
+        empty_crowd = empty_store.intel_crowding_note()
+        self.assertTrue(empty_crowd.available, empty_crowd.reason)
+        self.assertEqual(empty_crowd.data.live_n, 0)
+        self.assertEqual(empty_crowd.data.sample_n, 0)
+        self.assertIsNone(empty_crowd.data.live_peak_hour_density)
+        self.assertIn("不否决", empty_crowd.data.line)
+        self.assertIn("不算有效性", empty_crowd.data.line)
+
+        now = datetime.now(timezone.utc)
+        recent = _iso(now - timedelta(minutes=5))
+        mint = "mint111111111111111111111111111111111111111"
+        dev = "dev1111111111111111111111111111111111111111"
+        other = "oth1111111111111111111111111111111111111111"
+        with sqlite3.connect(empty_main) as conn:
+            conn.executemany(
+                """
+                INSERT INTO token_holder_snapshots (
+                    chain_id, token_address, snapshot_id, recorded_at, rank,
+                    holder_address, amount_ui, pct_of_supply, total_supply_ui
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    ("solana", mint, "early", "2026-10-14T00:00:00Z", 1, "a", None, None, 100.0),
+                    ("solana", mint, "late", recent, 1, "a", 20.0, 0.20, 100.0),
+                    ("solana", mint, "late", recent, 2, "b", 5.0, 0.05, 100.0),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO address_labels (chain_id, address, label_type, token_mint) VALUES (?, ?, ?, ?)",
+                ("solana", dev, "dev", mint),
+            )
+            conn.execute(
+                """
+                INSERT INTO token_transfer_edges (
+                    chain_id, token_address, from_address, to_address, amount_ui, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("solana", mint, dev, other, 6.0, recent),
+            )
+            conn.executemany(
+                """
+                INSERT INTO bot_fill_observations (
+                    chain_id, signature, wallet, token_address, recorded_at, bot_reason
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    ("solana", "sig-bot", "w1", mint, recent, "repeat"),
+                    ("solana", "sig-quiet", "w2", mint, recent, None),
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO decision_log
+                    (ts, strategy_id, action, purpose, chain_id, token_address)
+                VALUES (?, 'jev_strength_v1', 'buy', ?, 'solana', ?)
+                """,
+                [
+                    (recent, "live_candidate", mint),
+                    (_iso(now - timedelta(minutes=4)), "live_candidate", other),
+                    (_iso(now - timedelta(minutes=3)), "sample", mint),
+                ],
+            )
+        with sqlite3.connect(empty_paper) as conn:
+            conn.execute(
+                "INSERT INTO positions (id, meta_json, status) VALUES (?, ?, 'open')",
+                ("pos-1", json.dumps({"mid_price": 1.0, "slippage": 0.02})),
+            )
+            conn.execute(
+                "INSERT INTO positions (id, meta_json, status) VALUES (?, ?, 'open')",
+                ("pos-2", json.dumps({"mid_price": 2.0, "slippage": 0.04})),
+            )
+            conn.executemany(
+                """
+                INSERT INTO fills (position_id, side, price, created_at, note)
+                VALUES (?, 'buy', ?, ?, 'open')
+                """,
+                [("pos-1", 1.02, recent), ("pos-2", 2.08, recent)],
+            )
+        before = {
+            path: path.stat().st_mtime_ns
+            for path in (empty_main, empty_paper, empty_exec)
+        }
+        filled = empty_store.intel_holder_observe()
+        self.assertTrue(filled.available, filled.reason)
+        self.assertEqual(filled.data.weight, 0.0)
+        self.assertFalse(filled.data.wired)
+        self.assertEqual(filled.data.snapshot_n, 2)
+        self.assertEqual(filled.data.non_null_share_n, 1)
+        self.assertEqual(filled.data.non_null_delta_n, 1)
+        self.assertEqual(filled.data.gap, "")
+        by_snap = {item.snapshot_id: item for item in filled.data.latest}
+        self.assertIsNone(by_snap["early"].top10_share)
+        self.assertAlmostEqual(by_snap["late"].top10_share or 0.0, 0.25)
+        self.assertAlmostEqual(by_snap["late"].dev_balance_delta or 0.0, -6.0)
+        self.assertIsNone(by_snap["early"].top10_share)
+        slipped = empty_store.intel_slippage_observe()
+        self.assertTrue(slipped.available, slipped.reason)
+        self.assertEqual(slipped.data.slippage_n, 2)
+        self.assertAlmostEqual(slipped.data.mean or 0.0, 0.03)
+        self.assertAlmostEqual(slipped.data.bot_share or -1.0, 0.5)
+        self.assertEqual(slipped.data.bot_status, "observed")
+        self.assertEqual(slipped.data.bot_source, "bot_fill_observations")
+        self.assertEqual(slipped.data.bot_fills, 1)
+        self.assertEqual(slipped.data.total_fills, 2)
+        self.assertFalse(slipped.data.high_bot_skip_wired)
+        self.assertEqual(slipped.data.gap, "")
+        crowd = empty_store.intel_crowding_note()
+        self.assertTrue(crowd.available, crowd.reason)
+        self.assertEqual(crowd.data.live_n, 2)
+        self.assertEqual(crowd.data.sample_n, 1)
+        self.assertIsNotNone(crowd.data.live_peak_hour_density)
+        self.assertIn("不否决", crowd.data.line)
+        self.assertIn("不算有效性", crowd.data.line)
+        for path, stamp in before.items():
+            self.assertEqual(path.stat().st_mtime_ns, stamp)
+        self.assertNotIn("store", sys.modules)
+
+        # Receipt bot tags are not the #81 headline when the crawler table is absent.
+        tagged = self.root / "tagged-exec.db"
+        with sqlite3.connect(tagged) as conn:
+            conn.execute(
+                """
+                CREATE TABLE execution_log (
+                    ts TEXT,
+                    decision_log_id INTEGER,
+                    action TEXT,
+                    executed INTEGER,
+                    receipt_json TEXT
+                )
+                """
+            )
+            receipt = json.dumps(
+                {
+                    "paper_enabled": True,
+                    "executed": True,
+                    "exec_result": {
+                        "side": "buy",
+                        "mid_price": 1.0,
+                        "fill_price": 1.02,
+                        "slippage": 0.02,
+                        "bot": True,
+                    },
+                }
+            )
+            conn.execute(
+                """
+                INSERT INTO execution_log (ts, decision_log_id, action, executed, receipt_json)
+                VALUES (?, 1, 'buy', 1, ?)
+                """,
+                (recent, receipt),
+            )
+        tag_store = DataStore(
+            DbPaths(
+                main=self.root / "missing-main.db",
+                execution=tagged,
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        tagged_slip = tag_store.intel_slippage_observe()
+        self.assertTrue(tagged_slip.available, tagged_slip.reason)
+        self.assertEqual(tagged_slip.data.slippage_n, 1)
+        self.assertIsNone(tagged_slip.data.bot_share)
+        self.assertEqual(tagged_slip.data.bot_status, "data_gap")
+        self.assertFalse(tagged_slip.data.high_bot_skip_wired)
+
+        app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+        data_text = Path(__file__).resolve().parent.joinpath("data.py").read_text(encoding="utf-8")
+        self.assertIn('("持仓", "集中")', app_text)
+        self.assertIn('("滑点", "bot")', app_text)
+        self.assertIn("权重0 / 不接决策", app_text)
+        self.assertIn("旁证观察 · 不算有效性 · 不进盘中参 · 高 bot 不跳单", app_text)
+        self.assertIn("read_top10_share_history", data_text)
+        self.assertIn("read_dev_balance_delta", data_text)
+        self.assertIn("build_slippage_report", data_text)
+        self.assertNotIn("PositionManager", data_text)
+        self.assertNotIn("PositionManager", app_text)
+        holder_src = inspect.getsource(app_module._v2_intel_holders)
+        slip_src = inspect.getsource(app_module._v2_intel_slippage)
+        self.assertIn("data gap", holder_src)
+        self.assertIn("data gap", slip_src)
+        self.assertIn("不跳单", slip_src)
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent

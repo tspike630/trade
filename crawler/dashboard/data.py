@@ -7,12 +7,15 @@ tables return :class:`DataResult` instead of raising.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import re
 import sqlite3
 import statistics
 import json
+import sys
 import time
+import types
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -20,6 +23,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import quote
+
+from execution.slippage_report import build_report as build_slippage_report
 
 from dashboard.parsing import (
     clip,
@@ -397,6 +402,67 @@ class ExitHoldReport:
     buckets: tuple[ExitHoldBucket, ...]
 
 
+@dataclass(frozen=True)
+class IntelHolderPoint:
+    """One sampled snapshot. None metrics are gaps, not zeros."""
+
+    chain_id: str
+    token_address: str
+    snapshot_id: str | None
+    recorded_at: str | None
+    top10_share: float | None
+    dev_balance_delta: float | None
+
+
+@dataclass(frozen=True)
+class IntelHolderReport:
+    """I-1 observe sample. Weight stays 0 and nothing here is wired to a decision."""
+
+    snapshot_n: int
+    non_null_share_n: int
+    non_null_delta_n: int
+    token_n: int
+    latest: tuple[IntelHolderPoint, ...]
+    weight: float = 0.0
+    wired: bool = False
+    gap: str = ""
+
+
+@dataclass(frozen=True)
+class IntelSlippageReport:
+    """I-3 observe. ``high_bot_skip_wired`` is reported and never acted on."""
+
+    slippage_n: int
+    mean: float | None
+    p50: float | None
+    p90: float | None
+    bot_share: float | None
+    bot_status: str
+    bot_source: str
+    bot_fills: int | None
+    total_fills: int | None
+    high_bot_skip_wired: bool = False
+    gap: str = ""
+
+
+@dataclass(frozen=True)
+class IntelCrowdingNote:
+    """Short decision-side crowding footnote. Does not veto or fuse."""
+
+    strategy_id: str
+    live_n: int | None
+    sample_n: int | None
+    live_peak_hour_density: float | None
+    line: str
+
+
+_INTEL_HOLDER_SAMPLE = 8
+_INTEL_HOLDER_SHOW = 5
+_INTEL_CROWD_STRATEGY = "jev_strength_v1"
+_HOLDER_METRICS: Any = None
+_CROWDING_MOD: Any = None
+
+
 
 def _hkt_day(ts: str | None) -> str:
     """Calendar day in Asia/Hong_Kong for ISO timestamps (align decision/review)."""
@@ -612,6 +678,153 @@ def _liveness(age: float | None, limit: float | None = None) -> Liveness:
     return "stale"
 
 
+def _text_or_none(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _holder_point_key(point: IntelHolderPoint) -> tuple[str, str, str]:
+    return (point.recorded_at or "", point.chain_id, point.snapshot_id or "")
+
+
+def _parse_iso_utc(ts: str | None) -> datetime | None:
+    """Same clock parse as indicators.base.parse_iso, without importing it."""
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        try:
+            return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
+
+def _norm_chain(chain_id: str) -> str:
+    return str(chain_id).strip().lower()
+
+
+def _norm_address(address: str) -> str:
+    return str(address).strip().lower()
+
+
+def _helper_path(*parts: str) -> Path:
+    """Read-only helper next to this package, or under the nested crawler tree.
+
+    ``dashboard/`` at the repo root looks in ``crawler/``. The mirrored
+    ``crawler/dashboard/`` already sits inside that tree.
+    """
+    package_root = Path(__file__).resolve().parents[1]
+    candidates = [
+        package_root.joinpath(*parts),
+        package_root.joinpath("crawler", *parts),
+    ]
+    parents = Path(__file__).resolve().parents
+    if len(parents) > 2:
+        candidates.append(parents[2].joinpath(*parts))
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]
+
+
+def _holder_readers() -> Any:
+    """Load holder_metrics without importing crawler store (the write path).
+
+    The helper module imports ``store.norm_*`` and ``indicators.base.parse_iso``.
+    Those two names are bound to local copies for the load, then the stubs are
+    removed so this process does not keep a fake ``store`` module around.
+    """
+    global _HOLDER_METRICS
+    if _HOLDER_METRICS is not None:
+        return _HOLDER_METRICS
+    path = _helper_path("indicators", "holder_metrics.py")
+    if not path.is_file():
+        raise ImportError("holder_metrics.py missing")
+    store_stub = types.ModuleType("store")
+    store_stub.norm_chain = _norm_chain
+    store_stub.norm_address = _norm_address
+    base_stub = types.ModuleType("indicators.base")
+    base_stub.parse_iso = _parse_iso_utc
+    pkg_stub = types.ModuleType("indicators")
+    pkg_stub.__path__ = []  # type: ignore[attr-defined]
+    stubs = {
+        "store": store_stub,
+        "indicators": pkg_stub,
+        "indicators.base": base_stub,
+    }
+    planted: list[str] = []
+    for name, module in stubs.items():
+        if name not in sys.modules:
+            sys.modules[name] = module
+            planted.append(name)
+    module_name = "_dashboard_holder_metrics"
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError("holder_metrics spec failed")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+    finally:
+        for name in planted:
+            sys.modules.pop(name, None)
+    _HOLDER_METRICS = module
+    return module
+
+
+def _crowding_module() -> Any:
+    """Load scripts/signal_crowding.py. It does not touch execution or the crawler writer."""
+    global _CROWDING_MOD
+    if _CROWDING_MOD is not None:
+        return _CROWDING_MOD
+    path = _helper_path("scripts", "signal_crowding.py")
+    if not path.is_file():
+        raise ImportError("signal_crowding.py missing")
+    module_name = "_dashboard_signal_crowding"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError("signal_crowding spec failed")
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses looks the class module up in sys.modules during class body.
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    _CROWDING_MOD = module
+    return module
+
+
+def _file_has_table(path: Path | None, table: str) -> bool:
+    if path is None or not path.is_file():
+        return False
+    with ro_connect(path) as conn:
+        return _table_exists(conn, table)
+
+
+def _crowding_line(
+    strategy_id: str,
+    live_n: int | None,
+    sample_n: int | None,
+    peak: float | None,
+) -> str:
+    live_s = "data gap" if live_n is None else str(live_n)
+    sample_s = "data gap" if sample_n is None else str(sample_n)
+    peak_s = "data gap" if peak is None else f"{peak:.2f}"
+    return (
+        f"拥挤旁证 {strategy_id} · live n={live_s} · 峰值小时 {peak_s} · "
+        f"sample n={sample_s} · 不否决 · 不算有效性"
+    )
+
+
 class DataStore:
     def __init__(self, paths: DbPaths | None = None) -> None:
         self.paths = paths if paths is not None else DbPaths.from_env()
@@ -725,6 +938,41 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed paper_trade_frequency: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_trade_frequency")
+
+    def intel_holder_observe(self, limit: int = _INTEL_HOLDER_SAMPLE) -> DataResult:
+        """I-1 observe-only sample of top10_share and dev_balance_delta.
+
+        Calls the read-only holder helpers. A missing database or table is
+        unavailable. An empty table or an unsummable snapshot stays None.
+        """
+        started = time.perf_counter()
+        try:
+            return _finish(self._intel_holder_observe(started, limit), "intel_holder_observe")
+        except Exception as exc:
+            log.warning("read failed intel_holder_observe: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "intel_holder_observe")
+
+    def intel_slippage_observe(self) -> DataResult:
+        """I-3 observe-only slippage_1h and bot_trade_share.
+
+        Uses ``execution.slippage_report.build_report``. Does not skip orders.
+        Headline bot share is collection #81 only; anything else is a data gap.
+        """
+        started = time.perf_counter()
+        try:
+            return _finish(self._intel_slippage_observe(started), "intel_slippage_observe")
+        except Exception as exc:
+            log.warning("read failed intel_slippage_observe: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "intel_slippage_observe")
+
+    def intel_crowding_note(self) -> DataResult:
+        """Optional decision-side crowding footnote for jev_strength_v1."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._intel_crowding_note(started), "intel_crowding_note")
+        except Exception as exc:
+            log.warning("read failed intel_crowding_note: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "intel_crowding_note")
 
     def risk_daily_loss_today(self) -> DataResult:
 
@@ -1467,6 +1715,188 @@ class DataStore:
             ),
             started,
         )
+
+    def _intel_holder_observe(self, started: float, limit: int) -> DataResult:
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        sample = max(1, min(int(limit), 50))
+        try:
+            readers = _holder_readers()
+        except (OSError, ImportError, SyntaxError) as exc:
+            return _unavail(f"查询失败：{_safe_exc(exc)}", started)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "token_holder_snapshots", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                token_rows = _exec(
+                    conn,
+                    "SELECT chain_id, token_address, MAX(recorded_at) AS recorded_at "
+                    "FROM token_holder_snapshots "
+                    "GROUP BY chain_id, token_address "
+                    "ORDER BY recorded_at DESC "
+                    "LIMIT ?",
+                    (sample,),
+                ).fetchall()
+                points: list[IntelHolderPoint] = []
+                snapshot_n = 0
+                non_null_share_n = 0
+                non_null_delta_n = 0
+                for row in token_rows:
+                    chain = str(row["chain_id"] or "")
+                    token = str(row["token_address"] or "")
+                    history = readers.read_top10_share_history(conn, chain, token)
+                    delta = readers.read_dev_balance_delta(conn, chain, token)
+                    if delta is not None:
+                        non_null_delta_n += 1
+                    if not history:
+                        points.append(
+                            IntelHolderPoint(chain, token, None, None, None, delta)
+                        )
+                        continue
+                    for item in history:
+                        share = item.get("top10_share")
+                        share_value = share if isinstance(share, (int, float)) and not isinstance(share, bool) else None
+                        snapshot_n += 1
+                        if share_value is not None:
+                            non_null_share_n += 1
+                        points.append(
+                            IntelHolderPoint(
+                                chain,
+                                token,
+                                _text_or_none(item.get("snapshot_id")),
+                                _text_or_none(item.get("recorded_at")),
+                                share_value,
+                                delta,
+                            )
+                        )
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        latest = tuple(sorted(points, key=_holder_point_key, reverse=True)[:_INTEL_HOLDER_SHOW])
+        gap = "" if non_null_share_n or non_null_delta_n else "empty"
+        return _ok(
+            IntelHolderReport(
+                snapshot_n=snapshot_n,
+                non_null_share_n=non_null_share_n,
+                non_null_delta_n=non_null_delta_n,
+                token_n=len(token_rows),
+                latest=latest,
+                weight=0.0,
+                wired=False,
+                gap=gap,
+            ),
+            started,
+        )
+
+    def _intel_slippage_observe(self, started: float) -> DataResult:
+        ledger_path = self.paths.execution
+        paper_path = self.paths.paper
+        crawler_path = self.paths.main
+        ledger = ledger_path if ledger_path.is_file() else None
+        paper = paper_path if paper_path.is_file() else None
+        crawler = crawler_path if crawler_path.is_file() else None
+        if ledger is None and paper is None and crawler is None:
+            return _unavail(
+                "数据库文件不存在：execution_ledger.db / paper_trading.db / dexscreener.db",
+                started,
+            )
+        try:
+            slip_table = _file_has_table(ledger, "execution_log") or _file_has_table(paper, "fills")
+            bot_table = _file_has_table(crawler, "bot_fill_observations")
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败：{_safe_exc(exc)}", started)
+        if not slip_table and not bot_table:
+            return _unavail(
+                "缺少数据表：execution_log / fills / bot_fill_observations",
+                started,
+            )
+        try:
+            report = build_slippage_report(ledger=ledger, paper=paper, crawler_db=crawler)
+        except (OSError, sqlite3.Error) as exc:
+            return _unavail(f"查询失败：{_safe_exc(exc)}", started)
+        slip = report.get("slippage_1h") if isinstance(report, dict) else None
+        bot = report.get("bot_trade_share") if isinstance(report, dict) else None
+        skip = report.get("high_bot_skip") if isinstance(report, dict) else None
+        if not isinstance(slip, dict) or not isinstance(bot, dict):
+            return _unavail("查询失败：slippage report 不完整", started)
+        n = _as_int(slip.get("n")) or 0
+        mean = safe_float(slip.get("mean")) if n else None
+        p50 = safe_float(slip.get("p50")) if n else None
+        p90 = safe_float(slip.get("p90")) if n else None
+        source = str(bot.get("source") or "")
+        status = str(bot.get("status") or "data_gap")
+        share = safe_float(bot.get("share"))
+        # Collection #81 is the headline. Receipt tags stay a gap, not a share.
+        if source != "bot_fill_observations" or status != "observed" or share is None:
+            share = None
+            if status == "observed":
+                status = "data_gap"
+        fills = _as_int(bot.get("total_fills"))
+        bot_fills = _as_int(bot.get("bot_fills"))
+        wired = bool(skip.get("wired")) if isinstance(skip, dict) else False
+        if mean is None and share is None:
+            gap = "both"
+        elif mean is None:
+            gap = "slippage"
+        elif share is None:
+            gap = "bot"
+        else:
+            gap = ""
+        return _ok(
+            IntelSlippageReport(
+                slippage_n=n,
+                mean=mean,
+                p50=p50,
+                p90=p90,
+                bot_share=share,
+                bot_status=status,
+                bot_source=source or "bot_fill_observations",
+                bot_fills=bot_fills,
+                total_fills=fills,
+                high_bot_skip_wired=wired,
+                gap=gap,
+            ),
+            started,
+        )
+
+    def _intel_crowding_note(self, started: float) -> DataResult:
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        try:
+            crowding = _crowding_module()
+        except (OSError, ImportError, SyntaxError) as exc:
+            return _unavail(f"查询失败：{_safe_exc(exc)}", started)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "decision_log", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                report = crowding.compute_for_weekly(
+                    decision_conn=conn,
+                    strategy_id=_INTEL_CROWD_STRATEGY,
+                    window_days=7,
+                )
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        if not getattr(report, "available", False):
+            return _unavail(str(getattr(report, "note", "") or "查询失败"), started)
+        live = report.cohort("live_candidate")
+        sample = report.cohort("sample")
+        live_n = int(live.n_buys) if live is not None else None
+        sample_n = int(sample.n_buys) if sample is not None else None
+        peak = None
+        if live is not None and live_n:
+            peak = safe_float(live.peak_hour_density)
+        note = IntelCrowdingNote(
+            strategy_id=_INTEL_CROWD_STRATEGY,
+            live_n=live_n,
+            sample_n=sample_n,
+            live_peak_hour_density=peak,
+            line=_crowding_line(_INTEL_CROWD_STRATEGY, live_n, sample_n, peak),
+        )
+        return _ok(note, started)
 
     def _risk_daily_loss_today(self, started: float) -> DataResult:
         path = self.paths.execution
