@@ -91,6 +91,7 @@ DECISION_ENGINE_STEP1_RESULT.md
 | `DECISION_JEV_MIN_STRENGTH` | `0.3` | JEV 阈值 |
 | `DECISION_JEV_POSITION_PCT` | `0.05` | 信号仓位 |
 | `DECISION_COOLDOWN_SEC` | `0` | 同一 `(strategy, chain, token)` 买入冷却秒数。0 = 关闭，dry-run 观察行为不变。Step B（paper）应设为约等于 tick 间隔，避免每个 tick 对同一 token 重复开仓 |
+| `DECISION_MIN_LIQ_USD` | `50000` | 实盘/dry-run 买入流动性下限（USD），与回测 `FilterConfig.min_liq=50000` 对齐。`liquidity_usd` 缺失（`no_liquidity`）或低于下限（`liq_below_min`）的 buy 在写入 `decision_log` 前丢弃。卖出不过滤。只做风险入场过滤，不改变 JEV 强度阈值、权重或 purpose |
 | `DECISION_USE_API_FALLBACK` | `0` | 是否走 API（Step 1 默认关） |
 
 ## 如何运行

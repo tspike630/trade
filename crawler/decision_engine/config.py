@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -65,6 +66,29 @@ TECH_FRESH_SEC = int(
 # Step B (paper) should set DECISION_COOLDOWN_SEC ≈ DECISION_TICK_INTERVAL_SEC
 # so a token is not re-bought every tick while position-manager dedup is off.
 DECISION_COOLDOWN_SEC = float(os.environ.get("DECISION_COOLDOWN_SEC", "0") or "0")
+
+
+def _env_float(raw: str | None, default: float) -> float:
+    """Parse a DECISION_* float. Empty or non-finite values keep the default."""
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return value
+
+
+# Live/dry-run buy liquidity floor (USD). Aligned with backtest
+# FilterConfig.min_liq in decision_engine/backtest/filters.py (50_000).
+# RiskManager drops a buy when liquidity_usd is missing (no_liquidity, fail-closed)
+# or below this floor (liq_below_min), before SignalBus writes decision_log.
+# Sells are not filtered. This is an entry risk filter only: it does not change
+# JEV strength, factor weights, purpose gating, or paper/live trading flags.
+# Env: DECISION_MIN_LIQ_USD. Invalid values fall back to 50000.
+DECISION_MIN_LIQ_USD = _env_float(os.environ.get("DECISION_MIN_LIQ_USD", "50000"), 50_000.0)
 
 # JEV strength strategy defaults
 JEV_MIN_STRENGTH = float(os.environ.get("DECISION_JEV_MIN_STRENGTH", "0.3"))

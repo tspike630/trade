@@ -110,6 +110,7 @@ class PurposeEnumTests(unittest.TestCase):
             cfg,
         )
         self.assertIn('os.environ.get("DECISION_JEV_MIN_STRENGTH", "0.3")', cfg)
+        self.assertIn('os.environ.get("DECISION_MIN_LIQ_USD", "50000")', cfg)
 
 
 class SignalBusPurposeTests(unittest.TestCase):
@@ -308,6 +309,28 @@ def _seed_indicators(db: Path, *, live_strength: float, weak_strength: float) ->
                 "PairWeak",
                 "2026-10-13T00:00:00Z",
             ),
+        ],
+    )
+    # Purpose tests are about sample vs live_candidate, not the liquidity floor.
+    # Seed both pairs at the configured floor so those buys still emit.
+    floor = float(de_config.DECISION_MIN_LIQ_USD)
+    raw = json.dumps({"liquidity": {"usd": floor}})
+    conn.execute(
+        """
+        CREATE TABLE pairs (
+            chain_id TEXT,
+            pair_address TEXT,
+            token_address TEXT,
+            raw_json TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO pairs VALUES (?, ?, ?, ?, ?)",
+        [
+            ("solana", "PairLive", "TokLive", raw, "2026-10-13T00:00:00Z"),
+            ("solana", "PairWeak", "TokWeak", raw, "2026-10-13T00:00:00Z"),
         ],
     )
     conn.commit()

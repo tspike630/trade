@@ -187,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
 
     log.info(
         "decision_engine start db=%s dry_run=%s purpose=%s strategies=%s "
-        "interval=%s once=%s ticks=%s min_jev_strength=%s",
+        "interval=%s once=%s ticks=%s min_jev_strength=%s min_liq_usd=%s",
         db_path,
         dry_run,
         purpose,
@@ -196,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
         args.once,
         args.ticks,
         args.min_jev_strength,
+        de_config.DECISION_MIN_LIQ_USD,
     )
 
     adapter = IndicatorDataAdapter(db_path)
