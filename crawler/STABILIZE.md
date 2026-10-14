@@ -68,3 +68,14 @@ During stabilize it is OK if MAIN/ALERT chat ids are unset and only ADMIN (or `T
 
 - Non-`ENABLED_CHAINS` residuals (e.g. robinhood / other chains from earlier multi-chain runs) → WARN only; filter with `ENABLED_CHAINS=solana`.
 - Heartbeat stale when loop not running → expected WARN; while stabilize `--loop` is up, heartbeat should stay fresh.
+
+## Hot liquidity coverage (R1, not strategy validity)
+
+DexScreener sometimes omits `liquidity` on a pair payload. `history.extract_metrics` stores `liquidity_usd` NULL and does not invent a number. Decision then fail-closes that buy with `no_liquidity`. The existing `tokens/v1` enrich already snapshots liquidity only when the payload includes it; there is no second fill.
+
+`daily_check.py` check「热层流动性覆盖」reads hot `pair_history` (level = last 1h; 24h is context only):
+
+- WARN if missing (NULL or ≤0) **> 25%**, if the hot 1h window is empty, or if n < 20 while the missing rate is > 60%
+- FAIL if missing **> 60%** and n ≥ 20
+
+A ~34% missing rate is WARN. The rate is **10-19 周检旁证** and does not count toward strategy validity. The hourly report (`scripts/grok_report.py` → context markdown) prints one line under Health: hot 1h missing rate and `pending_enrich`. Do not change `ALERT_MIN_SCORE` or score weights from this metric.
