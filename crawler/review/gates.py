@@ -13,7 +13,10 @@ scan's ``n_raw``.
 
 from __future__ import annotations
 
-# Sample floors (weekly-check / jev_validity).
+import math
+from typing import Any
+
+# Sample floors (weekly-check / jev_validity). Do not lower these for M-1.
 MIN_RAW_N = 15
 MIN_UNIQUE_TOKEN = 10
 
@@ -37,3 +40,58 @@ SAMPLE_NOTE = (
     f"{MIN_RAW_N} 且 unique_token≥{MIN_UNIQUE_TOKEN}，连续 {CONSECUTIVE_WEEKS} 周 "
     f"1h≥{UP_1H_PROMOTE:.0%}）；本循环过门槛最多 status=accepted，不自动激活。"
 )
+
+# M-2. factor_loop.gate_candidate must not call calibrate_direction yet.
+# metrics["ic_mean"] is _latest_ic (often null, not this candidate's rank IC).
+# Fail-closed wiring would change weekly accept/reject. Weights stay 0.
+DIRECTION_CALIBRATION_TODO = (
+    "M-2: A-class accept requires calibrate_direction on a per-candidate "
+    "rank IC (both signs recorded; keep kept_sign). Not wired into "
+    "factor_loop.gate_candidate: ic_mean is the latest history row, not a "
+    "both-sign eval of this candidate. Wiring fail-closed would change "
+    "weekly accept/reject while that IC is null. Weights stay 0. "
+    "不算有效性。"
+)
+
+
+def calibrate_direction(ic: object) -> dict[str, Any]:
+    """Record both signs of one computed rank IC (AQuA / M-2).
+
+    A finite int/float stores the written value and its flip (``-ic``) and
+    keeps the orientation whose IC is >= 0 (``kept_sign`` +1, else -1).
+    Missing, non-numeric, bool, or non-finite input fails closed:
+    ``passed`` is False and no sign is registered.
+
+    ``passed`` means both signs were recorded. It does not accept a
+    candidate, move ``MIN_RAW_N``, or change weights. Weekly
+    ``gate_candidate`` does not call this; see ``DIRECTION_CALIBRATION_TODO``.
+    """
+    if isinstance(ic, bool) or not isinstance(ic, (int, float)) or not math.isfinite(ic):
+        return {
+            "passed": False,
+            "fail_closed": True,
+            "blocks_a_class": True,
+            "ic_as_written": None,
+            "ic_flipped": None,
+            "kept_sign": None,
+            "cleaner_ic": None,
+            "reason": "direction_calibration_missing",
+        }
+    written = float(ic)
+    flipped = -written
+    if written >= 0.0:
+        kept_sign = 1
+        cleaner = written
+    else:
+        kept_sign = -1
+        cleaner = flipped
+    return {
+        "passed": True,
+        "fail_closed": False,
+        "blocks_a_class": False,
+        "ic_as_written": written,
+        "ic_flipped": flipped,
+        "kept_sign": kept_sign,
+        "cleaner_ic": cleaner,
+        "reason": "both_signs_recorded",
+    }

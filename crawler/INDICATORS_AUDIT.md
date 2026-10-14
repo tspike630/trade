@@ -107,7 +107,9 @@ python -m api_server   # 只读 API + admin
 
 - 本文 **INDICATORS_AUDIT.md**（运维入口；含「警示事例 → 指标层纪律」）
 - STEP1 / STEP2 / STEP3 / P0 / LIGHT / AUTH_JEV（P-4 定价错误在 STEP2）
-- **INDICATORS_FACTOR_CANDIDATES.md** — 机构供需 P-3 吸筹区回踩 / P-4 新鲜度衰减：factor_loop 候选登记（文档 only，不接线，权重 0，不算有效性）
+- **INDICATORS_FACTOR_CANDIDATES.md** — 机构供需 P-3 / P-4 候选登记；**M-2 方向校准**（正反两符号，A 类接受前必过）。`calibrate_direction` 未接入周跑。权重 0，不算有效性
+- **INDICATORS_OPERATORIZATION.md** — **M-3** 时间序列算子硬规则（窗口在 t 收口；禁止日合计 / 未来分母）
+- 本文「统计功效脚注（M-1）」— n≥15 不改；约 350 个已结算样本才够谈 α≈0.02
 - README「Indicators 旁路」节 + 命令总索引
 
 ---
@@ -136,6 +138,7 @@ python -m api_server   # 只读 API + admin
 - **$0.95 黑天鹅 / 薄池打穿**（「那 5% 一旦出现，亏掉的不是 5% 而是 95%」；薄池单笔止损打穿、抹掉全部盈利）：tech 新鲜度与流动性字段是决策闸的输入。指标**不编造** liquidity（载荷缺 `liquidity` 就保持空）。`min_liq` fail-closed 归决策 [#41](https://github.com/tspike630/trade/pull/41)。本侧只保 hot tech 新鲜（[#40](https://github.com/tspike630/trade/pull/40) 已合）。
 - **洗盘 / 单点操纵**（书中约 25% 交易量虚假，外加预言机投票权集中翻转）：多源旁路（DexScreener + CCXT prior，见 `CCXT_SIDECHANNEL.md`）是防单点，不是加权重救曲线。
 - **因子质量 > 研究量**（Prediction Arena, arXiv 2604.07355）：纪律段在 `INDICATORS_FACTOR_CANDIDATES.md`。
+- **方向与算子（M-2 / M-3）**：factor_loop 候选先做正反方向校准（`INDICATORS_FACTOR_CANDIDATES.md`）；时间序列只许用到当前 bar（`INDICATORS_OPERATORIZATION.md`）。两条都不把信号强度当成胜率（口径仍是上面的 **信号强度 ≠ 胜率**，`INDICATORS_STEP2.md` P-4，PR #46）。
 
 ### P-2（指针，不实现）
 
@@ -144,6 +147,14 @@ python -m api_server   # 只读 API + admin
 ### P-5（观察候选）
 
 Polymarket 共识概率（例如「某币是否上币安」，价格 = 市场共识）只作为 factor_loop 的**观察因子候选**，须走验证流程，**不接入主决策**。书中警告：加密相关市场胜率约 60%，约 25% 交易量是洗盘，且有合规风险（中国大陆非法 / 香港灰色）；接入前先做合规评估。当前未接线。
+
+### 统计功效脚注（M-1，观察口径）
+
+Foresight Arena（arXiv 2605.00420）要检测相对市场共识 α≈0.02 的 edge，大约需要 **350** 个已结算预测。指标 / JEV 读样本时仍用周检门槛 **n≥15**（unique≥10）；W41 快照 n≈32 只说明方向，不够声称已经证明 edge。门槛不改。看板同一句旁证在 PR #53。本段不算有效性。信号强度仍 ≠ 胜率（`INDICATORS_STEP2.md` P-4）。
+
+### 算子化（M-3，指针）
+
+指标和因子的时间序列代码只许使用截止当前 bar 的数据，滚动窗口在 t 收口，禁止日合计或未来分母。全文硬规则在 `INDICATORS_OPERATORIZATION.md`。这不是新的打分，权重保持 0。
 
 ---
 
