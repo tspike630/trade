@@ -234,7 +234,12 @@ Expect: `DEDUP allowed=false reason=pm_rejected:token_dedup`; `PASSTHROUGH allow
 
 ## Daemon (box / stabilize)
 
-Resident loop must stay **paper gate closed** unless explicitly approved:
+Resident loop must stay **paper gate closed** unless explicitly approved.
+The 2026-10-14 paper authorization is that approval for paper only:
+`--paper-enabled --paper-tick --pm-enabled` plus the env set in
+[P1_PM_ROADMAP.md](P1_PM_ROADMAP.md). It does not change the code defaults
+in this file, and it does not open live. The unit file
+`deploy/dexscreener-execution.service` still starts Step A `--loop`.
 
 ```bash
 cd /workspace/dexscreener-crawler
@@ -262,5 +267,15 @@ not require `PM_ENABLED`).
 ## Success check
 
 - Step A: after `--once`, ledger rows with `executed=0`, `strategy_id` set.
-- Step B smoke: temp paper DB BUY→SELL→EQUITY as above; production `paper_trading.db` untouched; resident loop still without `--paper-enabled`.
+- Step B smoke: temp paper DB BUY→SELL→EQUITY as above; production `paper_trading.db` untouched; do not restart the resident loop from this smoke. The authorized paper command is in [P1_PM_ROADMAP.md](P1_PM_ROADMAP.md); code default remains paper off.
 - Step C smoke: temp paper DB — strategy A already open on token → strategy C buy same token with `PM_ENABLED=1 PM_TOKEN_DEDUP=1` → `pm_rejected:token_dedup`; with `PM_ENABLED=0` → pass-through.
+
+## 警示事例与 P-1（docs only）
+
+Code defaults in the tables above stay as written. The 2026-10-14 paper
+authorization, and the still-missing net-edge / account-drawdown / four-tier
+heat items, are in [P1_PM_ROADMAP.md](P1_PM_ROADMAP.md). Warning-case mapping
+（半胜仍亏、薄池打穿、$0.95 黑天鹅、周检拒因走 `order_events`）is in
+[WARNING_CASES.md](WARNING_CASES.md). Both notes are **不算有效性** until the
+2026-10-19 weekly check. They do not change TP/SL/hold, slippage tiers, or
+PM numbers.
