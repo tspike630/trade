@@ -1,6 +1,6 @@
 # Decision Engine — JEV 周检 + 采样
 
-**Time (HK / UTC+8):** 更新于 2026-10-14 16:40 HKT  
+**Time (HK / UTC+8):** 更新于 2026-10-15 01:30 HKT  
 **Repo:** `/workspace/dexscreener-crawler`  
 **原则：** 本机无系统 crontab（无 root 装 cron），由决策引擎 bot 的 routines **直接执行**仓库脚本；不接 paper/live；不杀 dry-run / main / indicators。
 
@@ -67,8 +67,11 @@ mkdir -p exports/reports logs
 
 同一条 `scripts/jev_validity.py` 默认再读 paper `positions`（`--paper-db`，否则 `EXECUTION_PAPER_DB` / `PAPER_DB_PATH` / `paper_trading.db`；窗口 `--side-window-days` 默认 7），把硬旁证和 F-1 写进 md，并给趋势 CSV 加列。缺库则该段记未形成，不否决。`--no-side-evidence` 可跳过。只读，不改 cooldown / min_liq / strength，不熔断。
 
+同一窗口再记 **信号拥挤**（`scripts/signal_crowding.py`）：`decision_log` 里 `jev_strength_v1` 的 buy，`purpose=live_candidate` 与 `purpose=sample` 分开。指标是 HKT 日均 buy、unique token / buy、峰值小时密度。写入周检 md，趋势 CSV 加 `crowd_lc_*` / `crowd_sample_*`。这是观察，**不否决 Step2**。`--no-side-evidence` 不关掉这一段。
+
 ```bash
 python3 scripts/tests/test_weekly_side_evidence.py
+python3 scripts/tests/test_signal_crowding.py
 ```
 
 产物：`exports/reports/jev_validity_YYYYMMDD.md`、`exports/reports/jev_validity_trend.csv`、`exports/reports/review_weekly_YYYY-MM-DD.md`、`logs/jev_validity.log`、`logs/review_weekly.log`、`logs/decision_engine_sample.log`。
@@ -78,6 +81,7 @@ python3 scripts/tests/test_weekly_side_evidence.py
 1. **过滤后 n 与 unique_token 是否增长**（有效样本优先 **unique_token≥10**，比 n≥15 更硬）
 2. **1h 上涨率是否稳定 ≥55%**（连续 2 周，且两周均 unique_token≥10）
 3. **strength 分层是否保持单调**（尤其 0.19+ 层 n→10+）
+4. **信号拥挤（只观察）** — 同窗口 `live_candidate` 与 `sample` 的 HKT 日均 buy、unique/buy、峰值小时密度。不进上面的决策表，不否决 Step2
 
 ## 决策门槛
 
@@ -139,6 +143,7 @@ Foresight Arena 的功效量级（已结算二元预测；相对市场共识的 
 | **G-4** `min_liq` 经典地板 | `DECISION_MIN_LIQ_USD`，回测 `FilterConfig.min_liq` | 经典回测地板 **50000** 已是买入闸（#41）。周检只记拒绝桶，不改 50000 |
 | **F-1** 连续 2 亏之后的第 3 笔 | 周检 md「F-1 信号连亏（只记不熔断）」 | 周检优先 `up_1h<0`（没有 1h 时用已平仓 pnl）。看板 F-1 卡只看已平仓 pnl。两边都只观察，不接入 RiskManager / PM pause。熔断留 R2/R3 |
 | **F-3 / C3** 出场 | `execution/exits.py`（C3 / E-2） | 出场归执行。决策层只指向，不改 hold / TP / SL |
+| **⑥ 信号拥挤** | `scripts/jev_validity.py`「信号拥挤度」；`decision_log` 同窗口 | **旁证，不算有效性，不否决 Step2。** `live_candidate` 与 `sample` 分列：HKT 日均 buy、unique/buy、峰值小时密度。不改强度 / min_liq / cooldown，不熔断，不盘中降级。激活留 R2/R3 |
 | 平仓归因三行 | paper 已平仓；看板 #45 旁证 | **胜率与期望分开**；**最差单笔**；**`liq_<50k` vs `≥50k`**（unknown 单列）。适用时标 **R2 规则缺口旁证**。不据此调 strength 或权重 |
 
 目录与上面「周检命令」相同（`/workspace/dexscreener-crawler`）。这是 10-19 首跑，不把 `--factor-layers` 改成常驻默认。
@@ -150,6 +155,19 @@ Foresight Arena 的功效量级（已结算二元预测；相对市场共识的 
 ```
 
 复盘不认领 **P-1**（PM 仓位比例 / 回撤，`execution/README.md`）、**P-4**（JEV 错价，指标）、**P-5**（共识概率观察候选，指标）。**F-3 / C3**：出场归执行（`execution/exits.py`，C3 / E-2）；决策层只指向，不改 hold / TP / SL。趋势出场仍只观察，要立项先 R3 回测。`accepted` ≠ `activated`。临时 `live_candidate` 样本单独分桶。
+
+## INTEL 边界（薄记）
+
+周检不把情报候选写成生效策略。拥挤度是决策层自己的观察，不是 I-1/I-2 的校准结果。
+
+| 项 | 周检怎么对待 |
+|----|----------------|
+| **I-1 / I-2** | 只读，直到方向校准完成。不在本层建表、不写采集器、不改权重 |
+| **I-3** | 执行质量（`bot_trade_share` / `slippage_1h`）。归执行，决策周检不算 |
+| **I-4** | OTC / 解锁时间表。只登记，决策周检不算 |
+| **⑥ 信号拥挤** | 决策层观察。`live_candidate` 与 `sample` 分开。不是硬旁证 |
+| 候选 | 候选 ≠ 自动激活。`accepted` 仍不是 `activated` |
+| Step2 | 仍只由 #71 硬旁证否决（止损占亏≥50% 或单日开仓≥20）。拥挤度不否决 |
 
 ## 10-19 复盘硬证据（代码计算）
 
