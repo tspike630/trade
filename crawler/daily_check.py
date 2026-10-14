@@ -53,10 +53,11 @@ from risk import (  # noqa: E402
     G13_HIGH_APY_TAG,
     count_g13_tagged_tokens,
 )
-from store import Store  # noqa: E402
+from store import Store, format_intel_observe_line  # noqa: E402
 
 HOT_LIQ_CHECK_NAME = "Hot liquidity 热层流动性覆盖"
 G13_CHECK_NAME = "G-13 high APY 异常高年化标签"
+INTEL_I1_CHECK_NAME = "INTEL_LOOP I-1 标签与持仓快照"
 
 # HK calendar day for report naming (UTC+8)
 _HK = timezone(timedelta(hours=8))
@@ -1182,6 +1183,47 @@ def check_g13_high_apy(store: Store, report: CheckReport) -> None:
     )
 
 
+def check_intel_loop_i1(store: Store, report: CheckReport) -> None:
+    """Observe I-1 label and holder-snapshot counts.
+
+    Empty tables are PASS. A query or schema miss is WARN. This check never
+    FAILs and does not count toward strategy validity. It does not gate buys.
+    """
+    flags = {
+        "counts_toward_strategy_validity": False,
+        "evidence_role": EVIDENCE_ROLE_SIDE,
+        "observe_only": True,
+    }
+    try:
+        counts = store.intel_observe_counts()
+    except Exception as exc:  # noqa: BLE001
+        report.add(
+            INTEL_I1_CHECK_NAME,
+            "WARN",
+            f"I-1 观察计数失败: {exc}",
+            {**flags, "error": str(exc)},
+        )
+        return
+    if not counts.get("available"):
+        report.add(
+            INTEL_I1_CHECK_NAME,
+            "WARN",
+            f"I-1 表不可读: {counts.get('error') or 'unavailable'}。不计策略有效性。",
+            {**flags, **counts},
+        )
+        return
+    report.add(
+        INTEL_I1_CHECK_NAME,
+        "PASS",
+        (
+            f"{format_intel_observe_line(counts)} "
+            f"transfer_edge_n={int(counts.get('transfer_edge_n') or 0)}. "
+            f"空表也是观察，不是 FAIL。不计策略有效性（{EVIDENCE_ROLE_SIDE}）"
+        ),
+        {**flags, **counts},
+    )
+
+
 def run_checks(*, db: str, stale_sec: int | None) -> CheckReport:
     report = CheckReport()
     db_path = Path(db)
@@ -1203,6 +1245,7 @@ def run_checks(*, db: str, stale_sec: int | None) -> CheckReport:
         check_history(store, report, db_path)
         check_hot_liquidity_coverage(store, report)
         check_g13_high_apy(store, report)
+        check_intel_loop_i1(store, report)
         check_scoring(store, report, log_path)
         check_multichain(store, report)
 

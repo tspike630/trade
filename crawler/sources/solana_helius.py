@@ -4,6 +4,10 @@ P1.2 Helius Solana logsSubscribe listener for new-pair / mint hints.
 Without HELIUS_API_KEY: TokenSource is a documented no-op.
 With key: background WebSocket logsSubscribe → parse → pending_enrich (+ upsert).
 
+INTEL_LOOP I-1: a confirmed getTransaction also labels initializeMint mintAuthority
+as dev and, when HOLDER_SNAPSHOT_ENABLED (default ON), snapshots top holders via
+the same HTTP RPC. Unknown deployer or a failed holder RPC writes nothing.
+
 Default program IDs are well-known public addresses (Raydium / Pump.fun / Meteora / Orca).
 Confirm against current on-chain deployments before production — override via HELIUS_PROGRAM_IDS.
 """
@@ -15,10 +19,12 @@ import json
 import queue
 import re
 import threading
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import httpx
 
+from alerts import emit_alert
 from config import (
     DB_PATH,
     HELIUS_API_KEY,
@@ -29,9 +35,12 @@ from config import (
     HELIUS_PROGRAM_IDS,
     HELIUS_RECONNECT_MAX_SEC,
     HELIUS_WS_URL,
+    HOLDER_SNAPSHOT_ENABLED,
 )
 from logging_setup import get_logger, redact_secrets
 from sources.base import SourceResult, TokenSource
+from sources.holder_snapshot import fetch_holder_snapshot
+from store import norm_address
 
 log = get_logger("sources.helius")
 
@@ -54,6 +63,11 @@ DEFAULT_HELIUS_PROGRAM_IDS: list[tuple[str, str]] = [
     ("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB", "Meteora pools"),
     ("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", "Orca Whirlpool"),
 ]
+
+_MINT_INIT_TYPES = frozenset({"initializemint", "initializemint2"})
+_TRANSFER_TYPES = frozenset({"transfer", "transferchecked"})
+DEV_LABEL_SOURCE = "helius:initializeMint"
+TRANSFER_EDGE_SOURCE = "helius:getTransaction"
 
 # Explicit mint fields only. A bare pubkey on an "initialize" line is not a mint.
 _MINT_FIELD_RE = re.compile(
@@ -264,6 +278,199 @@ async def rpc_get_transaction(
     return result if isinstance(result, dict) else None
 
 
+def known_program_ids() -> set[str]:
+    """Program and quote addresses that are not a token deployer."""
+    ids = {norm_address(item) for item in _SYSTEMISH}
+    ids.update(norm_address(pid) for pid, _label in DEFAULT_HELIUS_PROGRAM_IDS)
+    for pid in resolve_program_ids():
+        ids.add(norm_address(pid))
+    return ids
+
+
+def _iter_parsed_infos(tx: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    found: list[tuple[str, dict[str, Any]]] = []
+
+    def _walk(instructions: Any) -> None:
+        if not isinstance(instructions, list):
+            return
+        for ix in instructions:
+            if not isinstance(ix, dict):
+                continue
+            parsed = ix.get("parsed")
+            if not isinstance(parsed, dict):
+                continue
+            info = parsed.get("info")
+            kind = parsed.get("type")
+            if isinstance(info, dict) and isinstance(kind, str):
+                found.append((kind, info))
+
+    message = (tx.get("transaction") or {}).get("message") if isinstance(tx, dict) else None
+    if isinstance(message, dict):
+        _walk(message.get("instructions"))
+    meta = tx.get("meta") if isinstance(tx, dict) else None
+    if isinstance(meta, dict):
+        inner = meta.get("innerInstructions")
+        if isinstance(inner, list):
+            for block in inner:
+                if isinstance(block, dict):
+                    _walk(block.get("instructions"))
+    return found
+
+
+def _ui_from_token_amount(info: dict[str, Any]) -> tuple[str | None, float | None]:
+    token_amount = info.get("tokenAmount")
+    if not isinstance(token_amount, dict):
+        return None, None
+    raw = token_amount.get("amount")
+    amount_raw = str(raw).strip() if isinstance(raw, (str, int)) and not isinstance(raw, bool) else None
+    ui = token_amount.get("uiAmount")
+    amount_ui = float(ui) if isinstance(ui, (int, float)) and not isinstance(ui, bool) else None
+    return amount_raw or None, amount_ui
+
+
+def extract_dev_authorities(tx: dict[str, Any]) -> dict[str, str]:
+    """mint → mintAuthority for initializeMint, skipping programs and blanks.
+
+    Fee payer, token-balance owner, and freezeAuthority are not treated as dev.
+    A mint with no explicit mintAuthority stays unlabeled.
+    """
+    programs = known_program_ids()
+    found: dict[str, str] = {}
+    for kind, info in _iter_parsed_infos(tx):
+        if kind.strip().lower() not in _MINT_INIT_TYPES:
+            continue
+        mint = info.get("mint")
+        authority = info.get("mintAuthority")
+        if not isinstance(mint, str) or not isinstance(authority, str):
+            continue
+        mint_n = norm_address(mint)
+        auth_n = norm_address(authority)
+        if not mint_n or not auth_n or mint_n == auth_n:
+            continue
+        if auth_n in programs or mint_n in programs:
+            continue
+        found.setdefault(mint_n, auth_n)
+    return found
+
+
+def extract_transfer_edges(
+    tx: dict[str, Any],
+    *,
+    signature: str,
+    recorded_at: str,
+) -> list[dict[str, Any]]:
+    """SPL transfer / transferChecked rows from a getTransaction we already fetched.
+
+    A transfer with no mint, source, or destination is dropped. This is not a
+    full transfer index; historical backfill stays Phase-2.
+    """
+    if not signature or not recorded_at:
+        return []
+    edges: list[dict[str, Any]] = []
+    for kind, info in _iter_parsed_infos(tx):
+        if kind.strip().lower() not in _TRANSFER_TYPES:
+            continue
+        mint = info.get("mint")
+        source = info.get("source")
+        dest = info.get("destination")
+        if not all(isinstance(value, str) and value.strip() for value in (mint, source, dest)):
+            continue
+        if kind.strip().lower() == "transferchecked":
+            amount_raw, amount_ui = _ui_from_token_amount(info)
+        else:
+            raw = info.get("amount")
+            amount_raw = (
+                str(raw).strip()
+                if isinstance(raw, (str, int)) and not isinstance(raw, bool)
+                else None
+            )
+            amount_ui = None
+        edges.append(
+            {
+                "chain_id": "solana",
+                "token_address": norm_address(str(mint)),
+                "from_address": norm_address(str(source)),
+                "to_address": norm_address(str(dest)),
+                "amount_raw": amount_raw or None,
+                "amount_ui": amount_ui,
+                "signature": signature,
+                "recorded_at": recorded_at,
+                "source": TRANSFER_EDGE_SOURCE,
+            }
+        )
+    return edges
+
+
+def apply_helius_intel(store: Any, mints: list[str], intel: dict[str, Any] | None) -> None:
+    """Write dev labels, holder snapshots, and transfer edges for enqueued mints.
+
+    Labels and edges whose mint is not in this batch are ignored. whale_top10
+    is only the owner wallet of a snapshot row, never a bare token account and
+    never a known program id.
+    """
+    if not intel:
+        return
+    mint_set = {norm_address(mint) for mint in mints if str(mint).strip()}
+    programs = known_program_ids()
+    deployers = intel.get("deployers") or {}
+    if isinstance(deployers, dict):
+        for mint, authority in deployers.items():
+            mint_n = norm_address(str(mint))
+            if mint_n not in mint_set or not isinstance(authority, str) or not authority.strip():
+                continue
+            auth_n = norm_address(authority)
+            if not auth_n or auth_n in programs:
+                continue
+            store.upsert_address_label(
+                "solana",
+                auth_n,
+                "dev",
+                token_mint=mint_n,
+                source=DEV_LABEL_SOURCE,
+            )
+    snapshots = intel.get("snapshots") or {}
+    if isinstance(snapshots, dict):
+        for mint, snapshot in snapshots.items():
+            mint_n = norm_address(str(mint))
+            if mint_n not in mint_set or not isinstance(snapshot, dict):
+                continue
+            written = store.insert_holder_snapshot("solana", mint_n, snapshot)
+            if written <= 0:
+                continue
+            source = str(snapshot.get("source") or "helius:getTokenLargestAccounts")
+            stored_rows = store.list_holder_snapshot_rows(
+                "solana",
+                mint_n,
+                snapshot_id=str(snapshot.get("snapshot_id") or ""),
+            )
+            for row in stored_rows:
+                if row.get("address_kind") != "owner":
+                    continue
+                holder = row.get("holder_address")
+                if not isinstance(holder, str) or not holder.strip():
+                    continue
+                if holder in programs:
+                    continue
+                store.upsert_address_label(
+                    "solana",
+                    holder,
+                    "whale_top10",
+                    token_mint=mint_n,
+                    source=source,
+                )
+    transfers = intel.get("transfers") or []
+    if isinstance(transfers, list):
+        kept = []
+        for edge in transfers:
+            if not isinstance(edge, dict):
+                continue
+            token = norm_address(str(edge.get("token_address") or ""))
+            if token in mint_set:
+                kept.append(edge)
+        if kept:
+            store.insert_transfer_edges(kept)
+
+
 def enqueue_solana_mints(
     store: Any,
     mints: list[str],
@@ -271,11 +478,13 @@ def enqueue_solana_mints(
     signature: str | None = None,
     emit_new_listing: bool = True,
     cycle_id: str = "helius",
+    intel: dict[str, Any] | None = None,
 ) -> int:
-    """Upsert tokens + pending_enrich. Returns number of newly inserted tokens."""
-    from alerts import emit_alert
-    from store import norm_address
+    """Upsert tokens + pending_enrich. Returns number of newly inserted tokens.
 
+    `intel` is best-effort I-1 fill from a confirmed getTransaction. A failure
+    there does not undo the token row. Log-regex hints pass intel=None.
+    """
     inserted = 0
     for mint in mints:
         addr = norm_address(mint)
@@ -310,6 +519,11 @@ def enqueue_solana_mints(
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.error("helius new_listing alert failed: %s", type(exc).__name__)
+    if intel:
+        try:
+            apply_helius_intel(store, mints, intel)
+        except Exception as exc:  # noqa: BLE001
+            log.error("helius intel fill failed: %s", type(exc).__name__)
     return inserted
 
 
@@ -471,9 +685,15 @@ class HeliusListener:
     def _apply_job(self, store: Any, job: tuple[Any, ...]) -> None:
         kind = job[0]
         if kind == "mints":
-            _, mints, sig, emit = job
+            _, mints, sig, emit = job[:4]
+            side = job[4] if len(job) > 4 else None
             n = enqueue_solana_mints(
-                store, mints, signature=sig, emit_new_listing=emit, cycle_id="helius-listen"
+                store,
+                mints,
+                signature=sig,
+                emit_new_listing=emit,
+                cycle_id="helius-listen",
+                intel=side if isinstance(side, dict) else None,
             )
             log.info(
                 "helius enqueued sig=%s mints=%s newly_inserted=%s emit_new_listing=%s",
@@ -570,6 +790,7 @@ class HeliusListener:
             return
         sig = parsed["signature"]
         logs = parsed.get("logs") or []
+        tx: dict[str, Any] | None = None
         tx_mints: list[str] = []
         try:
             tx = await rpc_get_transaction(sig, http_url=default_http_url(self.api_key))
@@ -603,7 +824,53 @@ class HeliusListener:
                 sig[:16],
                 len(mints),
             )
-        self._submit(("mints", mints, sig, emit))
+        side = await self._intel_side(tx, mints, sig) if tx and emit else None
+        self._submit(("mints", mints, sig, emit, side))
+
+    async def _intel_side(
+        self,
+        tx: dict[str, Any],
+        mints: list[str],
+        signature: str,
+    ) -> dict[str, Any]:
+        """Dev label + transfers from the getTransaction already in hand.
+
+        Holder RPC runs only when the flag is on, and only for these confirmed
+        mints. A snapshot failure leaves that mint out of `snapshots`.
+        """
+        recorded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        side: dict[str, Any] = {
+            "deployers": extract_dev_authorities(tx),
+            "transfers": extract_transfer_edges(
+                tx, signature=signature, recorded_at=recorded_at
+            ),
+            "snapshots": {},
+        }
+        if not HOLDER_SNAPSHOT_ENABLED:
+            return side
+        http_url = default_http_url(self.api_key)
+
+        async def _one(mint: str) -> tuple[str, dict[str, Any] | None]:
+            try:
+                snap = await fetch_holder_snapshot(
+                    mint,
+                    http_url=http_url,
+                    enabled=True,
+                    timeout=12.0,
+                    recorded_at=recorded_at,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "helius holder snapshot failed mint=%s err=%s",
+                    mint[:8],
+                    type(exc).__name__,
+                )
+                return mint, None
+            return mint, snap
+
+        pairs = await asyncio.gather(*(_one(mint) for mint in mints))
+        side["snapshots"] = {mint: snap for mint, snap in pairs if snap}
+        return side
 
 
 def start_helius_listener_background(

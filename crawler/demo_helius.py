@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 from config import HELIUS_API_KEY  # noqa: E402
 from sources.solana_helius import (  # noqa: E402
     DEFAULT_HELIUS_PROGRAM_IDS,
+    extract_dev_authorities,
     extract_mints_from_logs,
     extract_mints_from_transaction,
     helius_enabled,
@@ -83,6 +84,10 @@ def main(argv: list[str] | None = None) -> int:
         if not tx_mints:
             print("FAIL: expected mints from tx fixture")
             return 1
+        devs = extract_dev_authorities(tx)
+        print(f"dev_authorities ({len(devs)}):")
+        for mint, auth in devs.items():
+            print(f"  {mint} -> {auth}")
     else:
         print(f"WARN: no tx fixture at {tx_path}")
 
