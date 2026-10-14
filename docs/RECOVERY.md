@@ -54,6 +54,8 @@ python daily_check.py
 
 警示事例（半胜仍亏、薄池打穿、洗盘/单点、未 enrich 的 `new_listing`）如何落到采集侧，见同文「警示事例 → 采集侧」。采集不拥有 P-1 / P-2 / P-4 / P-5；P-3 只以上述覆盖率作旁证。复盘侧（平仓归因三行、P-2 / P-3、10-19）见 `docs/REVIEW_WARNING_CASES.md`，`crawler/STABILIZE.md` 只有指针。不算有效性，此处不加参数。
 
+10-14 纸面旁证与第二批文献的采集边界（供流正常不等于可调参；不新增 LLM 预测源、不做 agent 扇出）见同文「学习/反思（10-14）」。不算有效性，不盘中改参。
+
 ## 3. 指标层恢复（代码在 `crawler/indicators/`，与采集同仓同 venv）
 
 指标旁路只写 `token_indicators` / `indicator_history` / `jev_signals`，**不改**评分权重（`INDICATORS_WEIGHT_*=0`）。密钥可选：无 `JEV_API_KEY` 时走 `jevs.fun` 公开档。
