@@ -11,6 +11,7 @@ import logging
 import re
 import sqlite3
 import statistics
+import json
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -370,6 +371,32 @@ class PaperTradeFrequencyReport:
     avg_opens_per_active_day: float | None = None
 
 
+@dataclass(frozen=True)
+class SignalStreakReport:
+    """F-1 observe: consecutive loss streak by strategy_id (no auto fuse)."""
+    strategy_id: str
+    closed: int
+    max_loss_streak: int
+    current_loss_streak: int
+    cond_n: int
+    cond_third_loss_rate: float | None  # P(3rd loss | 2 losses)
+
+
+@dataclass(frozen=True)
+class ExitHoldBucket:
+    exit_reason: str
+    count: int
+    median_hold_min: float | None
+    mean_hold_min: float | None
+    pnl_usd: float
+
+
+@dataclass(frozen=True)
+class ExitHoldReport:
+    days: int
+    buckets: tuple[ExitHoldBucket, ...]
+
+
 class MissingTable(LookupError):
     pass
 
@@ -658,7 +685,26 @@ class DataStore:
             log.warning("read failed recent_executions: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "recent_executions")
 
+    def paper_signal_streaks(self, days: int = 14) -> DataResult:
+        """F-1 observe-only: per-strategy loss streaks + P(3rd L|2L)."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._paper_signal_streaks(started, days), "paper_signal_streaks")
+        except Exception as exc:
+            log.warning("read failed paper_signal_streaks: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_signal_streaks")
+
+    def paper_exit_holds(self, days: int = 14) -> DataResult:
+        """F-3 observe-only: hold minutes by exit_reason (sync exit vs max_hold)."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._paper_exit_holds(started, days), "paper_exit_holds")
+        except Exception as exc:
+            log.warning("read failed paper_exit_holds: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_exit_holds")
+
     def paper_trade_frequency(self, days: int = 14) -> DataResult:
+
         """G-1 observe-only: opens/closed/pnl by UTC day from paper fills+positions."""
         started = time.perf_counter()
         try:
@@ -1230,6 +1276,122 @@ class DataStore:
             for row in rows
         )
         return _ok(payload, started)
+
+    def _paper_signal_streaks(self, started: float, days: int) -> DataResult:
+        path = self.paths.paper
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        window = max(1, min(int(days), 60))
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=window)).strftime("%Y-%m-%d")
+        try:
+            with ro_connect(path) as conn:
+                if "positions" not in {
+                    str(r[0]) for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }:
+                    return _unavail("缺少 positions 表", started)
+                rows = conn.execute(
+                    "SELECT closed_at, pnl_usd, meta_json FROM positions "
+                    "WHERE status = 'closed' AND closed_at IS NOT NULL "
+                    "ORDER BY closed_at ASC"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        by: dict[str, list[int]] = {}
+        for row in rows:
+            closed_at = str(_cell(row, "closed_at") or "")
+            if closed_at[:10] < cutoff:
+                continue
+            meta_raw = _cell(row, "meta_json")
+            sid = "unknown"
+            if meta_raw:
+                try:
+                    meta = json.loads(str(meta_raw))
+                    if isinstance(meta, dict) and meta.get("strategy_id"):
+                        sid = str(meta.get("strategy_id"))
+                except Exception:
+                    pass
+            pnl = safe_float(_cell(row, "pnl_usd")) or 0.0
+            by.setdefault(sid, []).append(1 if pnl > 0 else 0)
+        reports: list[SignalStreakReport] = []
+        for sid, seq in sorted(by.items()):
+            streak = 0
+            max_s = 0
+            cur = 0
+            for bit in seq:
+                if bit == 0:
+                    streak += 1
+                    max_s = max(max_s, streak)
+                    cur = streak
+                else:
+                    streak = 0
+                    cur = 0
+            after2: list[int] = []
+            for i in range(len(seq) - 2):
+                if seq[i] == 0 and seq[i + 1] == 0:
+                    after2.append(seq[i + 2])
+            rate = (sum(1 for x in after2 if x == 0) / len(after2)) if after2 else None
+            reports.append(
+                SignalStreakReport(
+                    strategy_id=sid,
+                    closed=len(seq),
+                    max_loss_streak=max_s,
+                    current_loss_streak=cur,
+                    cond_n=len(after2),
+                    cond_third_loss_rate=round(rate, 4) if rate is not None else None,
+                )
+            )
+        return _ok(tuple(reports), started)
+
+    def _paper_exit_holds(self, started: float, days: int) -> DataResult:
+        path = self.paths.paper
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        window = max(1, min(int(days), 60))
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=window)).strftime("%Y-%m-%d")
+        try:
+            with ro_connect(path) as conn:
+                rows = conn.execute(
+                    "SELECT exit_reason, opened_at, closed_at, pnl_usd FROM positions "
+                    "WHERE status = 'closed' AND closed_at IS NOT NULL"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        buckets: dict[str, list[float]] = {}
+        pnls: dict[str, float] = {}
+        for row in rows:
+            closed_at = str(_cell(row, "closed_at") or "")
+            if closed_at[:10] < cutoff:
+                continue
+            er = str(_cell(row, "exit_reason") or "unknown")
+            opened = str(_cell(row, "opened_at") or "")
+            try:
+                a = datetime.fromisoformat(opened.replace("Z", "+00:00"))
+                b = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+                mins = (b - a).total_seconds() / 60.0
+            except Exception:
+                continue
+            buckets.setdefault(er, []).append(mins)
+            pnls[er] = pnls.get(er, 0.0) + (safe_float(_cell(row, "pnl_usd")) or 0.0)
+        out: list[ExitHoldBucket] = []
+        for er, holds in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+            holds_sorted = sorted(holds)
+            n = len(holds_sorted)
+            mid = holds_sorted[n // 2] if n else None
+            if n and n % 2 == 0:
+                mid = (holds_sorted[n // 2 - 1] + holds_sorted[n // 2]) / 2.0
+            mean = (sum(holds_sorted) / n) if n else None
+            out.append(
+                ExitHoldBucket(
+                    exit_reason=er,
+                    count=n,
+                    median_hold_min=round(mid, 2) if mid is not None else None,
+                    mean_hold_min=round(mean, 2) if mean is not None else None,
+                    pnl_usd=round(pnls.get(er, 0.0), 4),
+                )
+            )
+        return _ok(ExitHoldReport(window, tuple(out)), started)
 
     def _paper_trade_frequency(self, started: float, days: int) -> DataResult:
         path = self.paths.paper

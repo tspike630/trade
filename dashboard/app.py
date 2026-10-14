@@ -1121,6 +1121,20 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     tools=("14d",),
                 )
                 _v2_comp(
+                    ("信号", "连亏"),
+                    "span-6",
+                    lambda: _v2_signal_streak(store),
+                    foot="F-1 只记录不熔断 · P(第3亏|连2亏) · 旁证",
+                    tools=("14d",),
+                )
+                _v2_comp(
+                    ("退出", "持仓"),
+                    "span-6",
+                    lambda: _v2_exit_hold(store),
+                    foot="F-3 / C3：exit×持仓分钟 vs max_hold · 旁证",
+                    tools=("14d",),
+                )
+                _v2_comp(
                     ("回测", "新闻"),
                     "span-6",
                     lambda: _v2_btnews(store),
@@ -2067,6 +2081,71 @@ def _v2_reject(store: DataStore) -> None:
     ).classes("v2-note")
 
 
+
+
+def _v2_signal_streak(store: DataStore) -> None:
+    result = store.paper_signal_streaks(days=14)
+    if not result.available or result.data is None:
+        ui.label("暂无数据").classes("v2-note")
+        return
+    reports = result.data
+    if not reports:
+        ui.label("近 14 日无平仓序列").classes("v2-note")
+        return
+    rows = []
+    for item in reports[:8]:
+        rate = getattr(item, "cond_third_loss_rate", None)
+        rate_t = f"{float(rate)*100:.0f}%" if isinstance(rate, (int, float)) else "—"
+        rows.append([
+            _v2_text(getattr(item, "strategy_id", None), 18),
+            str(getattr(item, "closed", "—")),
+            str(getattr(item, "max_loss_streak", "—")),
+            str(getattr(item, "current_loss_streak", "—")),
+            f"{rate_t} (n={getattr(item, 'cond_n', 0)})",
+        ])
+    _v2_table(
+        [("策略", ""), ("已平", "num"), ("最长连亏", "num"), ("当前连亏", "num"), ("P(3亏|2亏)", "num")],
+        rows,
+    )
+    ui.label(
+        "F-1 旁证：paper 只记连亏，不自动熔断；"
+        "周检看条件概率有增益再进 PM（R2/R3），不算有效性。"
+    ).classes("v2-note")
+
+
+def _v2_exit_hold(store: DataStore) -> None:
+    result = store.paper_exit_holds(days=14)
+    if not result.available or result.data is None:
+        ui.label("暂无数据").classes("v2-note")
+        return
+    report = result.data
+    buckets = getattr(report, "buckets", ()) or ()
+    if not buckets:
+        ui.label("近 14 日无退出持仓").classes("v2-note")
+        return
+    rows = []
+    tones = []
+    for item in buckets[:8]:
+        pnl = getattr(item, "pnl_usd", None)
+        pnl_t, pnl_tone = _signed_usd(pnl)
+        med = getattr(item, "median_hold_min", None)
+        med_t = f"{float(med):.0f}m" if isinstance(med, (int, float)) else "—"
+        rows.append([
+            _v2_text(getattr(item, "exit_reason", None)),
+            str(getattr(item, "count", "—")),
+            med_t,
+            pnl_t,
+        ])
+        tones.append(["", "", "", pnl_tone])
+    _v2_table(
+        [("退出", ""), ("笔数", "num"), ("持仓中位", "num"), ("PnL", "num")],
+        rows,
+        tones,
+    )
+    ui.label(
+        "F-3/C3 旁证：对照同步/快速退出 vs max_hold 硬时间；"
+        "现网 stop_loss 持仓更短但亏更大——退出快≠亏得小，不算有效性。"
+    ).classes("v2-note")
 
 def _v2_trade_freq(store: DataStore) -> None:
     result = store.paper_trade_frequency(days=14)
