@@ -11,6 +11,7 @@ Deduction applied in scoring.score_token_from_store; tags prefixed risk_*.
 from __future__ import annotations
 
 import json
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -57,6 +58,234 @@ class RiskScanner(ABC):
         token_raw: dict[str, Any] | None = None,
     ) -> RiskResult:
         ...
+
+
+# G-13 (江恩观察项): advertised APY/APR/yield >= 1000% is a credit-risk signal,
+# not an opportunity. Tag only — decision may downweight later. No new source.
+# Absent copy → no tag (normal pairs stay clean). Soft deduction is below the
+# existing risk_elevated threshold (20), so this tag alone does not hard-gate.
+G13_HIGH_APY_TAG = "risk_g13_high_apy"
+G13_HIGH_APY_MIN_PCT = 1000.0
+G13_HIGH_APY_DEDUCTION = 10.0
+
+_G13_NUM = r"(\d{1,3}(?:[,，]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+_G13_PCT = r"\s*[%％]\+?"
+_G13_ASCII_YIELD = r"(?<![A-Za-z])(?:apys?|aprs?|yields?)(?![A-Za-z])"
+_G13_ASCII_APY = r"(?<![A-Za-z])(?:apys?|aprs?)(?![A-Za-z])"
+_G13_YIELD_WORD = rf"(?:{_G13_ASCII_YIELD}|年化(?:收益|回报|率)?)"
+_G13_FARM_WORD = (
+    r"(?:(?<![A-Za-z])(?:stak(?:e|ed|ing)|farming|farms?|mining)(?![A-Za-z])|挖矿|质押)"
+)
+_G13_EARN_WORD = r"(?<![A-Za-z])(?:earn(?:ing)?|rewards?|apys?|aprs?|yields?)(?![A-Za-z])"
+_G13_LINK_KEYS = ("label", "title", "description", "name", "text")
+
+# Percent must sit on the yield/farm word. A nearby "up 1000%" does not count.
+_G13_PCT_THEN_YIELD = re.compile(rf"{_G13_NUM}{_G13_PCT}\s*{_G13_YIELD_WORD}", re.I)
+_G13_YIELD_THEN_PCT = re.compile(
+    rf"{_G13_YIELD_WORD}\s*(?:of\s+|up\s*to\s+|upto\s+|:|=)?\s*{_G13_NUM}{_G13_PCT}",
+    re.I,
+)
+_G13_YIELD_THEN_BARE = re.compile(
+    rf"(?:{_G13_ASCII_APY}|年化(?:收益|回报|率)?)"
+    rf"\s*(?:of\s+|up\s*to\s+|upto\s+|:|=)?\s*{_G13_NUM}"
+    rf"(?!\s*[%％])(?!\s*[A-Za-z])",
+    re.I,
+)
+_G13_FARM_EARN_PCT = re.compile(
+    rf"{_G13_FARM_WORD}[^.!?\n%]{{0,28}}?{_G13_EARN_WORD}[^.!?\n%]{{0,20}}?{_G13_NUM}{_G13_PCT}",
+    re.I,
+)
+_G13_FARM_IMMEDIATE_PCT = re.compile(
+    rf"{_G13_FARM_WORD}(?:\s*[:=])?\s*{_G13_NUM}{_G13_PCT}",
+    re.I,
+)
+_G13_PCT_THEN_FARM = re.compile(rf"{_G13_NUM}{_G13_PCT}\s*{_G13_FARM_WORD}", re.I)
+_G13_MULT_THEN_YIELD = re.compile(rf"{_G13_NUM}\s*[x×]\s*{_G13_YIELD_WORD}", re.I)
+_G13_YIELD_THEN_MULT = re.compile(
+    rf"(?:{_G13_ASCII_YIELD})\s*{_G13_NUM}\s*[x×]",
+    re.I,
+)
+_G13_UNLIMITED = re.compile(
+    r"(?:infinite|unlimited|uncapped|无穷|无限)\s*"
+    r"(?:(?<![A-Za-z])(?:apys?|aprs?|yields?)(?![A-Za-z])|年化)"
+    r"|(?:(?<![A-Za-z])(?:apys?|aprs?|yields?)(?![A-Za-z])|年化)\s*(?:is\s+)?"
+    r"(?:infinite|unlimited|uncapped|无穷|无限)",
+    re.I,
+)
+
+
+def _g13_parse_num(raw: str) -> float | None:
+    try:
+        return float(raw.replace(",", "").replace("，", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _g13_is_calendar_year(value: float) -> bool:
+    return value.is_integer() and 1900.0 <= value <= 2100.0
+
+
+def _g13_evidence(raw: str) -> str:
+    return " ".join(raw.split())[:96]
+
+
+def _g13_add(snippets: list[str], value: Any, *, depth: int = 0) -> None:
+    if depth > 4 or len(snippets) >= 40:
+        return
+    if isinstance(value, str):
+        text = " ".join(value.split())
+        if not text or text.lower().startswith(("http://", "https://")):
+            return
+        clipped = text[:4000]
+        if clipped not in snippets:
+            snippets.append(clipped)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _g13_add(snippets, item, depth=depth + 1)
+        return
+    if isinstance(value, dict):
+        for key in _G13_LINK_KEYS:
+            if key in value:
+                _g13_add(snippets, value.get(key), depth=depth + 1)
+
+
+def _g13_add_string_values(snippets: list[str], value: Any) -> None:
+    """Boosts are usually `{active: n}`. Only string copy can be a claim."""
+    if isinstance(value, str):
+        _g13_add(snippets, value)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, str):
+                _g13_add(snippets, item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            if isinstance(item, str):
+                _g13_add(snippets, item)
+
+
+def g13_text_snippets(
+    pair: dict[str, Any] | None,
+    token_raw: dict[str, Any] | None,
+) -> list[str]:
+    """Copy already stored on the pair/token. Skips URLs and numeric market fields."""
+    snippets: list[str] = []
+    pair = pair if isinstance(pair, dict) else {}
+    token_raw = token_raw if isinstance(token_raw, dict) else {}
+    _g13_add(snippets, pair.get("labels"))
+    for side in ("baseToken", "quoteToken"):
+        token = pair.get(side)
+        if isinstance(token, dict):
+            _g13_add(snippets, token.get("name"))
+            _g13_add(snippets, token.get("symbol"))
+    info = pair.get("info") if isinstance(pair.get("info"), dict) else {}
+    _g13_add(snippets, info.get("description"))
+    _g13_add(snippets, info.get("websites"))
+    _g13_add(snippets, info.get("socials"))
+    _g13_add_string_values(snippets, pair.get("boosts"))
+    for key in ("description", "name", "symbol", "labels"):
+        _g13_add(snippets, token_raw.get(key))
+    _g13_add(snippets, token_raw.get("links"))
+    token_info = token_raw.get("info") if isinstance(token_raw.get("info"), dict) else {}
+    _g13_add(snippets, token_info.get("description"))
+    _g13_add(snippets, token_info.get("websites"))
+    _g13_add(snippets, token_info.get("socials"))
+    return snippets
+
+
+def _g13_consider(
+    best_pct: float | None,
+    best_evidence: str,
+    pct: float,
+    evidence: str,
+) -> tuple[float | None, str]:
+    if pct < G13_HIGH_APY_MIN_PCT:
+        return best_pct, best_evidence
+    if best_pct is None or pct > best_pct:
+        return pct, evidence
+    return best_pct, best_evidence
+
+
+def detect_g13_high_apy(
+    pair: dict[str, Any] | None,
+    token_raw: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return a hit when stored copy advertises APY/APR/yield >= 1000%.
+
+    No reliable numeric APY field is read from DexScreener. This scans text
+    already on the payload, one snippet at a time. No match → None (do not tag).
+    A bare APY/APR number that is only a calendar year (1900–2100) is ignored;
+    the same number with a percent sign still counts.
+    """
+    best_pct: float | None = None
+    best_evidence = ""
+    unlimited_evidence = ""
+    for snippet in g13_text_snippets(pair, token_raw):
+        for match in _G13_UNLIMITED.finditer(snippet):
+            if not unlimited_evidence:
+                unlimited_evidence = _g13_evidence(match.group(0))
+        for kind, rx, scale in (
+            ("pct", _G13_PCT_THEN_YIELD, 1.0),
+            ("pct", _G13_YIELD_THEN_PCT, 1.0),
+            ("bare", _G13_YIELD_THEN_BARE, 1.0),
+            ("pct", _G13_FARM_EARN_PCT, 1.0),
+            ("pct", _G13_FARM_IMMEDIATE_PCT, 1.0),
+            ("pct", _G13_PCT_THEN_FARM, 1.0),
+            ("mult", _G13_MULT_THEN_YIELD, 100.0),
+            ("mult", _G13_YIELD_THEN_MULT, 100.0),
+        ):
+            for match in rx.finditer(snippet):
+                raw_num = next((group for group in match.groups() if group), None)
+                if raw_num is None:
+                    continue
+                number = _g13_parse_num(raw_num)
+                if number is None:
+                    continue
+                if kind == "bare" and _g13_is_calendar_year(number):
+                    continue
+                best_pct, best_evidence = _g13_consider(
+                    best_pct,
+                    best_evidence,
+                    number * scale,
+                    _g13_evidence(match.group(0)),
+                )
+    if best_pct is None and not unlimited_evidence:
+        return None
+    return {
+        "tag": G13_HIGH_APY_TAG,
+        "apy_pct": best_pct,
+        "evidence": best_evidence or unlimited_evidence,
+        "unlimited": best_pct is None,
+    }
+
+
+def count_g13_tagged_tokens(conn: Any) -> int:
+    """Observe-only count of tokens whose quality_tags include the G-13 tag."""
+    rows = conn.execute(
+        """
+        SELECT quality_tags FROM tokens
+        WHERE quality_tags IS NOT NULL AND instr(quality_tags, ?) > 0
+        """,
+        (G13_HIGH_APY_TAG,),
+    ).fetchall()
+    count = 0
+    for row in rows:
+        raw = row["quality_tags"] if hasattr(row, "keys") else row[0]
+        try:
+            tags = json.loads(raw or "[]")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(tags, list) and G13_HIGH_APY_TAG in tags:
+            count += 1
+    return count
+
+
+def format_g13_operator_line(tagged_n: int | None) -> str:
+    """One hourly-report line. The count is not strategy validity."""
+    shown = "n/a" if tagged_n is None else str(int(tagged_n))
+    return (
+        f"G-13 high APY (观察, 不计有效性): tag={G13_HIGH_APY_TAG} n={shown}"
+    )
 
 
 class HeuristicRiskScanner(RiskScanner):
@@ -135,6 +364,19 @@ class HeuristicRiskScanner(RiskScanner):
         if not links and liq_usd < 5000:
             tags.append("risk_no_socials")
             deduction += 5
+
+        # G-13: advertised high APY in copy already on this payload. No claim → skip.
+        g13 = detect_g13_high_apy(pair, token_raw)
+        if g13 is not None:
+            tags.append(G13_HIGH_APY_TAG)
+            flags["g13_high_apy"] = True
+            if g13.get("apy_pct") is not None:
+                flags["g13_apy_pct"] = g13["apy_pct"]
+            if g13.get("unlimited"):
+                flags["g13_unlimited"] = True
+            if g13.get("evidence"):
+                flags["g13_evidence"] = g13["evidence"]
+            deduction += G13_HIGH_APY_DEDUCTION
 
         return RiskResult(
             deduction=deduction,

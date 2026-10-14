@@ -78,20 +78,28 @@ DexScreener sometimes omits `liquidity` on a pair payload. `history.extract_metr
 - WARN if missing (NULL or ≤0) **> 25%**, if the hot 1h window is empty, or if n < 20 while the missing rate is > 60%
 - FAIL if missing **> 60%** and n ≥ 20
 
-A ~34% missing rate is WARN. The rate is **10-19 周检旁证** and does not count toward strategy validity. The hourly report (`scripts/grok_report.py` → context markdown) prints one line under Health: hot 1h missing rate and `pending_enrich`. Do not change `ALERT_MIN_SCORE` or score weights from this metric. How the warning cases use this check is in the next section.
+A ~34% missing rate is WARN. The rate is **10-19 周检旁证** and does not count toward strategy validity. The hourly report (`scripts/grok_report.py` → context markdown) prints one line under Health: hot 1h missing rate and `pending_enrich`. Do not change `ALERT_MIN_SCORE` or score weights from this metric. How the warning cases use this check is in 「警示事例 → 采集侧」.
+
+## G-13 异常高 APY（代码标签，观察）
+
+宣传 APY/APR/yield ≥ **1000%**（或文案里的无限年化、≥10x APY）是信用风险信号，不是机会。`HeuristicRiskScanner` 只扫已经落库的文案：pair 的 `labels`、代币名称/符号、`info` 描述与社交 label、boosts 里的字符串，以及 token profile 的 `description` / `links` label。不读价格、成交量、流动性数字，不加新源。
+
+命中则打 `risk_g13_high_apy`，并走现有 `apply_risk_to_score` 软扣 10 分（单独不够 `risk_elevated` 的 20 分门槛）。没有这段文案就不打标。省略 `liquidity` 仍是 NULL / `no_liquidity`，不编造。
+
+`daily_check.py` 与小时报各计一次带该标签的代币数。观察项，供决策以后降权。本层不自动拒绝、不改 `ALERT_MIN_SCORE`、不改循环。**不算有效性。**
 
 ## 警示事例 → 采集侧
 
-Polymarket 经验落地计划第四节的三条警示，映射到采集侧时只作旁证。**不算策略有效性。** 本文只记边界：docs-only，会话中不加参数。`ALERT_MIN_SCORE`、评分权重、现有 Telegram 路由、`history.extract_metrics` 的流动性写法保持原样。上一节的热层覆盖（#44）已经在跑，这里不另做监测。
+Polymarket 经验落地计划第四节的三条警示，映射到采集侧时只作旁证。**不算策略有效性。** 本文只记边界：docs-only，会话中不加参数。`ALERT_MIN_SCORE`、评分权重、现有 Telegram 路由、`history.extract_metrics` 的流动性写法保持原样。「热层流动性覆盖」那一节（#44）已经在跑，这里不另做监测。
 
 | 警示 | 采集侧 |
 |---|---|
 | 半胜仍亏（约 51% 胜率仍大亏） | 仓位与入场（PM + `min_liq` + SL）。采集参数不动。**P-1** 不归采集。 |
-| 单笔抹盈 / 薄池打穿（$0.95 黑天鹅，约 5% 抹掉约 95%；纸面 `stop_loss` 约 −84.33） | API 省略 `liquidity` 时 `liquidity_usd` 留 NULL，不编造。决策对缺失流动性以 `no_liquidity` fail-closed。#44 热层缺失率是 **10-19 周检旁证**。止损与仓位是 **P-2**，不归采集。**P-3** 采集只交上一节的流动性覆盖旁证，不拥有 `min_liq` 门槛。 |
+| 单笔抹盈 / 薄池打穿（$0.95 黑天鹅，约 5% 抹掉约 95%；纸面 `stop_loss` 约 −84.33） | API 省略 `liquidity` 时 `liquidity_usd` 留 NULL，不编造。决策对缺失流动性以 `no_liquidity` fail-closed。#44 热层缺失率是 **10-19 周检旁证**。止损与仓位是 **P-2**，不归采集。**P-3** 采集只交「热层流动性覆盖」旁证，不拥有 `min_liq` 门槛。 |
 | 洗盘 / 预言机单点 | 行情已是多源：DexScreener 主路径、Helius 链上线索、CCXT 旁路（`CCXT_SIDECHANNEL.md`）。周检人工核对留给人。**C1** 第二个 Telegram bot 保持 observe-only，不接入决策、不改现有推送路由。**P-4 / P-5** 不归采集。 |
 | 未 enrich 的 `new_listing` | Helius 在 `tokens/v1` enrich 之前写入 `pending_enrich`，并可能发 `new_listing`（severity `info`，文案是 mint hint）。这条告警和未完成的 enrich 队列都不是可交易信号。流动性以 enrich 后的 `pair_history.liquidity_usd` 为准；payload 没有该字段则仍为 NULL。 |
 
-归属：采集不拥有 **P-1 / P-2 / P-4 / P-5**。对 **P-3** 只提供上一节的热层流动性覆盖作为 10-19 旁证。以上全部标记为不算有效性。10-14 纸面旁证与文献边界见下一节。
+归属：采集不拥有 **P-1 / P-2 / P-4 / P-5**。对 **P-3** 只提供「热层流动性覆盖」作为 10-19 旁证。以上全部标记为不算有效性。10-14 纸面旁证与文献边界见下一节。
 
 ## 学习/反思（10-14）
 

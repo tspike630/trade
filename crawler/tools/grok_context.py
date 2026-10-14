@@ -29,6 +29,7 @@ from history import (  # noqa: E402
     liquidity_coverage,
     utc_hours_ago_iso,
 )
+from risk import count_g13_tagged_tokens, format_g13_operator_line  # noqa: E402
 from store import Store  # noqa: E402
 
 
@@ -109,6 +110,10 @@ def build_context(
             "counts_toward_strategy_validity": False,
             "evidence_role": EVIDENCE_ROLE_SIDE,
         }
+    try:
+        g13_n: int | None = count_g13_tagged_tokens(store._conn)
+    except Exception:  # noqa: BLE001
+        g13_n = None
     return {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": "dexscreener-crawler",
@@ -123,6 +128,7 @@ def build_context(
             "pending_enrich": store.count_pending_enrich(),
             "hot_liq_1h_n": hot_liq.get("n"),
             "hot_liq_1h_missing_rate": hot_liq.get("missing_rate"),
+            "g13_high_apy_n": g13_n,
             "cycle_number": store.get_cycle_number(),
         },
         "hot_liquidity_1h": hot_liq,
@@ -144,6 +150,7 @@ def to_markdown(ctx: dict[str, Any]) -> str:
             ctx.get("hot_liquidity_1h"),
             (ctx.get("stats") or {}).get("pending_enrich"),
         ),
+        format_g13_operator_line((ctx.get("stats") or {}).get("g13_high_apy_n")),
         f"",
         f"## Stats",
         f"",
