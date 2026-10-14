@@ -286,6 +286,7 @@ class Store:
         self._migrate_pair_created_at()
         self._migrate_market_cap_columns()
         self._migrate_intel_loop_i1()
+        self._migrate_intel_loop_i3()
 
     def _migrate_add_pair_flags(self) -> None:
         cols = self._table_columns("tokens")
@@ -1491,6 +1492,52 @@ class Store:
         )
         self._conn.commit()
 
+    def _migrate_intel_loop_i3(self) -> None:
+        """Additive I-3 bot markers. No backfill. Missing inputs stay NULL.
+
+        ``bot_fill_observations`` is one parsed fill (fee payer + mint whose
+        raw balance changed). ``bot_reason`` NULL means the row was not
+        flagged, not that the wallet is human. ``token_transfer_edges.bot_reason``
+        is stamped only after a heuristic hits that signature.
+        """
+        cur = self._conn.cursor()
+        cur.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS bot_fill_observations (
+                chain_id TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                wallet TEXT NOT NULL,
+                token_address TEXT NOT NULL,
+                slot INTEGER,
+                block_time INTEGER,
+                recorded_at TEXT NOT NULL,
+                fee_lamports INTEGER,
+                compute_unit_price INTEGER,
+                compute_unit_limit INTEGER,
+                priority_fee_lamports INTEGER,
+                source TEXT NOT NULL,
+                bot_reason TEXT,
+                PRIMARY KEY (chain_id, signature, wallet, token_address)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_bot_fills_wallet
+                ON bot_fill_observations (chain_id, wallet, token_address, recorded_at);
+
+            CREATE INDEX IF NOT EXISTS idx_bot_fills_token_time
+                ON bot_fill_observations (chain_id, token_address, recorded_at);
+            """
+        )
+        cols = self._table_columns("token_transfer_edges")
+        if "bot_reason" not in cols:
+            cur.execute("ALTER TABLE token_transfer_edges ADD COLUMN bot_reason TEXT")
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_transfer_edges_bot_reason
+                ON token_transfer_edges (bot_reason)
+            """
+        )
+        self._conn.commit()
+
     def _migrate_quality_score(self) -> None:
         cols = self._table_columns("tokens")
         cur = self._conn.cursor()
@@ -2123,6 +2170,278 @@ class Store:
             "transfer_edge_n": int(edges["c"] or 0),
         }
 
+    def insert_bot_observations(self, rows: list[dict[str, Any]]) -> int:
+        """Insert parsed bot-fill rows. Incomplete rows are skipped.
+
+        Conflict keeps the first recorded_at and fills only NULL measurements.
+        ``bot_reason`` is not set here.
+        """
+        if not rows:
+            return 0
+        pending: list[tuple[Any, ...]] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            chain_id = norm_chain(str(item.get("chain_id") or ""))
+            signature = item.get("signature")
+            wallet = item.get("wallet")
+            token = item.get("token_address")
+            recorded_at = item.get("recorded_at")
+            source = item.get("source")
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (chain_id, signature, wallet, token, recorded_at, source)
+            ):
+                continue
+            pending.append(
+                (
+                    chain_id,
+                    str(signature).strip(),
+                    norm_address(str(wallet)),
+                    norm_address(str(token)),
+                    _optional_int(item.get("slot")),
+                    _optional_int(item.get("block_time")),
+                    str(recorded_at).strip(),
+                    _optional_int(item.get("fee_lamports")),
+                    _optional_int(item.get("compute_unit_price")),
+                    _optional_int(item.get("compute_unit_limit")),
+                    _optional_int(item.get("priority_fee_lamports")),
+                    str(source).strip(),
+                )
+            )
+        if not pending:
+            return 0
+        cur = self._conn.cursor()
+        cur.executemany(
+            """
+            INSERT INTO bot_fill_observations (
+                chain_id, signature, wallet, token_address, slot, block_time,
+                recorded_at, fee_lamports, compute_unit_price, compute_unit_limit,
+                priority_fee_lamports, source, bot_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(chain_id, signature, wallet, token_address) DO UPDATE SET
+                slot = COALESCE(bot_fill_observations.slot, excluded.slot),
+                block_time = COALESCE(bot_fill_observations.block_time, excluded.block_time),
+                fee_lamports = COALESCE(
+                    bot_fill_observations.fee_lamports, excluded.fee_lamports
+                ),
+                compute_unit_price = COALESCE(
+                    bot_fill_observations.compute_unit_price, excluded.compute_unit_price
+                ),
+                compute_unit_limit = COALESCE(
+                    bot_fill_observations.compute_unit_limit, excluded.compute_unit_limit
+                ),
+                priority_fee_lamports = COALESCE(
+                    bot_fill_observations.priority_fee_lamports,
+                    excluded.priority_fee_lamports
+                )
+            """,
+            pending,
+        )
+        self._conn.commit()
+        return len(pending)
+
+    def list_bot_observations(
+        self,
+        chain_id: str,
+        wallet: str,
+        token_address: str,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Recent fills for one wallet and token, oldest first within the cap."""
+        cap = max(1, int(limit))
+        rows = self._conn.execute(
+            """
+            SELECT chain_id, signature, wallet, token_address, slot, block_time,
+                   recorded_at, fee_lamports, compute_unit_price, compute_unit_limit,
+                   priority_fee_lamports, source, bot_reason
+            FROM bot_fill_observations
+            WHERE chain_id = ? AND wallet = ? AND token_address = ?
+            ORDER BY recorded_at DESC, signature DESC
+            LIMIT ?
+            """,
+            (norm_chain(chain_id), norm_address(wallet), norm_address(token_address), cap),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def merge_bot_observation_reason(
+        self,
+        chain_id: str,
+        signature: str,
+        wallet: str,
+        token_address: str,
+        reason: str,
+    ) -> str | None:
+        """Union ``reason`` into the fill row. Does not clear an existing reason."""
+        merged_reason = _merge_bot_reason(None, reason)
+        if not merged_reason:
+            return None
+        cur = self._conn.cursor()
+        row = cur.execute(
+            """
+            SELECT bot_reason FROM bot_fill_observations
+            WHERE chain_id = ? AND signature = ? AND wallet = ? AND token_address = ?
+            """,
+            (
+                norm_chain(chain_id),
+                signature.strip(),
+                norm_address(wallet),
+                norm_address(token_address),
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        merged = _merge_bot_reason(row["bot_reason"], merged_reason)
+        cur.execute(
+            """
+            UPDATE bot_fill_observations
+            SET bot_reason = ?
+            WHERE chain_id = ? AND signature = ? AND wallet = ? AND token_address = ?
+            """,
+            (
+                merged,
+                norm_chain(chain_id),
+                signature.strip(),
+                norm_address(wallet),
+                norm_address(token_address),
+            ),
+        )
+        self._conn.commit()
+        return merged
+
+    def merge_bot_edge_reason(
+        self,
+        chain_id: str,
+        token_address: str,
+        signature: str,
+        reason: str,
+    ) -> int:
+        """Stamp transfer edges for one signature. Edges without a row stay absent."""
+        merged_reason = _merge_bot_reason(None, reason)
+        if not merged_reason:
+            return 0
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT id, bot_reason FROM token_transfer_edges
+            WHERE chain_id = ? AND token_address = ? AND signature = ?
+            """,
+            (norm_chain(chain_id), norm_address(token_address), signature.strip()),
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            merged = _merge_bot_reason(row["bot_reason"], merged_reason)
+            if merged == (row["bot_reason"] or ""):
+                continue
+            cur.execute(
+                "UPDATE token_transfer_edges SET bot_reason = ? WHERE id = ?",
+                (merged, row["id"]),
+            )
+            updated += 1
+        self._conn.commit()
+        return updated
+
+    def bot_observe_counts(self) -> dict[str, Any]:
+        """I-3 observe counts. A missing table is unavailable, not a filled zero."""
+        empty = {
+            "available": False,
+            "bot_suspect_n": 0,
+            "bot_edge_n": 0,
+        }
+        try:
+            if not self._table_exists("address_labels"):
+                return {**empty, "error": "missing table address_labels"}
+            if not self._table_exists("bot_fill_observations"):
+                return {**empty, "error": "missing table bot_fill_observations"}
+            if not self._table_exists("token_transfer_edges"):
+                return {**empty, "error": "missing table token_transfer_edges"}
+            if "bot_reason" not in self._table_columns("token_transfer_edges"):
+                return {**empty, "error": "missing column token_transfer_edges.bot_reason"}
+            suspect = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM address_labels WHERE label_type = 'bot_suspect'"
+            ).fetchone()
+            edges = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM token_transfer_edges
+                WHERE bot_reason IS NOT NULL AND bot_reason != ''
+                """
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            return {**empty, "error": type(exc).__name__}
+        return {
+            "available": True,
+            "bot_suspect_n": int(suspect["c"] or 0),
+            "bot_edge_n": int(edges["c"] or 0),
+        }
+
+    def bot_share_inputs(
+        self,
+        chain_id: str,
+        token_address: str,
+        *,
+        since_recorded_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Numerator and denominator for a later bot_trade_share.
+
+        Denominator = parsed fills in the window. Numerator = those with a
+        bot_reason. Unparsed transactions are left out, not counted as human.
+        ``share`` is NULL when the denominator is 0. A share of 0 is not a
+        human label and is not a skip signal.
+        """
+        empty = {
+            "available": False,
+            "total_fills": None,
+            "bot_fills": None,
+            "share": None,
+        }
+        try:
+            if not self._table_exists("bot_fill_observations"):
+                return {**empty, "error": "missing table bot_fill_observations"}
+            sql = (
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN bot_reason IS NOT NULL AND bot_reason != '' "
+                "THEN 1 ELSE 0 END) AS bot "
+                "FROM bot_fill_observations WHERE chain_id = ? AND token_address = ?"
+            )
+            params: list[Any] = [norm_chain(chain_id), norm_address(token_address)]
+            if since_recorded_at:
+                sql += " AND recorded_at >= ?"
+                params.append(since_recorded_at)
+            row = self._conn.execute(sql, params).fetchone()
+        except sqlite3.OperationalError as exc:
+            return {**empty, "error": type(exc).__name__}
+        total = int(row["total"] or 0)
+        bot_fills = int(row["bot"] or 0)
+        return {
+            "available": True,
+            "total_fills": total,
+            "bot_fills": bot_fills,
+            "share": None if total == 0 else bot_fills / total,
+        }
+
+
+def _optional_int(value: Any) -> int | None:
+    """Non-negative int, or None. Bools and floats are not coerced."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return None
+
+
+def _merge_bot_reason(existing: str | None, incoming: str | None) -> str:
+    parts: set[str] = set()
+    for blob in (existing, incoming):
+        if not isinstance(blob, str):
+            continue
+        parts.update(part for part in blob.split(",") if part)
+    return ",".join(sorted(parts))
+
 
 def _optional_real(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
@@ -2153,5 +2472,16 @@ def format_intel_observe_line(counts: dict[str, Any] | None) -> str:
         f"labeled_dev_n={int(counts.get('labeled_dev_n') or 0)} "
         f"holder_snapshot_n={int(counts.get('holder_snapshot_n') or 0)} "
         f"tokens_with_top10={int(counts.get('tokens_with_top10') or 0)}"
+    )
+
+
+def format_bot_observe_line(counts: dict[str, Any] | None) -> str:
+    """Hourly I-3 line. Counts are 10-19 side evidence, not a skip signal."""
+    if not isinstance(counts, dict) or counts.get("error") or not counts.get("available"):
+        return "I-3 observe (旁证, 不计有效性): unavailable"
+    return (
+        "I-3 observe (旁证, 不计有效性): "
+        f"bot_suspect_n={int(counts.get('bot_suspect_n') or 0)} "
+        f"bot_edge_n={int(counts.get('bot_edge_n') or 0)}"
     )
 

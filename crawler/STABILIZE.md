@@ -106,7 +106,27 @@ I-1 已落地的是表和尽力填充，不是因子。`address_labels` 记地�
 
 `token_transfer_edges` 只记这笔已经拉下来的 `getTransaction` 里、且 mint 属于本次入队代币的 SPL `transfer` / `transferChecked`。没有 mint 的转账丢掉。全量转账图和历史回填是 Phase-2。
 
-`daily_check` 检查「INTEL_LOOP I-1」和小时报只计 `labeled_dev_n`、`holder_snapshot_n`、`tokens_with_top10`。空表是 PASS。查询失败是 WARN，不是 FAIL。这是 **10-19 旁证**，不算策略有效性。不改 `ALERT_MIN_SCORE`、cooldown、`min_liq`、Telegram 路由，也不动 LIVE 闸。I-3（bot share）与 I-4（OTC）不在这次。
+`daily_check` 检查「INTEL_LOOP I-1」和小时报只计 `labeled_dev_n`、`holder_snapshot_n`、`tokens_with_top10`。空表是 PASS。查询失败是 WARN，不是 FAIL。这是 **10-19 旁证**，不算策略有效性。不改 `ALERT_MIN_SCORE`、cooldown、`min_liq`、Telegram 路由，也不动 LIVE 闸。I-3 的采集标记见下一节。I-4（OTC）不在这次。
+
+## INTEL_LOOP I-3（bot 标记，只采集）
+
+I-3 采集侧补的是以后填 `bot_trade_share` 的上游标记。候选不等于生效。高 bot 占比不跳单，不改执行，不接 PM。`ALERT_MIN_SCORE`、cooldown、`min_liq`、Telegram 路由、LIVE 闸都不动。
+
+`address_labels.label_type` 可以写成 `bot_suspect`（钱包 + 代币）。证据不够就不写。没有「不是 bot」这一档。
+
+`bot_fill_observations` 记这笔已经拉下来的 `getTransaction` 里，手续费支付者对某个代币的原始余额发生了变化。`slot`、`block_time`、`compute_unit_price` 缺了就是 NULL，不用入库时间冒充链上时间。余额对不上、或支付者是已知程序，就不插这一行。`token_transfer_edges.bot_reason` 只在同一笔签名被标上之后才写，否则保持 NULL。没解析出的转账不补边。
+
+三条启发式都是尽力而为，失败就关闭：
+
+- 同一 `slot`、同一钱包、同一代币、至少两笔不同签名：`same_slot_repeat`。`blockTime` 只有秒，没有毫秒字段就不编造毫秒间隔。同一 slot 是链上能看见的亚秒重复。没有 slot 就不打这条。
+- 至少三笔，`block_time` 间隔完全相等且大于 0，整段落在最近 1 小时：`fixed_interval`。间隔不等、少一笔、或没有 `block_time`，就不打。
+- 顶层最后一条 `SetComputeUnitPrice` 的 micro-lamports ≥ 1000000：`priority_fee`。指令不在、解析不了、或价格更低，就不打。不拿 `meta.fee` 反推竞价。
+
+不额外打 RPC。日志正则命中的 mint 不打标。`BOT_MARKERS_ENABLED` 默认开，只在纸面观察；设为 `0` 则实时监听不解析、不打 `bot_suspect`。dev 标签、转账边、持仓快照仍按 I-1。
+
+窗口份额的分子分母在 `bot_share_inputs`：被标上的已解析成交 / 已解析成交。分母为 0 时份额是 NULL。没解析到的成交不进分母，不当成人类。份额 0 也不是人类标签，更不是跳单。
+
+`daily_check` 检查「INTEL_LOOP I-3 bot 标记」和小时报只计 `bot_suspect_n`、`bot_edge_n`。空是 PASS。查询失败或表不在是 WARN，不是 FAIL。这是 **10-19 旁证**，不算策略有效性，也不是跳单依据。执行层只读 `slippage_report` 仍不自动跳单。I-4（OTC）不在这次。
 
 ## 警示事例 → 采集侧
 

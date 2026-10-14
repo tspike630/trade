@@ -163,6 +163,15 @@ HOLDER_SNAPSHOT_ENABLED = os.environ.get("HOLDER_SNAPSHOT_ENABLED", "1").strip()
     "yes",
     "on",
 )
+# INTEL_LOOP I-3 paper observe. Parsed from the getTransaction already fetched.
+# No extra RPC. 0 skips bot_suspect labels. Does not skip orders or gate buys.
+# Missing slot / block_time / priority fee stays unlabeled. Default ON.
+BOT_MARKERS_ENABLED = os.environ.get("BOT_MARKERS_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # P2: multi-chain filter (comma-separated). Empty = all chains allowed.
 # Documented: solana, ethereum, bsc, base (plus any DexScreener chainId).
