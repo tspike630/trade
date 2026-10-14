@@ -57,6 +57,16 @@ P2-06 / P2-07 的代码修复已经在库里：SELL 跳过 `max_open`、日亏�
 
 单市场去重与每日亏损上限已经在「已开」里（同票去重 + 每策略 5 + 日亏 200 USD）。它们不是缺项。单市场敞口 ≤15%（`PM_MAX_PER_TOKEN_PCT`）不是这组授权，上表单独登记为未来项。
 
+## 观察项 — 只登记，不改运行时
+
+不发明目标带宽度，不启用任何 env，不改 exits。全文在 [`WAITING_ITEMS.md`](WAITING_ITEMS.md)。
+
+| ID | 项 | 状态 | 对照 / 升级 |
+|----|----|------|-------------|
+| **C4 / E-2** | `target_band_failover` | **WAITING / 只观察。** 持仓期间若价格突破目标带，重估下一目标并继续持仓。不实现。 | 基线 = 现有 `max_hold`（默认 60min）+ TP/SL。升级 = R3 回测对照后再谈。禁止盘中改 tp / sl / max_hold。**不算有效性**（至少到 2026-10-19 周检旁证）。 |
+
+书出处 p145。与复盘 **C3**（趋势出场，`docs/REVIEW_WARNING_CASES.md`）**并列**：C3 仍只观察；C4 不并入 C3。
+
 ## 纪律
 
 1. **R1** — 周报只读。PM / 风控拒因从 `order_events` 分桶（[`WARNING_CASES.md`](WARNING_CASES.md)）。不改参。

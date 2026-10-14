@@ -61,6 +61,10 @@ PM / RISK 是服务层硬检查，写在 Python 里，不写在 LLM prompt 里�
 
 因子代码的 operatorization 归指标加工层。执行层碰到指标相邻的辅助代码时，不绕过因果算子：时间序列只允许截止当前 bar 的窗口。指标规格不在本文件。
 
+## E-2 一行（未实现）
+
+**C4** `target_band_failover` 已登记为 **WAITING / 只观察**，与复盘 C3 并列、不并入。见 [`WAITING_ITEMS.md`](WAITING_ITEMS.md)。不改运行时，不改 TP/SL/hold，不启用新闸门。**不算有效性。**
+
 ## 归属
 
 | 项 | 谁做 | 本文件 |
@@ -70,6 +74,7 @@ PM / RISK 是服务层硬检查，写在 Python 里，不写在 LLM prompt 里�
 | L2 ≤10U 与小额 paper；滑点档只记账 | 执行成本模型 | M-7。不改档 |
 | 单市场 ≤15% | 未来，R2 | 只登记。不启用 `PM_MAX_PER_TOKEN_PCT` |
 | operatorization | 指标加工层 | 一行。不写指标规格 |
+| C4 / E-2 `target_band_failover` | 执行观察 | 只登记。见 [`WAITING_ITEMS.md`](WAITING_ITEMS.md)。不改运行时 |
 | 10-19 周检 | 复盘 | 本文件不算有效性 |
 
 ## 不算有效性
