@@ -89,7 +89,7 @@ pkill -f 'python -m decision_engine.run --strategy jev_strength_v1 --dry-run'
 
 临时 paper 观察。和上面 2026-10-10 的默认 0.3 常驻、以及周一三五 `--purpose sample` 采样，是三条不同的命令。重启 paper 观察时用本节，不要回抄「启动命令」那一节（那一节没有冷却，也没有 0.15）。
 
-**不改代码默认。** `JEV_MIN_STRENGTH` / `DECISION_JEV_MIN_STRENGTH` 仍是 **0.3**。`DECISION_COOLDOWN_SEC` 的代码默认仍是 **0**。0.15 只出现在这条临时命令的 `--min-jev-strength` 上。这不是有效性实验：这些行保持未标记，不要标成 accepted。见 `DECISION_ENGINE_WEEKLY_CHECK.md` 的 2026-10-19 登记表。
+**不改代码默认。** `JEV_MIN_STRENGTH` / `DECISION_JEV_MIN_STRENGTH` 仍是 **0.3**。`DECISION_COOLDOWN_SEC` 的代码默认仍是 **0**。0.15 只出现在这条临时命令的 `--min-jev-strength` 上。这不是有效性实验：这些行保持未标记，不要标成 accepted。见 `DECISION_ENGINE_WEEKLY_CHECK.md` 的 2026-10-19 登记表。三条警示为什么不据此改参，见 `DECISION_ENGINE_WARNING_CASES.md`。
 
 | 必须带上 | 值 | 漏掉时实际发生的事 |
 |----------|----|--------------------|

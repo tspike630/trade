@@ -96,6 +96,8 @@ mkdir -p exports/reports logs
 
 下周一（**2026-10-19**）周检除了现有决策表，把下面三行记进当周笔记。这是观察登记，不改阈值、不改默认强度、不把临时观察标成 accepted。
 
+这三行对应执行单上的三条警示（半胜仍亏、薄池单笔抹盈、残余风险打穿）。映射到已有控制、以及为什么不在盘中改强度或再加过滤，见 `DECISION_ENGINE_WARNING_CASES.md`。仍**不算有效性**。
+
 10:19 的采样命令保持不变：`--once --min-jev-strength 0.15 --purpose sample`。它和临时 paper 观察（`--purpose live_candidate` + `DECISION_COOLDOWN_SEC=3600`）不是同一条进程。重启配方见 `DECISION_ENGINE_DRYRUN_24H.md`。
 
 | 证据 | 从哪看 | 怎么登记 |

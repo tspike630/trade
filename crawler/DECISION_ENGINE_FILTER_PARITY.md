@@ -35,3 +35,4 @@ Live 买入闸门：`decision_engine/core/risk_manager.py` 的 `RiskManager`，�
 1. 先改这张表里对应的一行，写明回测、周检、live 三边是否一起动。
 2. live 只通过现有 `DECISION_MIN_LIQ_USD`（以及已有的冷却环境变量）对齐，不要顺手改强度或权重默认。
 3. 重启 paper 观察后，用 dry-run 日志确认 `min_liq_usd=50000.0`，以及 `reason=liq_below_min` / `reason=no_liquidity` 是否在丢弃，而不是写入 `decision_log`。
+4. 执行单警示（半胜仍亏、薄池 `stop_loss` 单笔抹盈、残余风险打穿）只解释本表已有的 `min_liq` / fail-closed / 冷却，不在这里加第三条盘中过滤。见 `DECISION_ENGINE_WARNING_CASES.md`。
