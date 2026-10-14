@@ -784,6 +784,132 @@ class TechnicalPriorityPassTest(unittest.TestCase):
         )
         self.assertEqual(calls, ["hotdue", "cold1", "hotdue", "cold2"])
 
+    def test_warm_backlog_refreshes_hot_before_two_intervals(self) -> None:
+        """A long due-warm queue must not hold hot past the decision window.
+
+        Each warm upsert advances the scheduler clock. The hot token is
+        marked stale once that clock crosses one hot interval, and must be
+        refreshed again before two intervals while warm tokens remain.
+        """
+        now = datetime.now(timezone.utc)
+        window = HOT_SEEN_WINDOW_SEC
+        warm_ids = [f"warm{i}" for i in range(6)]
+        for address in warm_ids:
+            self._add(address, _iso(now - timedelta(seconds=window + 60)))
+        self._add("hotdue", _iso(now))
+        tech = self._open()
+        listed = {row["token_address"]: row for row in self.store.list_tokens_with_history()}
+        self.store.list_tokens_with_history = lambda: [  # type: ignore[method-assign]
+            *[listed[address] for address in warm_ids],
+            listed["hotdue"],
+        ]
+        clock = {"t": 0.0}
+        calls: list[str] = []
+        hot_at: list[float] = []
+        stale = {"on": False}
+        interval = 300
+
+        def _upsert(
+            chain_id: str,
+            token_address: str,
+            *,
+            tier: str | None = None,
+            force_full: bool = False,
+        ) -> dict[str, str | None]:
+            del force_full
+            calls.append(token_address)
+            if token_address == "hotdue":
+                hot_at.append(clock["t"])
+            self.store.upsert_token_indicators(
+                {
+                    "chain_id": chain_id,
+                    "token_address": token_address,
+                    "tier": tier,
+                    "tech_updated_at": utc_now_iso(),
+                }
+            )
+            clock["t"] += 120
+            if token_address != "hotdue" and clock["t"] >= interval and not stale["on"]:
+                stale["on"] = True
+                self.store.upsert_token_indicators(
+                    {
+                        "chain_id": "solana",
+                        "token_address": "hotdue",
+                        "tier": "hot",
+                        "tech_updated_at": "2020-01-01T00:00:00Z",
+                    }
+                )
+            return {"tier": tier}
+
+        tech.upsert_one = _upsert  # type: ignore[method-assign]
+        tech.run_batch(
+            only_due=True,
+            hot_interval_sec=interval,
+            warm_interval_sec=1800,
+            cold_interval_sec=14400,
+            _monotonic=lambda: clock["t"],
+        )
+        self.assertGreaterEqual(len(hot_at), 2)
+        self.assertLess(hot_at[1] - hot_at[0], 2 * interval)
+        second = calls.index("hotdue", calls.index("hotdue") + 1)
+        warm_before = [c for c in calls[:second] if c in warm_ids]
+        warm_after = [c for c in calls[second + 1 :] if c in warm_ids]
+        self.assertTrue(warm_before)
+        self.assertTrue(warm_after)
+        self.assertLess(len(warm_before), len(warm_ids))
+        self.assertEqual(calls[0], "hotdue")
+
+    def test_hot_backlog_continues_while_warm_advances(self) -> None:
+        """Due hot is sliced, not restarted, when each token fills the interval."""
+        now = datetime.now(timezone.utc)
+        window = HOT_SEEN_WINDOW_SEC
+        hot_ids = ["hot1", "hot2", "hot3"]
+        warm_ids = ["warm1", "warm2", "warm3"]
+        for address in warm_ids:
+            self._add(address, _iso(now - timedelta(seconds=window + 60)))
+        for address in hot_ids:
+            self._add(address, _iso(now))
+        tech = self._open()
+        listed = {row["token_address"]: row for row in self.store.list_tokens_with_history()}
+        self.store.list_tokens_with_history = lambda: [  # type: ignore[method-assign]
+            *[listed[address] for address in warm_ids],
+            *[listed[address] for address in hot_ids],
+        ]
+        clock = {"t": 0.0}
+        calls: list[str] = []
+        interval = 10
+
+        def _upsert(
+            chain_id: str,
+            token_address: str,
+            *,
+            tier: str | None = None,
+            force_full: bool = False,
+        ) -> dict[str, str | None]:
+            del force_full
+            calls.append(token_address)
+            self.store.upsert_token_indicators(
+                {
+                    "chain_id": chain_id,
+                    "token_address": token_address,
+                    "tier": tier,
+                    "tech_updated_at": utc_now_iso(),
+                }
+            )
+            clock["t"] += interval
+            return {"tier": tier}
+
+        tech.upsert_one = _upsert  # type: ignore[method-assign]
+        tech.run_batch(
+            only_due=True,
+            hot_interval_sec=interval,
+            _monotonic=lambda: clock["t"],
+        )
+        self.assertEqual(
+            calls,
+            ["hot1", "warm1", "hot2", "warm2", "hot3", "warm3"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
