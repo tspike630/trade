@@ -73,7 +73,7 @@ When it is on, SELL skips `max_open` so a full book can still close. `EXECUTION_
 - **Partial sell:** `size_pct` on a sell is the fraction of the position to close. `size_pct < 1` → `partial_sell_rejected` (position left open). Full close requires `size_pct=1`. Copying a buy's equity fraction (for example 0.05) onto a sell is rejected.
 - **Idempotent buy:** `meta.decision_log_id` already on a position → `duplicate_decision_log_id` (no second open)
 - **TP/SL/max_hold:** from signal (`tp_pct`/`sl_pct`/`max_hold_min` or extras), else `10%` / `5%` / `60min`. Tick calls `execution.exits.scan_exits` (same rules as backtest). `opened_at` may end in `Z`.
-- **Tick events:** tick closes update the paper position and `fills` only. They do not append `execution_log` / `order_events`, because `decision_log_id` is unique on the entry receipt.
+- **Tick events:** tick closes update the paper position and `fills`. They do not append `execution_log` / `order_events`, because `decision_log_id` is unique on the entry receipt. `PaperExecutor` also appends observe rows (`strategy_streak`, `streak_events`, `shadow_c3`) on the execution ledger after a tick close or a filled sell. Those rows do not reject orders. `peak_price` on the open position only rises. Exit rules stay 10% / 5% / 60min.
 - **One tick writer** per paper DB: `paper_trade.py tick` / `paper_tick_loop.sh` **or** `execution.run --paper-tick`, not both.
 - Main crawler DB opened **read-only** inside `PaperExecutor`
 
@@ -92,6 +92,7 @@ When it is on, SELL skips `max_open` so a full book can still close. `EXECUTION_
 | Quote max age | `PAPER_PRICE_MAX_AGE_SEC` default **3600** |
 | Risk gate | **`EXECUTION_RISK_ENABLED=0`** |
 | Daily loss limit | `EXECUTION_DAILY_LOSS_USD` unset (off) |
+| F-1 streak fuse | `EXECUTION_F1_CIRCUIT` unset = off. The order path does not read it |
 
 ## CLI
 
@@ -111,6 +112,11 @@ python -m execution.run --once \
 
 # Loop with paper + TP/SL/hold tick (explicit; do not enable on prod paper DB by accident)
 python -m execution.run --loop --paper-enabled --paper-db /path/to/paper.db --paper-tick
+
+# Read-only observe reports (do not reject orders; do not change TP/SL/hold)
+python -m execution.f1_streak_report --ledger execution_ledger.db --paper paper_trading.db
+python -m execution.shadow_c3_report --ledger execution_ledger.db
+python -m execution.risk.bankruptcy
 ```
 
 `--once` is the default when neither `--once` nor `--loop` is given.

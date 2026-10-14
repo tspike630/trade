@@ -45,11 +45,18 @@ from history import (  # noqa: E402
     format_rate_pct,
     hot_liq_coverage_level,
     liquidity_coverage,
+    market_cap_null_coverage,
     utc_hours_ago_iso,
+)
+from risk import (  # noqa: E402
+    G13_HIGH_APY_MIN_PCT,
+    G13_HIGH_APY_TAG,
+    count_g13_tagged_tokens,
 )
 from store import Store  # noqa: E402
 
 HOT_LIQ_CHECK_NAME = "Hot liquidity 热层流动性覆盖"
+G13_CHECK_NAME = "G-13 high APY 异常高年化标签"
 
 # HK calendar day for report naming (UTC+8)
 _HK = timezone(timedelta(hours=8))
@@ -1056,6 +1063,8 @@ def check_hot_liquidity_coverage(store: Store, report: CheckReport) -> None:
     Level uses the last 1h hot tier. Last 24h is context only.
     Not strategy validity — 10-19 weekly check may use the rates as 旁证.
     Does not invent liquidity. NULL stays the no_liquidity fail-closed path.
+    `mcap_hot_1h` is an observe count of NULL market_cap / fdv. It does not
+    change this check's level.
     """
     flags = {
         "counts_toward_strategy_validity": False,
@@ -1077,6 +1086,11 @@ def check_hot_liquidity_coverage(store: Store, report: CheckReport) -> None:
         hot_24h = liquidity_coverage(
             store._conn,
             since_iso=utc_hours_ago_iso(HOT_LIQ_CONTEXT_HOURS),
+            tier="hot",
+        )
+        mcap_1h = market_cap_null_coverage(
+            store._conn,
+            since_iso=utc_hours_ago_iso(HOT_LIQ_WINDOW_HOURS),
             tier="hot",
         )
     except Exception as exc:  # noqa: BLE001
@@ -1101,13 +1115,22 @@ def check_hot_liquidity_coverage(store: Store, report: CheckReport) -> None:
         note = " hot 1h 无快照（不 FAIL）。"
     elif thin:
         note = f" n<{HOT_LIQ_FAIL_MIN_N} 样本薄，高缺失不升 FAIL。"
+    mcap_note = ""
+    if mcap_1h.get("available"):
+        mcap_note = (
+            " G-5 denom hot 1h market_cap NULL="
+            f"{format_rate_pct(mcap_1h.get('market_cap_null_rate'))} "
+            f"fdv NULL={format_rate_pct(mcap_1h.get('fdv_null_rate'))} "
+            f"n={int(mcap_1h.get('n') or 0)}"
+            "（观察，不改本检查级别，不计有效性）。"
+        )
     detail = (
         f"hot 1h n={hot_1h['n']} missing={format_rate_pct(hot_1h['missing_rate'])} "
         f"(NULL/≤0) <50k={format_rate_pct(hot_1h['below_min_rate'])} "
         f">=50k={format_rate_pct(hot_1h['ge_min_rate'])} "
         f"price_present={format_rate_pct(hot_1h['price_present_rate'])}; "
         f"hot 24h n={hot_24h['n']} missing={format_rate_pct(hot_24h['missing_rate'])}; "
-        f"pending_enrich={pending}.{note} "
+        f"pending_enrich={pending}.{note}{mcap_note} "
         f"不计策略有效性（{EVIDENCE_ROLE_SIDE}）"
     )
     report.add(
@@ -1119,7 +1142,43 @@ def check_hot_liquidity_coverage(store: Store, report: CheckReport) -> None:
             "pending_enrich": pending,
             "hot_1h": hot_1h,
             "hot_24h": hot_24h,
+            "mcap_hot_1h": mcap_1h,
         },
+    )
+
+
+def check_g13_high_apy(store: Store, report: CheckReport) -> None:
+    """Observe how many tokens carry risk_g13_high_apy.
+
+    The count never changes the level: a large number is still PASS.
+    Decision downweight is later. This is not strategy validity.
+    """
+    flags = {
+        "counts_toward_strategy_validity": False,
+        "evidence_role": EVIDENCE_ROLE_SIDE,
+        "tag": G13_HIGH_APY_TAG,
+        "min_apy_pct": G13_HIGH_APY_MIN_PCT,
+        "observe_only": True,
+    }
+    try:
+        tagged = count_g13_tagged_tokens(store._conn)
+    except Exception as exc:  # noqa: BLE001
+        report.add(
+            G13_CHECK_NAME,
+            "WARN",
+            f"G-13 标签计数失败: {exc}",
+            {**flags, "error": str(exc)},
+        )
+        return
+    report.add(
+        G13_CHECK_NAME,
+        "PASS",
+        (
+            f"tokens tagged {G13_HIGH_APY_TAG}={tagged} "
+            f"(advertised APY/APR/yield ≥ {G13_HIGH_APY_MIN_PCT:.0f}%). "
+            "观察项，供决策降权，不计策略有效性。"
+        ),
+        {**flags, "tagged_n": tagged},
     )
 
 
@@ -1143,6 +1202,7 @@ def run_checks(*, db: str, stale_sec: int | None) -> CheckReport:
     with Store.open_ro(db_path) as store:
         check_history(store, report, db_path)
         check_hot_liquidity_coverage(store, report)
+        check_g13_high_apy(store, report)
         check_scoring(store, report, log_path)
         check_multichain(store, report)
 

@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from history import extract_metrics, pair_history_column_sql
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -223,6 +225,8 @@ class Store:
                 raw_json TEXT NOT NULL,
                 source TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                market_cap REAL,
+                fdv REAL,
                 PRIMARY KEY (chain_id, pair_address)
             );
 
@@ -280,6 +284,7 @@ class Store:
         self._migrate_pair_history()
         self._migrate_quality_score()
         self._migrate_pair_created_at()
+        self._migrate_market_cap_columns()
 
     def _migrate_add_pair_flags(self) -> None:
         cols = self._table_columns("tokens")
@@ -543,6 +548,9 @@ class Store:
         now = _utc_now_iso()
         raw_json = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
         pair_created_at = _parse_pair_created_at(raw)
+        metrics = extract_metrics(raw)
+        market_cap = metrics["market_cap"]
+        fdv = metrics["fdv"]
         if token_address is None:
             base = raw.get("baseToken") or {}
             token_address = base.get("address")
@@ -558,17 +566,29 @@ class Store:
             """
             INSERT INTO pairs (
                 chain_id, pair_address, token_address, raw_json, source, updated_at,
-                pair_created_at
+                pair_created_at, market_cap, fdv
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chain_id, pair_address) DO UPDATE SET
                 token_address = excluded.token_address,
                 raw_json = excluded.raw_json,
                 source = excluded.source,
                 updated_at = excluded.updated_at,
-                pair_created_at = excluded.pair_created_at
+                pair_created_at = excluded.pair_created_at,
+                market_cap = excluded.market_cap,
+                fdv = excluded.fdv
             """,
-            (chain_id, pair_address, token_address, raw_json, source, now, pair_created_at),
+            (
+                chain_id,
+                pair_address,
+                token_address,
+                raw_json,
+                source,
+                now,
+                pair_created_at,
+                market_cap,
+                fdv,
+            ),
         )
         self._conn.commit()
         return "updated" if exists else "inserted"
@@ -1360,7 +1380,9 @@ class Store:
                 volume_h1 REAL,
                 liquidity_usd REAL,
                 txns_h24 INTEGER,
-                tier TEXT
+                tier TEXT,
+                market_cap REAL,
+                fdv REAL
             );
             CREATE INDEX IF NOT EXISTS idx_pair_history_lookup
                 ON pair_history (chain_id, pair_address, recorded_at);
@@ -1372,6 +1394,23 @@ class Store:
         cols = self._table_columns("pairs")
         if "last_history_at" not in cols:
             cur.execute("ALTER TABLE pairs ADD COLUMN last_history_at TEXT")
+        self._conn.commit()
+
+    def _migrate_market_cap_columns(self) -> None:
+        """Nullable market_cap / fdv on pair_history and pairs.
+
+        No backfill from raw_json: a stored pair payload is the latest body,
+        not the market cap at each historical snapshot. Old rows stay NULL
+        until the next upsert or history snapshot. Dex omitting the field
+        writes NULL; fdv is never copied into market_cap.
+        """
+        cur = self._conn.cursor()
+        for table in ("pair_history", "pairs"):
+            cols = self._table_columns(table)
+            if "market_cap" not in cols:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN market_cap REAL")
+            if "fdv" not in cols:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN fdv REAL")
         self._conn.commit()
 
     def _migrate_quality_score(self) -> None:
@@ -1462,6 +1501,8 @@ class Store:
         volume_h1: float | None = None,
         liquidity_usd: float | None = None,
         txns_h24: int | None = None,
+        market_cap: float | None = None,
+        fdv: float | None = None,
         tier: str | None = None,
         recorded_at: str | None = None,
     ) -> int:
@@ -1474,12 +1515,14 @@ class Store:
             """
             INSERT INTO pair_history (
                 chain_id, pair_address, token_address, recorded_at,
-                price_usd, volume_h24, volume_h1, liquidity_usd, txns_h24, tier
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                price_usd, volume_h24, volume_h1, liquidity_usd, txns_h24, tier,
+                market_cap, fdv
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chain_id, pair_address, tok, now,
                 price_usd, volume_h24, volume_h1, liquidity_usd, txns_h24, tier,
+                market_cap, fdv,
             ),
         )
         cur.execute(
@@ -1527,9 +1570,9 @@ class Store:
         since: str | None = None,
     ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 2000))
-        sql = """
-            SELECT id, chain_id, pair_address, token_address, recorded_at,
-                   price_usd, volume_h24, volume_h1, liquidity_usd, txns_h24, tier
+        columns = pair_history_column_sql(self._table_columns("pair_history"))
+        sql = f"""
+            SELECT {columns}
             FROM pair_history
             WHERE chain_id = ? AND pair_address = ?
         """

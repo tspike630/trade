@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from execution.observe_schema import ensure_observe_schema
 from execution.order_events import record_event
 
 log = logging.getLogger("execution.ledger")
@@ -125,6 +126,7 @@ class ExecutionLedger:
             );
             """
         )
+        ensure_observe_schema(self.conn)
         self._ensure_status_columns()
         self._ensure_unique_decision()
 
