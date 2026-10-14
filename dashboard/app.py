@@ -1114,6 +1114,13 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     tools=("14d",),
                 )
                 _v2_comp(
+                    ("交易", "频率"),
+                    "span-6",
+                    lambda: _v2_trade_freq(store),
+                    foot="G-1 江恩：日开仓次数 vs 实现盈亏 · 旁证",
+                    tools=("14d",),
+                )
+                _v2_comp(
                     ("回测", "新闻"),
                     "span-6",
                     lambda: _v2_btnews(store),
@@ -2059,6 +2066,50 @@ def _v2_reject(store: DataStore) -> None:
         f"合计 {getattr(report, 'total', 0)} · pm_check / risk[] 细分（含 daily_loss）"
     ).classes("v2-note")
 
+
+
+def _v2_trade_freq(store: DataStore) -> None:
+    result = store.paper_trade_frequency(days=14)
+    if not result.available or result.data is None:
+        ui.label("暂无数据").classes("v2-note")
+        return
+    report = result.data
+    rows_data = getattr(report, "rows", ()) or ()
+    if not rows_data:
+        ui.label(f"近 {getattr(report, 'days', 14)} 日无成交").classes("v2-note")
+        return
+    avg = getattr(report, "avg_opens_per_active_day", None)
+    _v2_kv([
+        ("活跃日均开仓", f"{avg:.1f}" if isinstance(avg, (int, float)) else "—", "mute"),
+        ("开仓合计", str(getattr(report, "total_opens", "—")), "mute"),
+        ("平仓合计", str(getattr(report, "total_closed", "—")), "mute"),
+        (
+            "实现合计",
+            _v2_money(getattr(report, "total_pnl_usd", None)),
+            "down" if isinstance(getattr(report, "total_pnl_usd", None), (int, float)) and report.total_pnl_usd < 0 else "mute",
+        ),
+    ])
+    table = []
+    tones = []
+    for item in list(rows_data)[-10:]:
+        pnl = getattr(item, "pnl_usd", None)
+        pnl_text, pnl_tone = _signed_usd(pnl)
+        table.append([
+            _v2_text(getattr(item, "day", None)),
+            str(getattr(item, "opens", "—")),
+            str(getattr(item, "closed", "—")),
+            pnl_text,
+        ])
+        tones.append(["", "", "", pnl_tone])
+    _v2_table(
+        [("日", ""), ("开仓", "num"), ("平仓", "num"), ("PnL", "num")],
+        table,
+        tones,
+    )
+    ui.label(
+        "G-1 旁证：交易次数↑通常损耗↑（江恩）；"
+        "对照冷却/max_open，不盘中改参，不算有效性。"
+    ).classes("v2-note")
 
 def _v2_closed(store: DataStore) -> None:
     result = store.paper_closed_buckets(days=14)

@@ -351,6 +351,25 @@ class PaperClosedReport:
     stop_loss_share: float | None = None
 
 
+@dataclass(frozen=True)
+class PaperTradeDay:
+    """G-1 observe: daily open count vs realized pnl (Gann trade-frequency cost)."""
+    day: str
+    opens: int
+    closed: int
+    pnl_usd: float
+
+
+@dataclass(frozen=True)
+class PaperTradeFrequencyReport:
+    days: int
+    rows: tuple[PaperTradeDay, ...]
+    total_opens: int
+    total_closed: int
+    total_pnl_usd: float
+    avg_opens_per_active_day: float | None = None
+
+
 class MissingTable(LookupError):
     pass
 
@@ -639,7 +658,17 @@ class DataStore:
             log.warning("read failed recent_executions: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "recent_executions")
 
+    def paper_trade_frequency(self, days: int = 14) -> DataResult:
+        """G-1 observe-only: opens/closed/pnl by UTC day from paper fills+positions."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._paper_trade_frequency(started, days), "paper_trade_frequency")
+        except Exception as exc:
+            log.warning("read failed paper_trade_frequency: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_trade_frequency")
+
     def risk_daily_loss_today(self) -> DataResult:
+
         """Observe-only: whether RISK daily_loss fired today (order_events / receipt)."""
         started = time.perf_counter()
         try:
@@ -1201,6 +1230,70 @@ class DataStore:
             for row in rows
         )
         return _ok(payload, started)
+
+    def _paper_trade_frequency(self, started: float, days: int) -> DataResult:
+        path = self.paths.paper
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        window = max(1, min(int(days), 60))
+        try:
+            with ro_connect(path) as conn:
+                tabs = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                opens_by: dict[str, int] = {}
+                closed_by: dict[str, list] = {}
+                if "fills" in tabs:
+                    for row in conn.execute(
+                        "SELECT substr(created_at,1,10) AS d, COUNT(*) AS n "
+                        "FROM fills WHERE note = 'open' OR side = 'buy' "
+                        "GROUP BY 1"
+                    ).fetchall():
+                        day = str(row[0] or "")
+                        if day:
+                            opens_by[day] = int(row[1] or 0)
+                if "positions" in tabs:
+                    for row in conn.execute(
+                        "SELECT substr(closed_at,1,10) AS d, COUNT(*) AS n, "
+                        "COALESCE(SUM(pnl_usd),0) AS pnl "
+                        "FROM positions WHERE status = 'closed' "
+                        "AND closed_at IS NOT NULL AND closed_at != '' "
+                        "GROUP BY 1"
+                    ).fetchall():
+                        day = str(row[0] or "")
+                        if day:
+                            closed_by[day] = [int(row[1] or 0), float(row[2] or 0.0)]
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        days_sorted = sorted(set(opens_by) | set(closed_by), reverse=True)[:window]
+        rows = tuple(
+            PaperTradeDay(
+                day=day,
+                opens=int(opens_by.get(day, 0)),
+                closed=int((closed_by.get(day) or [0, 0.0])[0]),
+                pnl_usd=round(float((closed_by.get(day) or [0, 0.0])[1]), 4),
+            )
+            for day in sorted(days_sorted)
+        )
+        total_opens = sum(r.opens for r in rows)
+        total_closed = sum(r.closed for r in rows)
+        total_pnl = round(sum(r.pnl_usd for r in rows), 4)
+        active = [r for r in rows if r.opens or r.closed]
+        avg = (total_opens / len(active)) if active else None
+        return _ok(
+            PaperTradeFrequencyReport(
+                window,
+                rows,
+                total_opens,
+                total_closed,
+                total_pnl,
+                avg_opens_per_active_day=round(avg, 2) if avg is not None else None,
+            ),
+            started,
+        )
 
     def _risk_daily_loss_today(self, started: float) -> DataResult:
         path = self.paths.execution
