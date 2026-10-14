@@ -4,6 +4,11 @@ CLI entry for the indicators 旁路 process (Step 1–3: technical + funding + s
   python -m indicators.run --full
   python -m indicators.run --loop --interval 300
   python -m indicators.run --once          # due-only pass (tier intervals)
+
+Technical due-only passes refresh hot tokens whose tech_updated_at is NULL or
+older than the hot interval, then warm tokens past the warm interval, before
+the cold tail. The hot-then-warm queue is drained again each hot interval
+while that tail is still running.
 """
 
 from __future__ import annotations
@@ -51,6 +56,8 @@ def run_pass(
         vol_window_sec=INDICATORS_VOLATILITY_WINDOW_SEC,
         write_history_for_hot=INDICATORS_WRITE_HISTORY_HOT,
     )
+    # Due hot, then due warm, then the cold tail. While the tail runs, the
+    # hot-then-warm queue is drained again each hot interval.
     stats = tech.run_batch(
         force_full=force_full,
         only_due=only_due and not force_full,
@@ -157,11 +164,14 @@ def main(argv: list[str] | None = None) -> int:
             log.info("indicators --full start db=%s", db_path)
             stats = run_pass(store, force_full=True, only_due=False)
             log.info(
-                "indicators --full done ok=%s skip=%s err=%s seen=%s rows=%s",
+                "indicators --full done ok=%s skip=%s err=%s seen=%s "
+                "hot_due=%s warm_due=%s rows=%s",
                 stats["ok"],
                 stats["skip"],
                 stats["err"],
                 stats["seen"],
+                stats.get("hot_due", 0),
+                stats.get("warm_due", 0),
                 store.count_token_indicators(),
             )
             return 0 if stats["err"] == 0 or stats["ok"] > 0 else 1
@@ -181,11 +191,14 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 stats = run_pass(store, force_full=False, only_due=True)
                 log.info(
-                    "indicators pass ok=%s skip=%s err=%s seen=%s",
+                    "indicators pass ok=%s skip=%s err=%s seen=%s "
+                    "hot_due=%s warm_due=%s",
                     stats["ok"],
                     stats["skip"],
                     stats["err"],
                     stats["seen"],
+                    stats.get("hot_due", 0),
+                    stats.get("warm_due", 0),
                 )
                 _purge_indicator_history(store)
             except Exception as exc:  # noqa: BLE001 — never kill outer process silently

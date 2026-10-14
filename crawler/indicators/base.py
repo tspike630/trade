@@ -722,6 +722,43 @@ class IndicatorStore:
         ).fetchone()
         return row["updated_at"] if row else None
 
+    def map_tech_updated_at(self) -> dict[tuple[str, str], str | None]:
+        """tech_updated_at for every indicator row.
+
+        A missing key means no indicator row yet, which is the same as NULL:
+        technical has not completed a fresh pass. Callers must not substitute
+        updated_at.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT chain_id, token_address, tech_updated_at
+            FROM token_indicators
+            """
+        ).fetchall()
+        return {
+            (norm_chain(r["chain_id"]), norm_address(r["token_address"])): r[
+                "tech_updated_at"
+            ]
+            for r in rows
+        }
+
+    def map_token_recency(self) -> dict[tuple[str, str], dict[str, Any]]:
+        """has_pairs / last_seen_at for tiering, without scanning pair_history."""
+        rows = self._conn.execute(
+            """
+            SELECT chain_id, token_address, has_pairs, last_seen_at, updated_at
+            FROM tokens
+            """
+        ).fetchall()
+        return {
+            (norm_chain(r["chain_id"]), norm_address(r["token_address"])): {
+                "has_pairs": r["has_pairs"],
+                "last_seen_at": r["last_seen_at"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        }
+
     def get_tech_updated_at(
         self, chain_id: str, token_address: str
     ) -> str | None:
