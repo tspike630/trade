@@ -1,10 +1,10 @@
-# Indicators · factor_loop 候选登记（P-3 / P-4 · E-1 / E-4 / E-5）
+# Indicators · factor_loop 候选登记（P-3 / P-4 · E-1 / E-4 / E-5 · G-5）
 
 > 日期：2026-10-14  
-> 来源：机构供需交易法执行单（Sam Seiden / LTSD 改编）的 **P-3、P-4**；艾略特波浪执行单（Frost & Prechter，《艾略特波浪理论》20 周年纪念版）的 **E-1、E-4、E-5**。指标旁路只领这些。P-1（推保护）、P-2（概率打分 / 动态仓位）与 **E-2**（`target_band_failover`，目标位失效切换，归执行 / PM）不在本文。  
+> 来源：机构供需交易法执行单（Sam Seiden / LTSD 改编）的 **P-3、P-4**；艾略特波浪执行单（Frost & Prechter，《艾略特波浪理论》20 周年纪念版）的 **E-1、E-4、E-5**；江恩《Truth of the Stock Tape》（1923，中译《江恩趋势理论》）落地执行单的 **G-5**（G-15 同族）以及带阻断的 **G-7 / G-8**。指标旁路只领这些。P-1（推保护）、P-2（概率打分 / 动态仓位）、**E-2**（`target_band_failover`，目标位失效切换，归执行 / PM）与江恩其余纪律项（G-1..G-4、G-6、G-9..G-14）不在本文。  
 > 状态：**文档候选**。未接入决策，未改权重，**不算有效性**。
 
-本文登记供需两条假设，以及艾略特回撤候选、交汇方法与量能观察。不新增因子模块，不改 `decision_engine`、`review/factor_layers.py`，不写 `review/factor_candidates.db`。`gate_candidate` 的接受路径不改；M-2 的 `calibrate_direction` 还没接到周跑（见下文）。`INDICATORS_WEIGHT_*` 保持 **0**。
+本文登记供需两条假设，艾略特回撤候选、交汇方法与量能观察，以及江恩换手率候选。不新增因子模块，不改 `decision_engine`、`review/factor_layers.py`，不写 `review/factor_candidates.db`。`gate_candidate` 的接受路径不改；M-2 的 `calibrate_direction` 还没接到周跑（见下文）。`INDICATORS_WEIGHT_*` 保持 **0**。本次不新增观察 jsonl。
 
 检测器本次不实现。2026-10-19 周检之后，并且方向校准（M-2）与算子化（M-3）都完成后，才走 **A 类**验证（回测依据 + 变更登记 + 周检验证，纪律同 R1/R2/R3）。验证前这些条目不是信号、不是仓位、不是止损规则。
 
@@ -12,7 +12,7 @@
 
 时间序列检测器一旦要写，遵守 `INDICATORS_OPERATORIZATION.md`（M-3）：窗口在 t 收口，禁止日合计 / 未来分母。
 
-**纪律（Prediction Arena，[arXiv:2604.07355](https://arxiv.org/abs/2604.07355)）**：研究量 / token 用量与 PnL 相关约 0，因子质量高于研究量。指标侧不为凑候选条数再堆因子，只加深已有口径（JEV 纯化、流动性闸、僵尸过滤）。供需 P-3 / P-4 保持 A 类候选。艾略特只追加执行单点名的 E-1 三个回撤水平（同一假设）与依赖它的 E-4 / E-5；N-1..N-6 明确不追加。该文 P-1 首次命中率归复盘 / 周检，指标侧不登记。本段不算有效性。
+**纪律（Prediction Arena，[arXiv:2604.07355](https://arxiv.org/abs/2604.07355)）**：研究量 / token 用量与 PnL 相关约 0，因子质量高于研究量。指标侧不为凑候选条数再堆因子，只加深已有口径（JEV 纯化、流动性闸、僵尸过滤）。供需 P-3 / P-4 保持 A 类候选。艾略特只追加执行单点名的 E-1 三个回撤水平（同一假设）与依赖它的 E-4 / E-5；艾略特 N-1..N-6 明确不追加。江恩只追加执行单点名的 G-5 换手率一族（两个标签，同一族；G-15 不另给 id）。G-7 / G-8 只登记并写明阻断，不实现检测器。江恩 N-1..N-6 是另一张拒绝表（见文末），与艾略特 N 表不是同一组内容。该文 P-1 首次命中率归复盘 / 周检，指标侧不登记。本段不算有效性。
 
 ---
 
@@ -25,8 +25,12 @@
 | E-1 | 斐波那契回撤 `fib_retrace_0618` / `fib_retrace_05` / `fib_retrace_0382` | A 类 factor_loop **候选** | 无。权重 0。依赖波段原语（TODO，未实现） |
 | E-4 | 同价位多因子交汇（hit-count） | 依赖 E-1 的方法学；**仅 up_1h 有增益才保留** | 无。权重 0。不单独入库 |
 | E-5 | 量能斜率 / 背离 | **观察项**，还不是因子 | 无。等波段原语。`pair_history` 已有 volume |
+| G-5 | 换手尖峰 `turnover_spike` | A 类 factor_loop **候选** | 无。权重 0。不实现检测器。分母市值未落列（见下） |
+| G-5 / G-15 | 换手枯竭 `turnover_exhaust` | 与尖峰同一族的 A 类 **候选** | 无。权重 0。不另开观察 jsonl |
+| G-7 | 二次突破 `breakout_second` | **仅登记，阻断** | 无检测器。等链上突破定义（与 E-1 波段原语同一 TODO 姿态） |
+| G-8 | 相对强度 `rel_strength` | **仅登记，阻断** | 无检测器。等市场基准（池均值 vs BTC） |
 
-建议日后入库的 `factor_id`（本文不 INSERT）：`accum_zone_retest_v0`、`zone_freshness_decay_v0`、`fib_retrace_0618`、`fib_retrace_05`、`fib_retrace_0382`。E-4 / E-5 不另给 `factor_id`。`status` 最高仍停在候选库的 `accepted` 语义；本登记甚至未落库。A 类验证排在 10-19 周检之后，且必须先过 `calibrate_direction`（M-2）与算子化（M-3）。
+建议日后入库的 `factor_id`（本文不 INSERT）：`accum_zone_retest_v0`、`zone_freshness_decay_v0`、`fib_retrace_0618`、`fib_retrace_05`、`fib_retrace_0382`、`turnover_spike_v0`、`turnover_exhaust_v0`。E-4 / E-5 不另给 `factor_id`。`breakout_second_v0` 与 `rel_strength_v0` 在阻断解开前不入库。`status` 最高仍停在候选库的 `accepted` 语义；本登记甚至未落库。A 类验证排在 10-19 周检之后，且必须先过 `calibrate_direction`（M-2）与算子化（M-3）。
 
 ---
 
@@ -84,7 +88,7 @@
 
 ## 方向校准（M-2，A 类接受前的必过闸）
 
-AQuA（arXiv 2608.12841）：公式即使有预测力，初始符号也可能错。每个 factor_loop 候选——包括本文 P-3 / P-4 / E-1，以及日后任何入库候选——都要用**正、反两个符号**各评一次，留下解释更干净的方向（与前向收益同向、IC ≥ 0 的那一侧），然后才谈 A 类 `accepted`。E-1 的两个符号是：回撤到位后反弹，与回撤跌破后加速。规格见下文「E-1」。
+AQuA（arXiv 2608.12841）：公式即使有预测力，初始符号也可能错。每个 factor_loop 候选——包括本文 P-3 / P-4 / E-1 / G-5，以及日后任何入库候选——都要用**正、反两个符号**各评一次，留下解释更干净的方向（与前向收益同向、IC ≥ 0 的那一侧），然后才谈 A 类 `accepted`。E-1 的两个符号是：回撤到位后反弹，与回撤跌破后加速。G-5 的两个符号是：尖峰后下跌对继续上涨，枯竭后反弹对续跌。规格见下文「E-1」与「G-5」。
 
 2026-10-14 核对 `review/gates.py` 与 `review/factor_loop.py`：周跑里**还没有**这个闸。有限 IC 只记观察文件，不改 `accepted`。
 
@@ -183,9 +187,76 @@ E-4 不是第四个回撤比率，也不把浪 2 / 浪 4 等浪号写进因子�
 
 ---
 
+## 江恩换手（G-5）与阻断项（G-7 / G-8）
+
+指标旁路只登记可复算的结构。书中第十章：成交量要按已发售股票总量来衡量；换手骤增而价格滞涨是派发假设，下跌末段换手骤减是卖压出清（第二十一章，执行单 G-15）。这里收成同一族的两个标签，不为凑条数再拆第三个因子。不新增观察 jsonl。不实现检测器。
+
+### 采集核对（2026-10-14，只读代码）
+
+成交量已经落列，市值没有。
+
+| 位置 | 实际字段 |
+|------|----------|
+| `pairs` | `chain_id`, `pair_address`, `token_address`, `raw_json`, `source`, `updated_at`, `last_history_at`, `pair_created_at`。无市值列 |
+| `tokens` | `chain_id`, `token_address`, `raw_json`, `source`, `updated_at`, `pair_count`, `has_pairs`, `last_seen_at`, `last_enriched_at`, `clue_note`, `quality_score`, `quality_tags`, `scored_at`。无市值列 |
+| `pair_history` | `price_usd`, `volume_h24`, `volume_h1`, `liquidity_usd`, `txns_h24`, `tier`（`store.py` `_migrate_pair_history`） |
+| Dexscreener pair JSON | `validate_pair` 整对象写入 `pairs.raw_json`（`pipeline.py` → `store.upsert_pair`）。`volume.h24` / `h6` / `h1` / `m5` 会被收成数字。`extract_metrics`（`history.py`）只抽出 `priceUsd`、`volume.h24`、`volume.h1`、`liquidity.usd`、`txns.h24` |
+| 现网用法 | `alerts.py` 的 `volume_h24_jump` 比较相邻载荷的 `volume.h24`。`scoring.py` 从 `pairs.raw_json` 读 `volume.h24` |
+
+全库没有 `marketCap`、`fdv`、`market_cap`、`fully_diluted` 的读取或落列。`validate_pair` 不单独处理这两个键。公开 pair 对象若带 `marketCap` / `fdv`，只可能随整份 `raw_json` 原样躺着；本仓库不读、不抽列。**缺口记在这里。本次不补采集器。** 公式仍登记。分母未落列之前，G-5 不能进周检计数。
+
+`volume_h24` / `volume.h24` 是快照时刻的回看量，M-3 允许使用（`INDICATORS_OPERATORIZATION.md`）。不得改成事后才知道的自然日总量。价格腿用已有的 `pair_history.price_usd`。滞涨、尖峰、枯竭的具体倍数本文不拍板，那是统计参数，过 R1/R2/R3 之前不能当门槛。
+
+### G-5 换手率族
+
+| `factor_id`（不 INSERT） | 假设 |
+|--------------------------|------|
+| `turnover_spike_v0` | `volume_h24 / marketCap`（备选 `volume_h24 / fdv`）相对自身近期水平骤增，且 `price_usd` 滞涨。书中的派发假设 |
+| `turnover_exhaust_v0` | 下跌之后同一换手率坍缩。书中的卖压出清。执行单 G-15 是这一条，不另给 id |
+
+派发假设在链上只映射为现金 / 退出倾向。不打开做空（江恩 N-2）。两个标签都对齐 JEV 的 **up_1h**。周检数字沿用现闸（`review/gates.py`），不新开门槛：n≥15、unique_token≥10；过滤后 1h≥55% 为 pass（连续两周 ≥55% 才考虑激活，本循环最高 `accepted`）；50%–55% 为 `need_retest`；<50% 为 fail。`INDICATORS_WEIGHT_*` 保持 0。
+
+A 类之前缺一不可，本次都不实现检测器：
+
+1. **M-2 双侧方向校准。** `turnover_spike_v0`：尖峰后下跌，与尖峰后继续上涨，各评一次。`turnover_exhaust_v0`：枯竭后反弹，与枯竭后续跌，各评一次。留下 IC ≥ 0 的 `kept_sign`。`passed=True` 只表示两个符号都记下了，不是 `accepted`。`gate_candidate` **还不调用**它。IC 缺失则 fail closed。
+2. **M-3 算子化。** 窗口在 t 收口。换手分母必须是 t 当时已经知道的市值，禁止用 t 之后才公布的流通盘或当日合计成交量。
+3. **分母落列。** `marketCap` 或 `fdv` 成为可按快照读取的字段之前，不排 factor_loop 实现，不把缺分母的比值送进周检。补采集不在本登记。
+4. **滑点 / 成本入回测。** up_1h 对照含成交成本。滑点档在执行 `pricing.py`，本文不改档位。
+
+2026-10-19 周检之后，并且 M-2 与 M-3 都完成、分母已落列，才把 G-5 送进 A 类验证。此前不是信号、不是仓位、不是止损规则。
+
+### G-7 二次突破（阻断，无检测器）
+
+书中（第二十二章）：同一价位第二次创新高比第一次安全。可量化形式是 `breakout_second`：同一区域被突破的次数，或突破后回踩再启。预留 `factor_id` `breakout_second_v0`，**本文不 INSERT**。
+
+**阻断：** 链上「突破」还没有唯一定义。N 根 K 线新高，与历史新高池，两种算法会给出不同的第一次 / 第二次，并且历史池若用到 t 之后的 bar 就是 look-ahead（AQuA）。这与 E-1 的波段原语是同一条 TODO：局部极值必须由截止当前 bar 的 OHLC 定出，N 本文不拍板，原语未实现（见上文「波段原语」）。定义写死并且通过 M-3 之前，不写检测器，不进周检，不入库。权重 0。
+
+### G-8 相对强度（阻断，无检测器）
+
+书中：个股可独立于大盘；强者是大盘跌时它不跌、大盘涨时它领涨。可量化形式是 `rel_strength = token_return / market_avg_return`。预留 `factor_id` `rel_strength_v0`，**本文不 INSERT**。
+
+**阻断：** 「市场基准」还没有定义。全池均值，与对 BTC 收益，是两个不同的分母。采集层有个股 `pair_history.price_usd`，没有选定的市场序列。基准写进变更登记之前，不写检测器，不进周检，不入库。权重 0。
+
+### 江恩明确不采用（Gann N-1 .. N-6）
+
+与上文艾略特 N-1..N-6 **不是同一张表**。编号沿用江恩执行单，防止以后把案例、做空、画线、日历、时间预言、期货章节当成因子。不写检测器，不进看板，不进决策，不新增观察 jsonl。
+
+| # | 不采用 | 原因 |
+|---|--------|------|
+| N-1 | 1920 年代美股 / 期货具体案例（铁路、工业、棉花的历史点位与牛熊复盘表） | 做市与周 / 月周期和链上 5 分钟–1 小时不匹配。只取可量化原语 |
+| N-2 | 做空文化 | 链上现货无做空通道。派发只映射为现金 / 退出，不引入做空 |
+| N-3 | 人工判图 / 画线 | 图是可视化，不是人工判读输入。走确定性规则 |
+| N-4 | 1920 年代日历效应（周一、大选） | 加密 7×24，无交易日 / 大选。周末流动性只可作 C 类观察，不在本文立项 |
+| N-5 | 时间因素预测 / 年度预测 | 作者未给出可复现方法。只信可回测因子 |
+| N-6 | 期货章节（棉花 / 小麦 / 玉米，第四部） | 与链上现货无关 |
+
+本书不含后来被神化的角度线 / 正方 / 轮中轮。那些预测工具同样不采用。纪律层的价值不在指标候选表里改代码。
+
+---
+
 ## 不算有效性
 
-- 未接入 `decision_engine`，未注册进 `FACTOR_GETTERS`，未进 composite。E-1 的三个 `factor_id` 未 INSERT。波段原语未实现。
-- 权重保持 0。10-19 周检出数之前，不把 P-3 / P-4 / E-1 写成有效因子，也不实现检测器。E-4 无 up_1h 增益不保留。E-5 保持观察，不升级。
-- A 类只在 **10-19 及之后**，并且 **M-2**（`calibrate_direction`，正反两符号）与 **M-3**（算子化）都完成后才谈。回测依据要含滑点 / 成本，并做变更登记。缺校准不写 `accepted`。`calibrate_direction` 已可调用。周跑只在 IC 有限时把双侧结果写入观察文件，仍不接到 `gate_candidate`（见上表）。过门槛仍不自动激活策略（`factor_loop` 既有约束）。
-- N-1..N-6 不采用。E-2 归执行 / PM，不在指标层。E-3：因子只辅助确认，决策与 PM 硬规则拥有下单与风控。
+- 未接入 `decision_engine`，未注册进 `FACTOR_GETTERS`，未进 composite。E-1 的三个 `factor_id` 与 G-5 的 `turnover_spike_v0` / `turnover_exhaust_v0` 未 INSERT。G-7 / G-8 未 INSERT。波段原语未实现。市值 / FDV 未落列。
+- 权重保持 0。10-19 周检出数之前，不把 P-3 / P-4 / E-1 / G-5 写成有效因子，也不实现检测器。E-4 无 up_1h 增益不保留。E-5 保持观察，不升级。G-7 / G-8 在阻断解开前不是候选实现。
+- A 类只在 **10-19 及之后**，并且 **M-2**（`calibrate_direction`，正反两符号）与 **M-3**（算子化）都完成后才谈。G-5 还要等分母落列。回测依据要含滑点 / 成本，并做变更登记。缺校准不写 `accepted`。`calibrate_direction` 已可调用。周跑只在 IC 有限时把双侧结果写入既有观察文件，仍不接到 `gate_candidate`（见上表）。本次不新增观察 jsonl。过门槛仍不自动激活策略（`factor_loop` 既有约束）。
+- 艾略特 N-1..N-6 不采用。江恩 N-1..N-6 不采用。E-2 归执行 / PM，不在指标层。E-3：因子只辅助确认，决策与 PM 硬规则拥有下单与风控。
