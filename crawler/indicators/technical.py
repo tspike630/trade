@@ -559,12 +559,16 @@ class TechnicalIndicators:
         tech_updated_at IS NULL or older than that tier's interval.
         Shared updated_at is not consulted. NULL tech_updated_at is due.
 
-        While the cold tail runs, that hot-then-warm queue is drained again
-        every hot interval, measured from the start of the previous drain.
-        A hot row updated at the front of a drain is therefore refreshed again
-        before two hot intervals have elapsed, as long as the due-hot set
-        itself finishes within one interval. Cold tokens still run after the
-        priority queue, one slice at a time.
+        While warm tokens or the cold tail are still in progress, due hot is
+        drained again every hot interval, measured from the start of the
+        previous slice. A large due-hot set does not run as one unbounded
+        pass, and neither does due warm: unserved due hot keeps a forward
+        cursor, hot that is due again runs after that backlog, and the slice
+        stops at the interval. Warm, then cold, takes the time left. If the
+        hot slice already used the interval, one warm or cold token still
+        runs so the lower tiers keep moving. A hot row updated while its
+        due-hot set finishes inside one interval is therefore refreshed
+        again before two hot intervals have elapsed.
         """
         stats = {
             "seen": 0,
@@ -647,62 +651,121 @@ class TechnicalIndicators:
 
         interval = max(1, int(hot_interval_sec))
         tail_index = 0
+        # Warm is queued once per token per pass (appended if it becomes due
+        # later). Hot uses a separate cursor: unserved due hot first, then
+        # hot that has already been refreshed this pass and is due again.
+        warm_queue: list[tuple[dict[str, Any], str]] = []
+        warm_queued: set[tuple[str, str]] = set()
+        warm_index = 0
+        hot_served: set[tuple[str, str]] = set()
         first_drain = True
+        deadline = 0.0
+        advanced = 0
+
+        def _run(tok: dict[str, Any], tier: str) -> None:
+            self._process_token(
+                tok,
+                tier=tier,
+                stats=stats,
+                force_full=False,
+                only_due=True,
+                hot_interval_sec=hot_interval_sec,
+                warm_interval_sec=warm_interval_sec,
+                cold_interval_sec=cold_interval_sec,
+            )
+
+        def _take_hot(
+            items: list[tuple[dict[str, Any], str, tuple[str, str]]],
+        ) -> int:
+            nonlocal advanced
+            taken = 0
+            for tok, tier, key in items:
+                if advanced > 0 and monotonic() >= deadline:
+                    break
+                _run(tok, tier)
+                hot_served.add(key)
+                advanced += 1
+                taken += 1
+            return taken
+
         while True:
             drain_started = monotonic()
+            # Deadline is anchored to the slice start so the next hot refresh
+            # is one hot interval later, inside the decision window (2×),
+            # when the due-hot work itself finishes inside that interval.
+            deadline = drain_started + interval
+            advanced = 0
             due = self._due_priority(
                 universe,
                 hot_interval_sec=hot_interval_sec,
                 warm_interval_sec=warm_interval_sec,
                 cold_interval_sec=cold_interval_sec,
             )
-            if not first_drain and due:
+            hot_backlog: list[tuple[dict[str, Any], str, tuple[str, str]]] = []
+            hot_repeat: list[tuple[dict[str, Any], str, tuple[str, str]]] = []
+            for _rank, _index, tok, tier in due:
+                key = _token_key(tok)
+                if _rank == 0:
+                    if key in hot_served:
+                        hot_repeat.append((tok, tier, key))
+                    else:
+                        hot_backlog.append((tok, tier, key))
+                elif _rank == 1 and key not in warm_queued:
+                    warm_queued.add(key)
+                    warm_queue.append((tok, tier))
+            hot_n = len(hot_backlog) + len(hot_repeat)
+            if not first_drain and hot_n:
                 log.info(
-                    "technical priority refresh due=%s tail_left=%s",
-                    len(due),
+                    "technical priority refresh hot_due=%s warm_left=%s tail_left=%s",
+                    hot_n,
+                    max(0, len(warm_queue) - warm_index),
                     max(0, len(tail) - tail_index),
                 )
             first_drain = False
-            for _rank, _index, tok, tier in due:
-                self._process_token(
-                    tok,
-                    tier=tier,
-                    stats=stats,
-                    force_full=False,
-                    only_due=True,
-                    hot_interval_sec=hot_interval_sec,
-                    warm_interval_sec=warm_interval_sec,
-                    cold_interval_sec=cold_interval_sec,
-                )
-            if tail_index >= len(tail):
+            taken_backlog = _take_hot(hot_backlog)
+            _take_hot(hot_repeat)
+            backlog_left = taken_backlog < len(hot_backlog)
+            lower_left = warm_index < len(warm_queue) or tail_index < len(tail)
+            if not lower_left:
+                # One pass over warm and cold is enough. Keep walking a hot
+                # backlog that the interval cut short; do not spin on hot
+                # that is already served and simply due again.
+                if backlog_left and advanced > 0:
+                    continue
                 break
-            # One recency read for the slice. Tier can move while the tail
-            # runs; the next drain picks up hot/warm that became due.
-            # Deadline is anchored to the drain start so the next hot refresh
-            # is one hot interval later, inside the decision window (2×).
-            slice_now = datetime.now(timezone.utc)
-            slice_recency = self.store.map_token_recency()
-            deadline = drain_started + interval
-            advanced = 0
-            while tail_index < len(tail) and (
-                monotonic() < deadline or advanced == 0
-            ):
-                tok = tail[tail_index]
-                tail_index += 1
+
+            # Rest of this interval: due warm, then the cold tail. When the
+            # hot slice already consumed the interval, still take one lower
+            # token so warm/cold cannot stall for a whole hot sweep.
+            took_lower = False
+            while warm_index < len(warm_queue):
+                if took_lower and monotonic() >= deadline:
+                    break
+                tok, tier = warm_queue[warm_index]
+                warm_index += 1
+                took_lower = True
                 advanced += 1
-                tier = tier_from_token_row(
-                    _with_recency(tok, slice_recency),
-                    now=slice_now,
-                    hot_seen_window_sec=HOT_SEEN_WINDOW_SEC,
-                )
-                self._process_token(
-                    tok,
-                    tier=tier,
-                    stats=stats,
-                    force_full=False,
-                    only_due=True,
-                    hot_interval_sec=hot_interval_sec,
-                    warm_interval_sec=warm_interval_sec,
-                    cold_interval_sec=cold_interval_sec,
-                )
+                _run(tok, tier)
+            if tail_index < len(tail) and not (
+                took_lower and monotonic() >= deadline
+            ):
+                # One recency read for the slice. Tier can move while the
+                # tail runs; the next slice picks up hot/warm that became due.
+                slice_now = datetime.now(timezone.utc)
+                slice_recency = self.store.map_token_recency()
+                while tail_index < len(tail):
+                    if took_lower and monotonic() >= deadline:
+                        break
+                    tok = tail[tail_index]
+                    tail_index += 1
+                    took_lower = True
+                    advanced += 1
+                    tier = tier_from_token_row(
+                        _with_recency(tok, slice_recency),
+                        now=slice_now,
+                        hot_seen_window_sec=HOT_SEEN_WINDOW_SEC,
+                    )
+                    _run(tok, tier)
+            if advanced == 0:
+                break
         return stats
