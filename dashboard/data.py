@@ -346,6 +346,9 @@ class PaperClosedReport:
     first_hit_live_n: int = 0
     first_hit_live_wins: int = 0
     first_hit_live_rate: float | None = None
+    # Exit-reason dominance (10-14 lesson: stop_loss can eat almost all loss).
+    stop_loss_pnl_usd: float | None = None
+    stop_loss_share: float | None = None
 
 
 class MissingTable(LookupError):
@@ -635,6 +638,15 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed recent_executions: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "recent_executions")
+
+    def risk_daily_loss_today(self) -> DataResult:
+        """Observe-only: whether RISK daily_loss fired today (order_events / receipt)."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._risk_daily_loss_today(started), "risk_daily_loss_today")
+        except Exception as exc:
+            log.warning("read failed risk_daily_loss_today: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "risk_daily_loss_today")
 
     def rejection_buckets(self, days: int = 7) -> DataResult:
         started = time.perf_counter()
@@ -1190,6 +1202,64 @@ class DataStore:
         )
         return _ok(payload, started)
 
+    def _risk_daily_loss_today(self, started: float) -> DataResult:
+        path = self.paths.execution
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        try:
+            from zoneinfo import ZoneInfo
+            now_hkt = datetime.now(ZoneInfo("Asia/Hong_Kong"))
+        except Exception:
+            now_hkt = datetime.now(timezone.utc)
+        today = now_hkt.strftime("%Y-%m-%d")
+        cutoff = (now_hkt.astimezone(timezone.utc) - timedelta(hours=36)).strftime("%Y-%m-%dT%H:%M:%S")
+        hit = False
+        detail = ""
+        event_day = today
+        try:
+            with ro_connect(path) as conn:
+                tabs = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if "order_events" in tabs:
+                    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(order_events)")}
+                    if "detail_json" in cols and "event" in cols:
+                        rows = conn.execute(
+                            "SELECT detail_json, event_ts FROM order_events "
+                            "WHERE event = 'rejected' ORDER BY id DESC LIMIT 120"
+                        ).fetchall()
+                        for row in rows:
+                            blob = str(row[0] or "")
+                            ts = str(row[1] or "")
+                            if "daily_loss" not in blob:
+                                continue
+                            if ts >= cutoff or today in blob or (ts[:10] == today):
+                                hit = True
+                                detail = blob[:160]
+                                event_day = ts[:10] or today
+                                break
+                if not hit and "execution_log" in tabs:
+                    rows = conn.execute(
+                        "SELECT receipt_json, ts FROM execution_log "
+                        "ORDER BY id DESC LIMIT 60"
+                    ).fetchall()
+                    for row in rows:
+                        blob = str(row[0] or "")
+                        ts = str(row[1] or "")
+                        if "daily_loss" not in blob:
+                            continue
+                        if ts >= cutoff or today in blob:
+                            hit = True
+                            detail = "receipt daily_loss"
+                            event_day = ts[:10] or today
+                            break
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        return _ok({"hit": hit, "day": event_day, "detail": detail}, started)
+
     def _rejection_buckets(self, started: float, days: int) -> DataResult:
         path = self.paths.execution
         window_days = _clamp(days, 1, 30)
@@ -1361,6 +1431,11 @@ class DataStore:
         live_n = len(live_items)
         live_wins = sum(1 for item in live_items if item[2])
         live_rate = (live_wins / live_n) if live_n else None
+        stop_loss_pnl = sum(sum(vals) for (er, _lb), vals in agg.items() if er == "stop_loss")
+        stop_loss_pnl = float(stop_loss_pnl) if any(er == "stop_loss" for er, _ in agg) else None
+        stop_loss_share = None
+        if stop_loss_pnl is not None and total_pnl < 0 and abs(total_pnl) > 1e-9:
+            stop_loss_share = min(1.0, abs(stop_loss_pnl) / abs(total_pnl))
         return _ok(
             PaperClosedReport(
                 window_days,
@@ -1379,6 +1454,8 @@ class DataStore:
                 first_hit_live_n=live_n,
                 first_hit_live_wins=live_wins,
                 first_hit_live_rate=round(live_rate, 4) if live_rate is not None else None,
+                stop_loss_pnl_usd=round(stop_loss_pnl, 4) if stop_loss_pnl is not None else None,
+                stop_loss_share=round(stop_loss_share, 4) if stop_loss_share is not None else None,
             ),
             started,
         )

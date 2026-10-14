@@ -1623,17 +1623,30 @@ def _v2_gates() -> None:
     pm_on = bool(getattr(gates, "pm_enabled", False))
     live_on = bool(getattr(gates, "live_effective", False))
     kill = bool(getattr(gates, "kill_switch_present", False))
+    daily_hit = False
+    daily_day = ""
+    try:
+        snap = DataStore().risk_daily_loss_today()
+        if snap.available and isinstance(snap.data, dict):
+            daily_hit = bool(snap.data.get("hit"))
+            daily_day = str(snap.data.get("day") or "")
+    except Exception:
+        log.warning("daily_loss gate read failed")
     _v2_kv([
         ("模拟盘", "ON" if paper_on else "关", "up" if paper_on else "mute"),
         ("仓位管理", "ON" if pm_on else "关", "up" if pm_on else "mute"),
         ("实盘", "ON" if live_on else "关", "down" if live_on else "mute"),
+        ("日亏闸", "已触发" if daily_hit else "未触发", "down" if daily_hit else "mute"),
         ("杀开关", "存在" if kill else "—", "mute"),
     ])
-    ui.label(
+    note = (
         f"模拟盘来源：{gates.origin_hint('paper')}。仓位来源：{gates.origin_hint('pm')}。"
         "关是当前预期状态；实盘若变「开启」会标红。"
         "网关「陈旧」要和拒因一起读：仓满拒单时无新成交属健康态。"
-    ).classes("v2-note")
+    )
+    if daily_hit:
+        note += f" 日亏闸今日（{daily_day or '—'} HKT）已拒单——保护态，不盘中改阈值。"
+    ui.label(note).classes("v2-note")
 
 
 def _ratio_text(value: object, digits: int) -> str:
@@ -2043,7 +2056,7 @@ def _v2_reject(store: DataStore) -> None:
     ]
     _v2_table([("拒因", ""), ("笔数", "num")], rows)
     ui.label(
-        f"合计 {getattr(report, 'total', 0)} · 细粒度来自 receipt.pm_check.reason"
+        f"合计 {getattr(report, 'total', 0)} · pm_check / risk[] 细分（含 daily_loss）"
     ).classes("v2-note")
 
 
@@ -2088,6 +2101,20 @@ def _v2_closed(store: DataStore) -> None:
             "up" if isinstance(rest, (int, float)) and rest > 0 else "mute",
         ),
         ("单笔抹盈", "是" if wipe else "否", "down" if wipe else "mute"),
+        (
+            "止损占亏",
+            (
+                f"{float(getattr(report, 'stop_loss_share', 0) or 0) * 100:.0f}%"
+                if isinstance(getattr(report, "stop_loss_share", None), (int, float))
+                else "—"
+            ),
+            (
+                "down"
+                if isinstance(getattr(report, "stop_loss_share", None), (int, float))
+                and float(report.stop_loss_share) >= 0.5
+                else "mute"
+            ),
+        ),
     ])
     rows: list[list[str]] = []
     for item in buckets[:12]:
