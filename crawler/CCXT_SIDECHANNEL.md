@@ -76,6 +76,7 @@ nohup .venv/bin/python -m sources.ccxt --loop --interval 300 >> logs/ccxt_sidech
 - 根 `config.py` / `main.py` **无** CCXT 引用；主爬虫不强制启动本旁路
 - 不接决策 / 评分 / 告警 / Telegram
 - 需要时人工 `--once` 或 `--loop` 启用
+- **防单点，不加权重**：与 DexScreener 并列，是为了洗盘 / 单点操纵下不靠单一行情源（执行单 2026-10-14 警示事例，见 `INDICATORS_AUDIT.md`）。旁路本身不是上调 `INDICATORS_WEIGHT_*` 的理由；权重仍为 0。
 
 ---
 
