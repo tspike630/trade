@@ -1,6 +1,6 @@
 # Decision Engine — JEV 周检 + 采样
 
-**Time (HK / UTC+8):** 更新于 2026-10-10 13:26 HKT  
+**Time (HK / UTC+8):** 更新于 2026-10-14 16:40 HKT  
 **Repo:** `/workspace/dexscreener-crawler`  
 **原则：** 本机无系统 crontab（无 root 装 cron），由决策引擎 bot 的 routines **直接执行**仓库脚本；不接 paper/live；不杀 dry-run / main / indicators。
 
@@ -65,6 +65,12 @@ mkdir -p exports/reports logs
 
 `purpose` 与 `mode` 分开：采样行是 `mode=dry_run` 且 `purpose=sample`；24h 常驻（默认 0.3，不传 `--purpose`）是 `mode=dry_run` 且 `purpose=live_candidate`。漏传 `--purpose sample` 时，只要 `--min-jev-strength` 低于实时默认，仍会写成 `sample`。执行网关应拒 `sample`；本命令只负责写入。
 
+同一条 `scripts/jev_validity.py` 默认再读 paper `positions`（`--paper-db`，否则 `EXECUTION_PAPER_DB` / `PAPER_DB_PATH` / `paper_trading.db`；窗口 `--side-window-days` 默认 7），把硬旁证和 F-1 写进 md，并给趋势 CSV 加列。缺库则该段记未形成，不否决。`--no-side-evidence` 可跳过。只读，不改 cooldown / min_liq / strength，不熔断。
+
+```bash
+python3 scripts/tests/test_weekly_side_evidence.py
+```
+
 产物：`exports/reports/jev_validity_YYYYMMDD.md`、`exports/reports/jev_validity_trend.csv`、`exports/reports/review_weekly_YYYY-MM-DD.md`、`logs/jev_validity.log`、`logs/review_weekly.log`、`logs/decision_engine_sample.log`。
 
 ## 周检看什么
@@ -78,12 +84,13 @@ mkdir -p exports/reports logs
 | 周检结果 | 动作 |
 |----------|------|
 | **连续 2 周** 1h 上涨率 ≥55% **且** unique_token≥10（同时 n≥15） | 启动 Step 2 回测（内置流动性 / 覆盖率过滤） |
+| 上一行成立，但硬旁证任一为真（止损占亏≥50% **或** 单日开仓≥20） | **不可启动 Step2**。样本门槛不动 |
 | n≥15 且 unique_token≥10 且上涨率 <50% | JEV 单因子降级为评分加分项；Step 2 转向技术面 |
 | n<15，或 n≥15 但 unique_token<10，或 50–55% 边缘 | 继续攒样本，下周一再检 |
 
 ## 统计功效标注
 
-**不改门槛。** 上一张表照旧：有效样本优先 **unique_token≥10**（比 raw **n≥15** 更硬）；启动 Step 2 仍要 **连续 2 周** 1h 上涨率 **≥55%**，且两周都 unique_token≥10（同时 n≥15）。本段只标注这些数字能主张什么。看板总览 JEV 闸的「统计功效旁证」与这里同一口径，都只解读。
+**不改样本门槛。** 上一张表照旧：有效样本优先 **unique_token≥10**（比 raw **n≥15** 更硬）；启动 Step 2 仍要 **连续 2 周** 1h 上涨率 **≥55%**，且两周都 unique_token≥10（同时 n≥15）。硬旁证（止损占亏≥50% 或 日开仓≥20）是额外否决，不降低也不替代这三道。本段只标注这些数字能主张什么。看板总览 JEV 闸的「统计功效旁证」与这里同一口径，都只解读。
 
 | 现有样本能主张 | 现有样本不能主张 |
 |----------------|------------------|
@@ -114,7 +121,7 @@ Foresight Arena 的功效量级（已结算二元预测；相对市场共识的 
 
 | 证据 | 从哪看 | 怎么登记 |
 |------|--------|----------|
-| cooldown 是否生效 | paper 观察日志里的 `risk cooldown_sec=`，以及 `cooldown skip` | 启动行应是 `cooldown_sec=3600.0`。记下 skip 条数。`0` / `0.0` 表示重启时环境变量丢了。冷却在进程内存里，重启会清零，不要把重启后的第一笔 buy 当成冷却失效 |
+| cooldown 是否生效 | paper 观察日志里的 `risk cooldown_sec=`，以及 `cooldown skip` | 启动行应是 `cooldown_sec=3600.0`。记下 skip 条数。`0` / `0.0` 表示重启时环境变量丢了。冷却在进程内存里，重启会清零，不要把重启后的第一笔 buy 当成冷却失效。键是 `(strategy_id, chain_id, token_address)`，3600s 不封顶跨票日开仓。不改 `DECISION_COOLDOWN_SEC` 代码默认（仍 0） |
 | `min_liq` skip 次数 / 流动性分桶 | `reason=liq_below_min`、`reason=no_liquidity`，以及同行的 `liquidity_usd=` / `min_liq_usd=` | 分三桶计数：缺失（`no_liquidity`）、低于 50000（`liq_below_min`）、过闸后写入的 buy。`min_liq_usd=` 应为 `50000.0`。不要为了分桶改 50000 |
 | 临时 `min=0.15` 观察行 | `decision_log` 里 `purpose=live_candidate` 且强度低于实时默认 0.3 的 buy | **保持未标记，不得标成 accepted。** 它们不是有效性样本。`scripts/jev_validity.py` 按 `strategy_id=jev_strength_v1` 的全部 buy 读取，**不按 purpose 过滤**，所以这些行会进入周检输入。报告里单独脚注，不要拿它们去过「连续 2 周 ≥55%」门槛 |
 
@@ -126,6 +133,12 @@ Foresight Arena 的功效量级（已结算二元预测；相对市场共识的 
 |------|--------|----------|
 | **P-2** 真库 IC/IR 首跑 | 同一周检的 `review.run`，加上已有的 `--factor-layers`（IC 写入默认 `exports/reports/factor_ic_history.csv`） | 出数之后只写权重更新**设计**。一期只有 IC；不足两期则 IR 记「未形成」。`INDICATORS_WEIGHT_*` 保持 **0**，不激活。临时 `live_candidate` 且强度 0.15 **不得**写成 accepted |
 | **P-3** `min_liq` 拒绝桶 + cooldown | 上一节前两行，外加平仓流动性桶 | 旁证，不是有效性。看 cooldown 是否在跑、`liq_below_min` / `no_liquidity` / 过闸 buy，以及已平仓 `liq_<50k` vs `≥50k`。不据此改 50000，不开第三道统计参 |
+| **P-3 硬旁证** 止损占亏 ≥50% | `scripts/weekly_side_evidence.py`；paper `positions` 已平仓 | **硬旁证门槛，可否决 Step2。** 与看板 `stop_loss_share` 相同：净盈亏为负且有 `stop_loss` 时，`min(1, |Σ stop_loss pnl| / |净盈亏|)`。≥0.50 → `hard_旁证_stop_loss_share`。样本门槛过了也 **不可启动 Step2**。不算有效性 |
+| **P-3 硬旁证** 日开仓 ≥20 | 同上，`opened_at` 按 HKT 日历日取窗口内峰值 | **硬旁证门槛，可否决 Step2。** `max_daily_opens` ≥20 → `hard_旁证_daily_opens`。与止损占亏任一为真即否决 |
+| **G-1** 频率旁证 | 开仓计数，不是 cooldown 秒数 | 冷却键是 `(strategy_id, chain_id, token_address)`，不限制跨票日开仓。G-1 用 `max_daily_opens`（`positions.opened_at` 按 HKT 日；看板频率卡用 fills 的 UTC 日期前缀，都是单日开仓峰值）。**现在不改** `DECISION_COOLDOWN_SEC`（代码默认仍 0） |
+| **G-4** `min_liq` 经典地板 | `DECISION_MIN_LIQ_USD`，回测 `FilterConfig.min_liq` | 经典回测地板 **50000** 已是买入闸（#41）。周检只记拒绝桶，不改 50000 |
+| **F-1** 连续 2 亏之后的第 3 笔 | 周检 md「F-1 信号连亏（只记不熔断）」 | 周检优先 `up_1h<0`（没有 1h 时用已平仓 pnl）。看板 F-1 卡只看已平仓 pnl。两边都只观察，不接入 RiskManager / PM pause。熔断留 R2/R3 |
+| **F-3 / C3** 出场 | `execution/exits.py`（C3 / E-2） | 出场归执行。决策层只指向，不改 hold / TP / SL |
 | 平仓归因三行 | paper 已平仓；看板 #45 旁证 | **胜率与期望分开**；**最差单笔**；**`liq_<50k` vs `≥50k`**（unknown 单列）。适用时标 **R2 规则缺口旁证**。不据此调 strength 或权重 |
 
 目录与上面「周检命令」相同（`/workspace/dexscreener-crawler`）。这是 10-19 首跑，不把 `--factor-layers` 改成常驻默认。
@@ -136,7 +149,7 @@ Foresight Arena 的功效量级（已结算二元预测；相对市场共识的 
   >> logs/review_weekly.log 2>&1
 ```
 
-复盘不认领 **P-1**（PM 仓位比例 / 回撤，`execution/README.md`）、**P-4**（JEV 错价，指标）、**P-5**（共识概率观察候选，指标）。**C3** 趋势出场只观察；要立项先 R3 回测，不盘中追退出参数。`accepted` ≠ `activated`。临时 `live_candidate` 样本单独分桶。
+复盘不认领 **P-1**（PM 仓位比例 / 回撤，`execution/README.md`）、**P-4**（JEV 错价，指标）、**P-5**（共识概率观察候选，指标）。**F-3 / C3**：出场归执行（`execution/exits.py`，C3 / E-2）；决策层只指向，不改 hold / TP / SL。趋势出场仍只观察，要立项先 R3 回测。`accepted` ≠ `activated`。临时 `live_candidate` 样本单独分桶。
 
 ## 背景（保留）
 

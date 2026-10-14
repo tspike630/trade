@@ -3,8 +3,9 @@
 
 Forward 1h/4h returns for jev_strength_v1 buy signals, with liquidity /
 coverage / price filters and strength strata. Read-only on business tables;
-writes the optional markdown report, appends one trend CSV row under
-exports/reports/jev_validity_trend.csv, and prints a summary to stdout.
+writes the optional markdown report, rewrites one trend CSV row under
+exports/reports/jev_validity_trend.csv (hard-evidence and F-1 columns
+included), and prints a summary to stdout.
 """
 
 from __future__ import annotations
@@ -18,14 +19,20 @@ import re
 import sqlite3
 import statistics
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 _REPO = Path(__file__).resolve().parents[1]
+_SCRIPTS = Path(__file__).resolve().parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+import weekly_side_evidence as side_evidence
 
 from review.gates import (
     CONSECUTIVE_WEEKS,
@@ -515,10 +522,14 @@ def decision_line(
     unique_token: int,
     *,
     two_week_ok: Optional[bool] = None,
+    hard_veto: bool = False,
 ) -> str:
     """Effective sample: unique_token≥10 is harder than raw n≥15.
 
     If raw n≥15 but unique_token<10 → still 样本不足.
+    ``hard_veto`` is the P-3 side-evidence block (stop-loss loss share or
+    daily opens). It does not move the sample floors. When it is set, a
+    promote that would otherwise say 可进 Step2 is 不可启动 Step2.
     """
     sample_ok = n >= MIN_RAW_N and unique_token >= MIN_UNIQUE_TOKEN
     tw = ""
@@ -532,6 +543,9 @@ def decision_line(
             f" 连续{CONSECUTIVE_WEEKS}周门槛：未满足（需连续 {CONSECUTIVE_WEEKS} 周 "
             f"1h≥{UP_1H_PROMOTE:.0%} 且 unique_token≥{MIN_UNIQUE_TOKEN}）。"
         )
+    veto_note = ""
+    if hard_veto:
+        veto_note = " 硬旁证已触发，不可启动 Step2。"
 
     if not sample_ok:
         if n >= MIN_RAW_N and unique_token < MIN_UNIQUE_TOKEN:
@@ -540,19 +554,25 @@ def decision_line(
                 "样本不足（去重后不足），当前数据下无法确认过滤后有效性；"
                 "保留覆盖率爬坡期 caveat，暂缓据此开 Step2。"
                 + tw
+                + veto_note
             )
         return (
             f"n={n}<{MIN_RAW_N}（unique_token={unique_token}）→ 样本不足，"
             "当前数据下无法确认过滤后有效性；"
             "保留覆盖率爬坡期 caveat，暂缓据此开 Step2。"
             + tw
+            + veto_note
         )
     assert up_rate is not None
     if up_rate >= UP_1H_PROMOTE:
+        if hard_veto:
+            action = "样本门槛已过，但硬旁证否决，不可启动 Step2。"
+        else:
+            action = "有效需过滤，可进 Step2（仍建议 paper 先行）。"
         return (
             f"n={n}≥{MIN_RAW_N} 且 unique_token={unique_token}≥{MIN_UNIQUE_TOKEN} "
             f"且 1h 上涨率 {pct(up_rate)}≥{UP_1H_PROMOTE:.0%} → "
-            "有效需过滤，可进 Step2（仍建议 paper 先行）。"
+            + action
             + tw
         )
     if up_rate < UP_1H_DEGRADE:
@@ -561,12 +581,14 @@ def decision_line(
             f"且 1h 上涨率 {pct(up_rate)}<{UP_1H_DEGRADE:.0%} → "
             "当前数据下单因子确认偏弱，降级建议；Step2 可转向技术面。"
             + tw
+            + veto_note
         )
     return (
         f"n={n}≥{MIN_RAW_N} 且 unique_token={unique_token}≥{MIN_UNIQUE_TOKEN} "
         f"且 1h 上涨率 {pct(up_rate)} 介于 {UP_1H_DEGRADE:.0%}–{UP_1H_PROMOTE:.0%} → "
         "边缘区间，继续积累样本后再判；暂不据此开 Step2。"
         + tw
+        + veto_note
     )
 
 
@@ -669,6 +691,15 @@ TREND_FIELDS = [
     "up_1h_019plus",
     "n_1h",
     "n_4h",
+    "stop_loss_pnl_share",
+    "max_daily_opens",
+    "hard_旁证_stop_loss_share",
+    "hard_旁证_daily_opens",
+    "step2_blocked",
+    "f1_max_streak",
+    "f1_trials_after_two",
+    "f1_p_third_given_two",
+    "side_evidence",
 ]
 
 
@@ -684,11 +715,15 @@ def _ret_or_empty(x: Optional[float]) -> str:
     return f"{x:.6f}"
 
 
-def build_trend_row(result: dict[str, Any], when: Optional[datetime] = None) -> dict[str, str]:
+def build_trend_row(
+    result: dict[str, Any],
+    when: Optional[datetime] = None,
+    side: Optional[side_evidence.WeeklySide] = None,
+) -> dict[str, str]:
     when = when or datetime.now(HK_TZ)
     st1, st4 = result["st1"], result["st4"]
     s019 = result["strata"]["0.19+"]["1h"]
-    return {
+    row = {
         "date": when.strftime("%Y-%m-%d"),
         "raw_n": str(result["n_raw"]),
         "filtered_n": str(result["n_filt"]),
@@ -702,6 +737,8 @@ def build_trend_row(result: dict[str, Any], when: Optional[datetime] = None) -> 
         "n_1h": str(st1.n),
         "n_4h": str(st4.n),
     }
+    row.update(side_evidence.trend_fields(side))
+    return row
 
 
 def read_trend_rows(path: Path) -> list[dict[str, str]]:
@@ -713,15 +750,22 @@ def read_trend_rows(path: Path) -> list[dict[str, str]]:
 
 
 def append_trend_row(path: Path, row: dict[str, str]) -> list[dict[str, str]]:
-    """Append one trend row; return prior rows (before this append)."""
+    """Write prior rows plus this one under the current header.
+
+    Rewrites the file so new hard-evidence / F-1 columns appear on the
+    header. Older rows keep their values; new cells stay blank. Returns
+    the rows that were already on disk.
+    """
     prior = read_trend_rows(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists() or path.stat().st_size == 0
-    with path.open("a", encoding="utf-8", newline="") as f:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=TREND_FIELDS, extrasaction="ignore")
-        if write_header:
-            w.writeheader()
-        w.writerow(row)
+        w.writeheader()
+        for old in prior:
+            w.writerow({key: old.get(key, "") for key in TREND_FIELDS})
+        w.writerow({key: row.get(key, "") for key in TREND_FIELDS})
+    tmp.replace(path)
     return prior
 
 
@@ -825,6 +869,7 @@ def render_md(
     trend_prior: Optional[list[dict[str, str]]] = None,
     trend_row: Optional[dict[str, str]] = None,
     two_week_ok: Optional[bool] = None,
+    side: Optional[side_evidence.WeeklySide] = None,
 ) -> str:
     p = primary["params"]
     lines: list[str] = []
@@ -914,8 +959,6 @@ def render_md(
     a("")
 
     # drop reasons
-    from collections import Counter
-
     fails = Counter()
     for s in primary["all_samples"]:
         if s.filter_fail:
@@ -962,7 +1005,7 @@ def render_md(
     a("")
     a(
         f"决策摘要（按 1h 上涨率 + unique_token）："
-        f"**{decision_line(primary['st1'].n, primary['st1'].up_rate, primary['unique_token'], two_week_ok=two_week_ok)}**"
+        f"**{_decision_text(primary, two_week_ok=two_week_ok, side=side)}**"
     )
     a("")
 
@@ -1017,10 +1060,14 @@ def render_md(
         f"| 连续 {CONSECUTIVE_WEEKS} 周 1h≥{UP_1H_PROMOTE:.0%} "
         f"且 unique_token≥{MIN_UNIQUE_TOKEN} | Step2 启动的周检硬门槛（见趋势 CSV） |"
     )
+    a(
+        "| 硬旁证：止损占亏≥50% 或 单日开仓≥20 | "
+        "否决 Step2。样本门槛照旧，不可启动 Step2 |"
+    )
     a("")
     a(
         f"**本跑判定：** "
-        f"{decision_line(primary['st1'].n, primary['st1'].up_rate, primary['unique_token'], two_week_ok=two_week_ok)}"
+        f"{_decision_text(primary, two_week_ok=two_week_ok, side=side)}"
     )
     a("")
     if two_week_ok is True:
@@ -1037,6 +1084,9 @@ def render_md(
     else:
         a(f"**连续 {CONSECUTIVE_WEEKS} 周门槛：** 无历史可比（首次）→ 未满足。")
     a("")
+    if side is not None:
+        for line in side_evidence.render_markdown(side):
+            a(line)
 
     a("## 附录：排除 |ret|>500%")
     a("")
@@ -1100,11 +1150,31 @@ def render_md(
     return "\n".join(lines) + "\n"
 
 
+def _hard_veto(side: Optional[side_evidence.WeeklySide]) -> bool:
+    return bool(side is not None and side.hard.step2_blocked)
+
+
+def _decision_text(
+    result: dict[str, Any],
+    *,
+    two_week_ok: Optional[bool],
+    side: Optional[side_evidence.WeeklySide],
+) -> str:
+    return decision_line(
+        result["st1"].n,
+        result["st1"].up_rate,
+        result["unique_token"],
+        two_week_ok=two_week_ok,
+        hard_veto=_hard_veto(side),
+    )
+
+
 def print_summary(
     label: str,
     result: dict[str, Any],
     *,
     two_week_ok: Optional[bool] = None,
+    side: Optional[side_evidence.WeeklySide] = None,
 ) -> None:
     p = result["params"]
     st1, st4 = result["st1"], result["st4"]
@@ -1133,8 +1203,11 @@ def print_summary(
     print(" | ".join(bits))
     print(
         "decision:",
-        decision_line(st1.n, st1.up_rate, result["unique_token"], two_week_ok=two_week_ok),
+        _decision_text(result, two_week_ok=two_week_ok, side=side),
     )
+    if side is not None:
+        for line in side_evidence.format_stdout(side):
+            print(line)
     print()
 
 
@@ -1170,6 +1243,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Skip appending/reading the trend CSV",
     )
+    ap.add_argument(
+        "--paper-db",
+        type=Path,
+        default=None,
+        help="Paper ledger (default EXECUTION_PAPER_DB / PAPER_DB_PATH / paper_trading.db)",
+    )
+    ap.add_argument(
+        "--side-window-days",
+        type=int,
+        default=side_evidence.DEFAULT_WINDOW_DAYS,
+        help="HKT window for stop-loss share and daily opens (default 7)",
+    )
+    ap.add_argument(
+        "--no-side-evidence",
+        action="store_true",
+        help="Skip paper hard side-evidence and F-1 (no Step2 veto from this pass)",
+    )
     args = ap.parse_args(argv)
 
     db_path = args.db.resolve()
@@ -1181,7 +1271,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if out_path is None:
         out_path = db_path.parent / "DECISION_ENGINE_JEV_VALIDITY_FILTERED.md"
 
+    if args.side_window_days < 1:
+        print("side-window-days must be >= 1", file=sys.stderr)
+        return 2
+
     conn = open_db(db_path)
+    side: Optional[side_evidence.WeeklySide] = None
     try:
         primary = run_analysis(
             conn,
@@ -1201,6 +1296,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 min_price=args.min_price,
                 tol_sec=args.tol_sec,
             )
+        if not args.no_side_evidence:
+            ret_1h = {sample.id: sample.ret_1h for sample in primary["all_samples"]}
+            paper_db = side_evidence.resolve_paper_db(args.paper_db, _REPO)
+            side = side_evidence.compute_for_weekly(
+                decision_conn=conn,
+                ret_1h_by_id=ret_1h,
+                strategy_id=STRATEGY_ID,
+                paper_db=paper_db,
+                window_days=args.side_window_days,
+            )
     finally:
         conn.close()
 
@@ -1210,16 +1315,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     trend_path: Optional[Path] = None
     if not args.no_trend:
         trend_path = (args.trend_csv or DEFAULT_TREND_CSV).resolve()
-        trend_row = build_trend_row(primary)
+        trend_row = build_trend_row(primary, side=side)
         trend_prior = append_trend_row(trend_path, trend_row)
         if not trend_prior:
             two_week_ok = None  # 首次：无上周可比
         else:
             two_week_ok = two_week_consecutive_ok(trend_prior, trend_row)
-        print(f"trend: appended → {trend_path} (prior_rows={len(trend_prior)})")
+        print(f"trend: wrote → {trend_path} (prior_rows={len(trend_prior)})")
 
     print_summary(
-        f"primary liq>={args.min_liq:g}", primary, two_week_ok=two_week_ok
+        f"primary liq>={args.min_liq:g}",
+        primary,
+        two_week_ok=two_week_ok,
+        side=side,
     )
     if contrast is not None:
         print_summary(f"contrast liq>={args.contrast_liq:g}", contrast)
@@ -1231,6 +1339,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         trend_prior=trend_prior if not args.no_trend else None,
         trend_row=trend_row,
         two_week_ok=two_week_ok if not args.no_trend else None,
+        side=side,
     )
     out_path = out_path.resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
