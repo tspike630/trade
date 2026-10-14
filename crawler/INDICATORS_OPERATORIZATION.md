@@ -35,6 +35,7 @@ AQuA 记过一起真实 look-ahead：LLM 作者和 LLM 审查都漏掉了「当�
 
 ## 交叉
 
-- **M-2 方向校准**（正反两个符号，A 类接受前必过）：`INDICATORS_FACTOR_CANDIDATES.md`。
+- **M-2 方向校准**（正反两个符号，A 类接受前必过）：`INDICATORS_FACTOR_CANDIDATES.md` 的 `calibrate_direction` 段。E-1 回撤候选（`fib_retrace_0618` / `fib_retrace_05` / `fib_retrace_0382`）同一闸：到位反弹与跌破加速都要记下。周跑尚未调用该函数。
+- **E-1 / E-4 / E-5**（艾略特，文档候选）：波段极值对、同价位交汇与量能斜率一旦要写，窗口同样在 t 收口。`volume_h1` / `volume_h24` 只作快照回看（E-5）。原语未实现。登记与 N-1..N-6 拒绝列表在 `INDICATORS_FACTOR_CANDIDATES.md`。10-19 之后且 M-2 与本文 M-3 都完成才谈 A 类。不算有效性。权重 0。
 - **信号强度 ≠ 胜率**（PR #46）：`INDICATORS_STEP2.md`「设计依据：定价错误（P-4）」；层纪律在 `INDICATORS_AUDIT.md`「警示事例 → 指标层纪律」。算子合法不增加胜率含义。
 - **M-1 样本功效**：`INDICATORS_AUDIT.md`「统计功效脚注」。n≥15 不改；约 350 个已结算样本才够谈 α≈0.02。观察口径，不算有效性。

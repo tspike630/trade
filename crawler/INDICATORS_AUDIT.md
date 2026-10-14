@@ -107,7 +107,7 @@ python -m api_server   # 只读 API + admin
 
 - 本文 **INDICATORS_AUDIT.md**（运维入口；含「警示事例 → 指标层纪律」）
 - STEP1 / STEP2 / STEP3 / P0 / LIGHT / AUTH_JEV（P-4 定价错误在 STEP2）
-- **INDICATORS_FACTOR_CANDIDATES.md** — 机构供需 P-3 / P-4 候选登记；**M-2 方向校准**（正反两符号，A 类接受前必过）。`calibrate_direction` 未接入周跑。权重 0，不算有效性
+- **INDICATORS_FACTOR_CANDIDATES.md** — 机构供需 P-3 / P-4；艾略特 E-1 / E-4 / E-5 与拒绝项 N-1..N-6（指针见本文「艾略特候选」）。**M-2** `calibrate_direction` 未接入周跑。权重 0，不算有效性
 - **INDICATORS_OPERATORIZATION.md** — **M-3** 时间序列算子硬规则（窗口在 t 收口；禁止日合计 / 未来分母）
 - 本文「统计功效脚注（M-1）」— n≥15 不改；约 350 个已结算样本才够谈 α≈0.02
 - README「Indicators 旁路」节 + 命令总索引
@@ -155,6 +155,10 @@ Foresight Arena（arXiv 2605.00420）要检测相对市场共识 α≈0.02 的 e
 ### 算子化（M-3，指针）
 
 指标和因子的时间序列代码只许使用截止当前 bar 的数据，滚动窗口在 t 收口，禁止日合计或未来分母。全文硬规则在 `INDICATORS_OPERATORIZATION.md`。这不是新的打分，权重保持 0。
+
+### 艾略特候选（指针）
+
+E-1（`fib_retrace_0618` / `fib_retrace_05` / `fib_retrace_0382`）、E-4、E-5 与拒绝项 N-1..N-6 登记在 `INDICATORS_FACTOR_CANDIDATES.md`。E-1 是 A 类 factor_loop 候选，依赖尚未实现的波段原语（N 根 K 线局部极值对，OHLC）；正反方向走 `calibrate_direction`（M-2），时间序列走 `INDICATORS_OPERATORIZATION.md`（M-3），回测含滑点 / 成本。E-4 只在同价位多因子命中相对单因子有 up_1h 增益时保留。E-5 是量能斜率 / 背离观察，`pair_history` 已有 volume，不是新因子。E-3：因子只辅助确认，决策与 PM 硬规则拥有下单。meme / 新币若 up_1h 无增益，E-1 退役，不恋战。10-19 之后且校准与算子化完成才谈 A 类。E-2 归执行，不在指标层。权重 0。不算有效性。不写看板代码。
 
 ---
 
