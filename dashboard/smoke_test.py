@@ -746,6 +746,18 @@ class DashboardSmokeTest(unittest.TestCase):
             "pm_rejected:token_dedup",
         )
         self.assertEqual(rejection_key(1, "", "validated", {"status": "paper_failed"}), "paper_failed")
+        self.assertEqual(
+            rejection_key(
+                1,
+                "",
+                "rejected",
+                {
+                    "status": "risk_rejected",
+                    "risk": [{"ok": False, "reason": "daily_loss:2026-10-14:-316.5<-200.0"}],
+                },
+            ),
+            "risk_rejected:daily_loss",
+        )
         self.assertEqual(rejection_key(0, '["slippage"]', "rejected", None), "slippage")
         self.assertIsNone(rejection_key(1, "", "validated", {"status": "dry_run_acked"}))
         self.assertEqual(liq_bucket_label(11994.57), "liq_<50k")

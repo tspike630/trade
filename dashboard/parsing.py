@@ -189,22 +189,49 @@ def bucket_key(errors: str | None) -> str:
     return key
 
 
+def _normalize_risk_reason(raw: str) -> str:
+    """Stable risk bucket key; strip date/amount from daily_loss:... payloads."""
+    text = raw.strip()
+    if not text:
+        return text
+    head = text.split(":", 1)[0].strip().lower()
+    if head == "daily_loss":
+        return "risk_rejected:daily_loss"
+    if text.lower().startswith("risk_rejected:"):
+        return clip(text, 80)
+    return clip(f"risk_rejected:{text}", 80)
+
+
 def _receipt_reject_detail(receipt: dict[str, Any], receipt_status: str) -> str | None:
-    """Prefer fine-grained reason from pm_check / risk_check (matches order_events)."""
+    """Prefer fine-grained reason from pm_check / risk_check / risk[] (matches order_events)."""
     nested_key = {
         "pm_rejected": "pm_check",
         "risk_rejected": "risk_check",
         "paper_failed": "paper_result",
     }.get(receipt_status)
-    if not nested_key:
-        return None
-    nested = receipt.get(nested_key)
-    if not isinstance(nested, dict):
-        return None
-    for field in ("reason", "error", "code"):
-        value = nested.get(field)
-        if isinstance(value, str) and value.strip():
-            return clip(value.strip(), 80)
+    if nested_key:
+        nested = receipt.get(nested_key)
+        if isinstance(nested, dict):
+            for field in ("reason", "error", "code"):
+                value = nested.get(field)
+                if isinstance(value, str) and value.strip():
+                    raw = value.strip()
+                    if receipt_status == "risk_rejected":
+                        return _normalize_risk_reason(raw)
+                    return clip(raw, 80)
+    # Gateway shape: risk is a list of {ok, reason} (not risk_check dict).
+    if receipt_status == "risk_rejected":
+        risk = receipt.get("risk")
+        if isinstance(risk, list):
+            for item in risk:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("ok") is True:
+                    continue
+                for field in ("reason", "error", "code"):
+                    value = item.get(field)
+                    if isinstance(value, str) and value.strip():
+                        return _normalize_risk_reason(value)
     return None
 
 
