@@ -1135,6 +1135,20 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     tools=("14d",),
                 )
                 _v2_comp(
+                    ("持仓", "集中"),
+                    "span-6",
+                    lambda: _v2_intel_holders(store),
+                    foot="旁证观察 · 不算有效性 · 不进盘中参 · 高 bot 不跳单",
+                    tools=("权重0",),
+                )
+                _v2_comp(
+                    ("滑点", "bot"),
+                    "span-6",
+                    lambda: _v2_intel_slippage(store),
+                    foot="旁证观察 · 不算有效性 · 不进盘中参 · 高 bot 不跳单",
+                    tools=("不跳单",),
+                )
+                _v2_comp(
                     ("回测", "新闻"),
                     "span-6",
                     lambda: _v2_btnews(store),
@@ -2286,6 +2300,89 @@ def _v2_closed(store: DataStore) -> None:
         "首笔命中：按 pair 最早一笔已平仓；live_candidate 另列；"
         "旁证/不算有效性（n 仍小，对照周检）。"
     ).classes("v2-note")
+
+
+def _observe_num(value: object, digits: int = 4) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "data gap"
+    return f"{float(value):.{digits}f}"
+
+
+def _short_addr(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "—"
+    if len(text) <= 12:
+        return text
+    return text[:4] + "…" + text[-4:]
+
+
+def _v2_intel_holders(store: DataStore) -> None:
+    result = store.intel_holder_observe()
+    if not result.available or result.data is None:
+        ui.label(result.reason or "data gap").classes("v2-note")
+        ui.label("权重0 / 不接决策").classes("v2-note")
+        return
+    report = result.data
+    _v2_kv([
+        ("快照样本", str(getattr(report, "snapshot_n", 0)), "mute"),
+        ("top10 非空", str(getattr(report, "non_null_share_n", 0)), "mute"),
+        ("devΔ 非空", str(getattr(report, "non_null_delta_n", 0)), "mute"),
+        ("权重", "0", "mute"),
+    ])
+    latest = getattr(report, "latest", ()) or ()
+    if not latest or getattr(report, "gap", "") == "empty":
+        ui.label("data gap").classes("v2-note")
+    if latest:
+        rows = []
+        for item in latest:
+            chain = _v2_text(getattr(item, "chain_id", None), 8)
+            token = _short_addr(getattr(item, "token_address", None))
+            rows.append([
+                f"{chain} {token}".strip(),
+                _observe_num(getattr(item, "top10_share", None)),
+                _observe_num(getattr(item, "dev_balance_delta", None)),
+                _v2_text(getattr(item, "recorded_at", None), 20),
+            ])
+        _v2_table(
+            [("币", ""), ("top10_share", "num"), ("devΔ", "num"), ("时间", "")],
+            rows,
+        )
+    ui.label("权重0 / 不接决策").classes("v2-note")
+    ui.label("旁证观察 · 不算有效性 · 不进盘中参 · 高 bot 不跳单").classes("v2-note")
+    crowd = store.intel_crowding_note()
+    if crowd.available and crowd.data is not None:
+        ui.label(_v2_text(getattr(crowd.data, "line", None))).classes("v2-note")
+    else:
+        ui.label("拥挤旁证 data gap · 不否决 · 不算有效性").classes("v2-note")
+
+
+def _v2_intel_slippage(store: DataStore) -> None:
+    result = store.intel_slippage_observe()
+    if not result.available or result.data is None:
+        ui.label(result.reason or "data gap").classes("v2-note")
+        ui.label("高 bot 不跳单").classes("v2-note")
+        return
+    report = result.data
+    fills = getattr(report, "total_fills", None)
+    bot_fills = getattr(report, "bot_fills", None)
+    share = getattr(report, "bot_share", None)
+    if isinstance(share, (int, float)) and not isinstance(share, bool) and isinstance(fills, int) and isinstance(bot_fills, int):
+        fill_text = f"{bot_fills}/{fills}"
+    else:
+        fill_text = "data gap"
+    _v2_kv([
+        ("1h n", str(getattr(report, "slippage_n", 0)), "mute"),
+        ("mean", _observe_num(getattr(report, "mean", None)), "mute"),
+        ("p50", _observe_num(getattr(report, "p50", None)), "mute"),
+        ("p90", _observe_num(getattr(report, "p90", None)), "mute"),
+        ("bot 份额", _observe_num(share), "mute"),
+        ("bot 笔数", fill_text, "mute"),
+        ("高 bot", "不跳单", "mute"),
+    ])
+    if getattr(report, "high_bot_skip_wired", False):
+        ui.label("high_bot_skip 标记异常 · 仍不跳单").classes("v2-note")
+    ui.label("旁证观察 · 不算有效性 · 不进盘中参 · 高 bot 不跳单").classes("v2-note")
 
 
 def _v2_btnews(store: DataStore) -> None:
