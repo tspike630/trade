@@ -7,6 +7,16 @@
 
 看板旁证是 PR #45 总览上的平仓块：胜率、最差单笔、剔除最差、单笔抹盈，以及 `exit_reason` × 流动性桶。落地时记下的纸面侧例是胜率约 **51%**、最差单笔约 **−84**、剔除最差后约 **+36**、单笔抹盈 **是**。那是观察，不是周检样本。
 
+### 2026-10-14 纸面回撤（观察）
+
+快照约 **23:47 HKT**：权益 ≈ **$9683**（相对 $10000 约 **−3.2%**），空仓，已平 **43** 笔；已实现 ≈ **−$317**；胜率 ≈ **44%**；首次命中 **40%**（n=10）。**不算有效性。** 旁证，不是周检样本。
+
+归因来自执行 / 复盘：`stop_loss`×3 ≈ **−305**（最差 ≈ **−$190**）占主导；`max_hold`×40 ≈ **−12** 是次要。执行 `daily_loss` 拒绝过一次（已实现 ≈ −317，低于 −200）——保护，不是失效。
+
+反思：`live_candidate` 仍在流入。`decision_log` 里 `purpose=live_candidate` 到约 **23:54 HKT** 计 **83** 条，策略 `jev_strength_v1`，显式 min **0.15**。**信号量 ≠ PnL。** 半胜仍亏 / 薄池打穿已经映射到 `DECISION_MIN_LIQ_USD`、cooldown、R1–R3。
+
+调整：**盘中不改** `DECISION_MIN_LIQ_USD`、cooldown、`JEV_MIN_STRENGTH`、临时 **0.15**。2026-10-19 的 P-3 旁证继续挂着，见 `DECISION_ENGINE_WEEKLY_CHECK.md`。
+
 ## 三条警示 → 已有控制
 
 | 警示 | 看到什么 | 已有控制 | 不要做 |
@@ -64,4 +74,5 @@
 - 临时 `--min-jev-strength 0.15 --purpose live_candidate` 的 buy **保持未标记，不得标成 accepted**。
 - `scripts/jev_validity.py` 按 `strategy_id=jev_strength_v1` 的全部 buy 读取，**不按 purpose 过滤**，这些行会进入周检输入。报告里单独脚注，不要拿它们去过「连续 2 周 ≥55%」门槛。
 - 2026-10-19 的 cooldown 是否生效、`min_liq` 三桶、临时 0.15 观察行，三行都是观察登记。不改阈值、不改默认强度、不把临时观察标成 accepted。
-- **M-6**：高信心≠高收益，信号强度≠胜率（PolyBench / Prediction Arena）。只作解读，不加新过滤。临时 `purpose=live_candidate` 且 `--min-jev-strength 0.15` 的行保持未标记，**不算有效性**。
+- **M-6**：高信心≠高收益，信号强度≠胜率（PolyBench / Prediction Arena）。只作解读，不加新过滤。临时 `purpose=live_candidate` 且 `--min-jev-strength 0.15` 的行保持未标记，**不算有效性**。第二批文献（Prophet Arena / LiveTradeBench / When Agents Trade / FinPos / PredictionMarketBench）同样只作解读：**校准好 ≠ 赚钱**，**回测好看 ≠ 有效**；已被本条与 M-1 功效脚注覆盖（`DECISION_ENGINE_WEEKLY_CHECK.md`「统计功效标注」，[#54](https://github.com/tspike630/trade/pull/54)）。**不加新过滤。**
+- 文献映射（第一批不上 LLM 决策主路径、不上 agent 栈；第二批只读）见 `DECISION_ENGINE_RESEARCH_MAPPING.md`（`crawler/` 同文）。
