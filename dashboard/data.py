@@ -27,6 +27,7 @@ from dashboard.parsing import (
     extract_liquidity_usd,
     extract_pair,
     extract_symbol,
+    liq_bucket_label,
     parse_json,
     parse_ts,
     receipt_summary,
@@ -315,6 +316,23 @@ class RejectionReport:
     days: int
     total: int
     buckets: tuple[RejectionBucket, ...]
+
+
+@dataclass(frozen=True)
+class PaperClosedBucket:
+    """Observe-only attribution: exit_reason × liq bucket (min_liq=50k aligned)."""
+    exit_reason: str
+    liq_bucket: str
+    count: int
+    pnl_usd: float
+
+
+@dataclass(frozen=True)
+class PaperClosedReport:
+    days: int
+    closed: int
+    total_pnl_usd: float
+    buckets: tuple[PaperClosedBucket, ...]
 
 
 class MissingTable(LookupError):
@@ -612,6 +630,14 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed rejection_buckets: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "rejection_buckets")
+
+    def paper_closed_buckets(self, days: int = 14) -> DataResult:
+        started = time.perf_counter()
+        try:
+            return _finish(self._paper_closed_buckets(started, days), "paper_closed_buckets")
+        except Exception as exc:
+            log.warning("read failed paper_closed_buckets: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_closed_buckets")
 
     def _today_execution_stats(self, started: float) -> DataResult:
         path = self.paths.execution
@@ -1202,6 +1228,73 @@ class DataStore:
             for key, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
         )
         return _ok(RejectionReport(window_days, total, ordered), started)
+
+    def _paper_closed_buckets(self, started: float, days: int) -> DataResult:
+        path = self.paths.paper
+        window_days = _clamp(days, 1, 60)
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=window_days)
+        lower = (start - timedelta(days=1)).strftime("%Y-%m-%d")
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "positions", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "positions")
+                need = ("status", "closed_at", "exit_reason", "pnl_usd")
+                absent = _require(cols, need)
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                selected = ["status", "closed_at", "exit_reason", "pnl_usd"]
+                if "meta_json" in cols:
+                    selected.append("meta_json")
+                rows = _exec(
+                    conn,
+                    f"SELECT {', '.join(selected)} FROM positions WHERE status = ? AND closed_at >= ?",
+                    ("closed", lower),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        agg: dict[tuple[str, str], list[float]] = defaultdict(list)
+        closed = 0
+        total_pnl = 0.0
+        for row in rows:
+            if not _in_range(row["closed_at"], start, end, end_inclusive=True):
+                continue
+            reason = clip(str(_cell(row, "exit_reason") or "(empty)"), 40) or "(empty)"
+            pnl = safe_float(_cell(row, "pnl_usd"))
+            if pnl is None:
+                pnl = 0.0
+            meta = parse_json(str(_cell(row, "meta_json") or ""))
+            liq = None
+            if isinstance(meta, dict):
+                liq = safe_float(meta.get("liquidity_usd"))
+                if liq is None:
+                    extras = meta.get("extras")
+                    if isinstance(extras, dict):
+                        liq = safe_float(extras.get("liquidity_usd"))
+            bucket = liq_bucket_label(liq)
+            agg[(reason, bucket)].append(pnl)
+            closed += 1
+            total_pnl += pnl
+        ordered = tuple(
+            PaperClosedBucket(
+                exit_reason=key[0],
+                liq_bucket=key[1],
+                count=len(values),
+                pnl_usd=round(sum(values), 4),
+            )
+            for key, values in sorted(
+                agg.items(),
+                key=lambda item: (-abs(sum(item[1])), -len(item[1]), item[0][0], item[0][1]),
+            )
+        )
+        return _ok(
+            PaperClosedReport(window_days, closed, round(total_pnl, 4), ordered),
+            started,
+        )
 
     def _decision_ids_between(
         self,

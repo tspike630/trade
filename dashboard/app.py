@@ -1100,6 +1100,20 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     foot="模拟盘当前持仓 · 现价取 pair_history",
                 )
                 _v2_comp(
+                    ("拒因", "分桶"),
+                    "span-6",
+                    lambda: _v2_reject(store),
+                    foot="execution_log · pm_check.reason（对齐 order_events）",
+                    tools=("7d",),
+                )
+                _v2_comp(
+                    ("平仓", "旁证"),
+                    "span-6",
+                    lambda: _v2_closed(store),
+                    foot="exit_reason × liq 分桶 · 观察旁证 · 不算有效性",
+                    tools=("14d",),
+                )
+                _v2_comp(
                     ("回测", "新闻"),
                     "span-6",
                     lambda: _v2_btnews(store),
@@ -1618,6 +1632,7 @@ def _v2_gates() -> None:
     ui.label(
         f"模拟盘来源：{gates.origin_hint('paper')}。仓位来源：{gates.origin_hint('pm')}。"
         "关是当前预期状态；实盘若变「开启」会标红。"
+        "网关「陈旧」要和拒因一起读：仓满拒单时无新成交属健康态。"
     ).classes("v2-note")
 
 
@@ -1997,6 +2012,56 @@ def backtest_equity_tone(end: float, start: float | None) -> str:
     if end < start:
         return "down"
     return "mute"
+
+
+def _v2_reject(store: DataStore) -> None:
+    result = store.rejection_buckets(days=7)
+    if not result.available or result.data is None:
+        ui.label("暂无数据").classes("v2-note")
+        return
+    report = result.data
+    buckets = getattr(report, "buckets", ()) or ()
+    if not buckets:
+        ui.label(f"近 {getattr(report, 'days', 7)} 日无拒因").classes("v2-note")
+        return
+    rows = [
+        [_v2_text(getattr(item, "key", None)), str(getattr(item, "count", "—"))]
+        for item in buckets[:12]
+    ]
+    _v2_table([("拒因", ""), ("笔数", "num")], rows)
+    ui.label(
+        f"合计 {getattr(report, 'total', 0)} · 细粒度来自 receipt.pm_check.reason"
+    ).classes("v2-note")
+
+
+def _v2_closed(store: DataStore) -> None:
+    result = store.paper_closed_buckets(days=14)
+    if not result.available or result.data is None:
+        ui.label("暂无数据").classes("v2-note")
+        return
+    report = result.data
+    buckets = getattr(report, "buckets", ()) or ()
+    if not buckets:
+        ui.label(f"近 {getattr(report, 'days', 14)} 日无平仓").classes("v2-note")
+        return
+    rows: list[list[str]] = []
+    for item in buckets[:12]:
+        pnl = getattr(item, "pnl_usd", None)
+        rows.append([
+            _v2_text(getattr(item, "exit_reason", None)),
+            _v2_text(getattr(item, "liq_bucket", None)),
+            str(getattr(item, "count", "—")),
+            _v2_money(pnl) if isinstance(pnl, (int, float)) else "—",
+        ])
+    _v2_table(
+        [("退出", ""), ("流动性", ""), ("笔数", "num"), ("PnL", "num")],
+        rows,
+    )
+    total = getattr(report, "total_pnl_usd", None)
+    ui.label(
+        f"已平 {getattr(report, 'closed', 0)} · 合计 "
+        f"{_v2_money(total) if isinstance(total, (int, float)) else '—'} · 旁证非有效性"
+    ).classes("v2-note")
 
 
 def _v2_btnews(store: DataStore) -> None:
