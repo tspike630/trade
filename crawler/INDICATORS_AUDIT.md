@@ -162,7 +162,7 @@ E-1（`fib_retrace_0618` / `fib_retrace_05` / `fib_retrace_0382`）、E-4、E-5 
 
 ### 江恩候选（指针）
 
-G-5（`turnover_spike_v0` / `turnover_exhaust_v0`，G-15 同族不另给 id）登记为 A 类 factor_loop 候选。公式是 `volume_h24 / marketCap`（备选 `/ fdv`），对齐 JEV `up_1h`，周检仍是 n≥15 / unique≥10 / 1h≥55%。分母已落在 `pair_history.market_cap` / `pair_history.fdv`（`pairs` 上是最新 upsert；Dex 省略则 NULL）。`tokens` 仍无市值列。检测器仍不实现。G-7 `breakout_second` 阻断到链上突破定义写死（N 根新高 vs 历史池，防 look-ahead，与 E-1 波段原语同一 TODO）。G-8 `rel_strength` 阻断到市场基准写死（池均值 vs BTC）。江恩 N-1..N-6（案例、做空、人工画线、日历、时间预言、期货）另表拒绝，与艾略特 N 表不是同一组。不改 `gate_candidate` / `accepted`，不 INSERT `factor_candidates.db`，不新增观察 jsonl。权重 0。不算有效性。
+G-5（`turnover_spike_v0` / `turnover_exhaust_v0`，G-15 同族不另给 id）仍是 A 类 factor_loop **候选**。公式是同一历史行的 `volume_h24 / market_cap`（备选同一行 `/ fdv`；#70），对齐 JEV `up_1h`，周检门槛仍是 n≥15 / unique≥10 / 1h≥55%。禁止拿 `pairs` 最新市值去配更早的 `volume_h24`。周检计数要等 10-19 且 M-2、M-3 完成；分母列不再是阻断。周检必须用同一行非 NULL 的 `market_cap`（或 `fdv`）；NULL 分母行跳过；覆盖率只作 10-19 观察，不算有效性。`tokens` 仍无市值列。检测器仍不实现，不进 `decision_engine`，不 INSERT `factor_candidates.db`，不新增观察 jsonl，`gate_candidate` / `accepted` 不改。G-7 `breakout_second` 阻断到链上突破定义写死（N 根新高 vs 历史池，防 look-ahead，与 E-1 波段原语同一 TODO）。G-8 `rel_strength` 阻断到市场基准写死（池均值 vs BTC）。江恩 N-1..N-6（案例、做空、人工画线、日历、时间预言、期货）另表拒绝，与艾略特 N 表不是同一组。权重 0。不算有效性。
 
 ### 学习 → 改可观测（2026-10-14）
 
