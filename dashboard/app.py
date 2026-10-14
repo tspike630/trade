@@ -1905,8 +1905,13 @@ def _v2_jev_gate() -> None:
         view = None
     if not view:
         ui.label("暂无数据（周检后自动填充）").classes("v2-note")
-        return
-    _v2_kv(view)
+    else:
+        _v2_kv(view)
+    ui.label(
+        "统计功效旁证：门槛 n≥15 只排除随机级噪声；"
+        "证 edge≈0.02 约需 ~350 已结算样本（Foresight Arena）。"
+        "解读收紧，不改门槛、不算有效性。"
+    ).classes("v2-note")
 
 
 def _v2_market_base(store: DataStore) -> None:
