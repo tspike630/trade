@@ -34,7 +34,22 @@ from config import (  # noqa: E402
     LOG_FILE,
 )
 from heartbeat import check_health  # noqa: E402
+from history import (  # noqa: E402
+    EVIDENCE_ROLE_SIDE,
+    HOT_LIQ_CONTEXT_HOURS,
+    HOT_LIQ_FAIL_MIN_N,
+    HOT_LIQ_MIN_USD,
+    HOT_LIQ_MISSING_FAIL,
+    HOT_LIQ_MISSING_WARN,
+    HOT_LIQ_WINDOW_HOURS,
+    format_rate_pct,
+    hot_liq_coverage_level,
+    liquidity_coverage,
+    utc_hours_ago_iso,
+)
 from store import Store  # noqa: E402
+
+HOT_LIQ_CHECK_NAME = "Hot liquidity 热层流动性覆盖"
 
 # HK calendar day for report naming (UTC+8)
 _HK = timezone(timedelta(hours=8))
@@ -1035,6 +1050,79 @@ def check_position_overview(report: CheckReport) -> None:
 
 
 
+def check_hot_liquidity_coverage(store: Store, report: CheckReport) -> None:
+    """R1 monitor: hot pair_history liquidity completeness for the min_liq gate.
+
+    Level uses the last 1h hot tier. Last 24h is context only.
+    Not strategy validity — 10-19 weekly check may use the rates as 旁证.
+    Does not invent liquidity. NULL stays the no_liquidity fail-closed path.
+    """
+    flags = {
+        "counts_toward_strategy_validity": False,
+        "evidence_role": EVIDENCE_ROLE_SIDE,
+        "min_liq_usd": HOT_LIQ_MIN_USD,
+        "warn_missing_gt": HOT_LIQ_MISSING_WARN,
+        "fail_missing_gt": HOT_LIQ_MISSING_FAIL,
+        "fail_min_n": HOT_LIQ_FAIL_MIN_N,
+        "window_hours": HOT_LIQ_WINDOW_HOURS,
+        "context_hours": HOT_LIQ_CONTEXT_HOURS,
+    }
+    try:
+        pending = store.count_pending_enrich()
+        hot_1h = liquidity_coverage(
+            store._conn,
+            since_iso=utc_hours_ago_iso(HOT_LIQ_WINDOW_HOURS),
+            tier="hot",
+        )
+        hot_24h = liquidity_coverage(
+            store._conn,
+            since_iso=utc_hours_ago_iso(HOT_LIQ_CONTEXT_HOURS),
+            tier="hot",
+        )
+    except Exception as exc:  # noqa: BLE001
+        report.add(
+            HOT_LIQ_CHECK_NAME,
+            "WARN",
+            f"热层流动性覆盖查询失败: {exc}",
+            {**flags, "error": str(exc)},
+        )
+        return
+
+    level = hot_liq_coverage_level(int(hot_1h["n"]), hot_1h["missing_rate"])
+    thin = (
+        int(hot_1h["n"]) > 0
+        and int(hot_1h["n"]) < HOT_LIQ_FAIL_MIN_N
+        and hot_1h["missing_rate"] is not None
+        and float(hot_1h["missing_rate"]) > HOT_LIQ_MISSING_FAIL
+    )
+    empty = int(hot_1h["n"]) == 0
+    note = ""
+    if empty:
+        note = " hot 1h 无快照（不 FAIL）。"
+    elif thin:
+        note = f" n<{HOT_LIQ_FAIL_MIN_N} 样本薄，高缺失不升 FAIL。"
+    detail = (
+        f"hot 1h n={hot_1h['n']} missing={format_rate_pct(hot_1h['missing_rate'])} "
+        f"(NULL/≤0) <50k={format_rate_pct(hot_1h['below_min_rate'])} "
+        f">=50k={format_rate_pct(hot_1h['ge_min_rate'])} "
+        f"price_present={format_rate_pct(hot_1h['price_present_rate'])}; "
+        f"hot 24h n={hot_24h['n']} missing={format_rate_pct(hot_24h['missing_rate'])}; "
+        f"pending_enrich={pending}.{note} "
+        f"不计策略有效性（{EVIDENCE_ROLE_SIDE}）"
+    )
+    report.add(
+        HOT_LIQ_CHECK_NAME,
+        level,
+        detail,
+        {
+            **flags,
+            "pending_enrich": pending,
+            "hot_1h": hot_1h,
+            "hot_24h": hot_24h,
+        },
+    )
+
+
 def run_checks(*, db: str, stale_sec: int | None) -> CheckReport:
     report = CheckReport()
     db_path = Path(db)
@@ -1054,6 +1142,7 @@ def run_checks(*, db: str, stale_sec: int | None) -> CheckReport:
 
     with Store.open_ro(db_path) as store:
         check_history(store, report, db_path)
+        check_hot_liquidity_coverage(store, report)
         check_scoring(store, report, log_path)
         check_multichain(store, report)
 

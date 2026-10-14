@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from config import (
@@ -14,6 +14,19 @@ from config import (
 from logging_setup import get_logger
 
 log = get_logger("history")
+
+# R1 observation only. Does not count toward strategy validity.
+# The 10-19 weekly check may cite these rates as 旁证.
+# Live calibration: ~34% of hot pair_history rows in the last hour had
+# liquidity_usd NULL or <=0 while price was often present. That is WARN.
+# DexScreener omitting `liquidity` stays NULL — never invent a number.
+HOT_LIQ_MIN_USD = 50_000.0
+HOT_LIQ_WINDOW_HOURS = 1.0
+HOT_LIQ_CONTEXT_HOURS = 24.0
+HOT_LIQ_MISSING_WARN = 0.25  # WARN when hot missing rate is strictly greater
+HOT_LIQ_MISSING_FAIL = 0.60  # FAIL when hot missing rate is strictly greater
+HOT_LIQ_FAIL_MIN_N = 20  # thinner windows stay WARN even above the FAIL rate
+EVIDENCE_ROLE_SIDE = "10-19旁证"
 
 
 def _parse_iso(ts: str | None) -> datetime | None:
@@ -81,6 +94,12 @@ def history_due(store: Any, chain_id: str, pair_address: str, tier: str) -> bool
 
 
 def extract_metrics(pair: dict[str, Any]) -> dict[str, Any]:
+    """Copy numeric fields from a pair payload.
+
+    If DexScreener omits `liquidity` (or `liquidity.usd`), `liquidity_usd` is
+    None. Callers store that NULL. Do not invent a liquidity number — decision
+    fail-closes the buy as no_liquidity.
+    """
     vol = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
     liq = pair.get("liquidity") if isinstance(pair.get("liquidity"), dict) else {}
     txns = pair.get("txns") if isinstance(pair.get("txns"), dict) else {}
@@ -142,3 +161,128 @@ def maybe_snapshot_pair(
         m["price_usd"],
     )
     return True
+
+
+def utc_hours_ago_iso(hours: float, *, now: datetime | None = None) -> str:
+    """UTC timestamp `hours` before now, matching pair_history.recorded_at."""
+    anchor = now or datetime.now(timezone.utc)
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    return (anchor - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _rate(n: int, part: int) -> float | None:
+    if n <= 0:
+        return None
+    return round(part / n, 4)
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def liquidity_coverage(
+    conn: Any,
+    *,
+    since_iso: str,
+    tier: str | None = "hot",
+    min_liq_usd: float = HOT_LIQ_MIN_USD,
+) -> dict[str, Any]:
+    """Bucket recent pair_history rows by stored liquidity_usd.
+
+    missing = NULL or <=0 (no_liquidity, plus non-positive stored values).
+    below_min = 0 < liquidity < min_liq_usd.
+    ge_min = liquidity >= min_liq_usd.
+    The three counts partition `n`. This does not read or fill raw payloads.
+    """
+    where = "recorded_at >= ?"
+    params: list[Any] = [float(min_liq_usd), float(min_liq_usd), since_iso]
+    if tier is not None:
+        where += " AND lower(COALESCE(tier, '')) = ?"
+        params.append(tier.strip().lower())
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*) AS n,
+            SUM(CASE
+                WHEN liquidity_usd IS NULL OR liquidity_usd <= 0 THEN 1 ELSE 0
+            END) AS missing_n,
+            SUM(CASE
+                WHEN liquidity_usd > 0 AND liquidity_usd < ? THEN 1 ELSE 0
+            END) AS below_min_n,
+            SUM(CASE
+                WHEN liquidity_usd >= ? THEN 1 ELSE 0
+            END) AS ge_min_n,
+            SUM(CASE
+                WHEN price_usd IS NOT NULL AND price_usd > 0 THEN 1 ELSE 0
+            END) AS price_present_n
+        FROM pair_history
+        WHERE {where}
+        """,
+        params,
+    ).fetchone()
+    n = _as_int(row["n"] if row is not None else 0)
+    missing_n = _as_int(row["missing_n"] if row is not None else 0)
+    below_n = _as_int(row["below_min_n"] if row is not None else 0)
+    ge_n = _as_int(row["ge_min_n"] if row is not None else 0)
+    price_n = _as_int(row["price_present_n"] if row is not None else 0)
+    return {
+        "tier": tier,
+        "since_iso": since_iso,
+        "min_liq_usd": float(min_liq_usd),
+        "n": n,
+        "missing_n": missing_n,
+        "missing_rate": _rate(n, missing_n),
+        "below_min_n": below_n,
+        "below_min_rate": _rate(n, below_n),
+        "ge_min_n": ge_n,
+        "ge_min_rate": _rate(n, ge_n),
+        "price_present_n": price_n,
+        "price_present_rate": _rate(n, price_n),
+        "counts_toward_strategy_validity": False,
+        "evidence_role": EVIDENCE_ROLE_SIDE,
+    }
+
+
+def hot_liq_coverage_level(n: int, missing_rate: float | None) -> str:
+    """WARN above 25% missing; FAIL above 60% only when n is large enough.
+
+    Empty or thin windows stay WARN so a quiet hour does not fail daily QA.
+    ~34% missing (the live hot-tier observation) is WARN.
+    """
+    if n <= 0 or missing_rate is None:
+        return "WARN"
+    if missing_rate > HOT_LIQ_MISSING_FAIL and n >= HOT_LIQ_FAIL_MIN_N:
+        return "FAIL"
+    if missing_rate > HOT_LIQ_MISSING_WARN:
+        return "WARN"
+    return "PASS"
+
+
+def format_rate_pct(rate: float | None) -> str:
+    if rate is None:
+        return "n/a"
+    return f"{100.0 * float(rate):.1f}%"
+
+
+def format_hot_liq_operator_line(
+    coverage: dict[str, Any] | None,
+    pending_enrich: int | None,
+) -> str:
+    """One line for the hourly brief, placed next to health."""
+    pending = "n/a" if pending_enrich is None else str(int(pending_enrich))
+    if not isinstance(coverage, dict) or coverage.get("error") or "n" not in coverage:
+        return (
+            f"Hot liq 1h (旁证, 不计有效性): unavailable | pending_enrich={pending}"
+        )
+    return (
+        "Hot liq 1h (旁证, 不计有效性): "
+        f"missing={format_rate_pct(coverage.get('missing_rate'))} "
+        f"n={int(coverage.get('n') or 0)} "
+        f"<50k={format_rate_pct(coverage.get('below_min_rate'))} "
+        f">=50k={format_rate_pct(coverage.get('ge_min_rate'))} "
+        f"| pending_enrich={pending}"
+    )

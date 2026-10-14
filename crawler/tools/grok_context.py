@@ -22,6 +22,13 @@ sys.path.insert(0, str(ROOT))
 
 from config import ALERT_MIN_SCORE, DB_PATH, ENABLED_CHAINS  # noqa: E402
 from heartbeat import check_health, read_heartbeat  # noqa: E402
+from history import (  # noqa: E402
+    EVIDENCE_ROLE_SIDE,
+    HOT_LIQ_WINDOW_HOURS,
+    format_hot_liq_operator_line,
+    liquidity_coverage,
+    utc_hours_ago_iso,
+)
 from store import Store  # noqa: E402
 
 
@@ -86,6 +93,22 @@ def build_context(
         )
 
     alerts = store.list_alerts_api(limit=alerts_n)
+    try:
+        hot_liq = liquidity_coverage(
+            store._conn,
+            since_iso=utc_hours_ago_iso(HOT_LIQ_WINDOW_HOURS),
+            tier="hot",
+        )
+    except Exception as exc:  # noqa: BLE001
+        hot_liq = {
+            "n": 0,
+            "missing_rate": None,
+            "below_min_rate": None,
+            "ge_min_rate": None,
+            "error": str(exc),
+            "counts_toward_strategy_validity": False,
+            "evidence_role": EVIDENCE_ROLE_SIDE,
+        }
     return {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": "dexscreener-crawler",
@@ -98,8 +121,11 @@ def build_context(
             "alerts": store.count_alerts(),
             "pair_history_rows": store.count_pair_history(),
             "pending_enrich": store.count_pending_enrich(),
+            "hot_liq_1h_n": hot_liq.get("n"),
+            "hot_liq_1h_missing_rate": hot_liq.get("missing_rate"),
             "cycle_number": store.get_cycle_number(),
         },
+        "hot_liquidity_1h": hot_liq,
         "top_scores": [dict(r) for r in top],
         "low_scores": [dict(r) for r in low],
         "history_samples": hist_samples,
@@ -114,6 +140,10 @@ def to_markdown(ctx: dict[str, Any]) -> str:
         f"Generated: `{ctx['generated_at']}`",
         f"Chains: `{', '.join(ctx.get('enabled_chains') or [])}`",
         f"Health: **{'OK' if ctx.get('health', {}).get('ok') else 'FAIL'}** — {ctx.get('health', {}).get('message')}",
+        format_hot_liq_operator_line(
+            ctx.get("hot_liquidity_1h"),
+            (ctx.get("stats") or {}).get("pending_enrich"),
+        ),
         f"",
         f"## Stats",
         f"",

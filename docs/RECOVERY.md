@@ -50,6 +50,8 @@ python main.py --health   # 应 OK
 python daily_check.py
 ```
 
+热层流动性：DexScreener 缺 `liquidity` 时 `pair_history.liquidity_usd` 存 NULL，**不编造**。决策买入因此 `no_liquidity` 丢弃，是故意的 fail-closed。`daily_check.py` 的「热层流动性覆盖」和小时报 Health 下一行只监测 hot 1h 缺失率（>25% WARN，>60% 且 n≥20 FAIL）以及 `pending_enrich`。约 34% 缺失是 WARN。该数是 **10-19 周检旁证**，不计策略有效性。细节见 `crawler/STABILIZE.md`。
+
 ## 3. 指标层恢复（代码在 `crawler/indicators/`，与采集同仓同 venv）
 
 指标旁路只写 `token_indicators` / `indicator_history` / `jev_signals`，**不改**评分权重（`INDICATORS_WEIGHT_*=0`）。密钥可选：无 `JEV_API_KEY` 时走 `jevs.fun` 公开档。
