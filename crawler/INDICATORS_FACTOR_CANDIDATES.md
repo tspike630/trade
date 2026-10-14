@@ -25,7 +25,7 @@
 | E-1 | 斐波那契回撤 `fib_retrace_0618` / `fib_retrace_05` / `fib_retrace_0382` | A 类 factor_loop **候选** | 无。权重 0。依赖波段原语（TODO，未实现） |
 | E-4 | 同价位多因子交汇（hit-count） | 依赖 E-1 的方法学；**仅 up_1h 有增益才保留** | 无。权重 0。不单独入库 |
 | E-5 | 量能斜率 / 背离 | **观察项**，还不是因子 | 无。等波段原语。`pair_history` 已有 volume |
-| G-5 | 换手尖峰 `turnover_spike` | A 类 factor_loop **候选** | 无。权重 0。不实现检测器。分母已在 `pair_history.market_cap` / `fdv`（见下） |
+| G-5 | 换手尖峰 `turnover_spike` | A 类 factor_loop **候选** | 无。权重 0。不实现检测器。分母自 #70 起在同一行 `pair_history.market_cap` / `fdv`（见下） |
 | G-5 / G-15 | 换手枯竭 `turnover_exhaust` | 与尖峰同一族的 A 类 **候选** | 无。权重 0。不另开观察 jsonl |
 | G-7 | 二次突破 `breakout_second` | **仅登记，阻断** | 无检测器。等链上突破定义（与 E-1 波段原语同一 TODO 姿态） |
 | G-8 | 相对强度 `rel_strength` | **仅登记，阻断** | 无检测器。等市场基准（池均值 vs BTC） |
@@ -191,9 +191,9 @@ E-4 不是第四个回撤比率，也不把浪 2 / 浪 4 等浪号写进因子�
 
 指标旁路只登记可复算的结构。书中第十章：成交量要按已发售股票总量来衡量；换手骤增而价格滞涨是派发假设，下跌末段换手骤减是卖压出清（第二十一章，执行单 G-15）。这里收成同一族的两个标签，不为凑条数再拆第三个因子。不新增观察 jsonl。不实现检测器。
 
-### 采集核对（2026-10-14 落列）
+### 采集核对（#70，2026-10-14 落列）
 
-成交量本来就在 `pair_history`。G-5 分母现在与 `volume_h24` 同行。
+成交量本来就在 `pair_history`。自 #70（`ca4897b`）起，`pair_history.market_cap` 与 `pair_history.fdv` 和 `volume_h24` 写在同一行；载荷省略、空值或非数字为 NULL，不编造，不用 `fdv` 填 `market_cap`。公式 `volume_h24 / market_cap`（备选同一行 `/ fdv`）必须用这一历史行，禁止拿 `pairs` 上最新市值去配更早的 `volume_h24`。
 
 | 位置 | 实际字段 |
 |------|----------|
@@ -201,9 +201,9 @@ E-4 不是第四个回撤比率，也不把浪 2 / 浪 4 等浪号写进因子�
 | `tokens` | 仍无市值列。一个 token 对多条 pair，对不上某一行的 `volume_h24` |
 | `pair_history` | 可空 `market_cap`、`fdv`，与 `price_usd`、`volume_h24`、`volume_h1`、`liquidity_usd`、`txns_h24`、`tier` 同行 |
 | Dexscreener pair JSON | 根字段 `marketCap`（别名 `market_cap`）和 `fdv`。`extract_metrics` 抽出可选浮点。`validate_pair` 仍不单独改写这两个键，整对象照旧进 `raw_json` |
-| 读法 | `Store.list_pair_history`、`IndicatorStore.load_pair_history`、`load_token_history` 带出 `market_cap` 与 `fdv`。比值用这一行。不要用 `pairs` 上的最新市值去配更早的 `volume_h24` |
+| 读法 | `Store.list_pair_history`、`IndicatorStore.load_pair_history`、`load_token_history` 带出 `market_cap` 与 `fdv`。比值只用这一历史行，不用 `pairs` 上最新一次 upsert 去配更早的 `volume_h24` |
 
-检测器仍不实现，公式仍只是候选。`daily_check` 热层检查附带 `mcap_hot_1h`（hot 1h 的 NULL 计数）。该计数不改流动性 PASS/WARN/FAIL，是 **10-19 周检旁证**，不计有效性。周检计数仍要等 M-2、M-3 和含成本的回测。
+检测器仍不实现，公式仍只是候选。`daily_check` 热层检查附带 `mcap_hot_1h`（hot 1h 的 NULL 计数）。该计数不改流动性 PASS/WARN/FAIL。周检计数在 2026-10-19 之后，并且 M-2 与 M-3 都完成后才允许；分母列不再是阻断，M-2 / M-3 / 10-19 仍是。
 
 `volume_h24` / `volume.h24` 是快照时刻的回看量，M-3 允许使用（`INDICATORS_OPERATORIZATION.md`）。不得改成事后才知道的自然日总量。价格腿用已有的 `pair_history.price_usd`。滞涨、尖峰、枯竭的具体倍数本文不拍板，那是统计参数，过 R1/R2/R3 之前不能当门槛。
 
@@ -211,8 +211,8 @@ E-4 不是第四个回撤比率，也不把浪 2 / 浪 4 等浪号写进因子�
 
 | `factor_id`（不 INSERT） | 假设 |
 |--------------------------|------|
-| `turnover_spike_v0` | `volume_h24 / marketCap`（备选 `volume_h24 / fdv`）相对自身近期水平骤增，且 `price_usd` 滞涨。书中的派发假设 |
-| `turnover_exhaust_v0` | 下跌之后同一换手率坍缩。书中的卖压出清。执行单 G-15 是这一条，不另给 id |
+| `turnover_spike_v0` | 同一历史行 `volume_h24 / market_cap`（备选同一行 `/ fdv`）相对自身近期水平骤增，且 `price_usd` 滞涨。书中的派发假设 |
+| `turnover_exhaust_v0` | 下跌之后，同一历史行换手率坍缩。书中的卖压出清。执行单 G-15 是这一条，不另给 id |
 
 派发假设在链上只映射为现金 / 退出倾向。不打开做空（江恩 N-2）。两个标签都对齐 JEV 的 **up_1h**。周检数字沿用现闸（`review/gates.py`），不新开门槛：n≥15、unique_token≥10；过滤后 1h≥55% 为 pass（连续两周 ≥55% 才考虑激活，本循环最高 `accepted`）；50%–55% 为 `need_retest`；<50% 为 fail。`INDICATORS_WEIGHT_*` 保持 0。
 
@@ -220,10 +220,12 @@ A 类之前缺一不可，本次都不实现检测器：
 
 1. **M-2 双侧方向校准。** `turnover_spike_v0`：尖峰后下跌，与尖峰后继续上涨，各评一次。`turnover_exhaust_v0`：枯竭后反弹，与枯竭后续跌，各评一次。留下 IC ≥ 0 的 `kept_sign`。`passed=True` 只表示两个符号都记下了，不是 `accepted`。`gate_candidate` **还不调用**它。IC 缺失则 fail closed。
 2. **M-3 算子化。** 窗口在 t 收口。换手分母必须是 t 当时已经知道的市值，禁止用 t 之后才公布的流通盘或当日合计成交量。
-3. **分母已落列。** 快照字段是 `pair_history.market_cap` 与 `pair_history.fdv`（Dex 省略则为 NULL）。`pairs` 上的同名列只是最新一次 upsert。检测器仍不实现。缺校准、或分母为 NULL 的比值，不送进周检。
+3. **分母已落列（#70）。** 快照字段是同一行的 `pair_history.market_cap` 与 `pair_history.fdv`（Dex 省略则为 NULL，不编造）。`pairs` 上的同名列只是最新一次 upsert，不能配更早的 `volume_h24`。检测器仍不实现。列已经在，不再挡住周检；周检仍等 10-19、M-2、M-3。
 4. **滑点 / 成本入回测。** up_1h 对照含成交成本。滑点档在执行 `pricing.py`，本文不改档位。
 
-2026-10-19 周检之后，并且 M-2 与 M-3 都完成，才把 G-5 送进 A 类验证。分母列已经在。此前不是信号、不是仓位、不是止损规则。
+2026-10-19 周检之后，并且 M-2 与 M-3 都完成，才把 G-5 送进 A 类验证。分母列已经在，不再是阻断。此前不是信号、不是仓位、不是止损规则。
+
+周检计数必须用同一历史行上非 NULL 的 `market_cap`（备选同一行 `fdv`）；分母为 NULL 的行跳过；覆盖率只作 10-19 观察，不算有效性。
 
 ### G-7 二次突破（阻断，无检测器）
 
@@ -256,7 +258,7 @@ A 类之前缺一不可，本次都不实现检测器：
 
 ## 不算有效性
 
-- 未接入 `decision_engine`，未注册进 `FACTOR_GETTERS`，未进 composite。E-1 的三个 `factor_id` 与 G-5 的 `turnover_spike_v0` / `turnover_exhaust_v0` 未 INSERT。G-7 / G-8 未 INSERT。波段原语未实现。G-5 分母已落列（`pair_history.market_cap` / `fdv`，省略为 NULL），检测器未实现。
+- 未接入 `decision_engine`，未注册进 `FACTOR_GETTERS`，未进 composite。E-1 的三个 `factor_id` 与 G-5 的 `turnover_spike_v0` / `turnover_exhaust_v0` 未 INSERT。G-7 / G-8 未 INSERT。波段原语未实现。G-5 分母已落列（#70，同一行 `pair_history.market_cap` / `fdv`，省略为 NULL），检测器未实现。
 - 权重保持 0。10-19 周检出数之前，不把 P-3 / P-4 / E-1 / G-5 写成有效因子，也不实现检测器。E-4 无 up_1h 增益不保留。E-5 保持观察，不升级。G-7 / G-8 在阻断解开前不是候选实现。
 - A 类只在 **10-19 及之后**，并且 **M-2**（`calibrate_direction`，正反两符号）与 **M-3**（算子化）都完成后才谈。G-5 分母已落列，仍不因此入库或改权重。回测依据要含滑点 / 成本，并做变更登记。缺校准不写 `accepted`。`calibrate_direction` 已可调用。周跑只在 IC 有限时把双侧结果写入既有观察文件，仍不接到 `gate_candidate`（见上表）。本次不新增观察 jsonl。过门槛仍不自动激活策略（`factor_loop` 既有约束）。
 - 艾略特 N-1..N-6 不采用。江恩 N-1..N-6 不采用。E-2 归执行 / PM，不在指标层。E-3：因子只辅助确认，决策与 PM 硬规则拥有下单与风控。
