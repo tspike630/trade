@@ -289,6 +289,7 @@ class ExecutionGateway:
         self._paper_executor = PaperExecutor(
             paper_db=self.paper_db,
             crawler_db=self.decision_db,
+            observe_db=self.ledger.path,
         )
         self._owns_paper = True
         return self._paper_executor
@@ -392,7 +393,8 @@ class ExecutionGateway:
 
         SELL skips max_open inside the checker. Daily loss is passed through and
         stays off unless EXECUTION_DAILY_LOSS_USD is set. Missing book fails closed
-        only when the risk gate is on.
+        only when the risk gate is on. F-1 loss streaks are not a checker: the
+        order path does not read EXECUTION_F1_CIRCUIT and does not reject on streak.
         """
         if not EXECUTION_RISK_ENABLED:
             return []

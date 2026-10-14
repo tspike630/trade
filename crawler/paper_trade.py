@@ -47,6 +47,7 @@ from config import (  # noqa: E402
     PAPER_START_CASH,
 )
 from execution.exits import scan_exits  # noqa: E402
+from execution.shadow_c3 import refresh_open_peaks  # noqa: E402
 from execution.pricing import (  # noqa: E402
     liquidity_usd_from_raw,
     sell_fill_price,
@@ -264,6 +265,41 @@ class PaperLedger:
             raise
         return {"id": pid, "pnl_usd": pnl, "exit_price": price, "reason": reason}
 
+    def get_position(self, pid: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM positions WHERE id=?", (pid,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def merge_open_meta(self, pid: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+        """Merge keys into an open position's meta_json. Closed rows are unchanged.
+
+        Used to store ``peak_price``. Does not touch cash, qty, or exit fields.
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT meta_json, status FROM positions WHERE id=?", (pid,)
+            ).fetchone()
+            if not row or row["status"] != "open":
+                self.conn.execute("COMMIT")
+                return None
+            try:
+                parsed = json.loads(row["meta_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                parsed = {}
+            meta = parsed if isinstance(parsed, dict) else {}
+            meta.update(patch)
+            self.conn.execute(
+                "UPDATE positions SET meta_json=? WHERE id=? AND status='open'",
+                (json.dumps(meta), pid),
+            )
+            self.conn.execute("COMMIT")
+            return meta
+        except Exception:
+            self._rollback()
+            raise
+
     def find_by_decision_log_id(self, decision_log_id: Any) -> dict[str, Any] | None:
         """Position whose meta.decision_log_id matches (open or closed). None if unset."""
         if decision_log_id is None:
@@ -423,11 +459,17 @@ def tick(
     PaperExecutor signal sells. Does not write execution_log / order_events:
     the entry receipt already owns decision_log_id (unique). The close is on
     the paper position (exit_reason) and fills row.
+
+    Before the scan, each open position's ``meta_json.peak_price`` is raised
+    to the current mid and never lowered. That bookkeeping does not change
+    take_profit / stop_loss / max_hold.
     """
     actions: list[dict[str, Any]] = []
 
     def price_lookup(p: dict[str, Any]) -> float | None:
         return latest_price(store, p["chain_id"], p["pair_address"], now=now)
+
+    refresh_open_peaks(ledger, price_lookup)
 
     for pos, reason in scan_exits(ledger.list_open(), price_lookup, now=now):
         px = price_lookup(pos)
