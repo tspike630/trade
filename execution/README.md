@@ -117,7 +117,7 @@ python -m execution.run --loop --paper-enabled --paper-db /path/to/paper.db --pa
 python -m execution.f1_streak_report --ledger execution_ledger.db --paper paper_trading.db
 python -m execution.shadow_c3_report --ledger execution_ledger.db
 python -m execution.risk.bankruptcy
-python -m execution.slippage_report --ledger execution_ledger.db --paper paper_trading.db
+python -m execution.slippage_report --ledger execution_ledger.db --paper paper_trading.db --crawler-db dexscreener.db
 ```
 
 `--once` is the default when neither `--once` nor `--loop` is given.
@@ -292,6 +292,7 @@ TP/SL/hold, slippage tiers, or PM numbers, and they do not enable
 `PM_MAX_PER_TOKEN_PCT`. E-2 / C4 `target_band_failover` is registered as
 WAITING / observe-only in [WAITING_ITEMS.md](WAITING_ITEMS.md); it does not
 change runtime. I-3 `slippage_1h` is the read-only command
-`python -m execution.slippage_report` (bot share waits on a collection tag;
-high-bot skip is not wired). I-4 and INTEL_LOOP are registered only; a
+`python -m execution.slippage_report` (`bot_trade_share` reads collection #81
+`bot_fill_observations`; receipt tags are a secondary fallback; high-bot skip
+is not wired). I-4 and INTEL_LOOP are registered only; a
 candidate is not an activation. See that same file.

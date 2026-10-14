@@ -1,6 +1,7 @@
 """I-3 slippage_1h report: empty databases and sample fills do not crash.
 
-The report is read-only. It does not invent bot labels or skip orders.
+The report is read-only. ``bot_trade_share`` prefers ``bot_fill_observations``.
+It does not invent bot labels or skip orders.
 Run from the repo root:
 
     python -m unittest execution.tests.test_slippage_report
@@ -23,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from execution.slippage_report import build_report, main as report_main  # noqa: E402
+from execution.slippage_report import build_report, format_report, main as report_main  # noqa: E402
 
 
 AS_OF = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
@@ -35,6 +36,8 @@ def _py_env() -> dict[str, str]:
     env.pop("EXECUTION_LEDGER_PATH", None)
     env.pop("EXECUTION_PAPER_DB", None)
     env.pop("PAPER_DB_PATH", None)
+    env.pop("CRAWLER_DB", None)
+    env.pop("DB_PATH", None)
     return env
 
 
@@ -119,6 +122,38 @@ def _write_paper(path: Path, positions: list[tuple], fills: list[tuple]) -> None
     )
     conn.commit()
     conn.close()
+
+
+def _write_bot_fills(path: Path, rows: list[tuple]) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE bot_fill_observations (
+            chain_id TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            token_address TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            bot_reason TEXT,
+            PRIMARY KEY (chain_id, signature, wallet, token_address)
+        )
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO bot_fill_observations
+            (chain_id, signature, wallet, token_address, recorded_at, bot_reason)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+TOKEN_A = "So11111111111111111111111111111111111111112"
+TOKEN_B = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+_WALLET = "Wallet1111111111111111111111111111111111111"
 
 
 class SlippageReportTests(unittest.TestCase):
@@ -322,6 +357,201 @@ class SlippageReportTests(unittest.TestCase):
             self.assertEqual(report["bot_trade_share"]["status"], "observed")
             self.assertAlmostEqual(report["bot_trade_share"]["share"], 1.0)
             self.assertFalse(report["high_bot_skip"]["wired"])
+
+    def test_bot_fill_observations_drive_share(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crawler = root / "dexscreener.db"
+            _write_bot_fills(
+                crawler,
+                [
+                    ("solana", "sig-a", _WALLET, TOKEN_A, "2026-10-14T11:10:00Z", "same_slot_repeat"),
+                    ("solana", "sig-b", _WALLET, TOKEN_A, "2026-10-14T11:20:00Z", "priority_fee"),
+                    ("solana", "sig-c", _WALLET, TOKEN_A, "2026-10-14T11:40:00Z", None),
+                    ("solana", "sig-d", _WALLET, TOKEN_B, "2026-10-14T11:50:00Z", ""),
+                    ("solana", "sig-old", _WALLET, TOKEN_A, "2026-10-14T10:00:00Z", "fixed_interval"),
+                    ("solana", "sig-new", _WALLET, TOKEN_A, "2026-10-14T12:30:00Z", "priority_fee"),
+                ],
+            )
+            ledger = root / "execution_ledger.db"
+            _write_ledger(
+                ledger,
+                [("2026-10-14T11:15:00Z", 1, "buy", 1, _receipt(0.02, bot=True))],
+            )
+            before = crawler.read_bytes()
+            report = build_report(
+                ledger=ledger,
+                paper=None,
+                crawler_db=crawler,
+                as_of=AS_OF,
+            )
+            self.assertEqual(crawler.read_bytes(), before)
+            bot = report["bot_trade_share"]
+            self.assertEqual(bot["source"], "bot_fill_observations")
+            self.assertEqual(bot["status"], "observed")
+            self.assertAlmostEqual(bot["share"], 0.5)
+            self.assertEqual(bot["total_fills"], 4)
+            self.assertEqual(bot["bot_fills"], 2)
+            self.assertTrue(bot["available"])
+            self.assertIsNone(bot["gap"])
+            self.assertFalse(bot["pattern_recognition"])
+            by_token = {row["token_address"]: row for row in bot["by_token"]}
+            self.assertEqual(set(by_token), {TOKEN_A, TOKEN_B})
+            self.assertEqual(by_token[TOKEN_A]["total_fills"], 3)
+            self.assertEqual(by_token[TOKEN_A]["bot_fills"], 2)
+            self.assertAlmostEqual(by_token[TOKEN_A]["share"], 2 / 3)
+            self.assertEqual(by_token[TOKEN_B]["total_fills"], 1)
+            self.assertEqual(by_token[TOKEN_B]["bot_fills"], 0)
+            self.assertEqual(by_token[TOKEN_B]["share"], 0.0)
+            self.assertEqual(bot["receipt_fallback"]["source"], "receipt_tag")
+            self.assertAlmostEqual(bot["receipt_fallback"]["share"], 1.0)
+            self.assertFalse(report["high_bot_skip"]["wired"])
+            self.assertFalse(report["high_bot_skip"]["pm_gateway"])
+            self.assertFalse(report["rejects_orders"])
+            text = format_report(report)
+            self.assertIn("source=bot_fill_observations", text)
+            self.assertIn("wired=false", text)
+            self.assertIn("secondary", text)
+
+            quiet = root / "unflagged.db"
+            _write_bot_fills(
+                quiet,
+                [
+                    ("solana", "sig-1", _WALLET, TOKEN_A, "2026-10-14T11:05:00Z", None),
+                    ("solana", "sig-2", _WALLET, TOKEN_A, "2026-10-14T11:06:00Z", None),
+                ],
+            )
+            zero = build_report(ledger=None, paper=None, crawler_db=quiet, as_of=AS_OF)
+            share = zero["bot_trade_share"]
+            self.assertEqual(share["status"], "observed")
+            self.assertEqual(share["share"], 0.0)
+            self.assertEqual(share["total_fills"], 2)
+            self.assertEqual(share["bot_fills"], 0)
+            self.assertFalse(zero["high_bot_skip"]["wired"])
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = report_main(
+                    [
+                        "--ledger",
+                        str(ledger),
+                        "--crawler-db",
+                        str(crawler),
+                        "--as-of",
+                        "2026-10-14T12:00:00Z",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertAlmostEqual(payload["bot_trade_share"]["share"], 0.5)
+            self.assertFalse(payload["high_bot_skip"]["wired"])
+
+            previous_crawler = os.environ.get("CRAWLER_DB")
+            previous_db = os.environ.get("DB_PATH")
+            os.environ["DB_PATH"] = str(quiet)
+            os.environ["CRAWLER_DB"] = str(crawler)
+            try:
+                preferred = io.StringIO()
+                with contextlib.redirect_stdout(preferred):
+                    preferred_code = report_main(
+                        [
+                            "--ledger",
+                            str(root / "no-ledger.db"),
+                            "--as-of",
+                            "2026-10-14T12:00:00Z",
+                            "--json",
+                        ]
+                    )
+                os.environ.pop("CRAWLER_DB", None)
+                from_db_path = io.StringIO()
+                with contextlib.redirect_stdout(from_db_path):
+                    db_path_code = report_main(
+                        [
+                            "--ledger",
+                            str(root / "no-ledger.db"),
+                            "--as-of",
+                            "2026-10-14T12:00:00Z",
+                            "--json",
+                        ]
+                    )
+            finally:
+                if previous_crawler is None:
+                    os.environ.pop("CRAWLER_DB", None)
+                else:
+                    os.environ["CRAWLER_DB"] = previous_crawler
+                if previous_db is None:
+                    os.environ.pop("DB_PATH", None)
+                else:
+                    os.environ["DB_PATH"] = previous_db
+            self.assertEqual(preferred_code, 0)
+            self.assertAlmostEqual(
+                json.loads(preferred.getvalue())["bot_trade_share"]["share"],
+                0.5,
+            )
+            self.assertEqual(db_path_code, 0)
+            self.assertEqual(
+                json.loads(from_db_path.getvalue())["bot_trade_share"]["share"],
+                0.0,
+            )
+
+    def test_missing_or_empty_observation_table_is_data_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / "no-crawler.db"
+            ledger = root / "execution_ledger.db"
+            _write_ledger(
+                ledger,
+                [("2026-10-14T11:15:00Z", 1, "buy", 1, _receipt(0.02, bot=True))],
+            )
+            absent = build_report(
+                ledger=ledger,
+                paper=None,
+                crawler_db=missing,
+                as_of=AS_OF,
+            )
+            self.assertFalse(missing.exists())
+            bot = absent["bot_trade_share"]
+            self.assertEqual(bot["status"], "data_gap")
+            self.assertEqual(bot["gap"], "no_table")
+            self.assertIsNone(bot["share"])
+            self.assertFalse(bot["available"])
+            self.assertIn("missing crawler db", bot["error"])
+            self.assertAlmostEqual(bot["receipt_fallback"]["share"], 1.0)
+            self.assertFalse(absent["high_bot_skip"]["wired"])
+
+            bare = root / "other-tables.db"
+            conn = sqlite3.connect(bare)
+            conn.execute("CREATE TABLE tokens (id INTEGER PRIMARY KEY)")
+            conn.commit()
+            conn.close()
+            no_table = build_report(ledger=None, paper=None, crawler_db=bare, as_of=AS_OF)
+            gap = no_table["bot_trade_share"]
+            self.assertEqual(gap["status"], "data_gap")
+            self.assertEqual(gap["gap"], "no_table")
+            self.assertIsNone(gap["share"])
+            self.assertIn("missing table bot_fill_observations", gap["error"])
+            self.assertFalse(no_table["high_bot_skip"]["wired"])
+            self.assertFalse(no_table["high_bot_skip"]["pm_gateway"])
+
+            empty = root / "empty-fills.db"
+            _write_bot_fills(empty, [])
+            empty_report = build_report(
+                ledger=ledger,
+                paper=None,
+                crawler_db=empty,
+                as_of=AS_OF,
+            )
+            empty_bot = empty_report["bot_trade_share"]
+            self.assertEqual(empty_bot["status"], "data_gap")
+            self.assertEqual(empty_bot["gap"], "empty")
+            self.assertIsNone(empty_bot["share"])
+            self.assertEqual(empty_bot["total_fills"], 0)
+            self.assertEqual(empty_bot["bot_fills"], 0)
+            self.assertTrue(empty_bot["available"])
+            self.assertNotEqual(empty_bot["share"], 0)
+            self.assertAlmostEqual(empty_bot["receipt_fallback"]["share"], 1.0)
+            self.assertFalse(empty_report["high_bot_skip"]["wired"])
 
     def test_cli_missing_and_sample_exit_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

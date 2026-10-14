@@ -1,7 +1,7 @@
 """Read-only I-3 slippage report. Does not place or skip orders.
 
     python -m execution.slippage_report
-    python -m execution.slippage_report --ledger execution_ledger.db --paper paper_trading.db --json
+    python -m execution.slippage_report --ledger execution_ledger.db --paper paper_trading.db --crawler-db dexscreener.db --json
 
 ``slippage_1h`` aggregates the recorded ``slippage`` (else a cost derived from
 ``mid_price`` and ``fill_price``) over the last hour, and the same stats in
@@ -13,11 +13,17 @@ UTC day buckets. Sources, in order:
   fill's own note JSON carries the fields. Entry meta is not reused as the
   exit slip. Tick closes that never stored mid/slippage are skipped.
 
-``bot_trade_share`` reads a collection-layer tag if one is already on the row
-(``bot_tag`` / ``is_bot`` / ``bot_label`` / ``suspicious_bot`` / ``bot``, or
-the same names as columns). No tag is a data gap. This module does not
-classify millisecond repeats, intervals, or gas auctions, and it does not
-call PositionManager or the gateway.
+``bot_trade_share`` prefers collection #81 ``bot_fill_observations`` in the
+crawler DB (``--crawler-db``, else ``CRAWLER_DB`` / ``DB_PATH``, else
+``dexscreener.db``). The share matches ``Store.bot_share_inputs``: parsed
+fills in the 1h ``recorded_at`` window are the denominator, and rows whose
+``bot_reason`` is non-empty are the numerator. A missing table or an empty
+window is a data gap (share is null), not a human label and not zero. Receipt
+tags (``bot_tag`` / ``is_bot`` / ``bot_label`` / ``suspicious_bot`` / ``bot``)
+stay a secondary fallback and do not replace that headline. This module does
+not import the crawler, does not classify millisecond repeats, intervals, or
+gas auctions, and does not call PositionManager or the gateway.
+``high_bot_skip.wired`` stays false.
 """
 
 from __future__ import annotations
@@ -43,9 +49,18 @@ _BOT_FALSE = {"0", "false", "no", "n", "human"}
 _LABEL_KEYS = {"bot_tag", "bot_label", "suspicious_bot"}
 
 BOT_GAP_NOTE = (
-    "依赖采集层 bot 标记；标记未到 = data gap。"
+    "主源是采集 #81 bot_fill_observations："
+    "bot_reason 非空为分子，1h 窗内已解析成交为分母（与 bot_share_inputs 同义）。"
+    "表缺失或空表 = data gap，份额为 null，不当成人类，也不写成 0。"
+    "份额 0 只表示窗内没有 bot_reason，不是人类标签，也不是跳单。"
+    "receipt 的 bot_tag / is_bot / bot_label / suspicious_bot / bot 只作次要 fallback。"
     "不实现毫秒级 bot 模式识别（属采集）。"
     "高 bot 占比先记录，对拍后再 R2/R3，不自动跳单，不接 PM/gateway。"
+)
+# Same numerator as crawler Store.bot_share_inputs. The report adds a closed
+# recorded_at window and rolls the predicate up globally and per token.
+_BOT_REASON_HITS = (
+    "SUM(CASE WHEN bot_reason IS NOT NULL AND bot_reason != '' THEN 1 ELSE 0 END)"
 )
 HIGH_BOT_SKIP_NOTE = "先记录，对拍后再 R2/R3。不接 PM/gateway，不自动跳单。"
 
@@ -472,7 +487,11 @@ def _by_side(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 
 def bot_trade_share(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Share among tagged 1h fills. Untagged rows are a gap, not 'not a bot'."""
+    """Receipt-tag fallback. Untagged rows are a gap, not 'not a bot'.
+
+    Collection #81 is the headline when a crawler DB is passed. This result
+    does not replace that share.
+    """
     tagged = [row for row in rows if row.get("bot") in {"bot", "not_bot"}]
     bot_n = sum(1 for row in tagged if row["bot"] == "bot")
     not_bot_n = sum(1 for row in tagged if row["bot"] == "not_bot")
@@ -490,6 +509,7 @@ def bot_trade_share(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "status": status,
         "share": share,
         "window": "1h",
+        "source": "receipt_tag",
         "tagged_n": len(tagged),
         "bot_n": bot_n,
         "not_bot_n": not_bot_n,
@@ -497,6 +517,146 @@ def bot_trade_share(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "pattern_recognition": False,
         "note": BOT_GAP_NOTE,
     }
+
+
+def _crawler_share_base(since_recorded_at: str, until_recorded_at: str) -> dict[str, Any]:
+    return {
+        "status": "data_gap",
+        "share": None,
+        "window": "1h",
+        "source": "bot_fill_observations",
+        "available": False,
+        "total_fills": None,
+        "bot_fills": None,
+        "by_token": [],
+        "since_recorded_at": since_recorded_at,
+        "until_recorded_at": until_recorded_at,
+        "tagged_n": 0,
+        "bot_n": 0,
+        "not_bot_n": 0,
+        "untagged_n": 0,
+        "pattern_recognition": False,
+        "note": BOT_GAP_NOTE,
+        "error": None,
+        "gap": "no_table",
+    }
+
+
+def load_bot_fill_share(
+    path: Path,
+    *,
+    since_recorded_at: str,
+    until_recorded_at: str,
+) -> dict[str, Any]:
+    """Global and per-token share from ``bot_fill_observations``. Read-only.
+
+    Does not import ``crawler.store``. A missing file, missing table, or empty
+    window leaves ``share`` null. Rows with a null or empty ``bot_reason`` stay
+    in the denominator.
+    """
+    base = _crawler_share_base(since_recorded_at, until_recorded_at)
+    if not path.is_file():
+        return {**base, "error": "missing crawler db"}
+    try:
+        conn = _connect_ro(path)
+    except sqlite3.Error as exc:
+        return {**base, "error": type(exc).__name__}
+    try:
+        if "bot_fill_observations" not in _tables(conn):
+            return {**base, "error": "missing table bot_fill_observations"}
+        have = set(_columns(conn, "bot_fill_observations"))
+        needed = {"chain_id", "token_address", "recorded_at", "bot_reason"}
+        missing = sorted(needed - have)
+        if missing:
+            return {**base, "error": "missing column " + ", ".join(missing)}
+        params = (since_recorded_at, until_recorded_at)
+        where = "WHERE recorded_at >= ? AND recorded_at <= ?"
+        row = conn.execute(
+            f"SELECT COUNT(*) AS total, {_BOT_REASON_HITS} AS bot "
+            f"FROM bot_fill_observations {where}",
+            params,
+        ).fetchone()
+        grouped = conn.execute(
+            f"SELECT chain_id, token_address, COUNT(*) AS total, {_BOT_REASON_HITS} AS bot "
+            f"FROM bot_fill_observations {where} "
+            "GROUP BY chain_id, token_address "
+            "ORDER BY chain_id, token_address",
+            params,
+        ).fetchall()
+    except sqlite3.Error as exc:
+        return {**base, "error": type(exc).__name__}
+    finally:
+        conn.close()
+    total = int(row["total"] or 0)
+    bot_fills = int(row["bot"] or 0)
+    by_token: list[dict[str, Any]] = []
+    for item in grouped:
+        token_total = int(item["total"] or 0)
+        token_bot = int(item["bot"] or 0)
+        by_token.append(
+            {
+                "chain_id": item["chain_id"],
+                "token_address": item["token_address"],
+                "total_fills": token_total,
+                "bot_fills": token_bot,
+                "share": None if token_total == 0 else token_bot / token_total,
+            }
+        )
+    if total == 0:
+        return {
+            **base,
+            "available": True,
+            "total_fills": 0,
+            "bot_fills": 0,
+            "share": None,
+            "status": "data_gap",
+            "gap": "empty",
+            "by_token": [],
+            "error": None,
+        }
+    return {
+        **base,
+        "available": True,
+        "total_fills": total,
+        "bot_fills": bot_fills,
+        "share": bot_fills / total,
+        "status": "observed",
+        "gap": None,
+        "by_token": by_token,
+        "tagged_n": total,
+        "bot_n": bot_fills,
+        "not_bot_n": total - bot_fills,
+        "untagged_n": 0,
+        "error": None,
+    }
+
+
+def resolve_bot_trade_share(
+    rows: list[dict[str, Any]],
+    *,
+    crawler_db: Path | None,
+    since_recorded_at: str,
+    until_recorded_at: str,
+) -> dict[str, Any]:
+    """Prefer #81 observations. Receipt tags are nested and do not set the share."""
+    fallback = bot_trade_share(rows)
+    if crawler_db is None:
+        return fallback
+    primary = load_bot_fill_share(
+        crawler_db,
+        since_recorded_at=since_recorded_at,
+        until_recorded_at=until_recorded_at,
+    )
+    primary["receipt_fallback"] = {
+        "status": fallback["status"],
+        "share": fallback["share"],
+        "tagged_n": fallback["tagged_n"],
+        "bot_n": fallback["bot_n"],
+        "not_bot_n": fallback["not_bot_n"],
+        "untagged_n": fallback["untagged_n"],
+        "source": "receipt_tag",
+    }
+    return primary
 
 
 def _source_block(path: Path | None, present: bool | None, rows: int) -> dict[str, Any]:
@@ -514,6 +674,7 @@ def build_report(
     as_of: datetime | None = None,
     window_hours: float = 1.0,
     daily_days: int = 7,
+    crawler_db: Path | None = None,
 ) -> dict[str, Any]:
     end = as_of or datetime.now(timezone.utc)
     if end.tzinfo is None:
@@ -564,6 +725,15 @@ def build_report(
         daily.append(stats)
     hour_stats = summarize([float(row["slippage"]) for row in in_hour])
     hour_stats["by_side"] = _by_side(in_hour)
+    since_recorded_at = hour_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_recorded_at = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+    bot = resolve_bot_trade_share(
+        in_hour,
+        crawler_db=crawler_db,
+        since_recorded_at=since_recorded_at,
+        until_recorded_at=until_recorded_at,
+    )
+    crawler_rows = bot.get("total_fills")
     return {
         "report": "slippage_1h",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -579,6 +749,11 @@ def build_report(
         "sources": {
             "ledger": _source_block(ledger, ledger_present, ledger_scanned),
             "paper": _source_block(paper, paper_present, paper_scanned),
+            "crawler": _source_block(
+                crawler_db,
+                crawler_db is not None and crawler_db.is_file(),
+                crawler_rows if isinstance(crawler_rows, int) else 0,
+            ),
         },
         "samples": {
             "used_1h": len(in_hour),
@@ -591,7 +766,7 @@ def build_report(
         },
         "slippage_1h": hour_stats,
         "daily": daily,
-        "bot_trade_share": bot_trade_share(in_hour),
+        "bot_trade_share": bot,
     }
 
 
@@ -615,8 +790,10 @@ def format_report(report: dict[str, Any]) -> str:
         f"as_of={report['as_of']} window_hours={report['window_hours']} "
         f"daily_days={report['daily_days']} rejects_orders={report['rejects_orders']}",
     ]
-    for name in ("ledger", "paper"):
-        src = report["sources"][name]
+    for name in ("ledger", "paper", "crawler"):
+        src = report["sources"].get(name)
+        if not isinstance(src, dict):
+            continue
         lines.append(f"{name}: present={src['present']} rows={src['rows']} path={src['path']}")
     lines.append(_fmt_stats("1h", report["slippage_1h"]))
     for side, stats in report["slippage_1h"]["by_side"].items():
@@ -627,11 +804,32 @@ def format_report(report: dict[str, Any]) -> str:
     for row in report["daily"]:
         lines.append(_fmt_stats(f"  {row['date']}", row))
     bot = report["bot_trade_share"]
+    fills = ""
+    if bot.get("total_fills") is not None:
+        fills = f" total_fills={bot['total_fills']} bot_fills={bot['bot_fills']}"
     lines.append(
         f"bot_trade_share: status={bot['status']} share={_fmt(bot['share'])} "
+        f"source={bot.get('source', 'receipt_tag')} "
         f"tagged_n={bot['tagged_n']} bot_n={bot['bot_n']} untagged_n={bot['untagged_n']} "
-        f"pattern_recognition={bot['pattern_recognition']}"
+        f"pattern_recognition={bot['pattern_recognition']}{fills}"
     )
+    if bot.get("error"):
+        lines.append(f"  error={bot['error']}")
+    token_rows = bot.get("by_token") or []
+    for row in token_rows[:8]:
+        lines.append(
+            f"  token {row['chain_id']} {row['token_address']}: "
+            f"share={_fmt(row['share'])} bot_fills={row['bot_fills']} "
+            f"total_fills={row['total_fills']}"
+        )
+    if len(token_rows) > 8:
+        lines.append(f"  by_token_omitted={len(token_rows) - 8}")
+    fallback = bot.get("receipt_fallback")
+    if isinstance(fallback, dict):
+        lines.append(
+            f"  receipt_fallback: status={fallback['status']} "
+            f"share={_fmt(fallback['share'])} (secondary)"
+        )
     lines.append(f"  {bot['note']}")
     skip = report["high_bot_skip"]
     lines.append(
@@ -670,9 +868,21 @@ def _resolve_cli_path(text: str | None) -> Path | None:
     return path
 
 
+def default_crawler_db() -> Path:
+    """``CRAWLER_DB``, else ``DB_PATH``, else ``dexscreener.db`` (crawler config)."""
+    env = os.environ.get("CRAWLER_DB", "").strip() or os.environ.get("DB_PATH", "").strip()
+    resolved = _resolve_cli_path(env or "dexscreener.db")
+    if resolved is None:
+        return (Path.cwd() / "dexscreener.db").resolve()
+    return resolved
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Read-only slippage_1h report from paper fills and execution receipts"
+        description=(
+            "Read-only slippage_1h report. bot_trade_share reads collection #81 "
+            "bot_fill_observations and does not skip orders."
+        )
     )
     parser.add_argument(
         "--ledger",
@@ -683,6 +893,14 @@ def main(argv: list[str] | None = None) -> int:
         "--paper",
         default=None,
         help="paper DB (read-only). Default: EXECUTION_PAPER_DB or PAPER_DB_PATH when set.",
+    )
+    parser.add_argument(
+        "--crawler-db",
+        default=None,
+        help=(
+            "crawler SQLite with bot_fill_observations (read-only). "
+            "Default: CRAWLER_DB, else DB_PATH, else dexscreener.db."
+        ),
     )
     parser.add_argument("--hours", type=float, default=1.0, help="lookback hours for slippage_1h (default 1)")
     parser.add_argument("--days", type=int, default=7, help="UTC day buckets lookback (default 7)")
@@ -701,6 +919,9 @@ def main(argv: list[str] | None = None) -> int:
     paper = _resolve_cli_path(args.paper)
     if paper is None and args.paper is None:
         paper = _default_paper()
+    crawler_db = _resolve_cli_path(args.crawler_db)
+    if crawler_db is None:
+        crawler_db = default_crawler_db()
     as_of = _parse_ts(args.as_of) if args.as_of else None
     if args.as_of and as_of is None:
         print("error: --as-of is not a timestamp", file=sys.stderr)
@@ -712,6 +933,7 @@ def main(argv: list[str] | None = None) -> int:
             as_of=as_of,
             window_hours=args.hours,
             daily_days=args.days,
+            crawler_db=crawler_db,
         )
     except sqlite3.Error as exc:
         print(f"error: {exc}", file=sys.stderr)
