@@ -86,14 +86,14 @@
 
 AQuA（arXiv 2608.12841）：公式即使有预测力，初始符号也可能错。每个 factor_loop 候选——包括本文 P-3 / P-4 / E-1，以及日后任何入库候选——都要用**正、反两个符号**各评一次，留下解释更干净的方向（与前向收益同向、IC ≥ 0 的那一侧），然后才谈 A 类 `accepted`。E-1 的两个符号是：回撤到位后反弹，与回撤跌破后加速。规格见下文「E-1」。
 
-2026-10-14 核对 `review/gates.py` 与 `review/factor_loop.py`：周跑里**还没有**这个闸。
+2026-10-14 核对 `review/gates.py` 与 `review/factor_loop.py`：周跑里**还没有**这个闸。有限 IC 只记观察文件，不改 `accepted`。
 
 | 现况 | 说明 |
 |------|------|
 | `gate_candidate` | 只看 `n_raw`、`unique_token`、`up_1h`。过线则 `status=accepted`。不看符号 |
 | `ic_mean` | 来自 `_latest_ic`：整份 `factor_ic_history.csv` 的最后一行，不是该候选自己的双侧 IC，而且经常是 null |
-| `calibrate_direction(ic)` | 新的纯函数。IC 有限时记下 `ic_as_written` 与 `ic_flipped`（= −IC），`kept_sign` 取 IC ≥ 0 的一侧。IC 缺失、非数值或非有限则 **fail closed**（`passed=False`，`blocks_a_class=True`，不登记方向） |
-| 未接入周跑 | `gate_candidate` **不调用**它。缺 IC 就 fail closed 会把现在的 `accepted` 改掉，周跑结果会变。常量 `DIRECTION_CALIBRATION_TODO` 写明：等有逐候选 IC 再接上 |
+| `calibrate_direction(ic)` | 纯函数。IC 有限时记下 `ic_as_written` 与 `ic_flipped`（= −IC），`kept_sign` 取 IC ≥ 0 的一侧。IC 缺失、非数值或非有限则 **fail closed**（`passed=False`，`blocks_a_class=True`，不登记方向） |
+| 观察，不改闸 | 周跑在 IC 有限时调用它，追加 `exports/reports/direction_calibration_observe.jsonl`（正反两符号）。`gate_candidate` **不调用**它，`accepted` 语义不变。缺 IC 就 fail closed 会改掉现在的 `accepted`，所以 `DIRECTION_CALIBRATION_TODO` 仍在 |
 
 `passed=True` 只表示两个符号都记下了，不是接受候选，也不移动 n≥15。不翻 live 权重。`INDICATORS_WEIGHT_*` 保持 0。本段不算有效性。
 
@@ -177,7 +177,7 @@ E-4 不是第四个回撤比率，也不把浪 2 / 浪 4 等浪号写进因子�
 
 ### 与 M-2 / M-3 / 10-19
 
-- **方向：** `calibrate_direction`（`review/gates.py`）。正反两符号都记下才算 M-2 通过。周跑未调用。交叉见上文「方向校准」，算子全文在 `INDICATORS_OPERATORIZATION.md`。
+- **方向：** `calibrate_direction`（`review/gates.py`）。正反两符号都记下才算 M-2 通过。周跑在 IC 有限时只把双侧结果写入观察 jsonl，`gate_candidate` 不调用。交叉见上文「方向校准」，算子全文在 `INDICATORS_OPERATORIZATION.md`。
 - **A 类：** 2026-10-19 周检之后，且 M-2 与 M-3 都完成，才把 E-1 送进 A 类验证。此前不是信号。10-19 的 `factor_loop` 只收已经方向校准且已经算子化的候选；这两条没做完，不写 `accepted`。
 - 门槛数字不改。不算有效性。权重保持 0。
 
@@ -187,5 +187,5 @@ E-4 不是第四个回撤比率，也不把浪 2 / 浪 4 等浪号写进因子�
 
 - 未接入 `decision_engine`，未注册进 `FACTOR_GETTERS`，未进 composite。E-1 的三个 `factor_id` 未 INSERT。波段原语未实现。
 - 权重保持 0。10-19 周检出数之前，不把 P-3 / P-4 / E-1 写成有效因子，也不实现检测器。E-4 无 up_1h 增益不保留。E-5 保持观察，不升级。
-- A 类只在 **10-19 及之后**，并且 **M-2**（`calibrate_direction`，正反两符号）与 **M-3**（算子化）都完成后才谈。回测依据要含滑点 / 成本，并做变更登记。缺校准不写 `accepted`。`calibrate_direction` 已可调用，但尚未接到 `gate_candidate`（见上表）。过门槛仍不自动激活策略（`factor_loop` 既有约束）。
+- A 类只在 **10-19 及之后**，并且 **M-2**（`calibrate_direction`，正反两符号）与 **M-3**（算子化）都完成后才谈。回测依据要含滑点 / 成本，并做变更登记。缺校准不写 `accepted`。`calibrate_direction` 已可调用。周跑只在 IC 有限时把双侧结果写入观察文件，仍不接到 `gate_candidate`（见上表）。过门槛仍不自动激活策略（`factor_loop` 既有约束）。
 - N-1..N-6 不采用。E-2 归执行 / PM，不在指标层。E-3：因子只辅助确认，决策与 PM 硬规则拥有下单与风控。
