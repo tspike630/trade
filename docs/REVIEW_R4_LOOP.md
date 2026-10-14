@@ -89,6 +89,10 @@ params_audit 留痕 + 旧配置备份
 - [ ] 达标微调 → ACCEPT + 备份 + params_audit 三行齐全
 - [ ] 实盘闸门在无人工确认时永不开启（代码层硬约束）
 
+## 9. 警示事例不进盘中改参
+
+不在当次会话另加第三个统计参。`factor_loop` 的 `accepted` 不是 `activated`。临时 `purpose=live_candidate` 且强度 0.15 的样本单独分桶，不写成 accepted。映射与 10-19 的 P-2 / P-3 见 `docs/REVIEW_WARNING_CASES.md`。C3 趋势出场只观察；要立项先走 R3 回测，不盘中追退出参数。
+
 ---
 
 *R4 · 机制定稿 · 代码随 R3 建议表落地时实现（apply_params.py）*

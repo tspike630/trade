@@ -104,6 +104,26 @@ mkdir -p exports/reports logs
 | `min_liq` skip 次数 / 流动性分桶 | `reason=liq_below_min`、`reason=no_liquidity`，以及同行的 `liquidity_usd=` / `min_liq_usd=` | 分三桶计数：缺失（`no_liquidity`）、低于 50000（`liq_below_min`）、过闸后写入的 buy。`min_liq_usd=` 应为 `50000.0`。不要为了分桶改 50000 |
 | 临时 `min=0.15` 观察行 | `decision_log` 里 `purpose=live_candidate` 且强度低于实时默认 0.3 的 buy | **保持未标记，不得标成 accepted。** 它们不是有效性样本。`scripts/jev_validity.py` 按 `strategy_id=jev_strength_v1` 的全部 buy 读取，**不按 purpose 过滤**，所以这些行会进入周检输入。报告里单独脚注，不要拿它们去过「连续 2 周 ≥55%」门槛 |
 
+## 2026-10-19 复盘侧交付（P-2 / P-3）
+
+上一节三行是决策引擎日志登记。下面是复盘拥有的同一天交付，细则在 `docs/REVIEW_WARNING_CASES.md`（`crawler/REVIEW_WARNING_CASES.md` 同文）。**不算有效性。** 不改上面的有效性决策表，不改阈值，不把临时 0.15 标成 accepted。
+
+| 交付 | 从哪看 | 怎么登记 |
+|------|--------|----------|
+| **P-2** 真库 IC/IR 首跑 | 同一周检的 `review.run`，加上已有的 `--factor-layers`（IC 写入默认 `exports/reports/factor_ic_history.csv`） | 出数之后只写权重更新**设计**。一期只有 IC；不足两期则 IR 记「未形成」。`INDICATORS_WEIGHT_*` 保持 **0**，不激活。临时 `live_candidate` 且强度 0.15 **不得**写成 accepted |
+| **P-3** `min_liq` 拒绝桶 + cooldown | 上一节前两行，外加平仓流动性桶 | 旁证，不是有效性。看 cooldown 是否在跑、`liq_below_min` / `no_liquidity` / 过闸 buy，以及已平仓 `liq_<50k` vs `≥50k`。不据此改 50000，不开第三道统计参 |
+| 平仓归因三行 | paper 已平仓；看板 #45 旁证 | **胜率与期望分开**；**最差单笔**；**`liq_<50k` vs `≥50k`**（unknown 单列）。适用时标 **R2 规则缺口旁证**。不据此调 strength 或权重 |
+
+目录与上面「周检命令」相同（`/workspace/dexscreener-crawler`）。这是 10-19 首跑，不把 `--factor-layers` 改成常驻默认。
+
+```bash
+.venv/bin/python -m review.run --period 7d --report --factor-layers \
+  --min-strength 0.15 --min-liq 50000 --min-coverage 10 --min-price 1e-06 \
+  >> logs/review_weekly.log 2>&1
+```
+
+复盘不认领 **P-1**（PM 仓位比例 / 回撤，`execution/README.md`）、**P-4**（JEV 错价，指标）、**P-5**（共识概率观察候选，指标）。**C3** 趋势出场只观察；要立项先 R3 回测，不盘中追退出参数。`accepted` ≠ `activated`。临时 `live_candidate` 样本单独分桶。
+
 ## 背景（保留）
 
 - 过滤后方向性 37.5%→71.4% 值得继续验证，但当前 n=14 / **unique_token=9** 不够开 Step 2。
