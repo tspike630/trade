@@ -88,6 +88,16 @@ A ~34% missing rate is WARN. The rate is **10-19 周检旁证** and does not cou
 
 `daily_check.py` 与小时报各计一次带该标签的代币数。观察项，供决策以后降权。本层不自动拒绝、不改 `ALERT_MIN_SCORE`、不改循环。**不算有效性。**
 
+## G-5 market-cap denominator (observe, not validity)
+
+G-5 (`turnover_spike` / `turnover_exhaust` = `volume_h24 / marketCap`, alternate `/ fdv`) reads the denominator from the same snapshot as volume. `history.extract_metrics` copies DexScreener root `marketCap` (alias `market_cap`) and `fdv` onto `pair_history.market_cap` and `pair_history.fdv`. `upsert_pair` writes the same two nullable columns on `pairs` for the latest payload. `tokens` stays without them: one token row is not the `volume_h24` snapshot.
+
+Omitted, empty, or non-numeric fields are NULL. `fdv` is not copied into `market_cap`. Old rows are not backfilled from `raw_json` (that JSON is the latest body, not the cap at each past snapshot). Liquidity extraction is unchanged.
+
+The ratio itself stays with indicators. This note does not score G-5.
+
+`daily_check` check「热层流动性覆盖」adds `mcap_hot_1h`: hot 1h NULL counts for those columns. The liquidity PASS/WARN/FAIL level does not use them. The count is **10-19 周检旁证**, not strategy validity. `ALERT_MIN_SCORE`, Telegram routing, and loop intervals stay as they are.
+
 ## 警示事例 → 采集侧
 
 Polymarket 经验落地计划第四节的三条警示，映射到采集侧时只作旁证。**不算策略有效性。** 本文只记边界：docs-only，会话中不加参数。`ALERT_MIN_SCORE`、评分权重、现有 Telegram 路由、`history.extract_metrics` 的流动性写法保持原样。「热层流动性覆盖」那一节（#44）已经在跑，这里不另做监测。

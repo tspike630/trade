@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -48,6 +50,59 @@ def _num(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_float(value: Any) -> float | None:
+    """Parse one present payload value. Empty, bool, or non-finite → None."""
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _root_optional_float(pair: dict[str, Any], *keys: str) -> float | None:
+    """First present root key as a float.
+
+    A key that exists but is empty or non-numeric is NULL and does not fall
+    through to a later alias. A missing key is skipped.
+    """
+    for key in keys:
+        if key not in pair:
+            continue
+        return _optional_float(pair.get(key))
+    return None
+
+
+def pair_history_column_sql(present: set[str]) -> str:
+    """Column list for pair_history readers, including the G-5 denominator.
+
+    `market_cap` and `fdv` are always projected. Before ALTER they read as
+    NULL so a read-only open of an old database still works.
+    """
+    names = [
+        "id",
+        "chain_id",
+        "pair_address",
+        "token_address",
+        "recorded_at",
+        "price_usd",
+        "volume_h24",
+        "volume_h1",
+        "liquidity_usd",
+        "txns_h24",
+        "tier",
+    ]
+    for extra in ("market_cap", "fdv"):
+        if extra in present:
+            names.append(extra)
+        else:
+            names.append(f"NULL AS {extra}")
+    return ", ".join(names)
 
 
 def history_tier_for_token(store: Any, chain_id: str, token_address: str | None) -> str:
@@ -99,6 +154,10 @@ def extract_metrics(pair: dict[str, Any]) -> dict[str, Any]:
     If DexScreener omits `liquidity` (or `liquidity.usd`), `liquidity_usd` is
     None. Callers store that NULL. Do not invent a liquidity number — decision
     fail-closes the buy as no_liquidity.
+
+    Root `marketCap` (alias `market_cap`) and `fdv` are copied the same way.
+    Omitted, empty, or non-numeric values stay None. `fdv` is never copied
+    into `market_cap`. This does not compute a turnover ratio.
     """
     vol = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
     liq = pair.get("liquidity") if isinstance(pair.get("liquidity"), dict) else {}
@@ -118,6 +177,8 @@ def extract_metrics(pair: dict[str, Any]) -> dict[str, Any]:
         "volume_h1": _num(vol.get("h1")),
         "liquidity_usd": _num(liq.get("usd")),
         "txns_h24": txns_h24,
+        "market_cap": _root_optional_float(pair, "marketCap", "market_cap"),
+        "fdv": _root_optional_float(pair, "fdv"),
     }
 
 
@@ -151,6 +212,8 @@ def maybe_snapshot_pair(
         volume_h1=m["volume_h1"],
         liquidity_usd=m["liquidity_usd"],
         txns_h24=m["txns_h24"],
+        market_cap=m["market_cap"],
+        fdv=m["fdv"],
         tier=tier,
     )
     log.debug(
@@ -244,6 +307,75 @@ def liquidity_coverage(
         "price_present_rate": _rate(n, price_n),
         "counts_toward_strategy_validity": False,
         "evidence_role": EVIDENCE_ROLE_SIDE,
+    }
+
+
+def market_cap_null_coverage(
+    conn: Any,
+    *,
+    since_iso: str,
+    tier: str | None = "hot",
+) -> dict[str, Any]:
+    """NULL rates for pair_history.market_cap / fdv. Observe only.
+
+    A stored 0 counts as present. Missing columns return available=False so a
+    read-only open before ALTER does not fail the liquidity check. Does not
+    invent values and does not count toward strategy validity.
+    """
+    flags: dict[str, Any] = {
+        "available": False,
+        "tier": tier,
+        "since_iso": since_iso,
+        "counts_toward_strategy_validity": False,
+        "evidence_role": EVIDENCE_ROLE_SIDE,
+    }
+    try:
+        info = conn.execute("PRAGMA table_info(pair_history)").fetchall()
+        names: set[str] = set()
+        for row in info:
+            try:
+                names.add(str(row["name"]))
+            except (TypeError, KeyError, IndexError):
+                names.add(str(row[1]))
+        if "market_cap" not in names or "fdv" not in names:
+            return {**flags, "reason": "columns_missing"}
+        where = "recorded_at >= ?"
+        params: list[Any] = [since_iso]
+        if tier is not None:
+            where += " AND lower(COALESCE(tier, '')) = ?"
+            params.append(tier.strip().lower())
+        row = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS n,
+                SUM(CASE WHEN market_cap IS NULL THEN 1 ELSE 0 END) AS market_cap_null_n,
+                SUM(CASE WHEN fdv IS NULL THEN 1 ELSE 0 END) AS fdv_null_n,
+                SUM(CASE
+                    WHEN market_cap IS NULL AND fdv IS NULL THEN 1 ELSE 0
+                END) AS both_null_n
+            FROM pair_history
+            WHERE {where}
+            """,
+            params,
+        ).fetchone()
+    except sqlite3.Error as exc:
+        return {**flags, "reason": "query_failed", "error": str(exc)}
+    n = _as_int(row["n"] if row is not None else 0)
+    market_cap_null_n = _as_int(row["market_cap_null_n"] if row is not None else 0)
+    fdv_null_n = _as_int(row["fdv_null_n"] if row is not None else 0)
+    both_null_n = _as_int(row["both_null_n"] if row is not None else 0)
+    return {
+        **flags,
+        "available": True,
+        "n": n,
+        "market_cap_null_n": market_cap_null_n,
+        "market_cap_null_rate": _rate(n, market_cap_null_n),
+        "market_cap_present_n": n - market_cap_null_n,
+        "fdv_null_n": fdv_null_n,
+        "fdv_null_rate": _rate(n, fdv_null_n),
+        "fdv_present_n": n - fdv_null_n,
+        "both_null_n": both_null_n,
+        "both_null_rate": _rate(n, both_null_n),
     }
 
 
