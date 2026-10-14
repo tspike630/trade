@@ -1110,7 +1110,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     ("平仓", "旁证"),
                     "span-6",
                     lambda: _v2_closed(store),
-                    foot="exit_reason × liq 分桶 · 观察旁证 · 不算有效性",
+                    foot="首笔命中 + exit×liq · 观察旁证 · 不算有效性",
                     tools=("14d",),
                 )
                 _v2_comp(
@@ -2044,16 +2044,26 @@ def _v2_closed(store: DataStore) -> None:
     if not buckets:
         ui.label(f"近 {getattr(report, 'days', 14)} 日无平仓").classes("v2-note")
         return
+    def _pct(rate: object) -> str:
+        if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+            return f"{float(rate) * 100:.1f}%"
+        return "—"
+
     win_rate = getattr(report, "win_rate", None)
-    if isinstance(win_rate, (int, float)) and not isinstance(win_rate, bool):
-        wr_text = f"{float(win_rate) * 100:.1f}%"
-    else:
-        wr_text = "—"
+    wr_text = _pct(win_rate)
+    first_n = getattr(report, "first_hit_n", 0) or 0
+    first_rate = getattr(report, "first_hit_rate", None)
+    live_n = getattr(report, "first_hit_live_n", 0) or 0
+    live_rate = getattr(report, "first_hit_live_rate", None)
+    first_text = f"{_pct(first_rate)} (n={first_n})" if first_n else "—"
+    live_text = f"{_pct(live_rate)} (n={live_n})" if live_n else "—"
     worst = getattr(report, "worst_pnl_usd", None)
     rest = getattr(report, "rest_pnl_usd", None)
     wipe = bool(getattr(report, "single_wipe", False))
     _v2_kv([
-        ("胜率", wr_text, "mute"),
+        ("累计胜率", wr_text, "mute"),
+        ("首笔命中", first_text, "mute"),
+        ("live 首笔", live_text, "mute"),
         (
             "最差单笔",
             _v2_money(worst) if isinstance(worst, (int, float)) else "—",
@@ -2087,6 +2097,10 @@ def _v2_closed(store: DataStore) -> None:
     ui.label(
         "警示旁证：胜率≈一半仍可净亏（仓位/入场质量）；"
         "单笔抹盈≈薄池止损打穿——对齐 min_liq，不盘中加参。"
+    ).classes("v2-note")
+    ui.label(
+        "首笔命中：按 pair 最早一笔已平仓；live_candidate 另列；"
+        "旁证/不算有效性（n 仍小，对照周检）。"
     ).classes("v2-note")
 
 
