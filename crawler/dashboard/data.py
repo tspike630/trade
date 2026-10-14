@@ -27,6 +27,7 @@ from dashboard.parsing import (
     extract_liquidity_usd,
     extract_pair,
     extract_symbol,
+    liq_bucket_label,
     parse_json,
     parse_ts,
     receipt_summary,
@@ -317,6 +318,39 @@ class RejectionReport:
     buckets: tuple[RejectionBucket, ...]
 
 
+@dataclass(frozen=True)
+class PaperClosedBucket:
+    """Observe-only attribution: exit_reason × liq bucket (min_liq=50k aligned)."""
+    exit_reason: str
+    liq_bucket: str
+    count: int
+    pnl_usd: float
+
+
+@dataclass(frozen=True)
+class PaperClosedReport:
+    days: int
+    closed: int
+    total_pnl_usd: float
+    buckets: tuple[PaperClosedBucket, ...]
+    win_count: int = 0
+    loss_count: int = 0
+    win_rate: float | None = None
+    worst_pnl_usd: float | None = None
+    rest_pnl_usd: float | None = None
+    single_wipe: bool = False
+    # First-trade hit rate (Prediction Arena P-1): earliest closed per pair.
+    first_hit_n: int = 0
+    first_hit_wins: int = 0
+    first_hit_rate: float | None = None
+    first_hit_live_n: int = 0
+    first_hit_live_wins: int = 0
+    first_hit_live_rate: float | None = None
+    # Exit-reason dominance (10-14 lesson: stop_loss can eat almost all loss).
+    stop_loss_pnl_usd: float | None = None
+    stop_loss_share: float | None = None
+
+
 class MissingTable(LookupError):
     pass
 
@@ -605,6 +639,15 @@ class DataStore:
             log.warning("read failed recent_executions: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "recent_executions")
 
+    def risk_daily_loss_today(self) -> DataResult:
+        """Observe-only: whether RISK daily_loss fired today (order_events / receipt)."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._risk_daily_loss_today(started), "risk_daily_loss_today")
+        except Exception as exc:
+            log.warning("read failed risk_daily_loss_today: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "risk_daily_loss_today")
+
     def rejection_buckets(self, days: int = 7) -> DataResult:
         started = time.perf_counter()
         try:
@@ -612,6 +655,14 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed rejection_buckets: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "rejection_buckets")
+
+    def paper_closed_buckets(self, days: int = 14) -> DataResult:
+        started = time.perf_counter()
+        try:
+            return _finish(self._paper_closed_buckets(started, days), "paper_closed_buckets")
+        except Exception as exc:
+            log.warning("read failed paper_closed_buckets: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_closed_buckets")
 
     def _today_execution_stats(self, started: float) -> DataResult:
         path = self.paths.execution
@@ -1151,6 +1202,64 @@ class DataStore:
         )
         return _ok(payload, started)
 
+    def _risk_daily_loss_today(self, started: float) -> DataResult:
+        path = self.paths.execution
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        try:
+            from zoneinfo import ZoneInfo
+            now_hkt = datetime.now(ZoneInfo("Asia/Hong_Kong"))
+        except Exception:
+            now_hkt = datetime.now(timezone.utc)
+        today = now_hkt.strftime("%Y-%m-%d")
+        cutoff = (now_hkt.astimezone(timezone.utc) - timedelta(hours=36)).strftime("%Y-%m-%dT%H:%M:%S")
+        hit = False
+        detail = ""
+        event_day = today
+        try:
+            with ro_connect(path) as conn:
+                tabs = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if "order_events" in tabs:
+                    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(order_events)")}
+                    if "detail_json" in cols and "event" in cols:
+                        rows = conn.execute(
+                            "SELECT detail_json, event_ts FROM order_events "
+                            "WHERE event = 'rejected' ORDER BY id DESC LIMIT 120"
+                        ).fetchall()
+                        for row in rows:
+                            blob = str(row[0] or "")
+                            ts = str(row[1] or "")
+                            if "daily_loss" not in blob:
+                                continue
+                            if ts >= cutoff or today in blob or (ts[:10] == today):
+                                hit = True
+                                detail = blob[:160]
+                                event_day = ts[:10] or today
+                                break
+                if not hit and "execution_log" in tabs:
+                    rows = conn.execute(
+                        "SELECT receipt_json, ts FROM execution_log "
+                        "ORDER BY id DESC LIMIT 60"
+                    ).fetchall()
+                    for row in rows:
+                        blob = str(row[0] or "")
+                        ts = str(row[1] or "")
+                        if "daily_loss" not in blob:
+                            continue
+                        if ts >= cutoff or today in blob:
+                            hit = True
+                            detail = "receipt daily_loss"
+                            event_day = ts[:10] or today
+                            break
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        return _ok({"hit": hit, "day": event_day, "detail": detail}, started)
+
     def _rejection_buckets(self, started: float, days: int) -> DataResult:
         path = self.paths.execution
         window_days = _clamp(days, 1, 30)
@@ -1202,6 +1311,190 @@ class DataStore:
             for key, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
         )
         return _ok(RejectionReport(window_days, total, ordered), started)
+
+    def _paper_closed_buckets(self, started: float, days: int) -> DataResult:
+        path = self.paths.paper
+        window_days = _clamp(days, 1, 60)
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=window_days)
+        lower = (start - timedelta(days=1)).strftime("%Y-%m-%d")
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "positions", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "positions")
+                need = ("status", "closed_at", "exit_reason", "pnl_usd")
+                absent = _require(cols, need)
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                selected = ["status", "closed_at", "exit_reason", "pnl_usd"]
+                if "pair_address" in cols:
+                    selected.append("pair_address")
+                if "opened_at" in cols:
+                    selected.append("opened_at")
+                if "meta_json" in cols:
+                    selected.append("meta_json")
+                rows = _exec(
+                    conn,
+                    f"SELECT {', '.join(selected)} FROM positions WHERE status = ? AND closed_at >= ?",
+                    ("closed", lower),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        decision_ids: list[int] = []
+        for row in rows:
+            meta = parse_json(str(_cell(row, "meta_json") or ""))
+            if not isinstance(meta, dict):
+                continue
+            raw_id = meta.get("decision_log_id")
+            if isinstance(raw_id, bool):
+                continue
+            if isinstance(raw_id, (int, float)):
+                decision_ids.append(int(raw_id))
+            elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+                decision_ids.append(int(raw_id.strip()))
+        purposes = self._decision_purposes(decision_ids)
+        agg: dict[tuple[str, str], list[float]] = defaultdict(list)
+        closed = 0
+        total_pnl = 0.0
+        pnls: list[float] = []
+        # pair -> (opened_at sort key, closed_at, hit, purpose)
+        first_by_pair: dict[str, tuple[str, str, bool, str | None]] = {}
+        for row in rows:
+            if not _in_range(row["closed_at"], start, end, end_inclusive=True):
+                continue
+            reason = clip(str(_cell(row, "exit_reason") or "(empty)"), 40) or "(empty)"
+            pnl = safe_float(_cell(row, "pnl_usd"))
+            if pnl is None:
+                pnl = 0.0
+            meta = parse_json(str(_cell(row, "meta_json") or ""))
+            liq = None
+            purpose: str | None = None
+            if isinstance(meta, dict):
+                liq = safe_float(meta.get("liquidity_usd"))
+                if liq is None:
+                    extras = meta.get("extras")
+                    if isinstance(extras, dict):
+                        liq = safe_float(extras.get("liquidity_usd"))
+                raw_id = meta.get("decision_log_id")
+                did: int | None = None
+                if isinstance(raw_id, bool):
+                    did = None
+                elif isinstance(raw_id, (int, float)):
+                    did = int(raw_id)
+                elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+                    did = int(raw_id.strip())
+                if did is not None:
+                    purpose = purposes.get(did)
+            bucket = liq_bucket_label(liq)
+            agg[(reason, bucket)].append(pnl)
+            pnls.append(pnl)
+            closed += 1
+            total_pnl += pnl
+            pair = str(_cell(row, "pair_address") or "").strip()
+            if pair:
+                opened = str(_cell(row, "opened_at") or "")
+                closed_at = str(_cell(row, "closed_at") or "")
+                sort_key = opened or closed_at
+                hit = pnl > 0
+                prev = first_by_pair.get(pair)
+                if prev is None or (sort_key, closed_at) < (prev[0], prev[1]):
+                    first_by_pair[pair] = (sort_key, closed_at, hit, purpose)
+        ordered = tuple(
+            PaperClosedBucket(
+                exit_reason=key[0],
+                liq_bucket=key[1],
+                count=len(values),
+                pnl_usd=round(sum(values), 4),
+            )
+            for key, values in sorted(
+                agg.items(),
+                key=lambda item: (-abs(sum(item[1])), -len(item[1]), item[0][0], item[0][1]),
+            )
+        )
+        win_count = sum(1 for value in pnls if value > 0)
+        loss_count = sum(1 for value in pnls if value <= 0)
+        win_rate = (win_count / closed) if closed else None
+        worst = min(pnls) if pnls else None
+        rest = (total_pnl - worst) if worst is not None else None
+        # Case lesson: one loss wipes the rest (rest>0 and total<0).
+        single_wipe = bool(
+            worst is not None and rest is not None and rest > 0 and total_pnl < 0
+        )
+        first_n = len(first_by_pair)
+        first_wins = sum(1 for item in first_by_pair.values() if item[2])
+        first_rate = (first_wins / first_n) if first_n else None
+        live_items = [item for item in first_by_pair.values() if item[3] == "live_candidate"]
+        live_n = len(live_items)
+        live_wins = sum(1 for item in live_items if item[2])
+        live_rate = (live_wins / live_n) if live_n else None
+        stop_loss_pnl = sum(sum(vals) for (er, _lb), vals in agg.items() if er == "stop_loss")
+        stop_loss_pnl = float(stop_loss_pnl) if any(er == "stop_loss" for er, _ in agg) else None
+        stop_loss_share = None
+        if stop_loss_pnl is not None and total_pnl < 0 and abs(total_pnl) > 1e-9:
+            stop_loss_share = min(1.0, abs(stop_loss_pnl) / abs(total_pnl))
+        return _ok(
+            PaperClosedReport(
+                window_days,
+                closed,
+                round(total_pnl, 4),
+                ordered,
+                win_count=win_count,
+                loss_count=loss_count,
+                win_rate=round(win_rate, 4) if win_rate is not None else None,
+                worst_pnl_usd=round(worst, 4) if worst is not None else None,
+                rest_pnl_usd=round(rest, 4) if rest is not None else None,
+                single_wipe=single_wipe,
+                first_hit_n=first_n,
+                first_hit_wins=first_wins,
+                first_hit_rate=round(first_rate, 4) if first_rate is not None else None,
+                first_hit_live_n=live_n,
+                first_hit_live_wins=live_wins,
+                first_hit_live_rate=round(live_rate, 4) if live_rate is not None else None,
+                stop_loss_pnl_usd=round(stop_loss_pnl, 4) if stop_loss_pnl is not None else None,
+                stop_loss_share=round(stop_loss_share, 4) if stop_loss_share is not None else None,
+            ),
+            started,
+        )
+
+    def _decision_purposes(self, decision_ids: list[int]) -> dict[int, str | None]:
+        """Map decision_log.id -> purpose when the column exists; empty on miss."""
+        unique = sorted({int(item) for item in decision_ids if isinstance(item, int)})
+        if not unique:
+            return {}
+        path = self.paths.main
+        if not path.is_file():
+            return {}
+        try:
+            with ro_connect(path) as conn:
+                if _missing_table(conn, "decision_log", path.name):
+                    return {}
+                cols = _columns(conn, "decision_log")
+                if "id" not in cols or "purpose" not in cols:
+                    return {}
+                out: dict[int, str | None] = {}
+                chunk = 400
+                for index in range(0, len(unique), chunk):
+                    batch = unique[index : index + chunk]
+                    placeholders = ", ".join("?" for _ in batch)
+                    for row in _exec(
+                        conn,
+                        f"SELECT id, purpose FROM decision_log WHERE id IN ({placeholders})",
+                        tuple(batch),
+                    ).fetchall():
+                        raw = _cell(row, "purpose")
+                        if raw is None:
+                            out[int(row["id"])] = None
+                        else:
+                            text_purpose = str(raw).strip()
+                            out[int(row["id"])] = text_purpose or None
+                return out
+        except sqlite3.Error:
+            log.warning("decision purpose lookup failed")
+            return {}
 
     def _decision_ids_between(
         self,
