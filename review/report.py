@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -104,10 +105,125 @@ def _render_dim_table(dim_name: str, dim: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _render_f1_line(title: str, block: dict[str, Any]) -> list[str]:
+    """One F-1 line. The two lines are rendered separately and never averaged."""
+    source = block.get("source")
+    note = f" {block.get('note')}" if block.get("note") else ""
+    by_strategy = block.get("by_strategy") or {}
+    if block.get("status") != "ok" or not by_strategy:
+        return [
+            f"- **{title}：** data gap — {block.get('note') or 'unavailable'}"
+            f"（source=`{source}`）。"
+        ]
+    lines = [
+        f"- **{title}** P(第3笔亏 | 连亏2笔)，source=`{source}`。{note}",
+        "",
+        "| strategy_id | n | resolved | 条件样本 | 第3笔仍亏 | P |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for sid, row in by_strategy.items():
+        lines.append(
+            f"| `{sid}` | {row.get('n_closed') if row.get('n_closed') is not None else '—'} | "
+            f"{row.get('n_resolved') if row.get('n_resolved') is not None else '—'} | "
+            f"{row.get('n_given_two_loss') if row.get('n_given_two_loss') is not None else '—'} | "
+            f"{row.get('n_third_loss') if row.get('n_third_loss') is not None else '—'} | "
+            f"{_pct(row.get('p_third_loss_given_two_loss'))} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _render_weekly_evidence(evidence: Optional[dict[str, Any]]) -> list[str]:
+    """10-19 hard evidence. None keeps older reports unchanged."""
+    if not evidence:
+        return []
+    lines: list[str] = []
+    lines.append("### 10-19 硬证据（不算有效性 / R2旁证）")
+    lines.append("")
+    lines.append(
+        "观察登记。不改 JEV 门槛，不改 `min_liq` / cooldown / 权重，不接断路器。"
+        f" 标记：`{evidence.get('label') or '不算有效性 / R2旁证'}`。"
+    )
+    lines.append("")
+    stop = evidence.get("stop_loss") or {}
+    share = stop.get("loss_share")
+    worst = stop.get("worst_stop") or {}
+    worst_bit = "—"
+    if worst:
+        worst_bit = (
+            f"`{worst.get('position_id')}` {_num(worst.get('pnl_usd'))} "
+            f"@ `{worst.get('closed_at')}`"
+        )
+    lines.append(
+        f"- **止损亏损占比：** {_pct(share) if isinstance(share, (int, float)) else '—'} "
+        f"（净已实现 PnL {_num(stop.get('total_pnl_usd'))}，"
+        f"stop_loss 净额 {_num(stop.get('stop_loss_pnl_usd'))}；"
+        f"n_closed={stop.get('n_closed', 0)}）。最差止损：{worst_bit}。"
+        + (f" {stop.get('note')}" if stop.get("note") else "")
+    )
+    daily = evidence.get("daily_open_peak") or {}
+    lines.append(
+        f"- **单日开仓峰值：** {daily.get('peak') if daily.get('peak') is not None else '—'} "
+        f"（{daily.get('peak_day') or '—'} {daily.get('tz') or 'Asia/Hong_Kong'}，"
+        f"source=`{daily.get('source')}`，n_opens={daily.get('n_opens')}）。"
+        + (f" {daily.get('note')}" if daily.get("note") else "")
+    )
+    streak = evidence.get("f1_streak") or {}
+    lines.extend(
+        _render_f1_line(
+            "F-1（a）up_1h / 决策口径",
+            streak.get("up_1h") if isinstance(streak.get("up_1h"), dict) else {},
+        )
+    )
+    lines.extend(
+        _render_f1_line(
+            "F-1（b）已实现 PnL",
+            streak.get("realized_pnl") if isinstance(streak.get("realized_pnl"), dict) else {},
+        )
+    )
+    shadow = evidence.get("c3_shadow") or {}
+    if shadow.get("status") != "ok":
+        lines.append(
+            f"- **C3 shadow：** data gap — {shadow.get('note') or 'peaks not invented'}。"
+        )
+    else:
+        all_row = shadow.get("all") or {}
+        hold = shadow.get("max_hold") or {}
+        lines.append(
+            "- **C3 shadow：** peak_pnl_pct vs giveback_from_peak_pct vs actual exit，"
+            f"`max_hold` cohort（source=`{shadow.get('source')}`，n={shadow.get('n_rows')}）。"
+            + (f" {shadow.get('note')}" if shadow.get("note") else "")
+        )
+        lines.append("")
+        lines.append("| cohort | n | mean_peak_pnl_pct | mean_giveback_from_peak_pct | mean_actual_pnl_usd |")
+        lines.append("|---|---:|---:|---:|---:|")
+        lines.append(
+            f"| all | {all_row.get('n', 0)} | {_num(all_row.get('mean_peak_pnl_pct'))} | "
+            f"{_num(all_row.get('mean_giveback_from_peak_pct'))} | {_num(all_row.get('mean_actual_pnl_usd'))} |"
+        )
+        lines.append(
+            f"| max_hold | {hold.get('n', 0)} | {_num(hold.get('mean_peak_pnl_pct'))} | "
+            f"{_num(hold.get('mean_giveback_from_peak_pct'))} | {_num(hold.get('mean_actual_pnl_usd'))} |"
+        )
+        lines.append("")
+    ruin = evidence.get("g3_ruin") or {}
+    lines.append(f"- **G-3：** {ruin.get('line') or ruin.get('note') or 'data gap'}")
+    veto = evidence.get("step2_veto") or {}
+    lines.append("")
+    lines.append(f"> {veto.get('line') or 'Step2 veto 旁证：未计算。不算有效性 / R2旁证。'}")
+    lines.append("")
+    lines.append("```json")
+    lines.append(json.dumps(evidence, ensure_ascii=False, indent=2, default=str))
+    lines.append("```")
+    lines.append("")
+    return lines
+
+
 def _render_attribution_section(
     attribution: Optional[dict[str, Any]],
     fill_attr: Optional[dict[str, Any]],
     backtest_summary: Optional[dict[str, Any]],
+    weekly_evidence: Optional[dict[str, Any]] = None,
 ) -> list[str]:
     lines: list[str] = []
     lines.append("## 8. 信号层归因")
@@ -209,6 +325,7 @@ def _render_attribution_section(
         else:
             lines.append("_该 run 无 closed positions。_")
             lines.append("")
+    lines.extend(_render_weekly_evidence(weekly_evidence))
     return lines
 
 
@@ -299,6 +416,7 @@ def render_weekly_md(
     optimize_section: Optional[str] = None,
     evolution_suggestions: Optional[list[dict[str, Any]]] = None,
     factor_layers: Optional[dict[str, Any]] = None,
+    weekly_evidence: Optional[dict[str, Any]] = None,
 ) -> str:
     """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议 + 可选§11 因子分层 + §12 因子进化指针）。"""
     n = len(chain)
@@ -481,7 +599,11 @@ def render_weekly_md(
     lines.append("")
 
     # 8. 信号层归因（R2）
-    lines.extend(_render_attribution_section(attribution, fill_attr, backtest_summary))
+    lines.extend(
+        _render_attribution_section(
+            attribution, fill_attr, backtest_summary, weekly_evidence
+        )
+    )
 
     # 9. R3 参数寻优（脚手架占位）
     lines.append("## 9. R3 参数寻优 — 待历史≥7天且周检跨门槛")

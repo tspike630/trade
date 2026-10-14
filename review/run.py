@@ -35,6 +35,7 @@ from review.optimizer import (
     optimize,
 )
 from review.evolution import build_evolution_suggestions
+from review.weekly_evidence import compute_weekly_evidence
 from review.factor_layers import (
     FACTOR_GETTERS,
     factor_layers,
@@ -110,6 +111,10 @@ def _paths_under(db_root: Path) -> DbPaths:
         paper=str(db_root / "paper_trading.db"),
         backtest=str(db_root / "backtest_ledger.db"),
     )
+
+
+def _evidence_export_roots(db_root: Path) -> list[Path]:
+    return [db_root / "exports", db_root / "crawler" / "exports"]
 
 
 def _probe_dbs(paths: DbPaths) -> None:
@@ -251,6 +256,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             jev_metrics = {k: v for k, v in jev_metrics.items() if k != "by_strategy"}
         attr = signal_attribution(chain, baseline=baseline)
         fill_attr = fill_attribution(chain)
+        up_1h_rows = [
+            {
+                "strategy_id": row.strategy_id,
+                "ts": row.ts,
+                "decision_id": row.decision_id,
+                "fwd_1h": row.fwd_1h,
+            }
+            for row in chain
+        ]
+        weekly_evidence = compute_weekly_evidence(
+            paths,
+            period_start=period_start,
+            period_end=period_end,
+            strategy_id=args.strategy,
+            export_roots=_evidence_export_roots(db_root),
+            up_1h_rows=up_1h_rows,
+        )
+        fill_attr["evidence_1019"] = weekly_evidence
         bt_summary = load_backtest_summary(paths)
     except FileNotFoundError as e:
         print(f"error: cannot open DB read-only: {e}", file=sys.stderr)
@@ -272,6 +295,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"attribution: n={attr.get('n')} regime={regime} "
         f"fills={fill_attr.get('note')} "
         f"backtest={'ok' if bt_summary.get('ok') else bt_summary.get('note')}"
+    )
+    ev_stop = (weekly_evidence.get("stop_loss") or {}).get("loss_share")
+    ev_peak = (weekly_evidence.get("daily_open_peak") or {}).get("peak")
+    ev_veto = (weekly_evidence.get("step2_veto") or {}).get("triggered")
+    f1 = weekly_evidence.get("f1_streak") or {}
+    f1_up = (f1.get("up_1h") or {}).get("status")
+    f1_realized = (f1.get("realized_pnl") or {}).get("status")
+    print(
+        f"evidence_1019: stop_loss_loss_share={ev_stop} "
+        f"daily_open_peak={ev_peak} step2_veto={ev_veto} "
+        f"f1_up_1h={f1_up} f1_realized={f1_realized}"
     )
 
     opt_result = None
@@ -398,6 +432,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             optimize_section=optimize_section,
             evolution_suggestions=evo,
             factor_layers=factor_layer_result,
+            weekly_evidence=weekly_evidence,
         )
         written = write_report(md, str(out_path))
         print(f"report: {written}")

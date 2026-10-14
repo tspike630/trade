@@ -151,6 +151,19 @@ Foresight Arena 的功效量级（已结算二元预测；相对市场共识的 
 
 复盘不认领 **P-1**（PM 仓位比例 / 回撤，`execution/README.md`）、**P-4**（JEV 错价，指标）、**P-5**（共识概率观察候选，指标）。**F-3 / C3**：出场归执行（`execution/exits.py`，C3 / E-2）；决策层只指向，不改 hold / TP / SL。趋势出场仍只观察，要立项先 R3 回测。`accepted` ≠ `activated`。临时 `live_candidate` 样本单独分桶。
 
+## 10-19 复盘硬证据（代码计算）
+
+`python -m review.run --report` 在周报第 8 节写出下面六项（`review/weekly_evidence.py`）。**不算有效性 / R2旁证。** 不改 JEV 门槛，不改 `min_liq` / cooldown / 权重，不接断路器。
+
+| 交付 | 怎么算 |
+|------|--------|
+| 止损亏损占比 | 与看板相同：净已实现 PnL 为负且有 `stop_loss` 时 `min(1, \|Σ stop_loss pnl\| / \|Σ pnl\|)`，并列最差一笔止损。净正或无止损则为空 |
+| 单日开仓峰值 | 只按 `opened_at` 的 Asia/Hong_Kong 日历日。没有 `opened_at` 记 data gap，不用 UTC 日期前缀，也不用 executed entries |
+| F-1（两行，不合并） | (a) 有 `up_1h` 时 `up_1h<0` 为亏，0 不是亏，缺失打断连亏；(b) `python -m execution.f1_streak_report` 的 `streak_events`，`pnl<0` 为亏。各自的 P，不合成一个数 |
+| C3 shadow | 优先 `order_events` 的 `shadow_c3`；否则 `shadow_c3` 表（peak / giveback / actual exit，含 `max_hold`）。都没有则 data gap，不从纸面 peak 编造 |
+| G-3 | 有 `max_sequential_losses` 或 `floor(cash/per_trade_risk)` 导出则用该数；否则 `python -m execution.risk.bankruptcy` 的默认理论值（不是账本观察） |
+| Step2 veto 旁证 | 止损占比≥50% 或单日开仓≥20 时写明：即使 1h≥55% 也不据此启动 Step2 |
+
 ## 背景（保留）
 
 - 过滤后方向性 37.5%→71.4% 值得继续验证，但当前 n=14 / **unique_token=9** 不够开 Step 2。
