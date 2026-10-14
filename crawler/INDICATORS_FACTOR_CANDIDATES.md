@@ -4,11 +4,13 @@
 > 来源：机构供需交易法执行单（Sam Seiden / LTSD 改编）。指标旁路只领 **P-3、P-4**。P-1（推保护）与 P-2（概率打分 / 动态仓位）不在本文。  
 > 状态：**文档候选**。未接入决策，未改权重，**不算有效性**。
 
-本文只把两条假设放进 factor_loop 的提因子池说明。不新增因子模块，不改 `decision_engine`、`review/factor_layers.py`、`review/factor_loop.py`，不写 `review/factor_candidates.db`。`INDICATORS_WEIGHT_*` 保持 **0**。
+本文只把两条假设放进 factor_loop 的提因子池说明。不新增因子模块，不改 `decision_engine`、`review/factor_layers.py`，不写 `review/factor_candidates.db`。`gate_candidate` 的接受路径不改；M-2 的 `calibrate_direction` 还没接到周跑（见下文）。`INDICATORS_WEIGHT_*` 保持 **0**。
 
 检测器本次不实现。2026-10-19 周检之后才走 **A 类**验证（回测依据 + 变更登记 + 周检验证，纪律同 R1/R2/R3）。验证前这两条不是信号、不是仓位、不是止损规则。
 
-与 `INDICATORS_STEP2.md` 的 P-4（JEV 信号强度 ≠ 胜率）不是同一条。
+与 `INDICATORS_STEP2.md` 的 P-4（JEV 信号强度 ≠ 胜率）不是同一条。方向校准（下文 M-2）只决定符号，不把 `|IC|` 或 `jev_strength` 读成胜率。
+
+时间序列检测器一旦要写，遵守 `INDICATORS_OPERATORIZATION.md`（M-3）：窗口在 t 收口，禁止日合计 / 未来分母。
 
 **纪律（Prediction Arena，[arXiv:2604.07355](https://arxiv.org/abs/2604.07355)）**：研究量 / token 用量与 PnL 相关约 0，因子质量高于研究量。指标侧不为凑候选条数再堆因子，只加深已有口径（JEV 纯化、流动性闸、僵尸过滤）。供需 P-3 / P-4 保持 A 类候选。该文 P-1 首次命中率归复盘 / 周检，指标侧不登记。本段不算有效性。
 
@@ -77,8 +79,27 @@
 
 ---
 
+## 方向校准（M-2，A 类接受前的必过闸）
+
+AQuA（arXiv 2608.12841）：公式即使有预测力，初始符号也可能错。每个 factor_loop 候选——包括本文 P-3 / P-4，以及日后任何入库候选——都要用**正、反两个符号**各评一次，留下解释更干净的方向（与前向收益同向、IC ≥ 0 的那一侧），然后才谈 A 类 `accepted`。
+
+2026-10-14 核对 `review/gates.py` 与 `review/factor_loop.py`：周跑里**还没有**这个闸。
+
+| 现况 | 说明 |
+|------|------|
+| `gate_candidate` | 只看 `n_raw`、`unique_token`、`up_1h`。过线则 `status=accepted`。不看符号 |
+| `ic_mean` | 来自 `_latest_ic`：整份 `factor_ic_history.csv` 的最后一行，不是该候选自己的双侧 IC，而且经常是 null |
+| `calibrate_direction(ic)` | 新的纯函数。IC 有限时记下 `ic_as_written` 与 `ic_flipped`（= −IC），`kept_sign` 取 IC ≥ 0 的一侧。IC 缺失、非数值或非有限则 **fail closed**（`passed=False`，`blocks_a_class=True`，不登记方向） |
+| 未接入周跑 | `gate_candidate` **不调用**它。缺 IC 就 fail closed 会把现在的 `accepted` 改掉，周跑结果会变。常量 `DIRECTION_CALIBRATION_TODO` 写明：等有逐候选 IC 再接上 |
+
+`passed=True` 只表示两个符号都记下了，不是接受候选，也不移动 n≥15。不翻 live 权重。`INDICATORS_WEIGHT_*` 保持 0。本段不算有效性。
+
+**信号强度 ≠ 胜率**（PR #46）：见 `INDICATORS_STEP2.md`「设计依据：定价错误（P-4）」和 `INDICATORS_AUDIT.md`「警示事例 → 指标层纪律」。
+
+---
+
 ## 不算有效性
 
 - 未接入 `decision_engine`，未注册进 `FACTOR_GETTERS`，未进 composite。
 - 权重保持 0。10-19 周检出数之前，不把 P-3/P-4 写成有效因子，也不实现检测器。
-- A 类验证的顺序：周检 → 回测依据 → 变更登记 → 再谈是否入库为 `accepted` 候选。过门槛仍不自动激活策略（`factor_loop` 既有约束）。
+- A 类验证的顺序：周检 → 回测依据 → 变更登记 → **方向校准（M-2，正反两符号）** → 再谈是否入库为 `accepted` 候选。`calibrate_direction` 已可调用，但尚未接到 `gate_candidate`（见上表）。过门槛仍不自动激活策略（`factor_loop` 既有约束）。

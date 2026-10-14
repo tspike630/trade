@@ -638,7 +638,13 @@ def _overlay_framework_backtest(
 # 阶段 3：gate —— 门槛判定（防火墙，三段式结论）
 # ------------------------------------------------------------------ #
 def gate_candidate(metrics: dict[str, Any], *, week: str) -> dict[str, Any]:
-    """硬指标判定：pass / need_retest / fail + 观察/评估/判定三段式。"""
+    """硬指标判定：pass / need_retest / fail + 观察/评估/判定三段式。
+
+    M-2 方向校准不在这里做。``review.gates.calibrate_direction`` 会在 IC
+    有限时记下正反两个符号，IC 缺失则 fail closed；周跑仍只看 n / unique /
+    up_1h。接入会在 ic 为空时改掉 accepted，所以先留
+    ``DIRECTION_CALIBRATION_TODO``。权重保持 0。
+    """
     del week  # 周次由 store 写入；判定本身不改门槛
     n = metrics.get("n_raw") or 0
     uni = metrics.get("unique_token") or 0
