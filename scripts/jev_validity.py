@@ -4,8 +4,8 @@
 Forward 1h/4h returns for jev_strength_v1 buy signals, with liquidity /
 coverage / price filters and strength strata. Read-only on business tables;
 writes the optional markdown report, rewrites one trend CSV row under
-exports/reports/jev_validity_trend.csv (hard-evidence and F-1 columns
-included), and prints a summary to stdout.
+exports/reports/jev_validity_trend.csv (hard-evidence, F-1, and
+signal-crowding columns included), and prints a summary to stdout.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ if str(_REPO) not in sys.path:
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
+import signal_crowding
 import weekly_side_evidence as side_evidence
 
 from review.gates import (
@@ -700,6 +701,7 @@ TREND_FIELDS = [
     "f1_trials_after_two",
     "f1_p_third_given_two",
     "side_evidence",
+    *signal_crowding.TREND_KEYS,
 ]
 
 
@@ -719,6 +721,7 @@ def build_trend_row(
     result: dict[str, Any],
     when: Optional[datetime] = None,
     side: Optional[side_evidence.WeeklySide] = None,
+    crowd: Optional[signal_crowding.CrowdingReport] = None,
 ) -> dict[str, str]:
     when = when or datetime.now(HK_TZ)
     st1, st4 = result["st1"], result["st4"]
@@ -738,6 +741,7 @@ def build_trend_row(
         "n_4h": str(st4.n),
     }
     row.update(side_evidence.trend_fields(side))
+    row.update(signal_crowding.trend_fields(crowd))
     return row
 
 
@@ -870,6 +874,7 @@ def render_md(
     trend_row: Optional[dict[str, str]] = None,
     two_week_ok: Optional[bool] = None,
     side: Optional[side_evidence.WeeklySide] = None,
+    crowd: Optional[signal_crowding.CrowdingReport] = None,
 ) -> str:
     p = primary["params"]
     lines: list[str] = []
@@ -1087,6 +1092,9 @@ def render_md(
     if side is not None:
         for line in side_evidence.render_markdown(side):
             a(line)
+    if crowd is not None:
+        for line in signal_crowding.render_markdown(crowd):
+            a(line)
 
     a("## 附录：排除 |ret|>500%")
     a("")
@@ -1175,6 +1183,7 @@ def print_summary(
     *,
     two_week_ok: Optional[bool] = None,
     side: Optional[side_evidence.WeeklySide] = None,
+    crowd: Optional[signal_crowding.CrowdingReport] = None,
 ) -> None:
     p = result["params"]
     st1, st4 = result["st1"], result["st4"]
@@ -1207,6 +1216,9 @@ def print_summary(
     )
     if side is not None:
         for line in side_evidence.format_stdout(side):
+            print(line)
+    if crowd is not None:
+        for line in signal_crowding.format_stdout(crowd):
             print(line)
     print()
 
@@ -1277,6 +1289,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     conn = open_db(db_path)
     side: Optional[side_evidence.WeeklySide] = None
+    crowd: Optional[signal_crowding.CrowdingReport] = None
+    as_of = datetime.now(timezone.utc)
     try:
         primary = run_analysis(
             conn,
@@ -1305,7 +1319,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 strategy_id=STRATEGY_ID,
                 paper_db=paper_db,
                 window_days=args.side_window_days,
+                as_of=as_of,
             )
+        crowd = signal_crowding.compute_for_weekly(
+            decision_conn=conn,
+            strategy_id=STRATEGY_ID,
+            window_days=args.side_window_days,
+            as_of=as_of,
+        )
     finally:
         conn.close()
 
@@ -1315,7 +1336,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     trend_path: Optional[Path] = None
     if not args.no_trend:
         trend_path = (args.trend_csv or DEFAULT_TREND_CSV).resolve()
-        trend_row = build_trend_row(primary, side=side)
+        trend_row = build_trend_row(primary, side=side, crowd=crowd)
         trend_prior = append_trend_row(trend_path, trend_row)
         if not trend_prior:
             two_week_ok = None  # 首次：无上周可比
@@ -1328,6 +1349,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         primary,
         two_week_ok=two_week_ok,
         side=side,
+        crowd=crowd,
     )
     if contrast is not None:
         print_summary(f"contrast liq>={args.contrast_liq:g}", contrast)
@@ -1340,6 +1362,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         trend_row=trend_row,
         two_week_ok=two_week_ok if not args.no_trend else None,
         side=side,
+        crowd=crowd,
     )
     out_path = out_path.resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
