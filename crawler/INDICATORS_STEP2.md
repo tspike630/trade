@@ -6,6 +6,7 @@
 - **不发明代币**：JEV **不是** `TokenSource`，只 enrich 已有 token（热档）。
 - **异常只记日志**：单 token / 单 pass 失败不影响 `main.py` 与 `indicators.run` 主循环。
 - **API Key 可选**：未设置 `JEV_API_KEY` 时公开扫描；设置后按 `JEV_AUTH_MODE`（默认 `header`/`X-API-Key`）鉴权。 密钥永不入日志；`query` 模式经 `redact_url` 脱敏。详见 `AUTH_JEV.md`。
+- **信号强度 ≠ 胜率**：funding / `jev_strength` 度量的是定价错误（链上价或信号价相对合理价值的偏差），不是胜率确定性。见下方「设计依据」。
 
 ## 新增 / 修改文件
 
@@ -114,6 +115,14 @@ jev_strength   = round( (jev_raw_score / 100) * jev_confidence * direction_coef 
 缺 `jev_raw_score` 时 `jev_strength = 0`；缺 coverage 时 confidence 按 0 参与 strength。
 
 funding **从不发 HTTP**，只读 `jev_signals`。`indicators.run --full` / `--loop` 都会在 technical 之后跑 funding。
+
+### 设计依据：定价错误（P-4）
+
+JEV funding / `jev_strength` 要捕捉的是**定价错误**：链上价或信号价相对合理价值的偏差（「你认为 70%，市场只定价 50%」那种百分点差），不是赢面有多确定。
+
+**信号强度 ≠ 胜率。** `|jev_strength|` 只是偏差幅度 × 覆盖 × 方向，不得把强信号读成确定性。公式、`INDICATORS_WEIGHT_*`、composite 默认本次都不改。统计参等 10-19 周检 IC/IR + R3，不盘中追认。层纪律见 `INDICATORS_AUDIT.md`「警示事例 → 指标层纪律」。
+
+来源：执行单《预测市场经验落地执行单（Polymarket 指南 → 系统改进）》（2026-10-14）P-4。本节只记设计依据，不算策略有效性。
 
 ## 如何运行
 

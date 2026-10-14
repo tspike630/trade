@@ -105,8 +105,8 @@ python -m api_server   # 只读 API + admin
 
 ### 10. 文档索引
 
-- 本文 **INDICATORS_AUDIT.md**（运维入口）
-- STEP1 / STEP2 / STEP3 / P0 / LIGHT / AUTH_JEV
+- 本文 **INDICATORS_AUDIT.md**（运维入口；含「警示事例 → 指标层纪律」）
+- STEP1 / STEP2 / STEP3 / P0 / LIGHT / AUTH_JEV（P-4 定价错误在 STEP2）
 - README「Indicators 旁路」节 + 命令总索引
 
 ---
@@ -124,6 +124,24 @@ python -m api_server   # 只读 API + admin
 9. **本文档**。
 
 **未做（按范围）**：未改 `scoring.py` / 告警阈值；未把 composite 权重大于 0；未停 main/indicators/jev。
+
+---
+
+## 警示事例 → 指标层纪律
+
+> 来源：执行单《预测市场经验落地执行单（Polymarket 指南 → 系统改进）》（2026-10-14）第四节警示案例，以及同单 P-2 / P-5。看板平仓旁证已在 PR #45。本节是指标 / 旁路层纪律，**不算策略有效性**。IC/IR 与统计参仍归 **10-19 周检**。不改 `INDICATORS_WEIGHT_*`、composite 默认、technical loop。
+
+- **半胜仍亏 / 单笔抹盈**（书中约 51% 胜率仍大亏；本系统 paper 上单笔亦可抹掉全部盈利）：指标侧**不**用强信号当确定性。**信号强度 ≠ 胜率**（口径见 `INDICATORS_STEP2.md` P-4）。`INDICATORS_WEIGHT_*` 保持 **0**，直至 10-19 IC/IR + R3；不盘中追认统计参。
+- **$0.95 黑天鹅 / 薄池打穿**（「那 5% 一旦出现，亏掉的不是 5% 而是 95%」；薄池单笔止损打穿、抹掉全部盈利）：tech 新鲜度与流动性字段是决策闸的输入。指标**不编造** liquidity（载荷缺 `liquidity` 就保持空）。`min_liq` fail-closed 归决策 [#41](https://github.com/tspike630/trade/pull/41)。本侧只保 hot tech 新鲜（[#40](https://github.com/tspike630/trade/pull/40) 已合）。
+- **洗盘 / 单点操纵**（书中约 25% 交易量虚假，外加预言机投票权集中翻转）：多源旁路（DexScreener + CCXT prior，见 `CCXT_SIDECHANNEL.md`）是防单点，不是加权重救曲线。
+
+### P-2（指针，不实现）
+
+`review.factor_loop` 按因子 IC/IR 动态加权是 **design-after-10-19**：10-19 真库 IC/IR 出数之后才写设计稿（公式与阈值）。在此之前权重保持 0，不激活，不过门槛不生效。本文不实现权重更新代码。
+
+### P-5（观察候选）
+
+Polymarket 共识概率（例如「某币是否上币安」，价格 = 市场共识）只作为 factor_loop 的**观察因子候选**，须走验证流程，**不接入主决策**。书中警告：加密相关市场胜率约 60%，约 25% 交易量是洗盘，且有合规风险（中国大陆非法 / 香港灰色）；接入前先做合规评估。当前未接线。
 
 ---
 
