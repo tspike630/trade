@@ -8,6 +8,10 @@ INTEL_LOOP I-1: a confirmed getTransaction also labels initializeMint mintAuthor
 as dev and, when HOLDER_SNAPSHOT_ENABLED (default ON), snapshots top holders via
 the same HTTP RPC. Unknown deployer or a failed holder RPC writes nothing.
 
+INTEL_LOOP I-3: when BOT_MARKERS_ENABLED (default ON), that same getTransaction
+is scanned for bot-like fills. No extra RPC. Missing fields write no bot_suspect
+label. The flag does not skip orders.
+
 Default program IDs are well-known public addresses (Raydium / Pump.fun / Meteora / Orca).
 Confirm against current on-chain deployments before production — override via HELIUS_PROGRAM_IDS.
 """
@@ -26,6 +30,7 @@ import httpx
 
 from alerts import emit_alert
 from config import (
+    BOT_MARKERS_ENABLED,
     DB_PATH,
     HELIUS_API_KEY,
     HELIUS_DISCONNECT_ALERT_AFTER,
@@ -39,6 +44,7 @@ from config import (
 )
 from logging_setup import get_logger, redact_secrets
 from sources.base import SourceResult, TokenSource
+from sources.bot_markers import apply_bot_observations, extract_bot_observations
 from sources.holder_snapshot import fetch_holder_snapshot
 from store import norm_address
 
@@ -402,11 +408,11 @@ def extract_transfer_edges(
 
 
 def apply_helius_intel(store: Any, mints: list[str], intel: dict[str, Any] | None) -> None:
-    """Write dev labels, holder snapshots, and transfer edges for enqueued mints.
+    """Write dev labels, holder snapshots, transfer edges, and bot markers.
 
     Labels and edges whose mint is not in this batch are ignored. whale_top10
     is only the owner wallet of a snapshot row, never a bare token account and
-    never a known program id.
+    never a known program id. Bot markers label only when a heuristic hits.
     """
     if not intel:
         return
@@ -469,6 +475,14 @@ def apply_helius_intel(store: Any, mints: list[str], intel: dict[str, Any] | Non
                 kept.append(edge)
         if kept:
             store.insert_transfer_edges(kept)
+    observations = intel.get("bot_observations")
+    if isinstance(observations, list) and observations:
+        apply_bot_observations(
+            store,
+            mints,
+            observations,
+            skip_addresses=programs,
+        )
 
 
 def enqueue_solana_mints(
@@ -837,6 +851,8 @@ class HeliusListener:
 
         Holder RPC runs only when the flag is on, and only for these confirmed
         mints. A snapshot failure leaves that mint out of `snapshots`.
+        Bot markers parse this same transaction when their flag is on. They
+        do not call RPC. The flag off leaves `bot_observations` unset.
         """
         recorded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         side: dict[str, Any] = {
@@ -846,6 +862,14 @@ class HeliusListener:
             ),
             "snapshots": {},
         }
+        if BOT_MARKERS_ENABLED:
+            side["bot_observations"] = extract_bot_observations(
+                tx,
+                signature=signature,
+                recorded_at=recorded_at,
+                mints=mints,
+                skip_addresses=known_program_ids(),
+            )
         if not HOLDER_SNAPSHOT_ENABLED:
             return side
         http_url = default_http_url(self.api_key)

@@ -30,7 +30,7 @@ from history import (  # noqa: E402
     utc_hours_ago_iso,
 )
 from risk import count_g13_tagged_tokens, format_g13_operator_line  # noqa: E402
-from store import Store, format_intel_observe_line  # noqa: E402
+from store import Store, format_bot_observe_line, format_intel_observe_line  # noqa: E402
 
 
 def build_context(
@@ -119,6 +119,11 @@ def build_context(
     except Exception as exc:  # noqa: BLE001
         intel = {"available": False, "error": str(exc)}
     intel_ready = bool(intel.get("available"))
+    try:
+        bot = store.bot_observe_counts()
+    except Exception as exc:  # noqa: BLE001
+        bot = {"available": False, "error": str(exc)}
+    bot_ready = bool(bot.get("available"))
     return {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": "dexscreener-crawler",
@@ -137,10 +142,13 @@ def build_context(
             "labeled_dev_n": intel.get("labeled_dev_n") if intel_ready else None,
             "holder_snapshot_n": intel.get("holder_snapshot_n") if intel_ready else None,
             "tokens_with_top10": intel.get("tokens_with_top10") if intel_ready else None,
+            "bot_suspect_n": bot.get("bot_suspect_n") if bot_ready else None,
+            "bot_edge_n": bot.get("bot_edge_n") if bot_ready else None,
             "cycle_number": store.get_cycle_number(),
         },
         "hot_liquidity_1h": hot_liq,
         "intel_observe": intel,
+        "bot_observe": bot,
         "top_scores": [dict(r) for r in top],
         "low_scores": [dict(r) for r in low],
         "history_samples": hist_samples,
@@ -161,6 +169,7 @@ def to_markdown(ctx: dict[str, Any]) -> str:
         ),
         format_g13_operator_line((ctx.get("stats") or {}).get("g13_high_apy_n")),
         format_intel_observe_line(ctx.get("intel_observe")),
+        format_bot_observe_line(ctx.get("bot_observe")),
         f"",
         f"## Stats",
         f"",
