@@ -82,7 +82,12 @@ def check_daily_loss(
     daily_loss_limit_usd: Optional[float] = None,
     **_: Any,
 ) -> dict[str, Any]:
-    """当日已实现亏损熔断（USD；None=关）。"""
+    """当日已实现亏损熔断（USD；None=关）。
+
+    拒绝时 reason 固定为 ``daily_loss``。``today`` / ``pnl`` / ``limit`` 在
+    ``detail``，不拼进 reason，便于回执与 ``order_events`` 稳定分成
+    ``risk_rejected:daily_loss``。阈值仍是 ``pnl < -limit`` 才拒。
+    """
     if daily_loss_limit_usd is None:
         return {"ok": True}
     today = _utc_now().date().isoformat()
@@ -97,7 +102,11 @@ def check_daily_loss(
             continue
     limit = float(daily_loss_limit_usd)
     if pnl < -limit:
-        return {"ok": False, "reason": f"daily_loss:{today}:{pnl}<{-limit}"}
+        return {
+            "ok": False,
+            "reason": "daily_loss",
+            "detail": {"today": today, "pnl": pnl, "limit": limit},
+        }
     return {"ok": True, "note": "daily_loss skeleton (off unless limit set)"}
 
 

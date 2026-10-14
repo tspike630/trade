@@ -9,6 +9,8 @@
 
 看板旁证（PR #45）记下的纸面侧例：胜率约一半仍可净亏；最差单笔约 **−84**；剔除最差后早段盈利被抹掉。那是观察，不是周检样本。
 
+2026-10-14 纸面旁证（**不算有效性**，挂到 2026-10-19 周检）：实现约 **−317**。主因是 `stop_loss` ×3 约 **−305**；次要是 `max_hold` ×40 约 **−12**。当时空仓。`order_events` 已有 **1** 次日亏拒绝，reason 形如 `daily_loss:2026-10-14:…<-200.0`。日亏闸是保护，不是失效。信号或成交量不等于盈亏。此后新拒绝的 reason 是稳定键 `daily_loss`，`today` / `pnl` / `limit` 写在 detail，看板分成 `risk_rejected:daily_loss`。不据此改 `EXECUTION_DAILY_LOSS_USD`、TP/SL/hold 或 PM 数值。
+
 同层索引：指标层纪律在 `crawler/INDICATORS_AUDIT.md`，采集侧在 `crawler/STABILIZE.md`「警示事例 → 采集侧」，决策侧在 `DECISION_ENGINE_WARNING_CASES.md`（PR #47）。调研映射（M-4 / M-5 / M-7）在 [`RESEARCH_MAPPING.md`](RESEARCH_MAPPING.md)。E-2 / C4 `target_band_failover` 已登记、不改运行时，见 [`WAITING_ITEMS.md`](WAITING_ITEMS.md)。
 
 ## 三条警示 → 执行侧
@@ -62,7 +64,7 @@ PM 拒绝发生在校验通过之后。`validation_ok=1`，`validation_errors` �
 
 回执 `receipt_json.status` 是 `pm_rejected`，`error` 与事件里的 reason 相同。`execution_log.status` 因为有执行错误而写成 `rejected`。
 
-预交易风控拒绝走同一条事件，`stage='risk'`，reason 形如 `max_open:<strategy>:<n>>=<limit>` 或 `daily_loss:<date>:<pnl><-<limit>`。这些也不进 `validation_errors`。
+预交易风控拒绝走同一条事件，`stage='risk'`。`max_open` 的 reason 仍形如 `max_open:<strategy>:<n>>=<limit>`。日亏拒绝的 reason 是稳定键 `daily_loss`（date / pnl / limit 不在 reason 里），`detail` 带 `today`、`pnl`、`limit`。回执 `risk[]` 同形，看板把它分成 `risk_rejected:daily_loss`。10-14 那条历史行仍是 `daily_loss:<date>:<pnl><-<limit>`，按前缀 `daily_loss` 归并。这些也不进 `validation_errors`。
 
 对照：purpose 门禁（`purpose_sample` / `purpose_missing` / `purpose_invalid`）会写入 `validation_errors`，事件 `stage='purpose'`。校验失败是 `stage='validation'`。10-19 旁证如果只扫 `validation_errors`，会漏掉 PM 与风控拒绝。
 

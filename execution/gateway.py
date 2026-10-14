@@ -73,6 +73,25 @@ _DECISION_LOG_COLUMNS = (
 CLAIM_STALE_SEC = 60.0
 
 
+def _risk_rejected_event_detail(risk_reasons: list[dict[str, Any]]) -> dict[str, Any]:
+    """``order_events`` detail for a pre-trade risk reject.
+
+    ``reason`` is the checker key (``daily_loss`` stays exact). Date, pnl, and
+    the configured limit stay under ``detail`` when the checker supplied them.
+    ``stage=risk`` plus ``reason=daily_loss`` maps to ``risk_rejected:daily_loss``.
+    """
+    payload: dict[str, Any] = {
+        "stage": "risk",
+        "reason": ";".join(str(item.get("reason") or "") for item in risk_reasons),
+    }
+    for item in risk_reasons:
+        extra = item.get("detail")
+        if str(item.get("reason") or "") == "daily_loss" and isinstance(extra, dict):
+            payload["detail"] = extra
+            break
+    return payload
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -420,17 +439,7 @@ class ExecutionGateway:
             return events
         events.append(("validated", {"validation_ok": True}))
         if risk_reasons:
-            events.append(
-                (
-                    "rejected",
-                    {
-                        "stage": "risk",
-                        "reason": ";".join(
-                            str(r.get("reason") or "") for r in risk_reasons
-                        ),
-                    },
-                )
-            )
+            events.append(("rejected", _risk_rejected_event_detail(risk_reasons)))
             return events
         if executor == PM_GATE and exec_error:
             events.append(
