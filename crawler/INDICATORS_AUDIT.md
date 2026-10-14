@@ -107,7 +107,7 @@ python -m api_server   # 只读 API + admin
 
 - 本文 **INDICATORS_AUDIT.md**（运维入口；含「警示事例 → 指标层纪律」）
 - STEP1 / STEP2 / STEP3 / P0 / LIGHT / AUTH_JEV（P-4 定价错误在 STEP2）
-- **INDICATORS_FACTOR_CANDIDATES.md** — 机构供需 P-3 / P-4；艾略特 E-1 / E-4 / E-5 与拒绝项 N-1..N-6（指针见本文「艾略特候选」）。**M-2** 周跑只在 IC 有限时把双侧结果写入观察 jsonl，`gate_candidate` 仍不改 `accepted`。权重 0，不算有效性
+- **INDICATORS_FACTOR_CANDIDATES.md** — 机构供需 P-3 / P-4；艾略特 E-1 / E-4 / E-5 与拒绝项 N-1..N-6（指针见本文「艾略特候选」）；江恩 G-5 换手率 A 类候选，G-7 / G-8 仅登记并阻断，江恩 N-1..N-6 另表拒绝（指针见本文「江恩候选」）。**M-2** 周跑只在 IC 有限时把双侧结果写入既有观察 jsonl，`gate_candidate` 仍不改 `accepted`。本次不新增观察 jsonl。权重 0，不算有效性
 - **INDICATORS_OPERATORIZATION.md** — **M-3** 时间序列算子硬规则（窗口在 t 收口；禁止日合计 / 未来分母）
 - 本文「统计功效脚注（M-1）」— n≥15 不改；约 350 个已结算样本才够谈 α≈0.02
 - README「Indicators 旁路」节 + 命令总索引
@@ -159,6 +159,10 @@ Foresight Arena（arXiv 2605.00420）要检测相对市场共识 α≈0.02 的 e
 ### 艾略特候选（指针）
 
 E-1（`fib_retrace_0618` / `fib_retrace_05` / `fib_retrace_0382`）、E-4、E-5 与拒绝项 N-1..N-6 登记在 `INDICATORS_FACTOR_CANDIDATES.md`。E-1 是 A 类 factor_loop 候选，依赖尚未实现的波段原语（N 根 K 线局部极值对，OHLC）；正反方向走 `calibrate_direction`（M-2），时间序列走 `INDICATORS_OPERATORIZATION.md`（M-3），回测含滑点 / 成本。E-4 只在同价位多因子命中相对单因子有 up_1h 增益时保留。E-5 是量能斜率 / 背离观察，`pair_history` 已有 volume，不是新因子。E-3：因子只辅助确认，决策与 PM 硬规则拥有下单。meme / 新币若 up_1h 无增益，E-1 退役，不恋战。10-19 之后且校准与算子化完成才谈 A 类。E-2 归执行，不在指标层。权重 0。不算有效性。不写看板代码。不实现 Elliott 检测器。
+
+### 江恩候选（指针）
+
+G-5（`turnover_spike_v0` / `turnover_exhaust_v0`，G-15 同族不另给 id）登记为 A 类 factor_loop 候选。公式是 `volume_h24 / marketCap`（备选 `/ fdv`），对齐 JEV `up_1h`，周检仍是 n≥15 / unique≥10 / 1h≥55%。`pair_history` 已有 `volume_h24` / `volume_h1` / `price_usd`；`pairs` / `tokens` / `pair_history` 都没有市值或 FDV 列，全库不读 `marketCap` / `fdv`。缺口已写在候选文，本次不补采集器、不写检测器。G-7 `breakout_second` 阻断到链上突破定义写死（N 根新高 vs 历史池，防 look-ahead，与 E-1 波段原语同一 TODO）。G-8 `rel_strength` 阻断到市场基准写死（池均值 vs BTC）。江恩 N-1..N-6（案例、做空、人工画线、日历、时间预言、期货）另表拒绝，与艾略特 N 表不是同一组。不改 `gate_candidate` / `accepted`，不 INSERT `factor_candidates.db`，不新增观察 jsonl。权重 0。不算有效性。
 
 ### 学习 → 改可观测（2026-10-14）
 
