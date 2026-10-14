@@ -91,14 +91,36 @@ Polymarket 经验落地计划第四节的三条警示，映射到采集侧时只
 | 洗盘 / 预言机单点 | 行情已是多源：DexScreener 主路径、Helius 链上线索、CCXT 旁路（`CCXT_SIDECHANNEL.md`）。周检人工核对留给人。**C1** 第二个 Telegram bot 保持 observe-only，不接入决策、不改现有推送路由。**P-4 / P-5** 不归采集。 |
 | 未 enrich 的 `new_listing` | Helius 在 `tokens/v1` enrich 之前写入 `pending_enrich`，并可能发 `new_listing`（severity `info`，文案是 mint hint）。这条告警和未完成的 enrich 队列都不是可交易信号。流动性以 enrich 后的 `pair_history.liquidity_usd` 为准；payload 没有该字段则仍为 NULL。 |
 
-归属：采集不拥有 **P-1 / P-2 / P-4 / P-5**。对 **P-3** 只提供上一节的热层流动性覆盖作为 10-19 旁证。以上全部标记为不算有效性。
+归属：采集不拥有 **P-1 / P-2 / P-4 / P-5**。对 **P-3** 只提供上一节的热层流动性覆盖作为 10-19 旁证。以上全部标记为不算有效性。10-14 纸面旁证与文献边界见下一节。
+
+## 学习/反思（10-14）
+
+2026-10-14 HKT paper 的采集侧登记。**不算策略有效性。不盘中改参。** 不改运行参数、`ALERT_MIN_SCORE`、评分权重、现有 Telegram 路由、`history.extract_metrics` 的流动性写法、爬虫 loop。止损、日亏闸、仓位仍不归采集。
+
+纸面旁证：权益约 $9683（相对 $10k 起点约 −3.2%），当时持仓已平；已平 43 笔；已实现约 −$317，主因 `stop_loss` ×3 约 −305（最差单笔约 −$190）；日亏闸已触发。回撤主因是止损打穿和日亏闸，不是采集饿死。当时供流正常（PID 约 650835，心跳正常，cycle 约 4400+）。看板把 `daily_loss` 从 risk 串拆开，见 [#60](https://github.com/tspike630/trade/pull/60)。供流正常不等于可以调参。
+
+#44 热层：当日 hot 1h 流动性缺失约 32%，与上一节约 34% 同属 >25% WARN，仍记约 30%+。这仍是 **10-19 周检旁证**，不是改参依据。DexScreener 省略 `liquidity` 时 `liquidity_usd` 留 NULL，不编造；决策对缺失流动性仍以 `no_liquidity` fail-closed。`ALERT_MIN_SCORE` 与评分权重不动。
+
+文献只观察，不接入。第二批评的是 LLM 交易代理、预测源或多智能体扇出：LiveTradeBench、When Agents Trade、Prophet Arena、FinPos、PredictionMarketBench。此前一批同样只观察：Profit Mirage、StockBench、MAS / adaptive BTC。采集不新增 LLM 预测源，不做 agent 扇出。行情保持规则快照：DexScreener 主路径、Helius 链上线索、CCXT 旁路（`CCXT_SIDECHANNEL.md`）。文献里的收益和代理排名不是本系统参数。
+
+| 文献 | 采集侧 |
+|---|---|
+| [LiveTradeBench](https://arxiv.org/abs/2511.03628) | LLM 实盘组合分配评测。不把模型输出当新行情源。 |
+| [When Agents Trade](https://arxiv.org/abs/2510.11695) | 多市场 agent 竞技场。不扇出交易 agent。 |
+| [Prophet Arena](https://arxiv.org/abs/2510.17638) | LLM 对预测市场事件报概率。不接入预测源。 |
+| [FinPos](https://arxiv.org/abs/2510.27251) | 持仓感知的交易 agent。仓位不归采集。 |
+| [PredictionMarketBench](https://arxiv.org/abs/2602.00133) | 预测市场订单簿回放。不改采集 loop。 |
+| [Profit Mirage](https://arxiv.org/abs/2510.07920)、[StockBench](https://arxiv.org/abs/2510.02209) | 回测收益会在知识窗口外消失；LLM 股票代理多数跑不赢买入持有。不把文献收益写成有效性。 |
+| [MAS / adaptive BTC](https://arxiv.org/abs/2510.08068) | 多 agent 加口头反馈调 BTC。不接 Reflect agent，不改权重。 |
+
+以上全部 **不算有效性**。不盘中改参。
 
 ## 警示事例 → 复盘侧（指针）
 
 复盘拥有平仓归因分桶，以及 **P-2 / P-3** 的 10-19 旁证。全文在 `REVIEW_WARNING_CASES.md`（仓库 `docs/REVIEW_WARNING_CASES.md` 同文）。
 
-- **P-2**（复盘 + 指标）：10-19 真库 IC/IR 首跑之后只写权重更新设计。权重保持 0，不激活。上一表「止损与仓位是 P-2」只表示采集不改止损；执行单上的 P-2 不是采集项。
-- **P-3**：复盘记 `min_liq` 拒绝桶、cooldown 是否生效，以及平仓 `liq_<50k` vs `≥50k`。旁证，不是有效性。采集只交上一节的热层覆盖率。
+- **P-2**（复盘 + 指标）：10-19 真库 IC/IR 首跑之后只写权重更新设计。权重保持 0，不激活。「警示事例 → 采集侧」表里「止损与仓位是 P-2」只表示采集不改止损；执行单上的 P-2 不是采集项。
+- **P-3**：复盘记 `min_liq` 拒绝桶、cooldown 是否生效，以及平仓 `liq_<50k` vs `≥50k`。旁证，不是有效性。采集只交「热层流动性覆盖」那一节的覆盖率。
 - 复盘不拥有 PM 仓位比例 / 回撤、JEV 错价论述、采集流动性覆盖。
 
 不算有效性。此处不加参数。
