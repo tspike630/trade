@@ -6,7 +6,7 @@
 - **只决策、不执行**：只生成标准化信号并写入 `decision_log`；**不调用** `paper_trade` / `live_trade`；默认 `--dry-run`。
 - **只读下层数据**：指标用 SQLite `mode=ro` 读 `token_indicators`；可选读 `pairs.raw_json` 快照。**不写** tokens / pairs / pair_history / token_indicators。
 - **策略插件化**：每个策略一个文件，注册进 `STRATEGY_REGISTRY`；加策略不改引擎核心。
-- **风控占位**：`RiskManager` Step 1 透传（`risk_passed=True`），接口预留，不做实质校验。
+- **入场风控**：`RiskManager` 对 buy 做流动性地板（`DECISION_MIN_LIQ_USD`，默认 50000）和可选冷却（`DECISION_COOLDOWN_SEC`，代码默认 0）。未通过的 buy 在写入 `decision_log` 前丢弃。卖出不过滤。不改 JEV 强度默认、权重或 purpose。对照表见 `DECISION_ENGINE_FILTER_PARITY.md`。
 - **零侵入**：不改 indicators / 爬虫主循环 / 权重 / hooks；不订 `INDICATORS_ON_UPDATE_HOOK`；不打印密钥（含 `API_SECRET` / `JEV_API_Key` 等）。
 
 ## 新增文件
@@ -19,7 +19,7 @@ decision_engine/
   core/
     engine.py              # 主循环：读数 → 策略 → 风控 → 信号总线
     data_adapter.py        # 只读 token_indicators；可选 get_pair_snapshot
-    risk_manager.py        # passthrough 占位
+    risk_manager.py        # 买入流动性地板 + 可选冷却
     signal_bus.py          # 标准化信号 + decision_log 写入
   strategies/
     __init__.py            # STRATEGY_REGISTRY
@@ -67,7 +67,7 @@ DECISION_ENGINE_STEP1_RESULT.md
 | `chain_id` / `token_address` | TEXT | 标的 |
 | `size_pct` | REAL | 仓位占比 |
 | `reason` | TEXT | 触发原因 |
-| `risk_passed` | INTEGER | Step 1 恒为 1 |
+| `risk_passed` | INTEGER | 写入的行是通过风控的（1）。`no_liquidity` / `liq_below_min` / cooldown 未通过的 buy 在 emit 前丢弃，不落行 |
 | `mode` | TEXT | `dry_run` / `live_stub` |
 | `raw_json` | TEXT | 完整信号 JSON |
 
@@ -90,7 +90,7 @@ DECISION_ENGINE_STEP1_RESULT.md
 | `DECISION_DEFAULT_STRATEGY` | `jev_strength_v1` | 默认策略 |
 | `DECISION_JEV_MIN_STRENGTH` | `0.3` | JEV 阈值 |
 | `DECISION_JEV_POSITION_PCT` | `0.05` | 信号仓位 |
-| `DECISION_COOLDOWN_SEC` | `0` | 同一 `(strategy, chain, token)` 买入冷却秒数。0 = 关闭，dry-run 观察行为不变。Step B（paper）应设为约等于 tick 间隔，避免每个 tick 对同一 token 重复开仓 |
+| `DECISION_COOLDOWN_SEC` | `0` | 同一 `(strategy, chain, token)` 买入冷却秒数。代码默认 `0` = 关闭。临时 paper 观察在进程环境里设 `3600`，与回测 / paper 的 `max_hold_min=60`、`time_exit` 默认 `max_hold_seconds=3600` 对齐。不要把代码默认改成 3600。重启配方见 `DECISION_ENGINE_DRYRUN_24H.md`。冷却状态在进程内，重启清零 |
 | `DECISION_MIN_LIQ_USD` | `50000` | 实盘/dry-run 买入流动性下限（USD），与回测 `FilterConfig.min_liq=50000` 对齐。`liquidity_usd` 缺失（`no_liquidity`）或低于下限（`liq_below_min`）的 buy 在写入 `decision_log` 前丢弃。卖出不过滤。只做风险入场过滤，不改变 JEV 强度阈值、权重或 purpose |
 | `DECISION_USE_API_FALLBACK` | `0` | 是否走 API（Step 1 默认关） |
 
@@ -105,7 +105,8 @@ DECISION_ENGINE_STEP1_RESULT.md
 # 跑 N tick
 .venv/bin/python -m decision_engine.run --strategy jev_strength_v1 --dry-run --ticks 3 --interval 2
 
-# 调低阈值以便看到信号（库内 max jev_strength 可能 < 0.3）
+# 调低阈值以便看到信号（库内 max jev_strength 可能 < 0.3）。
+# 低于默认 0.3 且不传 --purpose 时，purpose 写成 sample，不是 paper 候选。
 .venv/bin/python -m decision_engine.run --strategy jev_strength_v1 --dry-run --once --min-jev-strength 0.15
 
 # 持续循环（Ctrl+C 退出）
@@ -133,9 +134,13 @@ DECISION_ENGINE_STEP1_RESULT.md
 
 默认阈值下「无信号」属预期（强度未达 0.3），不是故障。
 
+## Backtest ↔ live filter parity
+
+清单在 `DECISION_ENGINE_FILTER_PARITY.md`。`min_liq=50000` 已由 live `RiskManager` 执行（PR #41，日志 `min_liq_usd=` / `reason=liq_below_min` / `reason=no_liquidity`）。`min_price=1e-6`、`min_coverage=10`、以及周检对 coverage 缺失的 fail-closed，live 都还没执行。不要在本步笔记里新造阈值。
+
 ## 后续（非本 Step）
 
 - Step 2：历史回测框架 + 对接 `pair_history` / `paper_trade` 账本
 - Step 3：多策略并行 + 实时模拟盘
 - Step 4：小额实盘灰度（须过五层闸门）
-- 实质风控、事件 hook 订阅、API 写路径 — 均非 Step 1
+- 事件 hook 订阅、API 写路径 — 均非 Step 1。买入流动性地板是之后的 PR #41，见 `DECISION_ENGINE_FILTER_PARITY.md`

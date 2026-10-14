@@ -10,7 +10,7 @@
 - **零侵入采集与指标层**：不改 `main.py`、`indicators/`、`auto_hooks`、24h dry-run、采样、周检脚本。
 - **不接实盘**：不调用 `live_trade`；不改 `paper_trade` 默认库；账本独立（接口形态对齐 `PaperLedger`，便于日后对接）。
 - **策略插件化**：复用 `BaseStrategy.on_tick`；A/B/C 注册进 `STRATEGY_REGISTRY`。
-- **过滤钩子默认开**：与周检一致 — `liquidity≥50k`、`coverage≥10`、`min_price=1e-6`（coverage 缺失时默认 fail-open，可用 `--strict-coverage`）。
+- **过滤钩子默认开**：与周检一致 — `liquidity≥50k`、`coverage≥10`、`min_price=1e-6`（coverage 缺失时默认 fail-open，可用 `--strict-coverage`）。live 侧目前只对齐了 `min_liq`，对照表见 `DECISION_ENGINE_FILTER_PARITY.md`。
 - **不打印密钥**。
 
 ## 与 Step1 / 周检 / 根目录 backtest.py 的关系
