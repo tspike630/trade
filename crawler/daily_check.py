@@ -45,6 +45,7 @@ from history import (  # noqa: E402
     format_rate_pct,
     hot_liq_coverage_level,
     liquidity_coverage,
+    market_cap_null_coverage,
     utc_hours_ago_iso,
 )
 from store import Store  # noqa: E402
@@ -1056,6 +1057,8 @@ def check_hot_liquidity_coverage(store: Store, report: CheckReport) -> None:
     Level uses the last 1h hot tier. Last 24h is context only.
     Not strategy validity — 10-19 weekly check may use the rates as 旁证.
     Does not invent liquidity. NULL stays the no_liquidity fail-closed path.
+    `mcap_hot_1h` is an observe count of NULL market_cap / fdv. It does not
+    change this check's level.
     """
     flags = {
         "counts_toward_strategy_validity": False,
@@ -1077,6 +1080,11 @@ def check_hot_liquidity_coverage(store: Store, report: CheckReport) -> None:
         hot_24h = liquidity_coverage(
             store._conn,
             since_iso=utc_hours_ago_iso(HOT_LIQ_CONTEXT_HOURS),
+            tier="hot",
+        )
+        mcap_1h = market_cap_null_coverage(
+            store._conn,
+            since_iso=utc_hours_ago_iso(HOT_LIQ_WINDOW_HOURS),
             tier="hot",
         )
     except Exception as exc:  # noqa: BLE001
@@ -1101,13 +1109,22 @@ def check_hot_liquidity_coverage(store: Store, report: CheckReport) -> None:
         note = " hot 1h 无快照（不 FAIL）。"
     elif thin:
         note = f" n<{HOT_LIQ_FAIL_MIN_N} 样本薄，高缺失不升 FAIL。"
+    mcap_note = ""
+    if mcap_1h.get("available"):
+        mcap_note = (
+            " G-5 denom hot 1h market_cap NULL="
+            f"{format_rate_pct(mcap_1h.get('market_cap_null_rate'))} "
+            f"fdv NULL={format_rate_pct(mcap_1h.get('fdv_null_rate'))} "
+            f"n={int(mcap_1h.get('n') or 0)}"
+            "（观察，不改本检查级别，不计有效性）。"
+        )
     detail = (
         f"hot 1h n={hot_1h['n']} missing={format_rate_pct(hot_1h['missing_rate'])} "
         f"(NULL/≤0) <50k={format_rate_pct(hot_1h['below_min_rate'])} "
         f">=50k={format_rate_pct(hot_1h['ge_min_rate'])} "
         f"price_present={format_rate_pct(hot_1h['price_present_rate'])}; "
         f"hot 24h n={hot_24h['n']} missing={format_rate_pct(hot_24h['missing_rate'])}; "
-        f"pending_enrich={pending}.{note} "
+        f"pending_enrich={pending}.{note}{mcap_note} "
         f"不计策略有效性（{EVIDENCE_ROLE_SIDE}）"
     )
     report.add(
@@ -1119,6 +1136,7 @@ def check_hot_liquidity_coverage(store: Store, report: CheckReport) -> None:
             "pending_enrich": pending,
             "hot_1h": hot_1h,
             "hot_24h": hot_24h,
+            "mcap_hot_1h": mcap_1h,
         },
     )
 

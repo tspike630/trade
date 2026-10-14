@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from history import pair_history_column_sql
 from logging_setup import get_logger
 from store import norm_address, norm_chain
 
@@ -453,9 +454,9 @@ class IndicatorStore:
         chain_id = norm_chain(chain_id)
         pair_address = norm_address(pair_address)
         limit = max(1, min(int(limit), 10000))
-        sql = """
-            SELECT id, chain_id, pair_address, token_address, recorded_at,
-                   price_usd, volume_h24, volume_h1, liquidity_usd, txns_h24, tier
+        columns = pair_history_column_sql(self._table_columns("pair_history"))
+        sql = f"""
+            SELECT {columns}
             FROM pair_history
             WHERE chain_id = ? AND pair_address = ?
         """
@@ -479,9 +480,9 @@ class IndicatorStore:
         chain_id = norm_chain(chain_id)
         token_address = norm_address(token_address)
         limit = max(1, min(int(limit), 10000))
-        sql = """
-            SELECT id, chain_id, pair_address, token_address, recorded_at,
-                   price_usd, volume_h24, volume_h1, liquidity_usd, txns_h24, tier
+        columns = pair_history_column_sql(self._table_columns("pair_history"))
+        sql = f"""
+            SELECT {columns}
             FROM pair_history
             WHERE chain_id = ? AND token_address = ?
         """
