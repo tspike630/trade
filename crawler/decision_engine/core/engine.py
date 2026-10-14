@@ -70,6 +70,10 @@ class DecisionEngine:
                 "emitted": 0,
             }
 
+        # Shared buy choke point: every strategy's candidates pass through
+        # RiskManager before SignalBus.emit. Liquidity comes from the scanned
+        # rows (adapter batch lookup), so tech/combined/jev do not each filter.
+        self._stamp_buy_liquidity(candidates, hot)
         passed = self.risk.filter(candidates)
         emitted = self.bus.publish_many(passed)
         log.info(
@@ -85,6 +89,29 @@ class DecisionEngine:
             "candidates": len(candidates),
             "emitted": len(emitted),
         }
+
+    def _stamp_buy_liquidity(
+        self,
+        candidates: list[dict[str, Any]],
+        hot: list[dict[str, Any]],
+    ) -> None:
+        """Copy scanned-row liquidity onto buys. Missing row → leave unset (fail closed)."""
+        by_token: dict[tuple[str, str], Any] = {}
+        for row in hot:
+            key = (
+                str(row.get("chain_id") or ""),
+                str(row.get("token_address") or ""),
+            )
+            by_token[key] = row.get("liquidity_usd")
+        for sig in candidates:
+            if str(sig.get("action") or "").lower() != "buy":
+                continue
+            key = (
+                str(sig.get("chain_id") or ""),
+                str(sig.get("token_address") or ""),
+            )
+            if key in by_token:
+                sig["liquidity_usd"] = by_token[key]
 
     def run(
         self,

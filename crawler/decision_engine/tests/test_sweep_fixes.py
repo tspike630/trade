@@ -303,26 +303,28 @@ class HotFreshnessTests(unittest.TestCase):
 
 
 class CooldownTests(unittest.TestCase):
-    def test_default_zero_keeps_repeat_buys(self) -> None:
-        risk = RiskManager(cooldown_sec=0)
+    def _buy(self, **extra: object) -> dict:
+        # At the floor so these tests still exercise cooldown, not the liq gate.
         buy = {
             "strategy_id": "jev_strength_v1",
             "action": "buy",
             "chain_id": "solana",
             "token_address": "tok",
+            "liquidity_usd": 50_000.0,
         }
+        buy.update(extra)
+        return buy
+
+    def test_default_zero_keeps_repeat_buys(self) -> None:
+        risk = RiskManager(cooldown_sec=0, min_liq_usd=50_000)
+        buy = self._buy()
         self.assertEqual(len(risk.filter([dict(buy), dict(buy)])), 2)
 
     def test_cooldown_drops_repeat_buy_not_sell(self) -> None:
-        risk = RiskManager(cooldown_sec=60)
-        buy = {
-            "strategy_id": "jev_strength_v1",
-            "action": "buy",
-            "chain_id": "solana",
-            "token_address": "tok",
-        }
+        risk = RiskManager(cooldown_sec=60, min_liq_usd=50_000)
+        buy = self._buy()
         self.assertEqual(len(risk.filter([dict(buy), dict(buy)])), 1)
-        sell = dict(buy, action="sell")
+        sell = dict(buy, action="sell", liquidity_usd=None)
         self.assertEqual(len(risk.filter([sell])), 1)
         other = dict(buy, strategy_id="other")
         self.assertTrue(risk.check(other)["risk_passed"])

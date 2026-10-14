@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,6 +55,43 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 def _iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _safe_float(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def liquidity_usd_from_raw(raw: Any) -> float | None:
+    """Read liquidity.usd from a pairs.raw_json blob.
+
+    Matches get_pair_snapshot: only a JSON object with a dict ``liquidity``
+    contributes. A missing pair, bad JSON, or a non-dict liquidity is None
+    so the live entry floor can fail closed.
+    """
+    parsed: Any
+    if isinstance(raw, dict):
+        parsed = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    else:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    liquidity = parsed.get("liquidity")
+    if not isinstance(liquidity, dict):
+        return None
+    return _safe_float(liquidity.get("usd"))
 
 
 class IndicatorDataAdapter:
@@ -253,7 +291,7 @@ class IndicatorDataAdapter:
                 "on" if join_seen else "missing",
                 "on" if has_tech else "missing",
             )
-            return [dict(r) for r in rows]
+            return self._attach_liquidity([dict(r) for r in rows])
 
         if n_hot > 0:
             log.info(
@@ -278,7 +316,7 @@ class IndicatorDataAdapter:
             limit,
             len(rows),
         )
-        return [dict(r) for r in rows]
+        return self._attach_liquidity([dict(r) for r in rows])
 
     def get_indicators(self, chain_id: str, token_address: str) -> dict[str, Any] | None:
         if not self._table_exists("token_indicators"):
@@ -311,16 +349,80 @@ class IndicatorDataAdapter:
             return None
         out = dict(row)
         raw = out.get("raw_json")
+        out["liquidity_usd"] = liquidity_usd_from_raw(raw)
         if isinstance(raw, str) and raw.strip():
             try:
                 parsed = json.loads(raw)
-                out["price_usd"] = parsed.get("priceUsd")
-                liq = parsed.get("liquidity") or {}
-                if isinstance(liq, dict):
-                    out["liquidity_usd"] = liq.get("usd")
-                else:
-                    out["liquidity_usd"] = None
             except (json.JSONDecodeError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                out["price_usd"] = parsed.get("priceUsd")
+            else:
                 out["price_usd"] = None
-                out["liquidity_usd"] = None
         return out
+
+    def _liquidity_by_pair(
+        self, keys: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], float | None]:
+        """Batch pairs.raw_json → liquidity_usd. One query per chunk, not per token."""
+        found: dict[tuple[str, str], float | None] = {}
+        if not keys:
+            return found
+        columns = self._table_columns("pairs")
+        if not {"chain_id", "pair_address", "raw_json"} <= columns:
+            return found
+        chunk_size = 80
+        for start in range(0, len(keys), chunk_size):
+            chunk = keys[start : start + chunk_size]
+            clause = " OR ".join("(chain_id = ? AND pair_address = ?)" for _ in chunk)
+            params: list[Any] = []
+            for chain_id, pair_address in chunk:
+                params.extend((chain_id, pair_address))
+            try:
+                fetched = self.conn.execute(
+                    f"SELECT chain_id, pair_address, raw_json FROM pairs WHERE {clause}",
+                    params,
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                log.warning("liquidity lookup failed: %s", exc)
+                return found
+            for row in fetched:
+                found[(str(row["chain_id"]), str(row["pair_address"]))] = (
+                    liquidity_usd_from_raw(row["raw_json"])
+                )
+        return found
+
+    def _attach_liquidity(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Set liquidity_usd on scanned indicator rows. Missing pair/usd → None."""
+        if not rows:
+            return rows
+        keys: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
+            chain_id = str(row.get("chain_id") or "")
+            pair = row.get("primary_pair_address")
+            if not chain_id or pair is None or str(pair).strip() == "":
+                continue
+            key = (chain_id, str(pair))
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+        found = self._liquidity_by_pair(keys)
+        with_liq = 0
+        for row in rows:
+            chain_id = str(row.get("chain_id") or "")
+            pair = row.get("primary_pair_address")
+            if not chain_id or pair is None or str(pair).strip() == "":
+                row["liquidity_usd"] = None
+                continue
+            liquidity = found.get((chain_id, str(pair)))
+            row["liquidity_usd"] = liquidity
+            if liquidity is not None:
+                with_liq += 1
+        log.info(
+            "liquidity_usd attached rows=%s with_liq=%s missing=%s",
+            len(rows),
+            with_liq,
+            len(rows) - with_liq,
+        )
+        return rows
