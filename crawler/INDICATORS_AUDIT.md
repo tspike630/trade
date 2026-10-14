@@ -107,6 +107,7 @@ python -m api_server   # 只读 API + admin
 
 - 本文 **INDICATORS_AUDIT.md**（运维入口；含「警示事例 → 指标层纪律」）
 - STEP1 / STEP2 / STEP3 / P0 / LIGHT / AUTH_JEV（P-4 定价错误在 STEP2）
+- **INDICATORS_FACTOR_CANDIDATES.md** — 机构供需 P-3 吸筹区回踩 / P-4 新鲜度衰减：factor_loop 候选登记（文档 only，不接线，权重 0，不算有效性）
 - README「Indicators 旁路」节 + 命令总索引
 
 ---
