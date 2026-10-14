@@ -34,7 +34,7 @@
 | **P-4** JEV 错价（信号强度 ≠ 胜率） | **不归复盘。** `crawler/INDICATORS_STEP2.md`。 |
 | **P-5** Polymarket 共识概率观察候选 | **不归复盘。** 指标侧，当前未接线。 |
 | 采集热层流动性覆盖 | **不归复盘。** #44 / `crawler/STABILIZE.md`。复盘引用，不改覆盖率门槛。 |
-| **C3** 趋势出场 | **只观察。** 要立项先做 R3 回测。不盘中追 tp / sl / max_hold。 |
+| **C3** 趋势出场 | **只观察。** 要立项先做 R3 回测。不盘中追 tp / sl / max_hold。执行侧另有 C4 target_band_failover，见 execution/WAITING_ITEMS.md。 |
 
 采集文里「止损与仓位是 P-2」只表示采集不改止损。执行单上的 **P-2** 是本表这一行。
 

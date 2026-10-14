@@ -281,4 +281,6 @@ M-5 先选择后仓位且 Kelly / 方案 7 冻结、M-7 滑点档仍是成本模
 保持 R2-pending）is in [RESEARCH_MAPPING.md](RESEARCH_MAPPING.md). These notes
 are **不算有效性** until the 2026-10-19 weekly check. They do not change
 TP/SL/hold, slippage tiers, or PM numbers, and they do not enable
-`PM_MAX_PER_TOKEN_PCT`.
+`PM_MAX_PER_TOKEN_PCT`. E-2 / C4 `target_band_failover` is registered as
+WAITING / observe-only in [WAITING_ITEMS.md](WAITING_ITEMS.md); it does not
+change runtime.
