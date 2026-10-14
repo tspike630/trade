@@ -1117,7 +1117,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     ("交易", "频率"),
                     "span-6",
                     lambda: _v2_trade_freq(store),
-                    foot="G-1 江恩：日开仓次数 vs 实现盈亏 · 旁证",
+                    foot="G-1 江恩：日开仓次数 vs 实现盈亏 · 日切 HKT · 旁证",
                     tools=("14d",),
                 )
                 _v2_comp(
@@ -2186,7 +2186,7 @@ def _v2_trade_freq(store: DataStore) -> None:
         tones,
     )
     ui.label(
-        "G-1 旁证：交易次数↑通常损耗↑（江恩）；"
+        "G-1 旁证：日切 HKT；交易次数↑通常损耗↑（江恩）；"
         "对照冷却/max_open，不盘中改参，不算有效性。"
     ).classes("v2-note")
 
