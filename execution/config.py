@@ -37,5 +37,14 @@ EXECUTION_MAX_OPEN = int(os.getenv("EXECUTION_MAX_OPEN", "5"))
 # 当日已实现亏损熔断（USD）。未设置 → 不启用。不改变 EXECUTION_RISK_ENABLED 默认关。
 EXECUTION_DAILY_LOSS_USD = _env_float_or_none("EXECUTION_DAILY_LOSS_USD")
 
+
+def f1_circuit_enabled() -> bool:
+    """F-1 连亏熔断开关。缺省关。
+
+    订单路径不调用本函数。本版本即使把环境变量设为 1，也不拒单；
+    见 ``execution.streak.circuit_rejects_open``（恒为 False，无调用点）。
+    """
+    return _env_bool("EXECUTION_F1_CIRCUIT", False)
+
 # 订单事件流（方案5-2a；默认开——纯审计增强、零行为副作用，可关）
 EXECUTION_EVENTS_ENABLED = _env_bool("EXECUTION_EVENTS_ENABLED", True)

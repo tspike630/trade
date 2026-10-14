@@ -17,12 +17,14 @@ from logging_setup import get_logger
 from paper_trade import PaperLedger, latest_price, tick as paper_tick
 from store import fetch_latest_pair_price, fetch_pair_spot, norm_address, norm_chain
 
+from execution.close_observe import record_closed_position
 from execution.pricing import (
     buy_fill_price,
     liquidity_usd_from_raw,
     sell_fill_price,
     slippage_rate,
 )
+from execution.shadow_c3 import parse_meta, raise_peak
 
 log = get_logger("execution.paper_executor")
 
@@ -30,6 +32,18 @@ DEFAULT_TP_PCT = 10.0
 DEFAULT_SL_PCT = 5.0
 DEFAULT_MAX_HOLD_MIN = 60.0
 EXECUTOR_NAME = "paper"
+
+
+def _resolve_observe_db(observe_db: str | Path | None) -> Path | None:
+    """Execution ledger for F-1 / C3 rows. None skips those writes.
+
+    Peak updates still land on the paper position. The gateway passes its
+    ledger path; a bare PaperExecutor does not guess a production ledger.
+    """
+    if observe_db is None or not str(observe_db).strip():
+        return None
+    path = Path(observe_db).expanduser()
+    return path if path.is_absolute() else (Path.cwd() / path).resolve()
 
 
 def _env_paper_db_default() -> str:
@@ -134,6 +148,7 @@ class PaperExecutor:
         crawler_db: str | Path | None = None,
         ledger: PaperLedger | None = None,
         store: _CrawlerRO | None = None,
+        observe_db: str | Path | None = None,
     ) -> None:
         if crawler_db is None:
             crawler_db = DB_PATH
@@ -151,6 +166,7 @@ class PaperExecutor:
             if not self.paper_db.is_absolute():
                 self.paper_db = (Path.cwd() / self.paper_db).resolve()
             self.ledger = PaperLedger(self.paper_db)
+        self.observe_db = _resolve_observe_db(observe_db)
 
     def close(self) -> None:
         if self._owns_ledger:
@@ -276,6 +292,7 @@ class PaperExecutor:
                 "truncated": truncated,
                 "size_pct": size_pct,
                 "equity_usd": equity_usd,
+                "peak_price": mid,
             }
         )
         pid = self.ledger.open_position(
@@ -427,11 +444,13 @@ class PaperExecutor:
             return {"ok": False, "error": "no_price", "executor": EXECUTOR_NAME}
 
         fill_price = sell_fill_price(mid, slip)
+        self._note_peak(pos, mid)
         closed = self.ledger.close_position(
             pos["id"],
             price=fill_price,
             reason="signal_sell",
         )
+        self._record_observe(str(pos["id"]), source="signal_sell", mid_price=mid)
         out = {
             "ok": True,
             "executor": EXECUTOR_NAME,
@@ -472,5 +491,62 @@ class PaperExecutor:
 
         Only one tick writer may run against this paper DB (this method or
         paper_trade.py / paper_tick_loop.sh, not both).
+
+        After each close, when ``observe_db`` is set, append F-1 streak and
+        C3 shadow rows on that execution ledger. Those rows do not reject
+        orders and do not change exit rules. Peak maintenance itself happens
+        inside ``paper_tick`` for every open position.
         """
-        return paper_tick(self.ledger, self.store)
+        actions = paper_tick(self.ledger, self.store)
+        for closed in actions:
+            pid = closed.get("id")
+            if not pid:
+                continue
+            mid = closed.get("mid_price")
+            try:
+                mid_f = float(mid) if mid is not None else None
+            except (TypeError, ValueError):
+                mid_f = None
+            self._record_observe(str(pid), source="tick", mid_price=mid_f)
+        return actions
+
+    def _note_peak(self, pos: dict[str, Any], price: float | None) -> None:
+        """Raise meta peak before a signal sell. Failures do not block the close."""
+        if price is None:
+            return
+        meta = parse_meta(pos.get("meta_json"))
+        updated, changed = raise_peak(meta, price)
+        if not changed:
+            return
+        merge = getattr(self.ledger, "merge_open_meta", None)
+        if not callable(merge):
+            return
+        try:
+            merge(str(pos["id"]), {"peak_price": updated["peak_price"]})
+        except Exception:
+            log.exception("peak update failed position_id=%s", pos.get("id"))
+
+    def _record_observe(
+        self,
+        position_id: str,
+        *,
+        source: str,
+        mid_price: float | None,
+    ) -> None:
+        if self.observe_db is None:
+            return
+        getter = getattr(self.ledger, "get_position", None)
+        if not callable(getter):
+            return
+        row = getter(position_id)
+        if not isinstance(row, dict):
+            return
+        try:
+            record_closed_position(
+                self.observe_db,
+                row,
+                source=source,
+                mid_price=mid_price,
+            )
+        except Exception:
+            log.exception("observe close record failed position_id=%s", position_id)
