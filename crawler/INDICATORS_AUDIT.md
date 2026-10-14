@@ -107,7 +107,7 @@ python -m api_server   # 只读 API + admin
 
 - 本文 **INDICATORS_AUDIT.md**（运维入口；含「警示事例 → 指标层纪律」）
 - STEP1 / STEP2 / STEP3 / P0 / LIGHT / AUTH_JEV（P-4 定价错误在 STEP2）
-- **INDICATORS_FACTOR_CANDIDATES.md** — 机构供需 P-3 / P-4；艾略特 E-1 / E-4 / E-5 与拒绝项 N-1..N-6（指针见本文「艾略特候选」）；江恩 G-5 换手率 A 类候选，G-7 / G-8 仅登记并阻断，江恩 N-1..N-6 另表拒绝（指针见本文「江恩候选」）；I-2 持币集中度候选阻断于 I-1（指针见本文「持币集中度」）。**M-2** 周跑只在 IC 有限时把双侧结果写入既有观察 jsonl，`gate_candidate` 仍不改 `accepted`。本次不新增观察 jsonl。权重 0，不算有效性
+- **INDICATORS_FACTOR_CANDIDATES.md** — 机构供需 P-3 / P-4；艾略特 E-1 / E-4 / E-5 与拒绝项 N-1..N-6（指针见本文「艾略特候选」）；江恩 G-5 换手率 A 类候选，G-7 / G-8 仅登记并阻断，江恩 N-1..N-6 另表拒绝（指针见本文「江恩候选」）；I-2 持币集中度候选的 I-1 数据阻断已解除（指针见本文「持币集中度」）。**M-2** 周跑只在 IC 有限时把双侧结果写入既有观察 jsonl，`gate_candidate` 仍不改 `accepted`。本次不新增观察 jsonl。权重 0，不算有效性
 - **INDICATORS_OPERATORIZATION.md** — **M-3** 时间序列算子硬规则（窗口在 t 收口；禁止日合计 / 未来分母）
 - 本文「统计功效脚注（M-1）」— n≥15 不改；约 350 个已结算样本才够谈 α≈0.02
 - README「Indicators 旁路」节 + 命令总索引
@@ -166,7 +166,7 @@ G-5（`turnover_spike_v0` / `turnover_exhaust_v0`，G-15 同族不另给 id）�
 
 ### 持币集中度（I-2，指针）
 
-I-2（`concentration_top10` 横截面风险、`concentration_delta` 为 top10 占比的 24h 变化）登记在 `INDICATORS_FACTOR_CANDIDATES.md`，是 factor_loop 候选，**阻断到 I-1 数据存在**（`address_labels` + holder 快照上的 `top10_share`），姿态同 G-7 / G-8。可选 `hhi_index` 只作日后与 top10 二选一的备选。M-2 正反两符号；双门槛仍是 n≥15 / unique≥10 / 1h≥55%。权重 0。无检测器，不进 `decision_engine`，不 INSERT `factor_candidates.db`，不新增观察 jsonl。I-1 的 `dev_balance_delta` / `top10_share` 公式归指标，采集落地之后才算；本 PR 不建表、不写采集器。INTEL_LOOP：周检可以跑缺口扫描模板；AI 候选 ≠ 自动生效（R2/R3），无新自动化。I-3 / I-4 归执行 / registry，不在指标层。不算有效性。
+I-2（`concentration_top10` 横截面风险、`concentration_delta` 为 top10 占比的 24h 变化）登记在 `INDICATORS_FACTOR_CANDIDATES.md`，是 factor_loop 候选。**I-1 数据阻断已解除**：采集层 #79 写入 `address_labels`、`token_holder_snapshots`、`token_transfer_edges`；`indicators/holder_metrics.py` 只读计算 `top10_share`（单次快照，`top10_share_history` 留给 24h 变化）和 `dev_balance_delta`（`dev` 标签上的净流量；没有可用转账边时才用重复出现的持仓余额）。空输入与算不出的行为 NULL，不编造持仓。`concentration_top10` / `concentration_delta` 可以读这条 `top10_share` 历史；历史还没覆盖到窗口时变化仍是 NULL。可选 `hhi_index` 只作日后与 top10 二选一的备选。M-2 正反两符号；双门槛仍是 n≥15 / unique≥10 / 1h≥55%。A 类周检仍要 **10-19 + M-2 + M-3**。权重 0。无检测器，不进 `decision_engine`，不进 composite，不 INSERT `factor_candidates.db`，不改 `gate_candidate` / `accepted`，不新增观察 jsonl。过门槛不自动激活。INTEL_LOOP：周检可以跑缺口扫描模板；AI 候选 ≠ 自动生效（R2/R3），无新自动化。I-3 / I-4 归执行 / registry，不在指标层。不算有效性。
 
 ### 学习 → 改可观测（2026-10-14）
 
