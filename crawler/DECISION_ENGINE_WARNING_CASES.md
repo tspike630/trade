@@ -64,3 +64,4 @@
 - 临时 `--min-jev-strength 0.15 --purpose live_candidate` 的 buy **保持未标记，不得标成 accepted**。
 - `scripts/jev_validity.py` 按 `strategy_id=jev_strength_v1` 的全部 buy 读取，**不按 purpose 过滤**，这些行会进入周检输入。报告里单独脚注，不要拿它们去过「连续 2 周 ≥55%」门槛。
 - 2026-10-19 的 cooldown 是否生效、`min_liq` 三桶、临时 0.15 观察行，三行都是观察登记。不改阈值、不改默认强度、不把临时观察标成 accepted。
+- **M-6**：高信心≠高收益，信号强度≠胜率（PolyBench / Prediction Arena）。只作解读，不加新过滤。临时 `purpose=live_candidate` 且 `--min-jev-strength 0.15` 的行保持未标记，**不算有效性**。
