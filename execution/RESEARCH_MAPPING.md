@@ -28,6 +28,8 @@ PM / RISK 是服务层硬检查，写在 Python 里，不写在 LLM prompt 里�
 
 不要做：不要把 PM / RISK 改写成 prompt 条款。不要加「agent 可跳过」的开关。
 
+2026-10-14 文献两批只读（Profit Mirage / StockBench / LLM≠人类 / MAS·自适应 BTC；LiveTradeBench / When Agents Trade / Prophet Arena / FinPos / PredictionMarketBench）：执行层不做 LLM 下单主路径，不堆 agent。E-2 / C4 仍 WAITING。
+
 ## M-5 仓位顺序：先选择、后仓位
 
 顺序是三段。先有选择，再谈仓位，最后才是硬风控。本文件不新增 sizing 代码。

@@ -23,11 +23,13 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CRAWLER))
 
 import execution.gateway as gateway_mod  # noqa: E402
+from dashboard.parsing import rejection_key  # noqa: E402
 from execution.executors.paper_executor import PaperExecutor  # noqa: E402
 from execution.exits import exit_reason  # noqa: E402
-from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.gateway import ExecutionGateway, _risk_rejected_event_detail  # noqa: E402
 from execution.ledger import ExecutionLedger  # noqa: E402
 from execution.order_events import event_chain  # noqa: E402
+from execution.risk.limits import check_daily_loss  # noqa: E402
 from execution.position_manager import (  # noqa: E402
     PositionManager,
     PositionManagerConfig,
@@ -764,6 +766,178 @@ class RiskAndPmTests(unittest.TestCase):
             self.assertNotEqual(rows[sell_id]["status"], "risk_rejected")
             self.assertEqual(rows[sell_id]["executor"], "paper")
             self.assertGreaterEqual(stats.processed, 2)
+
+    def test_daily_loss_reason_is_stable_key(self) -> None:
+        today = _now().date().isoformat()
+
+        class _Closed:
+            def __init__(self, rows: list[dict]) -> None:
+                self._rows = rows
+
+            def list_closed(self, limit: int = 20) -> list[dict]:
+                return list(self._rows)[: int(limit)] if limit else []
+
+        skipped = check_daily_loss(
+            None, {"action": "sell"}, daily_loss_limit_usd=None
+        )
+        self.assertTrue(skipped["ok"])
+        self.assertNotIn("reason", skipped)
+
+        within = check_daily_loss(
+            _Closed(
+                [
+                    {"closed_at": f"{today}T01:00:00Z", "pnl_usd": -200.0},
+                    {"closed_at": "2020-01-01T00:00:00Z", "pnl_usd": -999.0},
+                ]
+            ),
+            {"action": "buy"},
+            daily_loss_limit_usd=200.0,
+        )
+        self.assertTrue(within["ok"])
+        self.assertNotEqual(within.get("reason"), "daily_loss")
+
+        denied = check_daily_loss(
+            _Closed(
+                [
+                    {"closed_at": f"{today}T01:00:00Z", "pnl_usd": -201.0},
+                    {"closed_at": "2020-01-01T00:00:00Z", "pnl_usd": -999.0},
+                ]
+            ),
+            {"action": "sell"},
+            daily_loss_limit_usd=200.0,
+        )
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["reason"], "daily_loss")
+        self.assertTrue(denied["reason"].startswith("daily_loss"))
+        self.assertNotIn(":", denied["reason"])
+        self.assertEqual(
+            denied["detail"],
+            {"today": today, "pnl": -201.0, "limit": 200.0},
+        )
+        self.assertNotIn(today, denied["reason"])
+
+    def test_daily_loss_gateway_receipt_and_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crawler = _PriceDB(root / "crawler.db")
+            now = _iso(_now())
+            crawler.add_history(now, 2.0)
+            crawler.add_spot(now, 2.0, liquidity=1_000_000)
+            buy_id = crawler.add_decision(strategy_id="strat_a", action="buy", size_pct=0.05)
+            sell_id = crawler.add_decision(
+                strategy_id="strat_a", action="sell", size_pct=1.0
+            )
+            crawler.close()
+            paper = PaperLedger(root / "paper.db")
+            lost = paper.open_position(
+                chain_id="solana",
+                pair_address="pair_lost",
+                token_address="lost",
+                price=1.0,
+                size_usd=400.0,
+                meta={"strategy_id": "strat_a"},
+            )
+            closed = paper.close_position(lost, price=0.1, reason="stop_loss")
+            paper.close()
+            self.assertLess(float(closed["pnl_usd"]), -200.0)
+            prev_risk = gateway_mod.EXECUTION_RISK_ENABLED
+            prev_loss = gateway_mod.EXECUTION_DAILY_LOSS_USD
+            gateway_mod.EXECUTION_RISK_ENABLED = True
+            gateway_mod.EXECUTION_DAILY_LOSS_USD = 200.0
+            try:
+                with ExecutionGateway(
+                    decision_db=root / "crawler.db",
+                    ledger_path=root / "exec.db",
+                    paper_enabled=True,
+                    paper_db=root / "paper.db",
+                    pm_enabled=False,
+                ) as gw:
+                    gw.process_pending(since_id=0)
+                    rows = {r["decision_log_id"]: r for r in gw.ledger.recent(limit=10)}
+                    buy_events = event_chain(gw.ledger.path, rows[buy_id]["id"])
+                    sell_events = event_chain(gw.ledger.path, rows[sell_id]["id"])
+            finally:
+                gateway_mod.EXECUTION_RISK_ENABLED = prev_risk
+                gateway_mod.EXECUTION_DAILY_LOSS_USD = prev_loss
+
+            for decision_id, events in ((buy_id, buy_events), (sell_id, sell_events)):
+                receipt = json.loads(rows[decision_id]["receipt_json"])
+                self.assertEqual(receipt["status"], "risk_rejected")
+                self.assertEqual(receipt["error"], "daily_loss")
+                item = receipt["risk"][0]
+                self.assertEqual(item["reason"], "daily_loss")
+                self.assertNotIn(":", item["reason"])
+                self.assertEqual(item["detail"]["limit"], 200.0)
+                self.assertLess(item["detail"]["pnl"], -200.0)
+                self.assertEqual(item["detail"]["today"], _now().date().isoformat())
+                self.assertEqual(
+                    rejection_key(1, "", "rejected", receipt),
+                    "risk_rejected:daily_loss",
+                )
+                rejected = [event for event in events if event["event"] == "rejected"]
+                self.assertEqual(len(rejected), 1)
+                self.assertEqual(rejected[0]["detail"]["stage"], "risk")
+                self.assertEqual(rejected[0]["detail"]["reason"], "daily_loss")
+                self.assertEqual(rejected[0]["detail"]["detail"]["limit"], 200.0)
+                self.assertLess(rejected[0]["detail"]["detail"]["pnl"], -200.0)
+
+    def test_daily_loss_unset_does_not_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crawler = _PriceDB(root / "crawler.db")
+            now = _iso(_now())
+            crawler.add_history(now, 2.0)
+            crawler.add_spot(now, 2.0, liquidity=1_000_000)
+            buy_id = crawler.add_decision(strategy_id="strat_a", action="buy", size_pct=0.05)
+            sell_id = crawler.add_decision(
+                strategy_id="strat_a", action="sell", size_pct=1.0
+            )
+            crawler.close()
+            paper = PaperLedger(root / "paper.db")
+            lost = paper.open_position(
+                chain_id="solana",
+                pair_address="pair_lost",
+                token_address="lost",
+                price=1.0,
+                size_usd=400.0,
+                meta={"strategy_id": "strat_a"},
+            )
+            paper.close_position(lost, price=0.1, reason="stop_loss")
+            paper.close()
+            prev_risk = gateway_mod.EXECUTION_RISK_ENABLED
+            prev_loss = gateway_mod.EXECUTION_DAILY_LOSS_USD
+            gateway_mod.EXECUTION_RISK_ENABLED = True
+            gateway_mod.EXECUTION_DAILY_LOSS_USD = None
+            try:
+                with ExecutionGateway(
+                    decision_db=root / "crawler.db",
+                    ledger_path=root / "exec.db",
+                    paper_enabled=True,
+                    paper_db=root / "paper.db",
+                    pm_enabled=False,
+                ) as gw:
+                    gw.process_pending(since_id=0)
+                    rows = {r["decision_log_id"]: r for r in gw.ledger.recent(limit=10)}
+            finally:
+                gateway_mod.EXECUTION_RISK_ENABLED = prev_risk
+                gateway_mod.EXECUTION_DAILY_LOSS_USD = prev_loss
+            buy_receipt = json.loads(rows[buy_id]["receipt_json"])
+            sell_receipt = json.loads(rows[sell_id]["receipt_json"])
+            self.assertNotEqual(buy_receipt["status"], "risk_rejected")
+            self.assertNotEqual(sell_receipt["status"], "risk_rejected")
+            self.assertEqual(rows[buy_id]["executor"], "paper")
+            self.assertEqual(rows[sell_id]["executor"], "paper")
+            self.assertNotIn("daily_loss", rows[buy_id]["receipt_json"])
+            self.assertNotIn("daily_loss", rows[sell_id]["receipt_json"])
+
+    def test_risk_event_keeps_max_open_reason(self) -> None:
+        detail = _risk_rejected_event_detail(
+            [{"ok": False, "reason": "max_open:strat_a:5>=5"}]
+        )
+        self.assertEqual(
+            detail,
+            {"stage": "risk", "reason": "max_open:strat_a:5>=5"},
+        )
 
 
 class DefaultGatesTests(unittest.TestCase):
