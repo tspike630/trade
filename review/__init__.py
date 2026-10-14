@@ -20,6 +20,7 @@ from review.optimizer import (
 )
 from review.report import render_weekly_md, write_report
 from review.evolution import build_evolution_suggestions, format_evolution_section
+from review.weekly_evidence import compute_weekly_evidence
 
 __all__ = [
     "DbPaths",
@@ -30,6 +31,7 @@ __all__ = [
     "build_param_grid",
     "format_evolution_section",
     "compute_signal_metrics",
+    "compute_weekly_evidence",
     "fill_attribution",
     "format_optimize_summary",
     "load_market_baseline",

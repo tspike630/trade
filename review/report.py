@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -104,10 +105,107 @@ def _render_dim_table(dim_name: str, dim: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _render_weekly_evidence(evidence: Optional[dict[str, Any]]) -> list[str]:
+    """10-19 hard evidence. None keeps older reports unchanged."""
+    if not evidence:
+        return []
+    lines: list[str] = []
+    lines.append("### 10-19 硬证据（不算有效性 / R2旁证）")
+    lines.append("")
+    lines.append(
+        "观察登记。不改 JEV 门槛，不改 `min_liq` / cooldown / 权重，不接断路器。"
+        f" 标记：`{evidence.get('label') or '不算有效性 / R2旁证'}`。"
+    )
+    lines.append("")
+    stop = evidence.get("stop_loss") or {}
+    share = stop.get("loss_share")
+    worst = stop.get("worst_stop") or {}
+    worst_bit = "—"
+    if worst:
+        worst_bit = (
+            f"`{worst.get('position_id')}` {_num(worst.get('pnl_usd'))} "
+            f"@ `{worst.get('closed_at')}`"
+        )
+    lines.append(
+        f"- **止损亏损占比：** {_pct(share) if isinstance(share, (int, float)) else '—'} "
+        f"（负已实现 PnL {_num(stop.get('negative_pnl_usd'))}，"
+        f"其中 stop_loss {_num(stop.get('stop_loss_negative_pnl_usd'))}；"
+        f"n_closed={stop.get('n_closed', 0)}）。最差止损：{worst_bit}。"
+        + (f" {stop.get('note')}" if stop.get("note") else "")
+    )
+    daily = evidence.get("daily_open_peak") or {}
+    lines.append(
+        f"- **单日开仓峰值：** {daily.get('peak') if daily.get('peak') is not None else '—'} "
+        f"（{daily.get('peak_day') or '—'} {daily.get('tz') or 'Asia/Hong_Kong'}，"
+        f"source=`{daily.get('source')}`，n_opens={daily.get('n_opens')}）。"
+        + (f" {daily.get('note')}" if daily.get("note") else "")
+    )
+    streak = evidence.get("f1_streak") or {}
+    by_strategy = streak.get("by_strategy") or {}
+    if not by_strategy:
+        lines.append(
+            f"- **F-1：** 无策略样本（source=`{streak.get('source')}`）。"
+            + (f" {streak.get('note')}" if streak.get("note") else "")
+        )
+    else:
+        lines.append(
+            f"- **F-1** P(第3笔亏 | 连亏2笔)，source=`{streak.get('source')}`。"
+            + (f" {streak.get('note')}" if streak.get("note") else "")
+        )
+        lines.append("")
+        lines.append("| strategy_id | n_closed | 条件样本 | 第3笔仍亏 | P |")
+        lines.append("|---|---:|---:|---:|---:|")
+        for sid, row in by_strategy.items():
+            lines.append(
+                f"| `{sid}` | {row.get('n_closed') if row.get('n_closed') is not None else '—'} | "
+                f"{row.get('n_given_two_loss') if row.get('n_given_two_loss') is not None else '—'} | "
+                f"{row.get('n_third_loss') if row.get('n_third_loss') is not None else '—'} | "
+                f"{_pct(row.get('p_third_loss_given_two_loss'))} |"
+            )
+        lines.append("")
+    shadow = evidence.get("c3_shadow") or {}
+    if shadow.get("status") != "ok":
+        lines.append(
+            f"- **C3 shadow：** data gap — {shadow.get('note') or 'peaks not invented'}。"
+        )
+    else:
+        all_row = shadow.get("all") or {}
+        hold = shadow.get("max_hold") or {}
+        lines.append(
+            "- **C3 shadow：** peak MFE vs 出场 PnL vs `max_hold` "
+            f"（basis=`{shadow.get('giveback_basis')}`，"
+            f"n_with_shadow={shadow.get('n_with_shadow')} / n_closed={shadow.get('n_closed')}）。"
+        )
+        lines.append("")
+        lines.append("| cohort | n | peak_mfe_usd | exit_pnl_usd | giveback_usd |")
+        lines.append("|---|---:|---:|---:|---:|")
+        lines.append(
+            f"| all | {all_row.get('n', 0)} | {_num(all_row.get('peak_mfe_usd_sum'))} | "
+            f"{_num(all_row.get('exit_pnl_usd_sum'))} | {_num(all_row.get('giveback_usd_sum'))} |"
+        )
+        lines.append(
+            f"| max_hold | {hold.get('n', 0)} | {_num(hold.get('peak_mfe_usd_sum'))} | "
+            f"{_num(hold.get('exit_pnl_usd_sum'))} | {_num(hold.get('giveback_usd_sum'))} |"
+        )
+        lines.append("")
+    ruin = evidence.get("g3_ruin") or {}
+    lines.append(f"- **G-3：** {ruin.get('line') or ruin.get('note') or 'data gap'}")
+    veto = evidence.get("step2_veto") or {}
+    lines.append("")
+    lines.append(f"> {veto.get('line') or 'Step2 veto 旁证：未计算。不算有效性 / R2旁证。'}")
+    lines.append("")
+    lines.append("```json")
+    lines.append(json.dumps(evidence, ensure_ascii=False, indent=2, default=str))
+    lines.append("```")
+    lines.append("")
+    return lines
+
+
 def _render_attribution_section(
     attribution: Optional[dict[str, Any]],
     fill_attr: Optional[dict[str, Any]],
     backtest_summary: Optional[dict[str, Any]],
+    weekly_evidence: Optional[dict[str, Any]] = None,
 ) -> list[str]:
     lines: list[str] = []
     lines.append("## 8. 信号层归因")
@@ -209,6 +307,7 @@ def _render_attribution_section(
         else:
             lines.append("_该 run 无 closed positions。_")
             lines.append("")
+    lines.extend(_render_weekly_evidence(weekly_evidence))
     return lines
 
 
@@ -299,6 +398,7 @@ def render_weekly_md(
     optimize_section: Optional[str] = None,
     evolution_suggestions: Optional[list[dict[str, Any]]] = None,
     factor_layers: Optional[dict[str, Any]] = None,
+    weekly_evidence: Optional[dict[str, Any]] = None,
 ) -> str:
     """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议 + 可选§11 因子分层 + §12 因子进化指针）。"""
     n = len(chain)
@@ -481,7 +581,11 @@ def render_weekly_md(
     lines.append("")
 
     # 8. 信号层归因（R2）
-    lines.extend(_render_attribution_section(attribution, fill_attr, backtest_summary))
+    lines.extend(
+        _render_attribution_section(
+            attribution, fill_attr, backtest_summary, weekly_evidence
+        )
+    )
 
     # 9. R3 参数寻优（脚手架占位）
     lines.append("## 9. R3 参数寻优 — 待历史≥7天且周检跨门槛")

@@ -138,6 +138,19 @@ Foresight Arena 的功效量级（已结算二元预测；相对市场共识的 
 
 复盘不认领 **P-1**（PM 仓位比例 / 回撤，`execution/README.md`）、**P-4**（JEV 错价，指标）、**P-5**（共识概率观察候选，指标）。**C3** 趋势出场只观察；要立项先 R3 回测，不盘中追退出参数。`accepted` ≠ `activated`。临时 `live_candidate` 样本单独分桶。
 
+## 10-19 复盘硬证据（代码计算）
+
+`python -m review.run --report` 在周报第 8 节写出下面六项（`review/weekly_evidence.py`）。**不算有效性 / R2旁证。** 不改 JEV 门槛，不改 `min_liq` / cooldown / 权重，不接断路器。
+
+| 交付 | 怎么算 |
+|------|--------|
+| 止损亏损占比 | 已平仓负已实现 PnL 里 `stop_loss` 的占比，并列最差一笔止损 |
+| 单日开仓峰值 | 窗口内香港日历日的开仓数峰值（没有 `opened_at` 时用 executed entries） |
+| F-1 | 有 `streak_observe`（execution/dashboard 导出或 order events）则读；否则按策略、平仓时间算 P(第3笔亏 \| 连亏2笔) |
+| C3 shadow | 平仓上有 `peak_price` / giveback 才报 peak MFE、出场 PnL、`max_hold` cohort；没有就 data gap，不编峰值 |
+| G-3 | execution 导出了 `floor(cash/per_trade_risk)` 才记一行；否则 data gap |
+| Step2 veto 旁证 | 止损占比≥50% 或单日开仓≥20 时写明：即使 1h≥55% 也不据此启动 Step2 |
+
 ## 背景（保留）
 
 - 过滤后方向性 37.5%→71.4% 值得继续验证，但当前 n=14 / **unique_token=9** 不够开 Step 2。
