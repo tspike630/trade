@@ -1100,6 +1100,20 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     foot="模拟盘当前持仓 · 现价取 pair_history",
                 )
                 _v2_comp(
+                    ("拒因", "分桶"),
+                    "span-6",
+                    lambda: _v2_reject(store),
+                    foot="execution_log · pm_check.reason（对齐 order_events）",
+                    tools=("7d",),
+                )
+                _v2_comp(
+                    ("平仓", "旁证"),
+                    "span-6",
+                    lambda: _v2_closed(store),
+                    foot="首笔命中 + exit×liq · 观察旁证 · 不算有效性",
+                    tools=("14d",),
+                )
+                _v2_comp(
                     ("回测", "新闻"),
                     "span-6",
                     lambda: _v2_btnews(store),
@@ -1618,6 +1632,7 @@ def _v2_gates() -> None:
     ui.label(
         f"模拟盘来源：{gates.origin_hint('paper')}。仓位来源：{gates.origin_hint('pm')}。"
         "关是当前预期状态；实盘若变「开启」会标红。"
+        "网关「陈旧」要和拒因一起读：仓满拒单时无新成交属健康态。"
     ).classes("v2-note")
 
 
@@ -1890,8 +1905,13 @@ def _v2_jev_gate() -> None:
         view = None
     if not view:
         ui.label("暂无数据（周检后自动填充）").classes("v2-note")
-        return
-    _v2_kv(view)
+    else:
+        _v2_kv(view)
+    ui.label(
+        "统计功效旁证：门槛 n≥15 只排除随机级噪声；"
+        "证 edge≈0.02 约需 ~350 已结算样本（Foresight Arena）。"
+        "解读收紧，不改门槛、不算有效性。"
+    ).classes("v2-note")
 
 
 def _v2_market_base(store: DataStore) -> None:
@@ -1997,6 +2017,96 @@ def backtest_equity_tone(end: float, start: float | None) -> str:
     if end < start:
         return "down"
     return "mute"
+
+
+def _v2_reject(store: DataStore) -> None:
+    result = store.rejection_buckets(days=7)
+    if not result.available or result.data is None:
+        ui.label("暂无数据").classes("v2-note")
+        return
+    report = result.data
+    buckets = getattr(report, "buckets", ()) or ()
+    if not buckets:
+        ui.label(f"近 {getattr(report, 'days', 7)} 日无拒因").classes("v2-note")
+        return
+    rows = [
+        [_v2_text(getattr(item, "key", None)), str(getattr(item, "count", "—"))]
+        for item in buckets[:12]
+    ]
+    _v2_table([("拒因", ""), ("笔数", "num")], rows)
+    ui.label(
+        f"合计 {getattr(report, 'total', 0)} · 细粒度来自 receipt.pm_check.reason"
+    ).classes("v2-note")
+
+
+def _v2_closed(store: DataStore) -> None:
+    result = store.paper_closed_buckets(days=14)
+    if not result.available or result.data is None:
+        ui.label("暂无数据").classes("v2-note")
+        return
+    report = result.data
+    buckets = getattr(report, "buckets", ()) or ()
+    if not buckets:
+        ui.label(f"近 {getattr(report, 'days', 14)} 日无平仓").classes("v2-note")
+        return
+    def _pct(rate: object) -> str:
+        if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+            return f"{float(rate) * 100:.1f}%"
+        return "—"
+
+    win_rate = getattr(report, "win_rate", None)
+    wr_text = _pct(win_rate)
+    first_n = getattr(report, "first_hit_n", 0) or 0
+    first_rate = getattr(report, "first_hit_rate", None)
+    live_n = getattr(report, "first_hit_live_n", 0) or 0
+    live_rate = getattr(report, "first_hit_live_rate", None)
+    first_text = f"{_pct(first_rate)} (n={first_n})" if first_n else "—"
+    live_text = f"{_pct(live_rate)} (n={live_n})" if live_n else "—"
+    worst = getattr(report, "worst_pnl_usd", None)
+    rest = getattr(report, "rest_pnl_usd", None)
+    wipe = bool(getattr(report, "single_wipe", False))
+    _v2_kv([
+        ("累计胜率", wr_text, "mute"),
+        ("首笔命中", first_text, "mute"),
+        ("live 首笔", live_text, "mute"),
+        (
+            "最差单笔",
+            _v2_money(worst) if isinstance(worst, (int, float)) else "—",
+            "down" if isinstance(worst, (int, float)) and worst < 0 else "mute",
+        ),
+        (
+            "剔除最差",
+            _v2_money(rest) if isinstance(rest, (int, float)) else "—",
+            "up" if isinstance(rest, (int, float)) and rest > 0 else "mute",
+        ),
+        ("单笔抹盈", "是" if wipe else "否", "down" if wipe else "mute"),
+    ])
+    rows: list[list[str]] = []
+    for item in buckets[:12]:
+        pnl = getattr(item, "pnl_usd", None)
+        rows.append([
+            _v2_text(getattr(item, "exit_reason", None)),
+            _v2_text(getattr(item, "liq_bucket", None)),
+            str(getattr(item, "count", "—")),
+            _v2_money(pnl) if isinstance(pnl, (int, float)) else "—",
+        ])
+    _v2_table(
+        [("退出", ""), ("流动性", ""), ("笔数", "num"), ("PnL", "num")],
+        rows,
+    )
+    total = getattr(report, "total_pnl_usd", None)
+    ui.label(
+        f"已平 {getattr(report, 'closed', 0)} · 合计 "
+        f"{_v2_money(total) if isinstance(total, (int, float)) else '—'} · 旁证非有效性"
+    ).classes("v2-note")
+    ui.label(
+        "警示旁证：胜率≈一半仍可净亏（仓位/入场质量）；"
+        "单笔抹盈≈薄池止损打穿——对齐 min_liq，不盘中加参。"
+    ).classes("v2-note")
+    ui.label(
+        "首笔命中：按 pair 最早一笔已平仓；live_candidate 另列；"
+        "旁证/不算有效性（n 仍小，对照周检）。"
+    ).classes("v2-note")
 
 
 def _v2_btnews(store: DataStore) -> None:
