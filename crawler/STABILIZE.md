@@ -92,3 +92,13 @@ Polymarket 经验落地计划第四节的三条警示，映射到采集侧时只
 | 未 enrich 的 `new_listing` | Helius 在 `tokens/v1` enrich 之前写入 `pending_enrich`，并可能发 `new_listing`（severity `info`，文案是 mint hint）。这条告警和未完成的 enrich 队列都不是可交易信号。流动性以 enrich 后的 `pair_history.liquidity_usd` 为准；payload 没有该字段则仍为 NULL。 |
 
 归属：采集不拥有 **P-1 / P-2 / P-4 / P-5**。对 **P-3** 只提供上一节的热层流动性覆盖作为 10-19 旁证。以上全部标记为不算有效性。
+
+## 警示事例 → 复盘侧（指针）
+
+复盘拥有平仓归因分桶，以及 **P-2 / P-3** 的 10-19 旁证。全文在 `REVIEW_WARNING_CASES.md`（仓库 `docs/REVIEW_WARNING_CASES.md` 同文）。
+
+- **P-2**（复盘 + 指标）：10-19 真库 IC/IR 首跑之后只写权重更新设计。权重保持 0，不激活。上一表「止损与仓位是 P-2」只表示采集不改止损；执行单上的 P-2 不是采集项。
+- **P-3**：复盘记 `min_liq` 拒绝桶、cooldown 是否生效，以及平仓 `liq_<50k` vs `≥50k`。旁证，不是有效性。采集只交上一节的热层覆盖率。
+- 复盘不拥有 PM 仓位比例 / 回撤、JEV 错价论述、采集流动性覆盖。
+
+不算有效性。此处不加参数。

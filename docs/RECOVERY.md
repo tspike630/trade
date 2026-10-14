@@ -52,7 +52,7 @@ python daily_check.py
 
 热层流动性：DexScreener 缺 `liquidity` 时 `pair_history.liquidity_usd` 存 NULL，**不编造**。决策买入因此 `no_liquidity` 丢弃，是故意的 fail-closed。`daily_check.py` 的「热层流动性覆盖」和小时报 Health 下一行只监测 hot 1h 缺失率（>25% WARN，>60% 且 n≥20 FAIL）以及 `pending_enrich`。约 34% 缺失是 WARN。该数是 **10-19 周检旁证**，不计策略有效性。细节见 `crawler/STABILIZE.md`。
 
-警示事例（半胜仍亏、薄池打穿、洗盘/单点、未 enrich 的 `new_listing`）如何落到采集侧，见同文「警示事例 → 采集侧」。采集不拥有 P-1 / P-2 / P-4 / P-5；P-3 只以上述覆盖率作旁证。不算有效性，此处不加参数。
+警示事例（半胜仍亏、薄池打穿、洗盘/单点、未 enrich 的 `new_listing`）如何落到采集侧，见同文「警示事例 → 采集侧」。采集不拥有 P-1 / P-2 / P-4 / P-5；P-3 只以上述覆盖率作旁证。复盘侧（平仓归因三行、P-2 / P-3、10-19）见 `docs/REVIEW_WARNING_CASES.md`，`crawler/STABILIZE.md` 只有指针。不算有效性，此处不加参数。
 
 ## 3. 指标层恢复（代码在 `crawler/indicators/`，与采集同仓同 venv）
 
@@ -95,7 +95,7 @@ python -m review.run --period 7d --report
 PYTHONPATH=crawler python -m sources.news --once
 ```
 
-规格与旁路说明：`docs/REVIEW_R1_SPEC.md`、`docs/REVIEW_R3_SCAFFOLD.md`、`docs/REVIEW_R4_LOOP.md`、`docs/EVOLUTION_SECTION10.md`、`docs/NEWS_SIDECHANNEL.md`。
+规格与旁路说明：`docs/REVIEW_R1_SPEC.md`、`docs/REVIEW_R3_SCAFFOLD.md`、`docs/REVIEW_R4_LOOP.md`、`docs/REVIEW_WARNING_CASES.md`、`docs/EVOLUTION_SECTION10.md`、`docs/NEWS_SIDECHANNEL.md`。警示事例的复盘映射不算有效性：复盘拥有平仓归因分桶与 P-2 / P-3 旁证，不拥有 PM 仓位比例 / 回撤、JEV 错价论述、采集流动性覆盖。
 
 ## 5. 其它层（各层跟进提交后）
 
