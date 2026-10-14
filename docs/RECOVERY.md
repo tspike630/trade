@@ -79,8 +79,9 @@ nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
 
 1. 装依赖（与主仓同一 venv / requirements；采集层为 `crawler/.venv`）
 2. 四库只读：`dexscreener.db` / `execution_ledger.db` / `paper_trading.db` / `backtest_ledger.db`
-3. `python -m review.run --period 7d --report`（报告写入 `exports/reports/`，该目录不进 Git）
+3. `python -m review.run --period 7d --report`（报告写入 `exports/reports/`，该目录不进 Git；含 `joint` 联合表）
 4. 可选：`python -m sources.news --once`（独立 `news_events.db`）；周一 routine（周一 09:30 周报+预回测；新闻 RSS 工作日半小时）
+5. 可选只读：`data/prior/db/prior.db` 的 `decision_prior_tags`。有行时 §8 / 联合表优先吃 prior_tagger 的 `age_bucket`（不写该库）；没有则用现算 `token_age`。`prior.db` 与其它 `*.db` 一样不进 Git
 
 ```bash
 # 若上一步停在 crawler/，先回到仓库根

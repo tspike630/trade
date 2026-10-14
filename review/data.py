@@ -62,6 +62,9 @@ class SignalChainRow:
     # 信号特征补充（周检过滤口径用；缺则 None）
     liquidity_at_signal: Optional[float] = None
     jev_coverage: Optional[float] = None
+    # token_age：pairs.pair_created_at（ms）→ 相对信号时刻的小时数
+    pair_created_at: Optional[int] = None  # ms epoch from pairs
+    token_age_hours: Optional[float] = None
     # 内部：同一 decision 多条 execution 时标记
     exec_dup: bool = False
 
@@ -606,6 +609,133 @@ def load_market_baseline(
         "period_start": period_start,
         "period_end": period_end,
     }
+
+
+
+def annotate_token_age(
+    rows: list[SignalChainRow],
+    paths: DbPaths,
+) -> list[SignalChainRow]:
+    """Join pairs.pair_created_at and set token_age_hours.
+
+    Prefer (chain_id, pair_address); fallback (chain_id, token_address).
+    age_hours = (signal_ts_ms - pair_created_at) / 3600000; missing → None.
+    """
+    if not rows:
+        return rows
+
+    pair_keys: set[tuple[str, str]] = set()
+    tok_keys: set[tuple[str, str]] = set()
+    for r in rows:
+        chain = (r.chain_id or "").strip()
+        if not chain:
+            continue
+        if r.pair_address:
+            pair_keys.add((chain, r.pair_address.strip()))
+        if r.token_address:
+            tok_keys.add((chain, r.token_address.strip()))
+
+    created_by_pair: dict[tuple[str, str], int] = {}
+    created_by_tok: dict[tuple[str, str], int] = {}
+
+    conn = connect_ro(paths.main)
+    try:
+        cols = _table_columns(conn, "pairs")
+        if "pair_created_at" not in cols:
+            return rows
+
+        # batch by pair_address
+        pair_list = sorted(pair_keys)
+        chunk = 400
+        for i in range(0, len(pair_list), chunk):
+            part = pair_list[i : i + chunk]
+            if not part:
+                continue
+            # OR of (chain_id=? AND pair_address=?) — safer than IN of tuples
+            clauses = " OR ".join(
+                "(chain_id = ? AND pair_address = ?)" for _ in part
+            )
+            params: list[Any] = []
+            for c, p in part:
+                params.extend([c, p])
+            for row in conn.execute(
+                f"""
+                SELECT chain_id, pair_address, pair_created_at
+                FROM pairs
+                WHERE pair_created_at IS NOT NULL
+                  AND ({clauses})
+                """,
+                params,
+            ).fetchall():
+                key = (str(row["chain_id"]), str(row["pair_address"]))
+                ms = row["pair_created_at"]
+                if ms is None:
+                    continue
+                try:
+                    created_by_pair[key] = int(ms)
+                except (TypeError, ValueError):
+                    continue
+
+        # token_address fallback (used only when pair join misses)
+        tok_list = sorted(tok_keys)
+        for i in range(0, len(tok_list), chunk):
+            part = tok_list[i : i + chunk]
+            if not part:
+                continue
+            clauses = " OR ".join(
+                "(chain_id = ? AND token_address = ?)" for _ in part
+            )
+            params = []
+            for c, t in part:
+                params.extend([c, t])
+            for row in conn.execute(
+                f"""
+                SELECT chain_id, token_address, pair_created_at
+                FROM pairs
+                WHERE pair_created_at IS NOT NULL
+                  AND ({clauses})
+                """,
+                params,
+            ).fetchall():
+                key = (str(row["chain_id"]), str(row["token_address"]))
+                if key in created_by_tok:
+                    continue  # keep first
+                ms = row["pair_created_at"]
+                if ms is None:
+                    continue
+                try:
+                    created_by_tok[key] = int(ms)
+                except (TypeError, ValueError):
+                    continue
+    finally:
+        conn.close()
+
+    out: list[SignalChainRow] = []
+    for r in rows:
+        chain = (r.chain_id or "").strip()
+        created: Optional[int] = None
+        if chain and r.pair_address:
+            created = created_by_pair.get((chain, r.pair_address.strip()))
+        if created is None and chain and r.token_address:
+            created = created_by_tok.get((chain, r.token_address.strip()))
+
+        age_hours: Optional[float] = None
+        if created is not None:
+            try:
+                signal_dt = parse_ts(r.ts)
+                signal_ms = signal_dt.timestamp() * 1000.0
+                age_hours = (signal_ms - float(created)) / 3600000.0
+            except (TypeError, ValueError):
+                age_hours = None
+
+        out.append(
+            replace(
+                r,
+                pair_created_at=created,
+                token_age_hours=age_hours,
+            )
+        )
+    return out
 
 
 def summarize_execution(rows: list[SignalChainRow]) -> dict[str, Any]:
