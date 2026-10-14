@@ -1103,7 +1103,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     ("拒因", "分桶"),
                     "span-6",
                     lambda: _v2_reject(store),
-                    foot="execution_log · pm_check.reason（对齐 order_events）",
+                    foot="execution_log · pm/risk 细分（含 daily_loss）",
                     tools=("7d",),
                 )
                 _v2_comp(
@@ -1981,8 +1981,16 @@ def _v2_positions(store: DataStore) -> None:
             share = f"{float(ratio) * 100:.2f}%"
         else:
             share = "—"
+    start_cash = 10_000.0
+    dd_text = "—"
+    dd_tone = "mute"
+    if isinstance(equity_raw, (int, float)) and not isinstance(equity_raw, bool) and start_cash:
+        dd_pct = (float(equity_raw) - start_cash) / start_cash
+        dd_text = f"{dd_pct * 100:+.2f}%"
+        dd_tone = "up" if dd_pct > 0 else ("down" if dd_pct < 0 else "mute")
     _v2_kv([
-        ("总权益", equity, ""),
+        ("总权益", equity, dd_tone if dd_tone != "mute" else ""),
+        ("相对起盘", dd_text, dd_tone),
         ("现金", cash, ""),
         ("持仓数", held, ""),
         ("仓位占比", share, ""),
@@ -2095,13 +2103,27 @@ def _v2_closed(store: DataStore) -> None:
         rows,
     )
     total = getattr(report, "total_pnl_usd", None)
+    by_exit: dict[str, list[float | int]] = {}
+    for item in buckets:
+        er = str(getattr(item, "exit_reason", None) or "unknown")
+        slot = by_exit.setdefault(er, [0, 0.0])
+        slot[0] = int(slot[0]) + int(getattr(item, "count", 0) or 0)
+        pnl = getattr(item, "pnl_usd", None)
+        if isinstance(pnl, (int, float)) and not isinstance(pnl, bool):
+            slot[1] = float(slot[1]) + float(pnl)
+    if by_exit:
+        parts = [
+            f"{name}×{int(cnt)}≈{_v2_money(pnl)}"
+            for name, (cnt, pnl) in sorted(by_exit.items(), key=lambda kv: float(kv[1][1]))
+        ]
+        ui.label("退出合计：" + "；".join(parts)).classes("v2-note")
     ui.label(
         f"已平 {getattr(report, 'closed', 0)} · 合计 "
         f"{_v2_money(total) if isinstance(total, (int, float)) else '—'} · 旁证非有效性"
     ).classes("v2-note")
     ui.label(
-        "警示旁证：胜率≈一半仍可净亏（仓位/入场质量）；"
-        "单笔抹盈≈薄池止损打穿——对齐 min_liq，不盘中加参。"
+        "反思旁证：半胜仍亏时常由少数 stop_loss 打穿主导；"
+        "日亏闸触发是保护不是失效——对齐 min_liq/冷却，不盘中改 TP·SL。"
     ).classes("v2-note")
     ui.label(
         "首笔命中：按 pair 最早一笔已平仓；live_candidate 另列；"

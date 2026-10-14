@@ -48,7 +48,7 @@ from dashboard.panels.shell import (
 )
 import dashboard.app as app_module
 from dashboard.app import backtest_equity_tone, jev_gate_view, prior_pulse_tone
-from dashboard.parsing import bucket_key, extract_jev_strength, rejection_key
+from dashboard.parsing import bucket_key, extract_jev_strength, liq_bucket_label, rejection_key
 from dashboard.settings import (
     bind_host,
     gateway_stale_seconds,
@@ -512,6 +512,7 @@ class DashboardSmokeTest(unittest.TestCase):
             empty.open_positions(),
             empty.recent_executions(),
             empty.rejection_buckets(),
+            empty.paper_closed_buckets(),
             empty.latest_backtest(),
             empty.latest_news(),
             empty.process_liveness(),
@@ -720,9 +721,48 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(bucket_key(None), "(empty)")
         self.assertEqual(len(bucket_key("a" * 100)), 80)
         self.assertEqual(rejection_key(1, "", "rejected", {"status": "pm_rejected"}), "pm_rejected")
+        self.assertEqual(
+            rejection_key(
+                1,
+                "",
+                "rejected",
+                {
+                    "status": "pm_rejected",
+                    "pm_check": {"allowed": False, "reason": "pm_rejected:max_open_per_strategy"},
+                },
+            ),
+            "pm_rejected:max_open_per_strategy",
+        )
+        self.assertEqual(
+            rejection_key(
+                1,
+                "",
+                "rejected",
+                {
+                    "status": "pm_rejected",
+                    "pm_check": {"allowed": False, "reason": "pm_rejected:token_dedup"},
+                },
+            ),
+            "pm_rejected:token_dedup",
+        )
         self.assertEqual(rejection_key(1, "", "validated", {"status": "paper_failed"}), "paper_failed")
+        self.assertEqual(
+            rejection_key(
+                1,
+                "",
+                "rejected",
+                {
+                    "status": "risk_rejected",
+                    "risk": [{"ok": False, "reason": "daily_loss:2026-10-14:-316.5<-200.0"}],
+                },
+            ),
+            "risk_rejected:daily_loss",
+        )
         self.assertEqual(rejection_key(0, '["slippage"]', "rejected", None), "slippage")
         self.assertIsNone(rejection_key(1, "", "validated", {"status": "dry_run_acked"}))
+        self.assertEqual(liq_bucket_label(11994.57), "liq_<50k")
+        self.assertEqual(liq_bucket_label(50_000), "liq_>=50k")
+        self.assertEqual(liq_bucket_label(None), "liq_unknown")
         self.assertEqual(backtest_equity_tone(11000, 10000), "up")
         self.assertEqual(backtest_equity_tone(9000, 10000), "down")
         self.assertEqual(backtest_equity_tone(15000, None), "mute")
@@ -924,7 +964,22 @@ class DashboardSmokeTest(unittest.TestCase):
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (1, _iso(now), 1, "", "rejected", json.dumps({"status": "pm_rejected"})),
+                    (
+                        1,
+                        _iso(now),
+                        1,
+                        "",
+                        "rejected",
+                        json.dumps(
+                            {
+                                "status": "pm_rejected",
+                                "pm_check": {
+                                    "allowed": False,
+                                    "reason": "pm_rejected:max_open_per_strategy",
+                                },
+                            }
+                        ),
+                    ),
                     (2, _iso(now), 1, "", "rejected", json.dumps({"status": "risk_rejected"})),
                     (3, _iso(now), 1, "", "validated", json.dumps({"status": "paper_failed"})),
                     (4, _iso(now), 0, '["slippage", "wide"]', "rejected", "{}"),
@@ -944,10 +999,118 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertTrue(report.available, report.reason)
         counts = {item.key: item.count for item in report.data.buckets}
         self.assertEqual(report.data.total, 4)
-        self.assertEqual(counts, {"pm_rejected": 1, "risk_rejected": 1, "paper_failed": 1, "slippage": 1})
+        self.assertEqual(counts, {"pm_rejected:max_open_per_strategy": 1, "risk_rejected": 1, "paper_failed": 1, "slippage": 1})
         failures = store.recent_failures()
         self.assertEqual([item.id for item in failures.data], [4, 3, 2, 1])
         self.assertIn("slippage", failures.data[0].validation_errors)
+
+    def test_paper_closed_buckets_by_exit_and_liq(self) -> None:
+        now = datetime.now(timezone.utc)
+        paper = self.root / "paper_trading.db"
+        with sqlite3.connect(paper) as conn:
+            conn.execute(
+                """
+                CREATE TABLE positions (
+                    id TEXT PRIMARY KEY,
+                    pair_address TEXT,
+                    status TEXT,
+                    opened_at TEXT,
+                    closed_at TEXT,
+                    exit_reason TEXT,
+                    pnl_usd REAL,
+                    meta_json TEXT
+                )
+                """
+            )
+            t0 = _iso(now - timedelta(hours=2))
+            t1 = _iso(now - timedelta(hours=1))
+            t2 = _iso(now)
+            conn.executemany(
+                """
+                INSERT INTO positions
+                    (id, pair_address, status, opened_at, closed_at, exit_reason, pnl_usd, meta_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        "a",
+                        "pairA",
+                        "closed",
+                        t0,
+                        t0,
+                        "stop_loss",
+                        -84.3,
+                        json.dumps({"liquidity_usd": 11994.57, "decision_log_id": 1}),
+                    ),
+                    (
+                        "b",
+                        "pairB",
+                        "closed",
+                        t1,
+                        t1,
+                        "max_hold",
+                        10.5,
+                        json.dumps({"liquidity_usd": 191062.78, "decision_log_id": 2}),
+                    ),
+                    (
+                        "c",
+                        "pairB",
+                        "closed",
+                        t2,
+                        t2,
+                        "max_hold",
+                        -4.3,
+                        json.dumps({"liquidity_usd": 386822.33, "decision_log_id": 3}),
+                    ),
+                    (
+                        "d",
+                        "pairC",
+                        "open",
+                        None,
+                        None,
+                        None,
+                        None,
+                        "{}",
+                    ),
+                ],
+            )
+        main = self.root / "main.db"
+        with sqlite3.connect(main) as conn:
+            conn.execute(
+                "CREATE TABLE decision_log (id INTEGER PRIMARY KEY, purpose TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO decision_log (id, purpose) VALUES (?, ?)",
+                [(1, "live_candidate"), (2, "live_candidate"), (3, "sample")],
+            )
+        store = DataStore(
+            DbPaths(
+                main=main,
+                execution=self.root / "missing-exec.db",
+                paper=paper,
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        report = store.paper_closed_buckets(days=14)
+        self.assertTrue(report.available, report.reason)
+        self.assertEqual(report.data.closed, 3)
+        keys = {(item.exit_reason, item.liq_bucket): item for item in report.data.buckets}
+        self.assertIn(("stop_loss", "liq_<50k"), keys)
+        self.assertEqual(keys[("stop_loss", "liq_<50k")].count, 1)
+        self.assertAlmostEqual(keys[("stop_loss", "liq_<50k")].pnl_usd, -84.3, places=2)
+        self.assertEqual(keys[("max_hold", "liq_>=50k")].count, 2)
+        self.assertEqual(report.data.win_count, 1)
+        self.assertEqual(report.data.loss_count, 2)
+        self.assertAlmostEqual(report.data.win_rate or 0, 1 / 3, places=4)
+        self.assertAlmostEqual(report.data.worst_pnl_usd or 0, -84.3, places=2)
+        self.assertTrue(report.data.single_wipe)
+        # first closed per pair: pairA loss, pairB win (earliest of B is +10.5)
+        self.assertEqual(report.data.first_hit_n, 2)
+        self.assertEqual(report.data.first_hit_wins, 1)
+        self.assertAlmostEqual(report.data.first_hit_rate or 0, 0.5, places=4)
+        self.assertEqual(report.data.first_hit_live_n, 2)
+        self.assertEqual(report.data.first_hit_live_wins, 1)
 
     def test_chat_context_uses_newest_messages(self) -> None:
         sessions = SessionStore(self.root / "dashboard_state.db")
