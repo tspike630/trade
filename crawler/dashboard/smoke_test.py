@@ -9,6 +9,7 @@ missing databases degrade instead of raising. Run from the project root::
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import logging
 import os
@@ -23,9 +24,17 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from dashboard.auth import SecretFilter, verify_api_key
+from dashboard.auth import SecretFilter, attach_secret_filters, verify_api_key
+from dashboard.chat.sessions import SessionStore
 from dashboard.data import DataStore, DbPaths, _WRITE_RE, connect_ro
 from dashboard.format_util import fmt_hold, fmt_liq, fmt_pct, fmt_usd
+from dashboard.panels.evolution import (
+    find_latest_weekly_report,
+    load_evolution_suggestions,
+    parse_evolution_section,
+    status_class,
+)
+from dashboard.panels.markets import _row as market_table_row
 from dashboard.panels.registry import PANELS
 from dashboard.panels.shell import (
     TOP_TABS,
@@ -37,10 +46,17 @@ from dashboard.panels.shell import (
     refresh_age_label,
     select_top_tab,
 )
-from dashboard.parsing import bucket_key, extract_jev_strength
 import dashboard.app as app_module
-from dashboard.app import jev_gate_view, prior_pulse_tone
-from dashboard.settings import bind_host, port, read_gates, refresh_seconds
+from dashboard.app import backtest_equity_tone, jev_gate_view, prior_pulse_tone
+from dashboard.parsing import bucket_key, extract_jev_strength, rejection_key
+from dashboard.settings import (
+    bind_host,
+    gateway_stale_seconds,
+    port,
+    read_gates,
+    refresh_seconds,
+    stale_seconds,
+)
 
 _TOUCHED = (
     "API_SECRET",
@@ -58,6 +74,8 @@ _TOUCHED = (
     "DB_PATH",
     "PAPER_DB_PATH",
     "HEARTBEAT_STALE_SEC",
+    "GATEWAY_HEARTBEAT_STALE_SEC",
+    "EXECUTION_LEDGER_PATH",
     "EXECUTION_PAPER_ENABLED",
     "PM_ENABLED",
     "LIVE_TRADING_ENABLED",
@@ -65,6 +83,7 @@ _TOUCHED = (
     "LIVE_KILL_SWITCH_PATH",
     "LIVE_EXCHANGE_API_KEY",
     "LIVE_EXCHANGE_API_SECRET",
+    "LIVE_EXCHANGE_API_URL",
 )
 _WRITE_SQL = re.compile(
     r"(?i)\b(insert\s+into|update\s+[a-z0-9_]+\s+set|delete\s+from|replace\s+into|"
@@ -629,15 +648,22 @@ class DashboardSmokeTest(unittest.TestCase):
         # Isolate from the live project's LIVE_TRADING_DISABLED kill-switch file.
         os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
         os.environ.pop("LIVE_KILL_SWITCH_PATH", None)
-        self.assertFalse(read_gates().paper_enabled)
-        self.assertFalse(read_gates().pm_enabled)
-        self.assertFalse(read_gates().live_effective)
+        idle = read_gates()
+        self.assertFalse(idle.paper_enabled)
+        self.assertFalse(idle.pm_enabled)
+        self.assertFalse(idle.live_effective)
+        self.assertEqual(idle.paper_origin, "看板进程")
+        self.assertEqual(idle.pm_origin, "看板进程")
+        self.assertFalse(idle.gateway_stale)
+        self.assertFalse(idle.exchange_url_set)
         os.environ["EXECUTION_PAPER_ENABLED"] = "YES"
         os.environ["PM_ENABLED"] = "on"
         os.environ["LIVE_TRADING_ENABLED"] = "1"
         status = read_gates()
         self.assertTrue(status.paper_enabled)
         self.assertTrue(status.pm_enabled)
+        self.assertEqual(status.paper_origin, "看板进程")
+        self.assertEqual(status.origin_hint("paper"), "看板进程")
         self.assertFalse(status.live_effective)
         self.assertEqual(status.live_block_reason, "确认短语未匹配")
 
@@ -652,10 +678,17 @@ class DashboardSmokeTest(unittest.TestCase):
         os.environ["LIVE_TRADING_ENABLED"] = "1"
         os.environ["LIVE_KILL_SWITCH_PATH"] = str(self.root / "absent-switch")
         os.environ["LIVE_TRADING_CONFIRM"] = "I_UNDERSTAND_THE_RISKS"
+        missing_url = read_gates()
+        self.assertFalse(missing_url.live_effective)
+        self.assertEqual(missing_url.live_block_reason, "交易所 URL 未设置")
+        self.assertEqual(missing_url.confirm_state, "matched")
+        os.environ["LIVE_EXCHANGE_API_URL"] = "https://exchange.example/orders"
         armed = read_gates()
         self.assertTrue(armed.live_effective)
+        self.assertTrue(armed.exchange_url_set)
         self.assertEqual(armed.confirm_state, "matched")
         self.assertNotIn("I_UNDERSTAND_THE_RISKS", armed.live_block_reason)
+        self.assertNotIn("exchange.example", armed.live_block_reason)
 
         os.environ["DASHBOARD_HOST"] = "0.0.0.0"
         self.assertEqual(bind_host(), "127.0.0.1")
@@ -682,9 +715,18 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertNotIn("abcdefghijklmnop", record.getMessage())
 
         self.assertEqual(bucket_key("liq_too_low; wide\nmore"), "liq_too_low")
+        self.assertEqual(bucket_key('["liq_too_low", "wide spread"]'), "liq_too_low")
         self.assertEqual(bucket_key("   "), "(empty)")
         self.assertEqual(bucket_key(None), "(empty)")
         self.assertEqual(len(bucket_key("a" * 100)), 80)
+        self.assertEqual(rejection_key(1, "", "rejected", {"status": "pm_rejected"}), "pm_rejected")
+        self.assertEqual(rejection_key(1, "", "validated", {"status": "paper_failed"}), "paper_failed")
+        self.assertEqual(rejection_key(0, '["slippage"]', "rejected", None), "slippage")
+        self.assertIsNone(rejection_key(1, "", "validated", {"status": "dry_run_acked"}))
+        self.assertEqual(backtest_equity_tone(11000, 10000), "up")
+        self.assertEqual(backtest_equity_tone(9000, 10000), "down")
+        self.assertEqual(backtest_equity_tone(15000, None), "mute")
+        self.assertEqual(backtest_equity_tone(10000, 10000), "mute")
         self.assertEqual(extract_jev_strength({"extras": {"jev_strength": "0.81"}}, None), 0.81)
         self.assertEqual(extract_jev_strength({}, "jev_strength=0.42 tail"), 0.42)
         self.assertEqual(fmt_pct(25), "+25.00%")
@@ -693,11 +735,12 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(fmt_usd(-2, signed=True), "-$2.00")
         self.assertEqual(fmt_liq(12345.6), "$12.3K")
         self.assertEqual(fmt_hold(5400), "1小时30分")
-        self.assertEqual([item.id for item in PANELS], ["risk", "positions", "signals", "execution", "market"])
+        self.assertEqual([item.id for item in PANELS], ["risk", "positions", "signals", "execution", "market", "evolution"])
         self.assertEqual(panel_group("risk"), "overview")
         self.assertEqual(panel_group("positions"), "overview")
         self.assertEqual(panel_group("signals"), "signals")
         self.assertEqual(panel_group("execution"), "execution")
+        self.assertEqual(panel_group("evolution"), "overview")
         self.assertEqual(panel_group("later"), "overview")
         self.assertEqual(heartbeat_summary(["alive", "stale", "unknown"]), ("进程 1/3 存活", "ok"))
         self.assertEqual(heartbeat_summary(["stale"]), ("进程 0/1 存活", "warn"))
@@ -708,6 +751,8 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(refresh_age_label(None), "刷新 —")
         self.assertEqual(refresh_age_label(3), "刷新 3s 前")
         app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+        self.assertNotIn("end >= 10000", app_text)
+        self.assertIn("attach_secret_filters", app_text)
         for label in (
             "SPIKE'S",
             "CRYPTO",
@@ -779,6 +824,161 @@ class DashboardSmokeTest(unittest.TestCase):
         market_src = inspect.getsource(DataStore._market_rows)
         for banned in ("rsi", "macd", "boll"):
             self.assertNotIn(banned, market_src.lower())
+
+    def test_fresh_receipt_overrides_process_env(self) -> None:
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+        os.environ["EXECUTION_PAPER_ENABLED"] = "0"
+        os.environ["PM_ENABLED"] = "1"
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ledger = self.root / "execution_ledger.db"
+        with sqlite3.connect(ledger) as conn:
+            conn.execute(
+                "CREATE TABLE execution_log (id INTEGER PRIMARY KEY, ts TEXT, receipt_json TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO execution_log (ts, receipt_json) VALUES (?, ?)",
+                (now, json.dumps({"paper_enabled": True, "pm_enabled": False})),
+            )
+        status = read_gates()
+        self.assertTrue(status.paper_enabled)
+        self.assertFalse(status.pm_enabled)
+        self.assertEqual(status.paper_origin, "网关回执")
+        self.assertEqual(status.pm_origin, "网关回执")
+        self.assertFalse(status.gateway_stale)
+        self.assertEqual(status.origin_hint("paper"), "网关回执")
+
+    def test_stale_receipt_falls_back_and_is_labeled(self) -> None:
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+        os.environ["EXECUTION_PAPER_ENABLED"] = "0"
+        os.environ["PM_ENABLED"] = "0"
+        old = (datetime.now(timezone.utc) - timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ledger = self.root / "execution_ledger.db"
+        with sqlite3.connect(ledger) as conn:
+            conn.execute(
+                "CREATE TABLE execution_log (id INTEGER PRIMARY KEY, ts TEXT, receipt_json TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO execution_log (ts, receipt_json) VALUES (?, ?)",
+                (old, json.dumps({"paper_enabled": True, "pm_enabled": True})),
+            )
+        status = read_gates()
+        self.assertFalse(status.paper_enabled)
+        self.assertFalse(status.pm_enabled)
+        self.assertTrue(status.gateway_stale)
+        self.assertEqual(status.paper_origin, "看板进程")
+        self.assertEqual(status.origin_hint("pm"), "网关陈旧 · 看板进程")
+
+    def test_execution_ledger_path_and_gateway_window(self) -> None:
+        self.assertEqual(stale_seconds(), 900.0)
+        self.assertEqual(gateway_stale_seconds(), 120.0)
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+        ledger = self.root / "from-execution.db"
+        os.environ["EXECUTION_LEDGER_PATH"] = str(ledger)
+        self.assertEqual(DbPaths.from_env().execution, ledger)
+        override = self.root / "override.db"
+        os.environ["DASHBOARD_EXECUTION_DB"] = str(override)
+        self.assertEqual(DbPaths.from_env().execution, override)
+
+        aged = datetime.now(timezone.utc) - timedelta(seconds=200)
+        main = self.root / "dexscreener.db"
+        execution = self.root / "execution_ledger.db"
+        with sqlite3.connect(main) as conn:
+            conn.execute("CREATE TABLE decision_log (id INTEGER PRIMARY KEY, ts TEXT)")
+            conn.execute("INSERT INTO decision_log (ts) VALUES (?)", (_iso(aged),))
+        with sqlite3.connect(execution) as conn:
+            conn.execute("CREATE TABLE execution_log (id INTEGER PRIMARY KEY, ts TEXT)")
+            conn.execute("INSERT INTO execution_log (ts) VALUES (?)", (_iso(aged),))
+        store = DataStore(
+            DbPaths(
+                main=main,
+                execution=execution,
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        probes = {item.name: item for item in store.process_liveness().data}
+        self.assertEqual(probes["决策引擎"].state, "alive")
+        self.assertEqual(probes["执行网关"].state, "stale")
+
+    def test_rejection_buckets_include_status_and_json_errors(self) -> None:
+        now = datetime.now(timezone.utc)
+        execution = self.root / "execution_ledger.db"
+        with sqlite3.connect(execution) as conn:
+            conn.execute(
+                """
+                CREATE TABLE execution_log (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT,
+                    validation_ok INTEGER,
+                    validation_errors TEXT,
+                    status TEXT,
+                    receipt_json TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO execution_log
+                    (id, ts, validation_ok, validation_errors, status, receipt_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (1, _iso(now), 1, "", "rejected", json.dumps({"status": "pm_rejected"})),
+                    (2, _iso(now), 1, "", "rejected", json.dumps({"status": "risk_rejected"})),
+                    (3, _iso(now), 1, "", "validated", json.dumps({"status": "paper_failed"})),
+                    (4, _iso(now), 0, '["slippage", "wide"]', "rejected", "{}"),
+                    (5, _iso(now), 1, "", "validated", json.dumps({"status": "dry_run_acked"})),
+                ],
+            )
+        store = DataStore(
+            DbPaths(
+                main=self.root / "missing-main.db",
+                execution=execution,
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        report = store.rejection_buckets()
+        self.assertTrue(report.available, report.reason)
+        counts = {item.key: item.count for item in report.data.buckets}
+        self.assertEqual(report.data.total, 4)
+        self.assertEqual(counts, {"pm_rejected": 1, "risk_rejected": 1, "paper_failed": 1, "slippage": 1})
+        failures = store.recent_failures()
+        self.assertEqual([item.id for item in failures.data], [4, 3, 2, 1])
+        self.assertIn("slippage", failures.data[0].validation_errors)
+
+    def test_chat_context_uses_newest_messages(self) -> None:
+        sessions = SessionStore(self.root / "dashboard_state.db")
+        info = sessions.create_session("sweep")
+        for index in range(205):
+            sessions.append_message(info.id, "user", f"m{index}")
+        msgs = sessions.list_messages(info.id, limit=200)
+        self.assertEqual(len(msgs), 200)
+        self.assertEqual(msgs[0].content, "m5")
+        self.assertEqual(msgs[-1].content, "m204")
+        self.assertLess(msgs[0].id, msgs[-1].id)
+
+    def test_secret_filter_scrubs_propagated_handler_records(self) -> None:
+        os.environ["API_SECRET"] = "abcdefghijklmnop"
+        attach_secret_filters()
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        root = logging.getLogger()
+        root.addHandler(handler)
+        child = logging.getLogger("dashboard.probe.secret")
+        child.setLevel(logging.INFO)
+        child.propagate = True
+        try:
+            child.info("leak abcdefghijklmnop")
+            text = stream.getvalue()
+            self.assertNotIn("abcdefghijklmnop", text)
+            self.assertIn("[redacted]", text)
+            self.assertTrue(any(isinstance(item, SecretFilter) for item in handler.filters))
+        finally:
+            root.removeHandler(handler)
 
     def test_market_rows_keep_indicator_columns(self) -> None:
         missing = DataStore(
@@ -886,10 +1086,225 @@ class DashboardSmokeTest(unittest.TestCase):
         second = result.data[1]
         self.assertAlmostEqual(second.coverage or 0, 25)
         self.assertIsNone(second.liquidity_usd)
+        self.assertEqual(first.tech_at, "")
+        self.assertEqual(first.fresh_at, "2026-10-10T00:00:00Z")
+        self.assertEqual(first.fresh_state, "stale")
+        self.assertIn("陈旧", str(market_table_row(first)["tech"]))
+        probes = {item.name: item for item in store.process_liveness().data}
+        self.assertEqual(probes["指标"].state, "stale")
         sol = store.market_rows(chain="solana")
         self.assertEqual([row.token_address for row in sol.data], ["T1"])
         self.assertEqual(list(store.market_rows(chain="not-a-chain").data or ()), [])
         self.assertEqual(main.stat().st_mtime_ns, before)
+
+    def test_indicator_clock_with_and_without_tech_column(self) -> None:
+        """Follow tech_updated_at when present; legacy updated_at when the column is absent."""
+        now = datetime.now(timezone.utc)
+        tech_fresh = _iso(now)
+        tech_old = _iso(now - timedelta(days=2))
+        shared_fresh = _iso(now)
+        shared_recent = _iso(now - timedelta(minutes=1))
+        shared_mid = _iso(now - timedelta(hours=2))
+        shared_old = _iso(now - timedelta(days=10))
+
+        legacy = self.root / "legacy-indicators.db"
+        with sqlite3.connect(legacy) as conn:
+            conn.execute(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    tier TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators (chain_id, token_address, tier, updated_at)
+                VALUES ('solana', 'OLD', 'warm', ?)
+                """,
+                (shared_old,),
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators (chain_id, token_address, tier, updated_at)
+                VALUES ('solana', 'NEW', 'warm', ?)
+                """,
+                (shared_fresh,),
+            )
+        legacy_store = self._store(legacy)
+        legacy_rows = legacy_store.market_rows()
+        self.assertTrue(legacy_rows.available, legacy_rows.reason)
+        self.assertEqual([row.token_address for row in legacy_rows.data], ["NEW", "OLD"])
+        newest = legacy_rows.data[0]
+        self.assertEqual(newest.tech_at, "")
+        self.assertEqual(newest.fresh_at, shared_fresh)
+        self.assertEqual(newest.fresh_state, "alive")
+        self.assertEqual(market_table_row(newest)["tech_class"], "pnl-flat")
+        self.assertNotIn("陈旧", str(market_table_row(newest)["tech"]))
+        legacy_probe = {item.name: item for item in legacy_store.process_liveness().data}
+        self.assertEqual(legacy_probe["指标"].state, "alive")
+        self.assertEqual(legacy_probe["指标"].detail, "")
+
+        tech = self.root / "tech-indicators.db"
+        with sqlite3.connect(tech) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    tier TEXT,
+                    updated_at TEXT,
+                    tech_updated_at TEXT
+                );
+                CREATE TABLE indicator_history (
+                    id INTEGER PRIMARY KEY,
+                    recorded_at TEXT
+                );
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO token_indicators
+                    (chain_id, token_address, tier, updated_at, tech_updated_at)
+                VALUES ('solana', ?, ?, ?, ?)
+                """,
+                [
+                    ("FUND", "warm", shared_fresh, tech_old),
+                    ("TECH", "warm", shared_old, tech_fresh),
+                    ("GAP", "hot", shared_mid, None),
+                    ("BLANK", "cold", shared_recent, "  "),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO indicator_history (recorded_at) VALUES (?)",
+                (shared_fresh,),
+            )
+        before = tech.stat().st_mtime_ns
+        tech_store = self._store(tech)
+        tech_rows = tech_store.market_rows()
+        self.assertTrue(tech_rows.available, tech_rows.reason)
+        self.assertEqual(
+            [row.token_address for row in tech_rows.data],
+            ["GAP", "TECH", "BLANK", "FUND"],
+        )
+        by_token = {row.token_address: row for row in tech_rows.data}
+        self.assertEqual(by_token["TECH"].tech_at, tech_fresh)
+        self.assertEqual(by_token["TECH"].fresh_at, tech_fresh)
+        self.assertEqual(by_token["TECH"].fresh_state, "alive")
+        self.assertEqual(by_token["FUND"].tech_at, tech_old)
+        self.assertEqual(by_token["FUND"].fresh_at, tech_old)
+        self.assertEqual(by_token["FUND"].fresh_state, "stale")
+        self.assertIn("陈旧", str(market_table_row(by_token["FUND"])["tech"]))
+        self.assertEqual(by_token["GAP"].tech_at, "")
+        self.assertEqual(by_token["GAP"].fresh_at, shared_mid)
+        self.assertEqual(by_token["GAP"].fresh_state, "stale")
+        self.assertEqual(by_token["BLANK"].tech_at, "")
+        self.assertEqual(by_token["BLANK"].fresh_at, shared_recent)
+        self.assertEqual(by_token["BLANK"].fresh_state, "alive")
+        tech_probe = {item.name: item for item in tech_store.process_liveness().data}
+        self.assertEqual(tech_probe["指标"].state, "alive")
+        self.assertEqual(tech_probe["指标"].detail, "tech_updated_at")
+        self.assertEqual(tech.stat().st_mtime_ns, before)
+
+        stale = self.root / "stale-tech.db"
+        with sqlite3.connect(stale) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    tier TEXT,
+                    updated_at TEXT,
+                    tech_updated_at TEXT
+                );
+                CREATE TABLE indicator_history (
+                    id INTEGER PRIMARY KEY,
+                    recorded_at TEXT
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators
+                    (chain_id, token_address, tier, updated_at, tech_updated_at)
+                VALUES ('solana', 'FROZEN', 'hot', ?, ?)
+                """,
+                (shared_fresh, tech_old),
+            )
+            conn.execute(
+                "INSERT INTO indicator_history (recorded_at) VALUES (?)",
+                (shared_fresh,),
+            )
+        stale_store = self._store(stale)
+        stale_probe = {item.name: item for item in stale_store.process_liveness().data}
+        self.assertEqual(stale_probe["指标"].state, "stale")
+        self.assertEqual(stale_probe["指标"].detail, "tech_updated_at")
+        self.assertGreater(stale_probe["指标"].age_seconds or 0, 86400)
+        os.environ["HEARTBEAT_STALE_SEC"] = "10000000"
+        wide = {item.name: item for item in stale_store.process_liveness().data}
+        self.assertEqual(wide["指标"].state, "alive")
+        widened_row = stale_store.market_rows().data[0]
+        self.assertEqual(widened_row.fresh_state, "alive")
+        os.environ["HEARTBEAT_STALE_SEC"] = "10"
+        narrow = {item.name: item for item in stale_store.process_liveness().data}
+        self.assertEqual(narrow["指标"].state, "stale")
+
+        empty_tech = self.root / "null-tech.db"
+        with sqlite3.connect(empty_tech) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT,
+                    token_address TEXT,
+                    tier TEXT,
+                    updated_at TEXT,
+                    tech_updated_at TEXT
+                );
+                CREATE TABLE indicator_history (
+                    id INTEGER PRIMARY KEY,
+                    recorded_at TEXT
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators
+                    (chain_id, token_address, tier, updated_at, tech_updated_at)
+                VALUES ('solana', 'UNSTAMPED', 'hot', ?, NULL)
+                """,
+                (shared_fresh,),
+            )
+            conn.execute(
+                "INSERT INTO token_indicators (chain_id, token_address, tier) VALUES ('solana', 'BARE', 'warm')"
+            )
+            conn.execute(
+                "INSERT INTO indicator_history (recorded_at) VALUES (?)",
+                (shared_fresh,),
+            )
+        os.environ.pop("HEARTBEAT_STALE_SEC", None)
+        empty_store = self._store(empty_tech)
+        empty_probe = {item.name: item for item in empty_store.process_liveness().data}
+        self.assertEqual(empty_probe["指标"].state, "unknown")
+        self.assertEqual(empty_probe["指标"].detail, "tech_updated_at")
+        bare = {row.token_address: row for row in empty_store.market_rows().data}
+        self.assertEqual(bare["UNSTAMPED"].tech_at, "")
+        self.assertEqual(bare["UNSTAMPED"].fresh_at, shared_fresh)
+        self.assertEqual(bare["BARE"].fresh_at, "")
+        self.assertEqual(bare["BARE"].fresh_state, "unknown")
+        self.assertEqual(market_table_row(bare["BARE"])["tech"], "—")
+
+    def _store(self, main: Path) -> DataStore:
+        return DataStore(
+            DbPaths(
+                main=main,
+                execution=self.root / "missing-exec.db",
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
 
     def test_market_base_and_strategy_buckets_are_read_only(self) -> None:
         paths = build_fixture(self.root)
@@ -998,6 +1413,63 @@ class DashboardSmokeTest(unittest.TestCase):
             self.assertNotIn(f'@ui.page("{dead}', app_text)
         self.assertIn("v2-subbar", inspect.getsource(app_module._module_tabs))
         self.assertNotIn("v2-subbar", inspect.getsource(app_module._render_dashboard))
+
+
+    def test_evolution_section_parse_and_registry(self) -> None:
+        sample = (
+            "# weekly\n\n"
+            "## 9. 其他\n\nignore\n\n"
+            "## 10. 进化建议\n\n"
+            "> note\n\n"
+            "| 层 | 项 | 状态 | 证据 | 行动提示 |\n"
+            "|---|---|---|---|---|\n"
+            "| 采集 | age 覆盖 | **观察中** | unknown=0/40 evidence long text | 继续观察；落地须走 R4 |\n"
+            "| 决策 | JEV 门槛 | **建议落地** | n=20 unique=12 | 交 R4 人工确认 |\n"
+            "| 复盘 | 退役规则 | **裁决** | 连续 2 周弱 | 止损退役 |\n\n"
+            "共 3 条；\n\n"
+            "### 基线滚动快照\n\n"
+            "| 层 | 项 | 状态 | 证据 | 行动提示 |\n"
+            "|---|---|---|---|---|\n"
+            "| 假 | 不该解析 | **观察中** | x | y |\n"
+        )
+        items = parse_evolution_section(sample)
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0].layer, "采集")
+        self.assertEqual(items[0].status, "观察中")
+        self.assertEqual(items[1].status, "建议落地")
+        self.assertEqual(items[2].status, "裁决")
+        self.assertEqual(status_class("观察中"), "muted")
+        self.assertEqual(status_class("**建议落地**"), "warn")
+        self.assertEqual(status_class("裁决"), "ok")
+        self.assertEqual(parse_evolution_section("# no section"), [])
+
+        reports = self.root / "exports" / "reports"
+        reports.mkdir(parents=True)
+        (reports / "review_weekly_2026-10-01.md").write_text(
+            "## 10. 进化建议\n\n_本期无进化建议（各层数据未交来）。_\n",
+            encoding="utf-8",
+        )
+        (reports / "review_weekly_2026-10-12.md").write_text(sample, encoding="utf-8")
+        latest = find_latest_weekly_report(self.root)
+        assert latest is not None
+        self.assertEqual(latest.name, "review_weekly_2026-10-12.md")
+        loaded, reason, source = load_evolution_suggestions(self.root)
+        self.assertIsNone(reason)
+        assert source is not None
+        self.assertEqual(source.name, "review_weekly_2026-10-12.md")
+        self.assertEqual(len(loaded), 3)
+        empty_root = self.root / "empty-exports"
+        empty_root.mkdir()
+        missing, miss_reason, miss_path = load_evolution_suggestions(empty_root)
+        self.assertEqual(missing, [])
+        self.assertIsNotNone(miss_reason)
+        self.assertIsNone(miss_path)
+        self.assertIn("evolution", [item.id for item in PANELS])
+        self.assertEqual(next(item.title for item in PANELS if item.id == "evolution"), "进化建议")
+        app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+        self.assertIn('("进化", "建议")', app_text)
+        self.assertIn("span-12", app_text)
+        self.assertIn("render_evolution_body", app_text)
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent

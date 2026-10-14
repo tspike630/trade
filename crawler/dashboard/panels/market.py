@@ -6,12 +6,23 @@ from nicegui import ui
 
 from dashboard.data import DataStore, MarketRow
 from dashboard.format_util import short_addr
-from dashboard.panels.common import col, data_table, panel_box, show_unavailable, slow_hint
+from dashboard.panels.common import (
+    col,
+    data_table,
+    indicator_fresh_cell,
+    panel_box,
+    show_unavailable,
+    slow_hint,
+)
 from dashboard.chat.page import set_chat_context
 
 
 def render_market(store: DataStore) -> None:
-    with panel_box("链上行情", "token_indicators + pair_history / jev_signals，Python 侧合并，只读。"):
+    with panel_box(
+        "链上行情",
+        "token_indicators + pair_history / jev_signals，Python 侧合并，只读。"
+        "技术时间优先 tech_updated_at，空值用 updated_at；超过 HEARTBEAT 标陈旧。",
+    ):
         with ui.row().classes("w-full items-center gap-2"):
             for label, val in (("全部", None), ("solana", "solana"), ("ethereum", "ethereum"), ("bsc", "bsc"), ("base", "base")):
                 ui.button(label, on_click=lambda _e=None, c=val: _reload(store, c)).props("flat dense")
@@ -49,6 +60,7 @@ def _body(store: DataStore, chain: str | None) -> None:
         return
     rows = []
     for r in rows_data:
+        tech_text, tech_class = indicator_fresh_cell(r.fresh_at, r.fresh_state)
         rows.append(
             {
                 "id": f"{r.chain_id}:{r.token_address}",
@@ -63,9 +75,11 @@ def _body(store: DataStore, chain: str | None) -> None:
                 "jev": _num(r.jev_strength),
                 "cov": _num(r.coverage),
                 "tier": r.tier or "—",
+                "tech": tech_text,
                 "c5m_class": _tone(r.change_5m),
                 "c1h_class": _tone(r.change_1h),
                 "c4h_class": _tone(r.change_4h),
+                "tech_class": tech_class,
             }
         )
     columns = [
@@ -79,6 +93,7 @@ def _body(store: DataStore, chain: str | None) -> None:
         col("jev", "JEV", "right"),
         col("cov", "coverage", "right"),
         col("tier", "tier"),
+        col("tech", "技术"),
     ]
     def _click(row: dict) -> None:
         token = str(row.get("token_raw") or row.get("token") or "").strip()
@@ -90,7 +105,7 @@ def _body(store: DataStore, chain: str | None) -> None:
         columns,
         rows,
         row_key="id",
-        color_fields=("c5m", "c1h", "c4h"),
+        color_fields=("c5m", "c1h", "c4h", "tech"),
         on_row_click=_click,
     )
 

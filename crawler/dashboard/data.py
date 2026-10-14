@@ -21,7 +21,6 @@ from typing import Any, Iterator
 from urllib.parse import quote
 
 from dashboard.parsing import (
-    bucket_key,
     clip,
     extract_coverage,
     extract_jev_strength,
@@ -31,9 +30,20 @@ from dashboard.parsing import (
     parse_json,
     parse_ts,
     receipt_summary,
+    rejection_key,
     safe_float,
+    validation_error_text,
 )
-from dashboard.settings import db_root, resolve_db_file, stale_seconds
+from dashboard.settings import (
+    EXECUTION_DB_ENV,
+    _ReceiptFlags,
+    _as_bool,
+    _parse_utc,
+    db_root,
+    gateway_stale_seconds,
+    resolve_db_file,
+    stale_seconds,
+)
 from dashboard.format_util import Liveness
 
 log = logging.getLogger("dashboard.data")
@@ -93,7 +103,7 @@ class DbPaths:
         root = db_root()
         return cls(
             main=resolve_db_file(("DASHBOARD_MAIN_DB", "DB_PATH"), "dexscreener.db", root),
-            execution=resolve_db_file(("DASHBOARD_EXECUTION_DB",), "execution_ledger.db", root),
+            execution=resolve_db_file(EXECUTION_DB_ENV, "execution_ledger.db", root),
             paper=resolve_db_file(("DASHBOARD_PAPER_DB", "PAPER_DB_PATH"), "paper_trading.db", root),
             backtest=resolve_db_file(("DASHBOARD_BACKTEST_DB",), "backtest_ledger.db", root),
             news=resolve_db_file(("DASHBOARD_NEWS_DB",), "news_events.db", root),
@@ -211,6 +221,11 @@ class MarketRow:
     symbol: str = ""
     change_15m: float | None = None
     change_24h: float | None = None
+    # tech_updated_at when present and non-blank; empty if the column or value is missing.
+    tech_at: str = ""
+    # Clock used for sort and staleness: tech_at, else updated_at / recorded_at. Never invented.
+    fresh_at: str = ""
+    fresh_state: Liveness = "unknown"
 
 
 @dataclass(frozen=True)
@@ -328,6 +343,44 @@ def ro_connect(path: str | Path) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def latest_gate_receipt() -> _ReceiptFlags:
+    """Newest execution_log receipt. A missing ledger is an empty snapshot, not an error.
+
+    Opened with ``connect_ro`` (``mode=ro``, ``query_only``). Called from
+    ``settings.read_gates`` so the gate lights can follow the gateway without
+    a second connection helper.
+    """
+    path = resolve_db_file(EXECUTION_DB_ENV, "execution_ledger.db")
+    if not path.is_file():
+        return _ReceiptFlags(False, None, None, None)
+    try:
+        with ro_connect(path) as conn:
+            if not _table_exists(conn, "execution_log"):
+                return _ReceiptFlags(False, None, None, None)
+            cols = _columns(conn, "execution_log")
+            if "receipt_json" not in cols:
+                return _ReceiptFlags(False, None, None, None)
+            order = "id" if "id" in cols else "rowid"
+            ts_expr = "ts" if "ts" in cols else "NULL"
+            found = _exec(
+                conn,
+                f"SELECT {ts_expr} AS ts, receipt_json FROM execution_log "
+                f"ORDER BY {order} DESC LIMIT 1",
+            ).fetchone()
+    except (OSError, sqlite3.Error, FileNotFoundError):
+        log.warning("gateway receipt unreadable")
+        return _ReceiptFlags(False, None, None, None)
+    if found is None:
+        return _ReceiptFlags(False, None, None, None)
+    payload = parse_json(str(found["receipt_json"] or ""))
+    return _ReceiptFlags(
+        True,
+        _parse_utc(found["ts"]),
+        _as_bool(payload.get("paper_enabled")),
+        _as_bool(payload.get("pm_enabled")),
+    )
+
+
 def _ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000.0
 
@@ -436,10 +489,32 @@ def _age_seconds(ts: Any, now: datetime) -> float | None:
     return (now - stamp).total_seconds()
 
 
-def _liveness(age: float | None) -> Liveness:
+def _rejection_sql_clauses(cols: set[str]) -> list[str]:
+    """Static predicates for rows that can be validation, PM, risk, or paper rejects."""
+    clauses: list[str] = []
+    if "validation_ok" in cols:
+        clauses.append("COALESCE(validation_ok, 0) != 1")
+    if "validation_errors" in cols:
+        clauses.append("(validation_errors IS NOT NULL AND TRIM(validation_errors) != '')")
+    if "status" in cols:
+        clauses.append("LOWER(COALESCE(status, '')) = 'rejected'")
+    if "receipt_json" in cols:
+        clauses.append(
+            "("
+            "INSTR(receipt_json, '\"pm_rejected\"') > 0"
+            " OR INSTR(receipt_json, '\"risk_rejected\"') > 0"
+            " OR INSTR(receipt_json, '\"paper_failed\"') > 0"
+            " OR INSTR(receipt_json, '\"validation_failed\"') > 0"
+            ")"
+        )
+    return clauses
+
+
+def _liveness(age: float | None, limit: float | None = None) -> Liveness:
     if age is None:
         return "unknown"
-    if age <= stale_seconds():
+    window = stale_seconds() if limit is None else limit
+    if age <= window:
         return "alive"
     return "stale"
 
@@ -641,31 +716,53 @@ class DataStore:
                         "strategy_id",
                         "action",
                         "token_address",
+                        "validation_ok",
                         "validation_errors",
+                        "status",
+                        "receipt_json",
                     )
                     if name in cols
                 ]
+                clauses = _rejection_sql_clauses(cols)
+                if not clauses:
+                    return _unavail(f"缺少字段：validation_errors（{path.name}）", started)
+                scan = min(max(bounded * 5, bounded), 200)
                 sql = (
                     f"SELECT {', '.join(wanted)} FROM execution_log "
-                    "WHERE validation_errors IS NOT NULL AND TRIM(validation_errors) != '' "
+                    f"WHERE {' OR '.join(clauses)} "
                     "ORDER BY id DESC LIMIT ?"
                 )
-                rows = _exec(conn, sql, (bounded,)).fetchall()
+                rows = _exec(conn, sql, (scan,)).fetchall()
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
-        payload = tuple(
-            FailureRow(
-                id=int(row["id"]),
-                ts=str(_cell(row, "ts") or ""),
-                decision_log_id=_text_id(_cell(row, "decision_log_id")),
-                strategy_id=clip(_cell(row, "strategy_id"), 40),
-                action=clip(_cell(row, "action"), 24),
-                token_address=str(_cell(row, "token_address") or ""),
-                validation_errors=clip(_cell(row, "validation_errors"), 180),
+        kept: list[FailureRow] = []
+        for row in rows:
+            raw_errors = str(_cell(row, "validation_errors") or "")
+            receipt = parse_json(str(_cell(row, "receipt_json") or ""))
+            status_text = _cell(row, "status")
+            key = rejection_key(
+                _as_int(_cell(row, "validation_ok")),
+                raw_errors,
+                None if status_text is None else str(status_text),
+                receipt or None,
             )
-            for row in rows
-        )
-        return _ok(payload, started)
+            if key is None:
+                continue
+            shown = validation_error_text(raw_errors).strip() or key
+            kept.append(
+                FailureRow(
+                    id=int(row["id"]),
+                    ts=str(_cell(row, "ts") or ""),
+                    decision_log_id=_text_id(_cell(row, "decision_log_id")),
+                    strategy_id=clip(_cell(row, "strategy_id"), 40),
+                    action=clip(_cell(row, "action"), 24),
+                    token_address=str(_cell(row, "token_address") or ""),
+                    validation_errors=clip(shown, 180),
+                )
+            )
+            if len(kept) >= bounded:
+                break
+        return _ok(tuple(kept), started)
 
     def _process_liveness(self, started: float) -> DataResult:
         path = self.paths.main
@@ -675,9 +772,7 @@ class DataStore:
         try:
             with ro_connect(path) as conn:
                 crawler = _probe_checkpoint(conn, now)
-                indicator = _probe_max(conn, "indicator_history", "recorded_at", "指标", now)
-                if indicator.state == "unknown":
-                    indicator = _probe_max(conn, "token_indicators", "updated_at", "指标", now)
+                indicator = _probe_indicator(conn, now)
                 jev = _probe_max(conn, "jev_signals", "fetched_at", "JEV", now)
                 if jev.state == "unknown":
                     jev = _probe_max(conn, "jev_signals", "analyzed_at", "JEV", now)
@@ -694,7 +789,14 @@ class DataStore:
             return ProcessProbe("执行网关", "unknown", None, "")
         try:
             with ro_connect(path) as conn:
-                return _probe_max(conn, "execution_log", "ts", "执行网关", now)
+                return _probe_max(
+                    conn,
+                    "execution_log",
+                    "ts",
+                    "执行网关",
+                    now,
+                    limit=gateway_stale_seconds(),
+                )
         except sqlite3.Error:
             log.warning("gateway heartbeat unreadable")
             return ProcessProbe("执行网关", "unknown", None, "")
@@ -1066,9 +1168,14 @@ class DataStore:
                 absent = _require(cols, ("ts", "validation_ok", "validation_errors"))
                 if absent:
                     return _unavail(f"{absent}（{path.name}）", started)
+                selected = ["ts", "validation_ok", "validation_errors"]
+                if "status" in cols:
+                    selected.append("status")
+                if "receipt_json" in cols:
+                    selected.append("receipt_json")
                 rows = _exec(
                     conn,
-                    "SELECT ts, validation_ok, validation_errors FROM execution_log WHERE ts >= ?",
+                    f"SELECT {', '.join(selected)} FROM execution_log WHERE ts >= ?",
                     (lower,),
                 ).fetchall()
         except sqlite3.Error as exc:
@@ -1078,13 +1185,18 @@ class DataStore:
         for row in rows:
             if not _in_range(row["ts"], start, end, end_inclusive=True):
                 continue
-            errors = str(row["validation_errors"] or "")
-            ok = _as_int(row["validation_ok"])
-            if ok == 1 and not errors.strip():
+            receipt = parse_json(str(_cell(row, "receipt_json") or ""))
+            status_text = _cell(row, "status")
+            key = rejection_key(
+                _as_int(row["validation_ok"]),
+                str(row["validation_errors"] or ""),
+                None if status_text is None else str(status_text),
+                receipt or None,
+            )
+            if key is None:
                 continue
-            if ok != 1 or errors.strip():
-                counts[bucket_key(errors)] += 1
-                total += 1
+            counts[key] += 1
+            total += 1
         ordered = tuple(
             RejectionBucket(key=key, count=count)
             for key, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
@@ -1217,15 +1329,15 @@ class DataStore:
                 if miss:
                     return _unavail(miss, started)
                 ti_cols = _columns(conn, "token_indicators")
-                ts_col = "updated_at" if "updated_at" in ti_cols else ("recorded_at" if "recorded_at" in ti_cols else None)
-                if not ts_col:
+                clock = _indicator_clock_expr(ti_cols)
+                if not clock:
                     return _unavail("token_indicators 缺少 updated_at/recorded_at", started)
                 where = ""
                 params: list[Any] = []
                 if chain and chain.lower() not in ("all", "*", "any"):
                     where = "WHERE chain_id = ?"
                     params.append(chain)
-                order = f"ORDER BY CASE WHEN tier = 'hot' THEN 0 ELSE 1 END, {ts_col} DESC"
+                order = f"ORDER BY CASE WHEN tier = 'hot' THEN 0 ELSE 1 END, {clock} DESC"
                 sql = f"SELECT * FROM token_indicators {where} {order} LIMIT ?"
                 params.append(limit)
                 rows = _exec(conn, sql, tuple(params)).fetchall()
@@ -1241,6 +1353,7 @@ class DataStore:
                 quotes = _load_quotes(conn, pair_keys) if _table_exists(conn, "pair_history") else {}
                 cov = _load_coverage(conn, token_keys) if _table_exists(conn, "jev_signals") else {}
                 symbols = _load_symbols(conn, token_keys) if _table_exists(conn, "tokens") else {}
+                now = datetime.now(timezone.utc)
                 out: list[MarketRow] = []
                 for row in rows:
                     ch = str(_cell(row, "chain_id") or "")
@@ -1268,6 +1381,7 @@ class DataStore:
                         val = safe_float(_cell(row, key))
                         if val is not None:
                             sent_parts.append(f"{key}={val:.4g}")
+                    tech_at, fresh_at, fresh_state = _indicator_freshness(row, ti_cols, now)
                     out.append(
                         MarketRow(
                             chain_id=ch,
@@ -1286,6 +1400,9 @@ class DataStore:
                             symbol=symbols.get((ch, tok), "") or str(_cell(row, "symbol") or ""),
                             change_15m=safe_float(_cell(row, "change_15m")),
                             change_24h=safe_float(_cell(row, "change_24h")),
+                            tech_at=tech_at,
+                            fresh_at=fresh_at,
+                            fresh_state=fresh_state,
                         )
                     )
                 return _ok(out, started)
@@ -1748,6 +1865,84 @@ def _strength_fallback(
     return found
 
 
+def _text_stamp(row: sqlite3.Row, name: str) -> str:
+    if name not in row.keys():
+        return ""
+    return str(row[name] or "").strip()
+
+
+def _null_if_blank(column: str) -> str:
+    _ident(column)
+    return f"NULLIF(TRIM({column}), '')"
+
+
+def _indicator_clock_expr(cols: set[str]) -> str | None:
+    """SQL clock for token_indicators sort and staleness.
+
+    Indicator #32 keeps technical freshness on tech_updated_at. When PRAGMA
+    shows that column, it wins. A NULL or blank value falls back to updated_at,
+    then recorded_at — the same degrade as decision #31's reader when the
+    technical column is absent. No stamp is synthesized.
+    """
+    fallbacks = [name for name in ("updated_at", "recorded_at") if name in cols]
+    parts: list[str] = []
+    if "tech_updated_at" in cols:
+        parts.append(_null_if_blank("tech_updated_at"))
+    parts.extend(_null_if_blank(name) for name in fallbacks)
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return "COALESCE(" + ", ".join(parts) + ")"
+
+
+def _indicator_freshness(
+    row: sqlite3.Row,
+    cols: set[str],
+    now: datetime,
+) -> tuple[str, str, Liveness]:
+    """Return (tech_at, fresh_at, state) for one token_indicators row.
+
+    tech_at stays empty when the column is missing or the value is NULL/blank.
+    fresh_at is that tech stamp, otherwise updated_at / recorded_at. Both empty
+    means unknown — the caller must not invent a time.
+    """
+    tech = _text_stamp(row, "tech_updated_at") if "tech_updated_at" in cols else ""
+    fallback = ""
+    if not tech:
+        for name in ("updated_at", "recorded_at"):
+            if name not in cols:
+                continue
+            fallback = _text_stamp(row, name)
+            if fallback:
+                break
+    chosen = tech or fallback
+    if not chosen:
+        return "", "", "unknown"
+    return tech, chosen, _liveness(_age_seconds(chosen, now))
+
+
+def _probe_indicator(conn: sqlite3.Connection, now: datetime) -> ProcessProbe:
+    """Indicator heartbeat. Technical life is tech_updated_at when the column exists.
+
+    Funding, sentiment, and composite bump token_indicators.updated_at and can
+    also append indicator_history.recorded_at. Once tech_updated_at is present,
+    MAX of that column is the pulse, including when it is stale or entirely
+    NULL. Those shared clocks must not report the technical pass as alive.
+    Without the column, fall back to indicator_history.recorded_at, then
+    token_indicators.updated_at.
+    """
+    if _table_exists(conn, "token_indicators"):
+        cols = _columns(conn, "token_indicators")
+        if "tech_updated_at" in cols:
+            found = _probe_max(conn, "token_indicators", "tech_updated_at", "指标", now)
+            return ProcessProbe(found.name, found.state, found.age_seconds, "tech_updated_at")
+    history = _probe_max(conn, "indicator_history", "recorded_at", "指标", now)
+    if history.state != "unknown":
+        return history
+    return _probe_max(conn, "token_indicators", "updated_at", "指标", now)
+
+
 def _probe_checkpoint(conn: sqlite3.Connection, now: datetime) -> ProcessProbe:
     if not _table_exists(conn, "run_checkpoint"):
         return ProcessProbe("主爬虫", "unknown", None, "")
@@ -1774,6 +1969,7 @@ def _probe_max(
     time_col: str,
     name: str,
     now: datetime,
+    limit: float | None = None,
 ) -> ProcessProbe:
     if table not in _TABLES or not _table_exists(conn, table):
         return ProcessProbe(name, "unknown", None, "")
@@ -1785,4 +1981,4 @@ def _probe_max(
     if row is None or not row["ts"]:
         return ProcessProbe(name, "unknown", None, "")
     age = _age_seconds(row["ts"], now)
-    return ProcessProbe(name, _liveness(age), age, "")
+    return ProcessProbe(name, _liveness(age, limit), age, "")

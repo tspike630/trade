@@ -6,6 +6,7 @@
 说明：
 - 不替换既有 change_*/volatility_24h/volume_strength；仅核对它们仍可计算。
 - 新列 rsi_14/macd*/boll_* 用 technical_lib 复算，做范围 sanity（非旧公式 diff）。
+- atr_14/adx_14 亦复算打印（只算不落库；短历史允许 None）。
 """
 from __future__ import annotations
 
@@ -152,6 +153,16 @@ def main() -> int:
             if not (float(low) <= float(mid) <= float(up)):
                 problems.append(f"boll order broken: {low}/{mid}/{up}")
 
+        # atr_14 / adx_14: compute-only; short history → None OK
+        atr = lib.get("atr_14")
+        adx = lib.get("adx_14")
+        if _finite(atr) and float(atr) < 0.0:
+            problems.append(f"atr_14 negative: {atr}")
+        if _finite(adx) and not (0.0 <= float(adx) <= 100.0):
+            # ADX is typically 0–100; allow tiny float noise above 100
+            if float(adx) < 0.0 or float(adx) > 105.0:
+                problems.append(f"adx_14 out of range: {adx}")
+
         # Naive vs library RSI when both present
         naive = naive_rsi(closes)
         rsi_diff = None
@@ -165,6 +176,7 @@ def main() -> int:
         print(
             f"{status} {chain_id}/{str(token_address)[:12]} n={n} closes={len(closes)} "
             f"rsi={rsi} macd={lib.get('macd')} boll_mid={mid} "
+            f"atr_14={atr} adx_14={adx} "
             f"chg1h={chg_1h} vol={vol} vs={vs} rsi_diff={rsi_diff}"
         )
         if problems:
@@ -176,7 +188,7 @@ def main() -> int:
         for e in errors[:10]:
             print("  -", e)
         return 1
-    print("\nPASS: sample OK (legacy fields intact; pandas-ta ADD-ON sane)")
+    print("\nPASS: sample OK (legacy fields intact; pandas-ta ADD-ON sane; atr/adx compute-only)")
     return 0
 
 

@@ -165,6 +165,9 @@ def _ind_dict(row: MarketRow) -> dict[str, Any]:
         "volatility": row.volatility,
         "sentiment": row.sentiment or "—",
         "tier": row.tier,
+        "tech_at": row.tech_at or "",
+        "fresh_at": row.fresh_at or "",
+        "fresh_state": row.fresh_state,
     }
 
 

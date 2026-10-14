@@ -135,13 +135,19 @@ class SessionStore:
             )
 
     def list_messages(self, session_id: str, limit: int = 200) -> list[ChatMessage]:
+        """Newest ``limit`` messages, oldest of that window first.
+
+        ``ORDER BY id ASC LIMIT`` kept the earliest rows, so once a session
+        passed the cap the model context never saw the latest turns.
+        """
         bounded = max(1, min(int(limit), 500))
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT id, session_id, role, content, created_at FROM chat_messages "
-                "WHERE session_id = ? ORDER BY id ASC LIMIT ?",
+                "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
                 (session_id, bounded),
             ).fetchall()
+        rows = list(reversed(rows))
         return [
             ChatMessage(
                 id=int(row["id"]),

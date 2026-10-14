@@ -53,8 +53,8 @@ def _gates(status: GateStatus) -> None:
     pm_value, pm_tone = ("开", "tone-warn") if status.pm_enabled else ("关", "")
     live_value, live_tone = _live_face(status)
     with ui.element("div").classes("kpi-grid"):
-        kpi("模拟盘执行", paper_value, "EXECUTION_PAPER_ENABLED", paper_tone)
-        kpi("仓位管理", pm_value, "PM_ENABLED", pm_tone)
+        kpi("模拟盘执行", paper_value, status.origin_hint("paper"), paper_tone)
+        kpi("仓位管理", pm_value, status.origin_hint("pm"), pm_tone)
         kpi("实盘", live_value, _live_hint(status), live_tone)
     ui.label(
         "关是当前预期状态（模拟盘未开闸）。实盘若变为「开启」会标红。这里没有开关。"
@@ -304,6 +304,8 @@ def _live_face(status: GateStatus) -> tuple[str, str]:
         return "开启", "tone-bad"
     if status.live_env_enabled and status.kill_switch_present:
         return "阻断", "tone-warn"
+    if status.live_env_enabled and status.confirm_state == "matched" and not status.exchange_url_set:
+        return "缺 URL", "tone-warn"
     if status.live_env_enabled:
         return "未确认", "tone-warn"
     return "关闭", ""
@@ -316,6 +318,7 @@ def _live_hint(status: GateStatus) -> str:
         f"LIVE_TRADING_ENABLED {env}",
         f"杀开关 {status.kill_switch_name} {switch}",
         f"确认短语{confirm_label(status.confirm_state)}",
+        "交易所 URL 已设置" if status.exchange_url_set else "交易所 URL 未设置",
     ]
     if status.live_block_reason and status.live_block_reason not in parts:
         parts.append(status.live_block_reason)
@@ -402,7 +405,7 @@ def _failures(store: DataStore) -> None:
         return
     rows = [_failure_row(item) for item in result.data]
     if not rows:
-        ui.label("暂无 validation_errors").classes("muted")
+        ui.label("暂无拒绝记录").classes("muted")
         return
     data_table(
         [

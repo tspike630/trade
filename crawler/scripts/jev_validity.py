@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import sqlite3
 import statistics
@@ -22,9 +23,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-_TREE = Path(__file__).resolve().parents[1]
-if str(_TREE) not in sys.path:
-    sys.path.insert(0, str(_TREE))
+_REPO = Path(__file__).resolve().parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
 from review.gates import (
     CONSECUTIVE_WEEKS,
@@ -34,8 +35,20 @@ from review.gates import (
     UP_1H_PROMOTE,
 )
 
-DEFAULT_DB = _TREE / "dexscreener.db"
-DEFAULT_TREND_CSV = _TREE / "exports" / "reports" / "jev_validity_trend.csv"
+
+def default_db_path() -> Path:
+    """Crawl DB: DECISION_DB_PATH or DB_PATH, else repo root, else crawler/."""
+    env = os.environ.get("DECISION_DB_PATH", "").strip() or os.environ.get("DB_PATH", "").strip()
+    if env:
+        return Path(env)
+    root_db = _REPO / "dexscreener.db"
+    if root_db.is_file() or not (_REPO / "crawler" / "config.py").is_file():
+        return root_db
+    return _REPO / "crawler" / "dexscreener.db"
+
+
+DEFAULT_DB = default_db_path()
+DEFAULT_TREND_CSV = _REPO / "exports" / "reports" / "jev_validity_trend.csv"
 STRATEGY_ID = "jev_strength_v1"
 STRENGTH_RE = re.compile(r"jev_strength=([0-9.]+)")
 HK_TZ = timezone(timedelta(hours=8))

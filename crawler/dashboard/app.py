@@ -24,11 +24,12 @@ from typing import Literal
 from fastapi import Request
 from nicegui import app, ui
 
-from dashboard.auth import SecretFilter, verify_api_key
+from dashboard.auth import attach_secret_filters, verify_api_key
 from dashboard.data import DataStore
 from dashboard.format_util import fmt_age, fmt_rate, liveness_label
 from dashboard.panels import risk as risk_panel
 from dashboard.panels.common import panel_box, panel_guard, show_unavailable
+from dashboard.panels.evolution import render_evolution_body
 from dashboard.panels.markets import render_markets
 from dashboard.panels.registry import PANELS
 from dashboard.panels.shell import (
@@ -667,6 +668,7 @@ body { margin: 0; }
 .v2-comp.span-4 { grid-column: span 4; }
 .v2-comp.span-6 { grid-column: span 6; }
 .v2-comp.span-8 { grid-column: span 8; }
+.v2-comp.span-12 { grid-column: span 12; }
 .v2-head {
   display: flex; align-items: center; gap: 8px; padding: 5px 10px;
   background: var(--v2-header); border-bottom: 1px solid var(--v2-border); flex-shrink: 0;
@@ -875,7 +877,7 @@ def setup_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    logging.getLogger().addFilter(SecretFilter())
+    attach_secret_filters()
     _logging_ready = True
 
 
@@ -1102,6 +1104,13 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     "span-6",
                     lambda: _v2_btnews(store),
                     foot="latest_backtest · news_events",
+                )
+                _v2_comp(
+                    ("进化", "建议"),
+                    "span-12",
+                    render_evolution_body,
+                    foot="周报 §10 · 只观察 · 不调权",
+                    tools=("只读",),
                 )
                 ui.label("阶段一只读监控。手动交易确认不在本看板内。").classes("footer-note")
 
@@ -1411,8 +1420,18 @@ def _v2_kpi_strip(store: DataStore) -> None:
         if raw is not None:
             count = str(raw)
     reason = getattr(gates, "live_block_reason", None) or "LIVE"
-    _v2_kpi("模拟盘", "ON" if paper_on else "OFF", "PAPER · 默认关", "tone-warn" if paper_on else "tone-ok")
-    _v2_kpi("仓位闸", "ON" if pm_on else "OFF", "PM · 默认关", "tone-warn" if pm_on else "tone-ok")
+    _v2_kpi(
+        "模拟盘",
+        "ON" if paper_on else "OFF",
+        gates.origin_hint("paper"),
+        "tone-warn" if paper_on else "tone-ok",
+    )
+    _v2_kpi(
+        "仓位闸",
+        "ON" if pm_on else "OFF",
+        gates.origin_hint("pm"),
+        "tone-warn" if pm_on else "tone-ok",
+    )
     _v2_kpi("实盘", "ON" if live_on else "OFF", str(reason), "tone-bad" if live_on else "tone-ok")
     _v2_kpi("今日信号", count, "execution_log", "tone-ok" if today.available else "")
 
@@ -1596,7 +1615,10 @@ def _v2_gates() -> None:
         ("实盘", "ON" if live_on else "关", "down" if live_on else "mute"),
         ("杀开关", "存在" if kill else "—", "mute"),
     ])
-    ui.label("关是当前预期状态；实盘若变「开启」会标红。").classes("v2-note")
+    ui.label(
+        f"模拟盘来源：{gates.origin_hint('paper')}。仓位来源：{gates.origin_hint('pm')}。"
+        "关是当前预期状态；实盘若变「开启」会标红。"
+    ).classes("v2-note")
 
 
 def _ratio_text(value: object, digits: int) -> str:
@@ -1962,6 +1984,21 @@ def _v2_positions(store: DataStore) -> None:
     ui.label("现价取 pair_history 最新；无价为「—」").classes("v2-note")
 
 
+def backtest_equity_tone(end: float, start: float | None) -> str:
+    """Color a backtest against its own start cash.
+
+    A fixed 10000 baseline paints a losing run green whenever it finishes
+    above that number, and a winning run red when the book started higher.
+    """
+    if start is None:
+        return "mute"
+    if end > start:
+        return "up"
+    if end < start:
+        return "down"
+    return "mute"
+
+
 def _v2_btnews(store: DataStore) -> None:
     result = store.latest_backtest()
     if result.available and result.data is not None:
@@ -1969,7 +2006,9 @@ def _v2_btnews(store: DataStore) -> None:
         end = getattr(run, "end_equity", None)
         if isinstance(end, (int, float)) and not isinstance(end, bool):
             equity = f"${end:,.0f}"
-            tone = "up" if end >= 10000 else "down"
+            start = getattr(run, "start_cash", None)
+            start_value = start if isinstance(start, (int, float)) and not isinstance(start, bool) else None
+            tone = backtest_equity_tone(float(end), start_value)
         else:
             equity = "—"
             tone = "mute"

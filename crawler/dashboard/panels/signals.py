@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dashboard.data import DataStore, SignalRow
+from dashboard.parsing import validation_error_text
 from dashboard.format_util import (
     flag_text,
     fmt_coverage,
@@ -85,5 +86,5 @@ def _row(item: SignalRow) -> dict[str, object]:
         "done_class": done_class,
         "executor": item.executor or "—",
         "link": link,
-        "errors": item.validation_errors or "—",
+        "errors": validation_error_text(item.validation_errors) or "—",
     }

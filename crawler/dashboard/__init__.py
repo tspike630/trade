@@ -1,4 +1,10 @@
-"""Read-only trading monitor meant to be copied into the dexscreener-crawler root.
+"""Read-only trading monitor.
+
+The repository root ``dashboard/`` is the source of truth. ``crawler/dashboard``
+is a lagging copy (it has no ``panels/evolution.py``) and is not kept in sync
+by this package.
+
+Meant to be copied into the dexscreener-crawler root.
 
 Session files for the UI (a boolean "logged in" flag only) live under
 NICEGUI_STORAGE_PATH. That path is set before NiceGUI is imported so the

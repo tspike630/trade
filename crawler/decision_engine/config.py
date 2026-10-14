@@ -5,8 +5,15 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# Load project .env the same way as root config (keys never printed)
-_ROOT = Path(__file__).resolve().parents[1]
+# Load project .env the same way as root config (keys never printed).
+# At the monorepo root, crawl config and .env live under crawler/.
+_PKG_PARENT = Path(__file__).resolve().parents[1]
+if (_PKG_PARENT / "logging_setup.py").is_file():
+    _ROOT = _PKG_PARENT
+elif (_PKG_PARENT / "crawler" / "logging_setup.py").is_file():
+    _ROOT = _PKG_PARENT / "crawler"
+else:
+    _ROOT = _PKG_PARENT
 try:
     from dotenv import load_dotenv
 
