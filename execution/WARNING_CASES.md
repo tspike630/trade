@@ -11,7 +11,7 @@
 
 2026-10-14 纸面旁证（**不算有效性**，挂到 2026-10-19 周检）：实现约 **−317**。主因是 `stop_loss` ×3 约 **−305**；次要是 `max_hold` ×40 约 **−12**。当时空仓。`order_events` 已有 **1** 次日亏拒绝，reason 形如 `daily_loss:2026-10-14:…<-200.0`。日亏闸是保护，不是失效。信号或成交量不等于盈亏。此后新拒绝的 reason 是稳定键 `daily_loss`，`today` / `pnl` / `limit` 写在 detail，看板分成 `risk_rejected:daily_loss`。不据此改 `EXECUTION_DAILY_LOSS_USD`、TP/SL/hold 或 PM 数值。
 
-同层索引：指标层纪律在 `crawler/INDICATORS_AUDIT.md`，采集侧在 `crawler/STABILIZE.md`「警示事例 → 采集侧」，决策侧在 `DECISION_ENGINE_WARNING_CASES.md`（PR #47）。调研映射（M-4 / M-5 / M-7）在 [`RESEARCH_MAPPING.md`](RESEARCH_MAPPING.md)。E-2 / C4 `target_band_failover` 已登记、不改运行时，见 [`WAITING_ITEMS.md`](WAITING_ITEMS.md)。F-1 连亏只记账、不熔断；C3/F-3 回吐影子已接线、退出触发未改；G-2 禁摊薄；G-11 不设绝对目标价（现网仍是百分比止盈 + 时间 + 信号）。
+同层索引：指标层纪律在 `crawler/INDICATORS_AUDIT.md`，采集侧在 `crawler/STABILIZE.md`「警示事例 → 采集侧」，决策侧在 `DECISION_ENGINE_WARNING_CASES.md`（PR #47）。调研映射（M-4 / M-5 / M-7）在 [`RESEARCH_MAPPING.md`](RESEARCH_MAPPING.md)。E-2 / C4 `target_band_failover` 已登记、不改运行时，见 [`WAITING_ITEMS.md`](WAITING_ITEMS.md)。F-1 连亏只记账、不熔断；C3/F-3 回吐影子已接线、退出触发未改；G-2 禁摊薄；G-11 不设绝对目标价（现网仍是百分比止盈 + 时间 + 信号）。I-3 滑点只读报告见同登记，不改滑点档，不自动跳单。
 
 ## 三条警示 → 执行侧
 
@@ -96,6 +96,7 @@ ORDER BY n DESC;
 | PM / 日亏现状与缺项 | `P1_PM_ROADMAP.md` | 指针 |
 | 10-19 PM 拒因旁证 | 本层 `order_events` | 上节 SQL。不算有效性 |
 | C4 / E-2 `target_band_failover` | 执行观察登记 | 只登记。见 [`WAITING_ITEMS.md`](WAITING_ITEMS.md)。不改 tp / sl / max_hold |
+| I-3 `slippage_1h` | 执行只读报告 | `python -m execution.slippage_report`。不改滑点档，不自动跳单。见 [`WAITING_ITEMS.md`](WAITING_ITEMS.md) |
 
 ## 不算有效性
 
