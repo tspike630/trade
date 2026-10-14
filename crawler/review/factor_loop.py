@@ -18,6 +18,7 @@ import csv
 import importlib.util
 import io
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -40,6 +41,7 @@ from review.gates import (
     GATE_UP_1H,
     GATE_UP_1H_DEGRADE,
     SAMPLE_NOTE,
+    calibrate_direction,
 )
 
 try:
@@ -640,10 +642,9 @@ def _overlay_framework_backtest(
 def gate_candidate(metrics: dict[str, Any], *, week: str) -> dict[str, Any]:
     """硬指标判定：pass / need_retest / fail + 观察/评估/判定三段式。
 
-    M-2 方向校准不在这里做。``review.gates.calibrate_direction`` 会在 IC
-    有限时记下正反两个符号，IC 缺失则 fail closed；周跑仍只看 n / unique /
-    up_1h。接入会在 ic 为空时改掉 accepted，所以先留
-    ``DIRECTION_CALIBRATION_TODO``。权重保持 0。
+    M-2 方向校准不在这里做。周跑若候选带有有限 IC，会另写观察 jsonl，
+    不读回本函数的 status / accepted。缺 IC 就 fail closed 会改掉现在的
+    accepted，所以 ``DIRECTION_CALIBRATION_TODO`` 仍留在闸外。权重保持 0。
     """
     del week  # 周次由 store 写入；判定本身不改门槛
     n = metrics.get("n_raw") or 0
@@ -695,6 +696,61 @@ def gate_candidate(metrics: dict[str, Any], *, week: str) -> dict[str, Any]:
         "gate_reason": f"观察:{obs}; 评估:{eva}; 判定:无预测力，记录教训",
         "status": "rejected",
     }
+
+
+def direction_observe_path() -> Path:
+    """Sidecar for both-sign IC notes. Not a gate input."""
+    return REPORTS / "direction_calibration_observe.jsonl"
+
+
+def _finite_metric_ic(ic: object) -> float | None:
+    if isinstance(ic, bool) or not isinstance(ic, (int, float)) or not math.isfinite(ic):
+        return None
+    return float(ic)
+
+
+def observe_direction_calibration(
+    metrics: dict[str, Any],
+    *,
+    factor_id: str,
+    week: str,
+    path: Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any] | None:
+    """Append both signs when this candidate's metrics carry a finite IC.
+
+    Calls ``calibrate_direction`` and writes one jsonl line. Does not read
+    or write ``accepted`` / ``gate_result``. A missing or non-finite IC
+    writes nothing (fail-closed calibration must not become a gate).
+    ``ic_mean`` is still the latest history row copied onto the candidate,
+    not a per-candidate rank IC; the record says so.
+    """
+    ic = _finite_metric_ic(metrics.get("ic_mean"))
+    if ic is None:
+        return None
+    calibrated = calibrate_direction(ic)
+    if not calibrated.get("passed"):
+        return None
+    record = {
+        "recorded_at": _utc_now_iso(),
+        "week": week,
+        "factor_id": factor_id,
+        "ic_source": "metrics.ic_mean",
+        "observe_only": True,
+        "changes_gate": False,
+        "dry_run": bool(dry_run),
+        "passed": True,
+        "ic_as_written": calibrated["ic_as_written"],
+        "ic_flipped": calibrated["ic_flipped"],
+        "kept_sign": calibrated["kept_sign"],
+        "cleaner_ic": calibrated["cleaner_ic"],
+        "reason": calibrated["reason"],
+    }
+    dest = path if path is not None else direction_observe_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
 
 
 # ------------------------------------------------------------------ #
@@ -770,6 +826,12 @@ def _write_report(
         lines.append(f"- 回测: {json.dumps(row['metrics'], ensure_ascii=False)}")
         lines.append(f"- 判定: {gate['gate_reason']}")
         lines.append(f"- 状态: {gate['status']}")
+        observed = row.get("direction_observe")
+        if observed:
+            lines.append(
+                "- 方向观察（不改 accepted）: "
+                + json.dumps(observed, ensure_ascii=False)
+            )
         lines.append("")
     rep.write_text("\n".join(lines), encoding="utf-8")
     return rep
@@ -800,6 +862,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     for cand in cands:
         metrics = backtest_candidate(cand, with_backtest=args.with_backtest, ctx=ctx)
         decision = gate_candidate(metrics, week=args.week)
+        direction_observe = observe_direction_calibration(
+            metrics,
+            factor_id=str(cand["factor_id"]),
+            week=args.week,
+            dry_run=bool(args.dry_run),
+        )
         rows.append(
             {
                 "factor_id": cand["factor_id"],
@@ -808,6 +876,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "retry": bool(cand.get("retry")),
                 "metrics": metrics,
                 "gate": decision,
+                "direction_observe": direction_observe,
             }
         )
         if not args.dry_run:

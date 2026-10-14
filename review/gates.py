@@ -44,12 +44,16 @@ SAMPLE_NOTE = (
 # M-2. factor_loop.gate_candidate must not call calibrate_direction yet.
 # metrics["ic_mean"] is _latest_ic (often null, not this candidate's rank IC).
 # Fail-closed wiring would change weekly accept/reject. Weights stay 0.
+# A finite IC may be appended to the observe-only jsonl by the weekly path.
+# That append does not change accepted.
 DIRECTION_CALIBRATION_TODO = (
     "M-2: A-class accept requires calibrate_direction on a per-candidate "
     "rank IC (both signs recorded; keep kept_sign). Not wired into "
     "factor_loop.gate_candidate: ic_mean is the latest history row, not a "
     "both-sign eval of this candidate. Wiring fail-closed would change "
-    "weekly accept/reject while that IC is null. Weights stay 0. "
+    "weekly accept/reject while that IC is null. Observe-only jsonl may "
+    "record both signs when that IC is finite; it does not change accepted. "
+    "Weights stay 0. "
     "不算有效性。"
 )
 
@@ -64,7 +68,9 @@ def calibrate_direction(ic: object) -> dict[str, Any]:
 
     ``passed`` means both signs were recorded. It does not accept a
     candidate, move ``MIN_RAW_N``, or change weights. Weekly
-    ``gate_candidate`` does not call this; see ``DIRECTION_CALIBRATION_TODO``.
+    ``gate_candidate`` does not call this. The factor-loop weekly path may
+    append an observe-only sidecar when IC is finite; that append does not
+    change ``accepted``. See ``DIRECTION_CALIBRATION_TODO``.
     """
     if isinstance(ic, bool) or not isinstance(ic, (int, float)) or not math.isfinite(ic):
         return {
