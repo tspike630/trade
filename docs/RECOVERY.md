@@ -52,6 +52,8 @@ python daily_check.py
 
 热层流动性：DexScreener 缺 `liquidity` 时 `pair_history.liquidity_usd` 存 NULL，**不编造**。决策买入因此 `no_liquidity` 丢弃，是故意的 fail-closed。`daily_check.py` 的「热层流动性覆盖」和小时报 Health 下一行只监测 hot 1h 缺失率（>25% WARN，>60% 且 n≥20 FAIL）以及 `pending_enrich`。约 34% 缺失是 WARN。该数是 **10-19 周检旁证**，不计策略有效性。细节见 `crawler/STABILIZE.md`。
 
+G-13：采集在已有文案里看到宣传 APY/APR/yield ≥1000% 时打 `risk_g13_high_apy`（软扣分，观察）。决策以后可以据此降权；本层不自动拒绝。`daily_check` 与小时报只计标签数量。细节见 `crawler/STABILIZE.md`。不算有效性，此处不加参数。
+
 警示事例（半胜仍亏、薄池打穿、洗盘/单点、未 enrich 的 `new_listing`）如何落到采集侧，见同文「警示事例 → 采集侧」。采集不拥有 P-1 / P-2 / P-4 / P-5；P-3 只以上述覆盖率作旁证。复盘侧（平仓归因三行、P-2 / P-3、10-19）见 `docs/REVIEW_WARNING_CASES.md`，`crawler/STABILIZE.md` 只有指针。不算有效性，此处不加参数。
 
 10-14 纸面旁证与第二批文献的采集边界（供流正常不等于可调参；不新增 LLM 预测源、不做 agent 扇出）见同文「学习/反思（10-14）」。不算有效性，不盘中改参。

@@ -80,6 +80,14 @@ DexScreener sometimes omits `liquidity` on a pair payload. `history.extract_metr
 
 A ~34% missing rate is WARN. The rate is **10-19 周检旁证** and does not count toward strategy validity. The hourly report (`scripts/grok_report.py` → context markdown) prints one line under Health: hot 1h missing rate and `pending_enrich`. Do not change `ALERT_MIN_SCORE` or score weights from this metric. How the warning cases use this check is in the next section.
 
+## G-13 异常高 APY（代码标签，观察）
+
+宣传 APY/APR/yield ≥ **1000%**（或文案里的无限年化、≥10x APY）是信用风险信号，不是机会。`HeuristicRiskScanner` 只扫已经落库的文案：pair 的 `labels`、代币名称/符号、`info` 描述与社交 label、boosts 里的字符串，以及 token profile 的 `description` / `links` label。不读价格、成交量、流动性数字，不加新源。
+
+命中则打 `risk_g13_high_apy`，并走现有 `apply_risk_to_score` 软扣 10 分（单独不够 `risk_elevated` 的 20 分门槛）。没有这段文案就不打标。省略 `liquidity` 仍是 NULL / `no_liquidity`，不编造。
+
+`daily_check.py` 与小时报各计一次带该标签的代币数。观察项，供决策以后降权。本层不自动拒绝、不改 `ALERT_MIN_SCORE`、不改循环。**不算有效性。**
+
 ## 警示事例 → 采集侧
 
 Polymarket 经验落地计划第四节的三条警示，映射到采集侧时只作旁证。**不算策略有效性。** 本文只记边界：docs-only，会话中不加参数。`ALERT_MIN_SCORE`、评分权重、现有 Telegram 路由、`history.extract_metrics` 的流动性写法保持原样。上一节的热层覆盖（#44）已经在跑，这里不另做监测。

@@ -47,9 +47,15 @@ from history import (  # noqa: E402
     liquidity_coverage,
     utc_hours_ago_iso,
 )
+from risk import (  # noqa: E402
+    G13_HIGH_APY_MIN_PCT,
+    G13_HIGH_APY_TAG,
+    count_g13_tagged_tokens,
+)
 from store import Store  # noqa: E402
 
 HOT_LIQ_CHECK_NAME = "Hot liquidity 热层流动性覆盖"
+G13_CHECK_NAME = "G-13 high APY 异常高年化标签"
 
 # HK calendar day for report naming (UTC+8)
 _HK = timezone(timedelta(hours=8))
@@ -1123,6 +1129,41 @@ def check_hot_liquidity_coverage(store: Store, report: CheckReport) -> None:
     )
 
 
+def check_g13_high_apy(store: Store, report: CheckReport) -> None:
+    """Observe how many tokens carry risk_g13_high_apy.
+
+    The count never changes the level: a large number is still PASS.
+    Decision downweight is later. This is not strategy validity.
+    """
+    flags = {
+        "counts_toward_strategy_validity": False,
+        "evidence_role": EVIDENCE_ROLE_SIDE,
+        "tag": G13_HIGH_APY_TAG,
+        "min_apy_pct": G13_HIGH_APY_MIN_PCT,
+        "observe_only": True,
+    }
+    try:
+        tagged = count_g13_tagged_tokens(store._conn)
+    except Exception as exc:  # noqa: BLE001
+        report.add(
+            G13_CHECK_NAME,
+            "WARN",
+            f"G-13 标签计数失败: {exc}",
+            {**flags, "error": str(exc)},
+        )
+        return
+    report.add(
+        G13_CHECK_NAME,
+        "PASS",
+        (
+            f"tokens tagged {G13_HIGH_APY_TAG}={tagged} "
+            f"(advertised APY/APR/yield ≥ {G13_HIGH_APY_MIN_PCT:.0f}%). "
+            "观察项，供决策降权，不计策略有效性。"
+        ),
+        {**flags, "tagged_n": tagged},
+    )
+
+
 def run_checks(*, db: str, stale_sec: int | None) -> CheckReport:
     report = CheckReport()
     db_path = Path(db)
@@ -1143,6 +1184,7 @@ def run_checks(*, db: str, stale_sec: int | None) -> CheckReport:
     with Store.open_ro(db_path) as store:
         check_history(store, report, db_path)
         check_hot_liquidity_coverage(store, report)
+        check_g13_high_apy(store, report)
         check_scoring(store, report, log_path)
         check_multichain(store, report)
 
