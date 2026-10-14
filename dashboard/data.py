@@ -397,6 +397,19 @@ class ExitHoldReport:
     buckets: tuple[ExitHoldBucket, ...]
 
 
+
+def _hkt_day(ts: str | None) -> str:
+    """Calendar day in Asia/Hong_Kong for ISO timestamps (align decision/review)."""
+    raw = str(ts or "").strip()
+    if not raw:
+        return ""
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.astimezone(ZoneInfo("Asia/Hong_Kong")).strftime("%Y-%m-%d")
+    except Exception:
+        return raw[:10]
+
 class MissingTable(LookupError):
     pass
 
@@ -705,7 +718,7 @@ class DataStore:
 
     def paper_trade_frequency(self, days: int = 14) -> DataResult:
 
-        """G-1 observe-only: opens/closed/pnl by UTC day from paper fills+positions."""
+        """G-1 observe-only: opens/closed/pnl by HKT day from paper fills+positions."""
         started = time.perf_counter()
         try:
             return _finish(self._paper_trade_frequency(started, days), "paper_trade_frequency")
@@ -1410,24 +1423,22 @@ class DataStore:
                 closed_by: dict[str, list] = {}
                 if "fills" in tabs:
                     for row in conn.execute(
-                        "SELECT substr(created_at,1,10) AS d, COUNT(*) AS n "
-                        "FROM fills WHERE note = 'open' OR side = 'buy' "
-                        "GROUP BY 1"
+                        "SELECT created_at FROM fills WHERE note = 'open' OR side = 'buy'"
                     ).fetchall():
-                        day = str(row[0] or "")
+                        day = _hkt_day(row[0] if row else "")
                         if day:
-                            opens_by[day] = int(row[1] or 0)
+                            opens_by[day] = opens_by.get(day, 0) + 1
                 if "positions" in tabs:
                     for row in conn.execute(
-                        "SELECT substr(closed_at,1,10) AS d, COUNT(*) AS n, "
-                        "COALESCE(SUM(pnl_usd),0) AS pnl "
-                        "FROM positions WHERE status = 'closed' "
-                        "AND closed_at IS NOT NULL AND closed_at != '' "
-                        "GROUP BY 1"
+                        "SELECT closed_at, pnl_usd FROM positions "
+                        "WHERE status = 'closed' AND closed_at IS NOT NULL AND closed_at != ''"
                     ).fetchall():
-                        day = str(row[0] or "")
-                        if day:
-                            closed_by[day] = [int(row[1] or 0), float(row[2] or 0.0)]
+                        day = _hkt_day(row[0] if row else "")
+                        if not day:
+                            continue
+                        slot = closed_by.setdefault(day, [0, 0.0])
+                        slot[0] += 1
+                        slot[1] += float(row[1] or 0.0)
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
         days_sorted = sorted(set(opens_by) | set(closed_by), reverse=True)[:window]
