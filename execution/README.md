@@ -276,6 +276,9 @@ Code defaults in the tables above stay as written. The 2026-10-14 paper
 authorization, and the still-missing net-edge / account-drawdown / four-tier
 heat items, are in [P1_PM_ROADMAP.md](P1_PM_ROADMAP.md). Warning-case mapping
 （半胜仍亏、薄池打穿、$0.95 黑天鹅、周检拒因走 `order_events`）is in
-[WARNING_CASES.md](WARNING_CASES.md). Both notes are **不算有效性** until the
-2026-10-19 weekly check. They do not change TP/SL/hold, slippage tiers, or
-PM numbers.
+[WARNING_CASES.md](WARNING_CASES.md). Research mapping（M-4 服务层硬检查、
+M-5 先选择后仓位且 Kelly / 方案 7 冻结、M-7 滑点档仍是成本模型、单市场 15%
+保持 R2-pending）is in [RESEARCH_MAPPING.md](RESEARCH_MAPPING.md). These notes
+are **不算有效性** until the 2026-10-19 weekly check. They do not change
+TP/SL/hold, slippage tiers, or PM numbers, and they do not enable
+`PM_MAX_PER_TOKEN_PCT`.

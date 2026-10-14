@@ -9,7 +9,7 @@
 
 看板旁证（PR #45）记下的纸面侧例：胜率约一半仍可净亏；最差单笔约 **−84**；剔除最差后早段盈利被抹掉。那是观察，不是周检样本。
 
-同层索引：指标层纪律在 `crawler/INDICATORS_AUDIT.md`，采集侧在 `crawler/STABILIZE.md`「警示事例 → 采集侧」，决策侧在 `DECISION_ENGINE_WARNING_CASES.md`（PR #47）。
+同层索引：指标层纪律在 `crawler/INDICATORS_AUDIT.md`，采集侧在 `crawler/STABILIZE.md`「警示事例 → 采集侧」，决策侧在 `DECISION_ENGINE_WARNING_CASES.md`（PR #47）。调研映射（M-4 / M-5 / M-7）在 [`RESEARCH_MAPPING.md`](RESEARCH_MAPPING.md)。
 
 ## 三条警示 → 执行侧
 
