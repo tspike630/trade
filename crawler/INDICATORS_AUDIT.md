@@ -135,6 +135,7 @@ python -m api_server   # 只读 API + admin
 - **半胜仍亏 / 单笔抹盈**（书中约 51% 胜率仍大亏；本系统 paper 上单笔亦可抹掉全部盈利）：指标侧**不**用强信号当确定性。**信号强度 ≠ 胜率**（口径见 `INDICATORS_STEP2.md` P-4）。`INDICATORS_WEIGHT_*` 保持 **0**，直至 10-19 IC/IR + R3；不盘中追认统计参。
 - **$0.95 黑天鹅 / 薄池打穿**（「那 5% 一旦出现，亏掉的不是 5% 而是 95%」；薄池单笔止损打穿、抹掉全部盈利）：tech 新鲜度与流动性字段是决策闸的输入。指标**不编造** liquidity（载荷缺 `liquidity` 就保持空）。`min_liq` fail-closed 归决策 [#41](https://github.com/tspike630/trade/pull/41)。本侧只保 hot tech 新鲜（[#40](https://github.com/tspike630/trade/pull/40) 已合）。
 - **洗盘 / 单点操纵**（书中约 25% 交易量虚假，外加预言机投票权集中翻转）：多源旁路（DexScreener + CCXT prior，见 `CCXT_SIDECHANNEL.md`）是防单点，不是加权重救曲线。
+- **因子质量 > 研究量**（Prediction Arena, arXiv 2604.07355）：纪律段在 `INDICATORS_FACTOR_CANDIDATES.md`。
 
 ### P-2（指针，不实现）
 
