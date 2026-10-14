@@ -13,7 +13,7 @@
 
 **当天采样不计当天周检**：周一 10:19 采样写入的 buy **不进入**当天 09:15 已跑完的周检窗口；要等到**下周一**周检才会计入。周检在前、采样在后，避免「边采边验」自污染。
 
-三线不冲突：24h 常驻 dry-run（默认 0.3）/ 周一三五采样（0.15 once）/ 周一周检（只读复盘）各自独立进程与日志，互不杀停。
+三线不冲突：dry-run（2026-10-10 那段默认 0.3 常驻，或临时 paper 观察）/ 周一三五采样（0.15 once，`purpose=sample`）/ 周一周检（只读复盘）各自独立进程与日志，互不杀停。临时 paper 观察的启动参数以 `DECISION_ENGINE_DRYRUN_24H.md` 的重启配方为准，不要和采样命令混用。
 
 ## 两层怎么分工
 
@@ -31,7 +31,7 @@
 | JEV 周检复盘 | 周一 09:15 | 跑过滤版有效性 + R1 周报 + 决策表建议发本聊天 |
 | JEV 信号采样 | 周一/三/五 10:19 | dry-run once（0.15，`purpose=sample`），短结果发本聊天 |
 
-24h 常驻 dry-run（默认 0.3）继续挂着：见 `DECISION_ENGINE_DRYRUN_24H.md` / `logs/decision_engine_dryrun.pid`。
+dry-run 的 pid 见 `DECISION_ENGINE_DRYRUN_24H.md` / `logs/decision_engine_dryrun.pid`。临时 paper 观察重启用该文的配方（`DECISION_COOLDOWN_SEC=3600`、config 默认 `min_liq` 50000、`--min-jev-strength 0.15 --purpose live_candidate`）。不要用 2026-10-10 那段默认 0.3、没有冷却的启动块把它拉起来。
 
 ## 周检命令（与 routine 一致）
 
@@ -91,6 +91,18 @@ mkdir -p exports/reports logs
 
 原则：调参是「修」，退役是「止损」——无限调参本身就是过拟合的一种。现阶段 JEV 样本未跨门槛，本规则只写进决策表，不另写代码。
 
+
+## 2026-10-19 周检要登记的证据
+
+下周一（**2026-10-19**）周检除了现有决策表，把下面三行记进当周笔记。这是观察登记，不改阈值、不改默认强度、不把临时观察标成 accepted。
+
+10:19 的采样命令保持不变：`--once --min-jev-strength 0.15 --purpose sample`。它和临时 paper 观察（`--purpose live_candidate` + `DECISION_COOLDOWN_SEC=3600`）不是同一条进程。重启配方见 `DECISION_ENGINE_DRYRUN_24H.md`。
+
+| 证据 | 从哪看 | 怎么登记 |
+|------|--------|----------|
+| cooldown 是否生效 | paper 观察日志里的 `risk cooldown_sec=`，以及 `cooldown skip` | 启动行应是 `cooldown_sec=3600.0`。记下 skip 条数。`0` / `0.0` 表示重启时环境变量丢了。冷却在进程内存里，重启会清零，不要把重启后的第一笔 buy 当成冷却失效 |
+| `min_liq` skip 次数 / 流动性分桶 | `reason=liq_below_min`、`reason=no_liquidity`，以及同行的 `liquidity_usd=` / `min_liq_usd=` | 分三桶计数：缺失（`no_liquidity`）、低于 50000（`liq_below_min`）、过闸后写入的 buy。`min_liq_usd=` 应为 `50000.0`。不要为了分桶改 50000 |
+| 临时 `min=0.15` 观察行 | `decision_log` 里 `purpose=live_candidate` 且强度低于实时默认 0.3 的 buy | **保持未标记，不得标成 accepted。** 它们不是有效性样本。`scripts/jev_validity.py` 按 `strategy_id=jev_strength_v1` 的全部 buy 读取，**不按 purpose 过滤**，所以这些行会进入周检输入。报告里单独脚注，不要拿它们去过「连续 2 周 ≥55%」门槛 |
 
 ## 背景（保留）
 
