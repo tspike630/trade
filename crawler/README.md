@@ -346,7 +346,7 @@ python -m api_server   # 打开 /
 |------|------|
 | **INDICATORS_AUDIT.md** | 全流程审计清单 + 运维（推荐入口；含 M-1 功效脚注） |
 | INDICATORS_OPERATORIZATION.md | M-3 时间序列算子硬规则（防 look-ahead） |
-| INDICATORS_FACTOR_CANDIDATES.md | factor_loop 候选 + M-2 方向校准 |
+| INDICATORS_FACTOR_CANDIDATES.md | factor_loop 候选（供需 P-3/P-4；艾略特 E-1/E-4/E-5，N-1..N-6 不采用）+ M-2 方向校准 |
 | INDICATORS_STEP1.md | 技术面 |
 | INDICATORS_STEP2.md | JEV 资金面（信号强度 ≠ 胜率） |
 | INDICATORS_STEP3.md | X 舆情面 |
