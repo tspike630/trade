@@ -73,3 +73,5 @@ python -m review.run --period 7d --optimize        # 不足则 skip + 理由原�
 
 - `from review.optimizer import build_param_grid, optimize` 可 import
 - `--report` exit 0；`--optimize` 在现况下 `status=skipped` 并说明样本/历史不足
+
+脚手架产出仍是原型证据。Alpha Illusion（arXiv:2605.16895）对 R1 / R2 / R3 与 paper 观察期的支撑见 `docs/REVIEW_RESEARCH_MAPPING.md`。M-1 功效见周检「统计功效标注」（[#54](https://github.com/tspike630/trade/pull/54)），不在本文重述。**不算有效性。**

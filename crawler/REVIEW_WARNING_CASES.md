@@ -38,6 +38,10 @@
 
 采集文里「止损与仓位是 P-2」只表示采集不改止损。执行单上的 **P-2** 是本表这一行。
 
+## 周报怎么读门槛（M-1 指针）
+
+n、unique_token、1h 上涨率的功效主张以周检「统计功效标注」为准（[#54](https://github.com/tspike630/trade/pull/54)，`DECISION_ENGINE_WEEKLY_CHECK.md`，`crawler/` 同文）。复盘周报沿用该段，不另写样本量级。过了 unique≥10 且 n≥15 只排除纯噪声级结论。**不算有效性。** Alpha Illusion 对 R1 / R2 / R3 与 paper 观察期的支撑，以及 10-19 `factor_loop` 只收指标已方向校准（M-2）且已算子化（M-3）的候选，见 `docs/REVIEW_RESEARCH_MAPPING.md`。
+
 ## 2026-10-19 复盘交付
 
 与 `DECISION_ENGINE_WEEKLY_CHECK.md` 的登记表同一天。决策表三行（cooldown、`min_liq` skip、临时 0.15）保持原样；下面是复盘要交的。
@@ -61,6 +65,7 @@ cd /workspace/dexscreener-crawler
 - **accepted ≠ activated。** `review.factor_loop` 过门槛最高是 `status=accepted`（待激活）。accepted 不把权重打开，不启用策略。临时 0.15 的 `live_candidate` **连 accepted 都不要写**。
 - **临时样本单独分桶。** `purpose=live_candidate` 且强度低于实时默认 0.3 的行，与 `purpose=sample`、与默认 0.3 的 `live_candidate` 分开记。`scripts/jev_validity.py` 不按 purpose 过滤，这些行会进周检输入；脚注它们，不要拿去过「连续 2 周 ≥55%」。平仓归因同样分开，避免把临时管道上的薄池止损混进默认账面而不标注。
 - **C3** 见上表。观察可以写进当周笔记；退出参数的改动先有 R3 回测，再谈 R4。
+- **factor_loop 收录。** 10-19 只接受指标 **M-2** 方向校准且 **M-3** 算子化之后的候选。缺一条不写 accepted。不认领 M-4 / M-5 / M-7。细则 `docs/REVIEW_RESEARCH_MAPPING.md`。不算有效性。
 
 ## 不改什么
 

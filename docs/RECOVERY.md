@@ -95,7 +95,7 @@ python -m review.run --period 7d --report
 PYTHONPATH=crawler python -m sources.news --once
 ```
 
-规格与旁路说明：`docs/REVIEW_R1_SPEC.md`、`docs/REVIEW_R3_SCAFFOLD.md`、`docs/REVIEW_R4_LOOP.md`、`docs/REVIEW_WARNING_CASES.md`、`docs/EVOLUTION_SECTION10.md`、`docs/NEWS_SIDECHANNEL.md`。警示事例的复盘映射不算有效性：复盘拥有平仓归因分桶与 P-2 / P-3 旁证，不拥有 PM 仓位比例 / 回撤、JEV 错价论述、采集流动性覆盖。
+规格与旁路说明：`docs/REVIEW_R1_SPEC.md`、`docs/REVIEW_R3_SCAFFOLD.md`、`docs/REVIEW_R4_LOOP.md`、`docs/REVIEW_WARNING_CASES.md`、`docs/REVIEW_RESEARCH_MAPPING.md`、`docs/EVOLUTION_SECTION10.md`、`docs/NEWS_SIDECHANNEL.md`。警示事例的复盘映射不算有效性：复盘拥有平仓归因分桶与 P-2 / P-3 旁证，不拥有 PM 仓位比例 / 回撤、JEV 错价论述、采集流动性覆盖。M-1 功效见周检 [#54](https://github.com/tspike630/trade/pull/54)，调研映射不重抄。
 
 ## 5. 其它层（各层跟进提交后）
 

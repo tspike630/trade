@@ -20,3 +20,4 @@
 - R3 `--optimize` 在历史不足时会 skip
 - 落地走 R4；实盘闸门永远人工确认
 - 警示事例见 `docs/REVIEW_WARNING_CASES.md`：10-19 交 P-2 / P-3 旁证与平仓三行。不算有效性。不盘中加第三个统计参
+- 调研映射见 `docs/REVIEW_RESEARCH_MAPPING.md`：Alpha Illusion 支撑 R1 / R2 / R3 与 paper 观察期；`factor_loop` 只收指标已方向校准且已算子化的候选。M-1 指向周检 [#54](https://github.com/tspike630/trade/pull/54)。不算有效性
