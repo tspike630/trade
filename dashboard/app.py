@@ -2044,6 +2044,28 @@ def _v2_closed(store: DataStore) -> None:
     if not buckets:
         ui.label(f"近 {getattr(report, 'days', 14)} 日无平仓").classes("v2-note")
         return
+    win_rate = getattr(report, "win_rate", None)
+    if isinstance(win_rate, (int, float)) and not isinstance(win_rate, bool):
+        wr_text = f"{float(win_rate) * 100:.1f}%"
+    else:
+        wr_text = "—"
+    worst = getattr(report, "worst_pnl_usd", None)
+    rest = getattr(report, "rest_pnl_usd", None)
+    wipe = bool(getattr(report, "single_wipe", False))
+    _v2_kv([
+        ("胜率", wr_text, "mute"),
+        (
+            "最差单笔",
+            _v2_money(worst) if isinstance(worst, (int, float)) else "—",
+            "down" if isinstance(worst, (int, float)) and worst < 0 else "mute",
+        ),
+        (
+            "剔除最差",
+            _v2_money(rest) if isinstance(rest, (int, float)) else "—",
+            "up" if isinstance(rest, (int, float)) and rest > 0 else "mute",
+        ),
+        ("单笔抹盈", "是" if wipe else "否", "down" if wipe else "mute"),
+    ])
     rows: list[list[str]] = []
     for item in buckets[:12]:
         pnl = getattr(item, "pnl_usd", None)
@@ -2061,6 +2083,10 @@ def _v2_closed(store: DataStore) -> None:
     ui.label(
         f"已平 {getattr(report, 'closed', 0)} · 合计 "
         f"{_v2_money(total) if isinstance(total, (int, float)) else '—'} · 旁证非有效性"
+    ).classes("v2-note")
+    ui.label(
+        "警示旁证：胜率≈一半仍可净亏（仓位/入场质量）；"
+        "单笔抹盈≈薄池止损打穿——对齐 min_liq，不盘中加参。"
     ).classes("v2-note")
 
 

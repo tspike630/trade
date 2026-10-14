@@ -333,6 +333,12 @@ class PaperClosedReport:
     closed: int
     total_pnl_usd: float
     buckets: tuple[PaperClosedBucket, ...]
+    win_count: int = 0
+    loss_count: int = 0
+    win_rate: float | None = None
+    worst_pnl_usd: float | None = None
+    rest_pnl_usd: float | None = None
+    single_wipe: bool = False
 
 
 class MissingTable(LookupError):
@@ -1260,6 +1266,7 @@ class DataStore:
         agg: dict[tuple[str, str], list[float]] = defaultdict(list)
         closed = 0
         total_pnl = 0.0
+        pnls: list[float] = []
         for row in rows:
             if not _in_range(row["closed_at"], start, end, end_inclusive=True):
                 continue
@@ -1277,6 +1284,7 @@ class DataStore:
                         liq = safe_float(extras.get("liquidity_usd"))
             bucket = liq_bucket_label(liq)
             agg[(reason, bucket)].append(pnl)
+            pnls.append(pnl)
             closed += 1
             total_pnl += pnl
         ordered = tuple(
@@ -1291,8 +1299,28 @@ class DataStore:
                 key=lambda item: (-abs(sum(item[1])), -len(item[1]), item[0][0], item[0][1]),
             )
         )
+        win_count = sum(1 for value in pnls if value > 0)
+        loss_count = sum(1 for value in pnls if value <= 0)
+        win_rate = (win_count / closed) if closed else None
+        worst = min(pnls) if pnls else None
+        rest = (total_pnl - worst) if worst is not None else None
+        # Case lesson: one loss wipes the rest (rest>0 and total<0).
+        single_wipe = bool(
+            worst is not None and rest is not None and rest > 0 and total_pnl < 0
+        )
         return _ok(
-            PaperClosedReport(window_days, closed, round(total_pnl, 4), ordered),
+            PaperClosedReport(
+                window_days,
+                closed,
+                round(total_pnl, 4),
+                ordered,
+                win_count=win_count,
+                loss_count=loss_count,
+                win_rate=round(win_rate, 4) if win_rate is not None else None,
+                worst_pnl_usd=round(worst, 4) if worst is not None else None,
+                rest_pnl_usd=round(rest, 4) if rest is not None else None,
+                single_wipe=single_wipe,
+            ),
             started,
         )
 

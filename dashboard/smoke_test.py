@@ -1066,6 +1066,11 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(keys[("stop_loss", "liq_<50k")].count, 1)
         self.assertAlmostEqual(keys[("stop_loss", "liq_<50k")].pnl_usd, -84.3, places=2)
         self.assertEqual(keys[("max_hold", "liq_>=50k")].count, 2)
+        self.assertEqual(report.data.win_count, 1)
+        self.assertEqual(report.data.loss_count, 2)
+        self.assertAlmostEqual(report.data.win_rate or 0, 1 / 3, places=4)
+        self.assertAlmostEqual(report.data.worst_pnl_usd or 0, -84.3, places=2)
+        self.assertTrue(report.data.single_wipe)
 
     def test_chat_context_uses_newest_messages(self) -> None:
         sessions = SessionStore(self.root / "dashboard_state.db")
