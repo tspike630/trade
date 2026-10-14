@@ -8,15 +8,22 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
+from config import HOT_SEEN_WINDOW_SEC
 from decision_engine.backtest.replay import coalesce_indicator_rows
+from history import history_tier_for_token
 from indicators.base import (
     INDICATOR_BUSY_TIMEOUT_MS,
     IndicatorStore,
     utc_now_iso,
 )
 from indicators.library_apply import apply_library_fields, technical_refresh_due
-from indicators.technical import TechnicalIndicators
+from indicators.technical import (
+    TechnicalIndicators,
+    order_technical_tokens,
+    tier_from_token_row,
+)
 from indicators.technical_lib import compute_pandas_ta
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -521,6 +528,261 @@ class PriorIngestTest(unittest.TestCase):
             kept = bak.execute("SELECT note FROM cex_scope_snapshots").fetchone()
             self.assertEqual(kept[0], "keep")
             bak.close()
+
+
+def _order_ids(
+    rows: list[dict[str, Any]], *, now: datetime, force_full: bool = False
+) -> list[Any]:
+    ordered = order_technical_tokens(
+        rows,
+        tier_of=lambda row: str(row["tier"]),
+        tech_updated_at_of=lambda row: row.get("tech_updated_at"),
+        now=now,
+        hot_interval_sec=300,
+        warm_interval_sec=1800,
+        cold_interval_sec=14400,
+        force_full=force_full,
+    )
+    return [row["id"] for row in ordered]
+
+
+class TechnicalPriorityTest(unittest.TestCase):
+    def test_priority_order_puts_hot_due_before_cold(self) -> None:
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+        rows: list[dict[str, Any]] = [
+            {"id": "cold", "tier": "cold", "tech_updated_at": None},
+            {
+                "id": "hot-fresh",
+                "tier": "hot",
+                "tech_updated_at": _iso(now - timedelta(seconds=30)),
+            },
+            {"id": "warm-due", "tier": "warm", "tech_updated_at": None},
+            {"id": "hot-due", "tier": "hot", "tech_updated_at": None},
+            {
+                "id": "hot-stale",
+                "tier": "hot",
+                "tech_updated_at": _iso(now - timedelta(seconds=301)),
+            },
+            {
+                "id": "warm-fresh",
+                "tier": "warm",
+                "tech_updated_at": _iso(now - timedelta(seconds=400)),
+            },
+        ]
+        ids = _order_ids(rows, now=now)
+        self.assertEqual(ids[:3], ["hot-due", "hot-stale", "warm-due"])
+        self.assertLess(ids.index("hot-due"), ids.index("cold"))
+        self.assertLess(ids.index("hot-stale"), ids.index("cold"))
+        self.assertLess(ids.index("warm-due"), ids.index("cold"))
+        # Inside the interval: stay with the tail, after due hot/warm.
+        self.assertLess(ids.index("cold"), ids.index("hot-fresh"))
+        self.assertLess(ids.index("cold"), ids.index("warm-fresh"))
+
+    def test_force_full_still_puts_hot_before_cold(self) -> None:
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+        rows: list[dict[str, Any]] = [
+            {"id": "cold", "tier": "cold", "tech_updated_at": None},
+            {
+                "id": "hot-fresh",
+                "tier": "hot",
+                "tech_updated_at": _iso(now),
+            },
+        ]
+        ids = _order_ids(rows, now=now, force_full=True)
+        self.assertEqual(ids, ["hot-fresh", "cold"])
+
+    def test_tier_from_token_row_hot_warm_cold(self) -> None:
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+        window = 3600
+        self.assertEqual(
+            tier_from_token_row(
+                {"last_seen_at": _iso(now), "has_pairs": 1},
+                now=now,
+                hot_seen_window_sec=window,
+            ),
+            "hot",
+        )
+        self.assertEqual(
+            tier_from_token_row(
+                {
+                    "last_seen_at": _iso(now - timedelta(seconds=window + 60)),
+                    "has_pairs": 1,
+                },
+                now=now,
+                hot_seen_window_sec=window,
+            ),
+            "warm",
+        )
+        self.assertEqual(
+            tier_from_token_row(
+                {
+                    "last_seen_at": _iso(now - timedelta(seconds=window * 6 + 60)),
+                    "has_pairs": 0,
+                },
+                now=now,
+                hot_seen_window_sec=window,
+            ),
+            "cold",
+        )
+        self.assertEqual(
+            tier_from_token_row(
+                {"last_seen_at": None, "updated_at": None, "has_pairs": 1},
+                now=now,
+                hot_seen_window_sec=window,
+            ),
+            "cold",
+        )
+
+
+class TechnicalPriorityPassTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ind.db"
+        self.conn = sqlite3.connect(self.db_path)
+        _seed_market(self.conn)
+        self.conn.commit()
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        if hasattr(self, "store"):
+            self.store.close()
+        self._tmp.cleanup()
+
+    def _add(self, address: str, last_seen: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO tokens (
+                chain_id, token_address, has_pairs, pair_count,
+                last_seen_at, last_enriched_at, updated_at
+            ) VALUES ('solana', ?, 1, 1, ?, NULL, ?)
+            """,
+            (address, last_seen, last_seen),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO pair_history (
+                chain_id, pair_address, token_address, recorded_at,
+                price_usd, volume_h1, liquidity_usd, tier
+            ) VALUES ('solana', ?, ?, ?, 1.0, 10, 100, 'hot')
+            """,
+            (address + "pair", address, last_seen),
+        )
+        self.conn.commit()
+
+    def _open(self) -> TechnicalIndicators:
+        self.store = IndicatorStore(self.db_path)
+        return TechnicalIndicators(self.store, write_history_for_hot=False)
+
+    def test_run_batch_puts_hot_due_before_cold(self) -> None:
+        now = datetime.now(timezone.utc)
+        window = HOT_SEEN_WINDOW_SEC
+        self._add("colddue", _iso(now - timedelta(seconds=window * 6 + 3600)))
+        self._add("warmdue", _iso(now - timedelta(seconds=window + 60)))
+        self._add("hotdue", _iso(now))
+        tech = self._open()
+        self.assertEqual(history_tier_for_token(self.store, "solana", "hotdue"), "hot")
+        self.assertEqual(history_tier_for_token(self.store, "solana", "warmdue"), "warm")
+        self.assertEqual(history_tier_for_token(self.store, "solana", "colddue"), "cold")
+        listed = {row["token_address"]: row for row in self.store.list_tokens_with_history()}
+        # Raw scan order is cold first. The pass must not follow that.
+        self.store.list_tokens_with_history = lambda: [  # type: ignore[method-assign]
+            listed["colddue"],
+            listed["warmdue"],
+            listed["hotdue"],
+        ]
+        calls: list[tuple[str, str | None]] = []
+
+        def _upsert(
+            chain_id: str,
+            token_address: str,
+            *,
+            tier: str | None = None,
+            force_full: bool = False,
+        ) -> dict[str, str | None]:
+            del force_full
+            calls.append((token_address, tier))
+            self.store.upsert_token_indicators(
+                {
+                    "chain_id": chain_id,
+                    "token_address": token_address,
+                    "tier": tier,
+                    "tech_updated_at": utc_now_iso(),
+                }
+            )
+            return {"tier": tier}
+
+        tech.upsert_one = _upsert  # type: ignore[method-assign]
+        stats = tech.run_batch(
+            only_due=True,
+            hot_interval_sec=300,
+            warm_interval_sec=1800,
+            cold_interval_sec=14400,
+        )
+        self.assertEqual(
+            calls,
+            [("hotdue", "hot"), ("warmdue", "warm"), ("colddue", "cold")],
+        )
+        self.assertEqual(stats["hot_due"], 1)
+        self.assertEqual(stats["warm_due"], 1)
+        self.assertEqual(stats["ok"], 3)
+        saved = self.store.get_token_indicators("solana", "hotdue", use_cache=False)
+        assert saved is not None
+        self.assertEqual(saved["tier"], "hot")
+        self.assertIsNotNone(saved["tech_updated_at"])
+
+    def test_tail_refreshes_hot_due_before_the_next_cold(self) -> None:
+        now = datetime.now(timezone.utc)
+        window = HOT_SEEN_WINDOW_SEC
+        self._add("cold1", _iso(now - timedelta(seconds=window * 6 + 3600)))
+        self._add("cold2", _iso(now - timedelta(seconds=window * 6 + 7200)))
+        self._add("hotdue", _iso(now))
+        tech = self._open()
+        listed = {row["token_address"]: row for row in self.store.list_tokens_with_history()}
+        self.store.list_tokens_with_history = lambda: [  # type: ignore[method-assign]
+            listed["cold1"],
+            listed["cold2"],
+            listed["hotdue"],
+        ]
+        clock = {"t": 0.0}
+        calls: list[str] = []
+
+        def _upsert(
+            chain_id: str,
+            token_address: str,
+            *,
+            tier: str | None = None,
+            force_full: bool = False,
+        ) -> dict[str, str | None]:
+            del force_full
+            calls.append(token_address)
+            if token_address == "hotdue":
+                self.store.upsert_token_indicators(
+                    {
+                        "chain_id": chain_id,
+                        "token_address": token_address,
+                        "tier": tier,
+                        "tech_updated_at": utc_now_iso(),
+                    }
+                )
+            elif calls.count("cold1") == 1 and token_address == "cold1":
+                self.store.upsert_token_indicators(
+                    {
+                        "chain_id": "solana",
+                        "token_address": "hotdue",
+                        "tier": "hot",
+                        "tech_updated_at": "2020-01-01T00:00:00Z",
+                    }
+                )
+                clock["t"] = 10_000.0
+            return {"tier": tier}
+
+        tech.upsert_one = _upsert  # type: ignore[method-assign]
+        tech.run_batch(
+            only_due=True,
+            hot_interval_sec=300,
+            _monotonic=lambda: clock["t"],
+        )
+        self.assertEqual(calls, ["hotdue", "cold1", "hotdue", "cold2"])
 
 
 if __name__ == "__main__":

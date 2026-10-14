@@ -8,13 +8,22 @@ from __future__ import annotations
 
 import math
 import statistics
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
+from config import HOT_SEEN_WINDOW_SEC
 from history import history_tier_for_token
 from logging_setup import get_logger
+from store import norm_address, norm_chain
 
-from indicators.base import INTERVAL_SEC, IndicatorStore, to_epoch, utc_now_iso
+from indicators.base import (
+    INTERVAL_SEC,
+    IndicatorStore,
+    parse_iso,
+    to_epoch,
+    utc_now_iso,
+)
 from indicators.library_apply import apply_library_fields, technical_refresh_due
 from indicators import technical_lib
 
@@ -218,6 +227,106 @@ def volume_strength(series: list[dict[str, Any]], *, window_sec: int = DEFAULT_V
     return current / mean_v
 
 
+def _token_key(tok: dict[str, Any]) -> tuple[str, str]:
+    return (norm_chain(str(tok["chain_id"])), norm_address(str(tok["token_address"])))
+
+
+def tier_from_token_row(
+    row: dict[str, Any],
+    *,
+    now: datetime,
+    hot_seen_window_sec: int,
+) -> str:
+    """Map token recency to hot|warm|cold.
+
+    Same rules as history.history_tier_for_token, using last_seen_at / updated_at /
+    has_pairs already loaded on the row.
+    """
+    seen = parse_iso(row.get("last_seen_at") or row.get("updated_at"))
+    if seen is None:
+        return "cold"
+    age = (now - seen).total_seconds()
+    if age <= hot_seen_window_sec and row.get("has_pairs") == 1:
+        return "hot"
+    if age <= hot_seen_window_sec * 6:
+        return "warm"
+    return "cold"
+
+
+def technical_pass_rank(
+    tier: str,
+    tech_updated_at: str | None,
+    *,
+    now: datetime,
+    hot_interval_sec: int,
+    warm_interval_sec: int,
+    cold_interval_sec: int,
+    force_full: bool = False,
+) -> int:
+    """Lower rank runs first.
+
+    0 — hot and due (tech_updated_at NULL, or older than the hot interval)
+    1 — warm and due (NULL, or older than the warm interval)
+    2 — cold / other tiers, and hot/warm still inside their interval
+
+    ``force_full`` still places every hot token, then every warm token, ahead of
+    the rest. Due-ness is technical_refresh_due: NULL is due, and the shared
+    updated_at column is not read.
+    """
+    if tier not in ("hot", "warm"):
+        return 2
+    needs_refresh = force_full or technical_refresh_due(
+        tech_updated_at,
+        tier=tier,
+        now=now,
+        hot_interval_sec=hot_interval_sec,
+        warm_interval_sec=warm_interval_sec,
+        cold_interval_sec=cold_interval_sec,
+    )
+    if not needs_refresh:
+        return 2
+    if tier == "hot":
+        return 0
+    return 1
+
+
+def order_technical_tokens(
+    tokens: list[dict[str, Any]],
+    *,
+    tier_of: Callable[[dict[str, Any]], str],
+    tech_updated_at_of: Callable[[dict[str, Any]], str | None],
+    now: datetime,
+    hot_interval_sec: int,
+    warm_interval_sec: int,
+    cold_interval_sec: int,
+    force_full: bool = False,
+) -> list[dict[str, Any]]:
+    """Stable order: due hot, then due warm, then cold and everything else."""
+    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    for index, tok in enumerate(tokens):
+        rank = technical_pass_rank(
+            tier_of(tok),
+            tech_updated_at_of(tok),
+            now=now,
+            hot_interval_sec=hot_interval_sec,
+            warm_interval_sec=warm_interval_sec,
+            cold_interval_sec=cold_interval_sec,
+            force_full=force_full,
+        )
+        ranked.append((rank, index, tok))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [tok for _rank, _index, tok in ranked]
+
+
+def _with_recency(
+    tok: dict[str, Any], recency: dict[tuple[str, str], dict[str, Any]]
+) -> dict[str, Any]:
+    extra = recency.get(_token_key(tok))
+    if not extra:
+        return tok
+    return {**tok, **extra}
+
+
 class TechnicalIndicators:
     """Compute and upsert technical fields into token_indicators."""
 
@@ -352,6 +461,86 @@ class TechnicalIndicators:
                 log.warning("indicator_history write failed: %s", exc)
         return row
 
+    def _process_token(
+        self,
+        tok: dict[str, Any],
+        *,
+        tier: str,
+        stats: dict[str, int],
+        force_full: bool,
+        only_due: bool,
+        hot_interval_sec: int,
+        warm_interval_sec: int,
+        cold_interval_sec: int,
+    ) -> None:
+        stats["seen"] += 1
+        chain_id = tok["chain_id"]
+        token_address = tok["token_address"]
+        try:
+            stats[tier] = stats.get(tier, 0) + 1
+            if only_due and not force_full:
+                last = self.store.get_tech_updated_at(chain_id, token_address)
+                if not technical_refresh_due(
+                    last,
+                    tier=tier,
+                    now=datetime.now(timezone.utc),
+                    hot_interval_sec=hot_interval_sec,
+                    warm_interval_sec=warm_interval_sec,
+                    cold_interval_sec=cold_interval_sec,
+                ):
+                    stats["skip"] += 1
+                    return
+            row = self.upsert_one(
+                chain_id, token_address, tier=tier, force_full=force_full
+            )
+            if row:
+                stats["ok"] += 1
+            else:
+                stats["skip"] += 1
+        except Exception as exc:  # noqa: BLE001 — fault-isolated per token
+            stats["err"] += 1
+            log.warning(
+                "technical failed %s/%s: %s",
+                chain_id,
+                str(token_address)[:12],
+                exc,
+            )
+
+    def _due_priority(
+        self,
+        universe: list[dict[str, Any]],
+        *,
+        hot_interval_sec: int,
+        warm_interval_sec: int,
+        cold_interval_sec: int,
+    ) -> list[tuple[int, int, dict[str, Any], str]]:
+        """Hot-due then warm-due, using a fresh recency and tech_updated_at read.
+
+        NULL tech_updated_at is due. Rank 2 (cold / not yet due) is omitted.
+        """
+        now = datetime.now(timezone.utc)
+        recency = self.store.map_token_recency()
+        stamps = self.store.map_tech_updated_at()
+        due: list[tuple[int, int, dict[str, Any], str]] = []
+        for index, tok in enumerate(universe):
+            tier = tier_from_token_row(
+                _with_recency(tok, recency),
+                now=now,
+                hot_seen_window_sec=HOT_SEEN_WINDOW_SEC,
+            )
+            rank = technical_pass_rank(
+                tier,
+                stamps.get(_token_key(tok)),
+                now=now,
+                hot_interval_sec=hot_interval_sec,
+                warm_interval_sec=warm_interval_sec,
+                cold_interval_sec=cold_interval_sec,
+            )
+            if rank < 2:
+                due.append((rank, index, tok, tier))
+        due.sort(key=lambda item: (item[0], item[1]))
+        return due
+
     def run_batch(
         self,
         *,
@@ -360,51 +549,160 @@ class TechnicalIndicators:
         hot_interval_sec: int = 300,
         warm_interval_sec: int = 1800,
         cold_interval_sec: int = 14400,
+        _monotonic: Callable[[], float] | None = None,
     ) -> dict[str, int]:
         """
-        Process all tokens that have pair_history.
-        only_due: skip tokens whose tech_updated_at is within the tier interval.
-        Shared updated_at is not consulted (funding/sentiment bump it every pass).
-        NULL tech_updated_at is due.
+        Process tokens that have pair_history.
+
+        Order when a refresh is selective (``only_due``) or full:
+        due hot, then due warm, then cold and other tiers. Due means
+        tech_updated_at IS NULL or older than that tier's interval.
+        Shared updated_at is not consulted. NULL tech_updated_at is due.
+
+        While the cold tail runs, that hot-then-warm queue is drained again
+        every hot interval, measured from the start of the previous drain.
+        A hot row updated at the front of a drain is therefore refreshed again
+        before two hot intervals have elapsed, as long as the due-hot set
+        itself finishes within one interval. Cold tokens still run after the
+        priority queue, one slice at a time.
         """
-        stats = {"seen": 0, "ok": 0, "skip": 0, "err": 0, "hot": 0, "warm": 0, "cold": 0}
-        tokens = self.store.list_tokens_with_history()
+        stats = {
+            "seen": 0,
+            "ok": 0,
+            "skip": 0,
+            "err": 0,
+            "hot": 0,
+            "warm": 0,
+            "cold": 0,
+            "hot_due": 0,
+            "warm_due": 0,
+        }
+        universe = self.store.list_tokens_with_history()
+        if not universe:
+            return stats
+
+        monotonic = _monotonic or time.monotonic
         now = datetime.now(timezone.utc)
+        recency = self.store.map_token_recency()
+        stamps = self.store.map_tech_updated_at()
 
-        for tok in tokens:
-            stats["seen"] += 1
-            chain_id = tok["chain_id"]
-            token_address = tok["token_address"]
-            try:
-                tier = self.resolve_tier(chain_id, token_address)
-                stats[tier] = stats.get(tier, 0) + 1
+        def tier_of(tok: dict[str, Any]) -> str:
+            return tier_from_token_row(
+                _with_recency(tok, recency),
+                now=now,
+                hot_seen_window_sec=HOT_SEEN_WINDOW_SEC,
+            )
 
-                if only_due and not force_full:
-                    last = self.store.get_tech_updated_at(chain_id, token_address)
-                    if not technical_refresh_due(
-                        last,
-                        tier=tier,
-                        now=now,
-                        hot_interval_sec=hot_interval_sec,
-                        warm_interval_sec=warm_interval_sec,
-                        cold_interval_sec=cold_interval_sec,
-                    ):
-                        stats["skip"] += 1
-                        continue
+        def tech_of(tok: dict[str, Any]) -> str | None:
+            return stamps.get(_token_key(tok))
 
-                row = self.upsert_one(
-                    chain_id, token_address, tier=tier, force_full=force_full
+        ordered = order_technical_tokens(
+            universe,
+            tier_of=tier_of,
+            tech_updated_at_of=tech_of,
+            now=now,
+            hot_interval_sec=hot_interval_sec,
+            warm_interval_sec=warm_interval_sec,
+            cold_interval_sec=cold_interval_sec,
+            force_full=force_full,
+        )
+        tail: list[dict[str, Any]] = []
+        for tok in ordered:
+            rank = technical_pass_rank(
+                tier_of(tok),
+                tech_of(tok),
+                now=now,
+                hot_interval_sec=hot_interval_sec,
+                warm_interval_sec=warm_interval_sec,
+                cold_interval_sec=cold_interval_sec,
+                force_full=force_full,
+            )
+            if rank == 0:
+                stats["hot_due"] += 1
+            elif rank == 1:
+                stats["warm_due"] += 1
+            else:
+                tail.append(tok)
+        log.info(
+            "technical priority hot_due=%s warm_due=%s tail=%s",
+            stats["hot_due"],
+            stats["warm_due"],
+            len(tail),
+        )
+
+        repeat = bool(only_due and not force_full)
+        if not repeat:
+            for tok in ordered:
+                self._process_token(
+                    tok,
+                    tier=tier_of(tok),
+                    stats=stats,
+                    force_full=force_full,
+                    only_due=only_due,
+                    hot_interval_sec=hot_interval_sec,
+                    warm_interval_sec=warm_interval_sec,
+                    cold_interval_sec=cold_interval_sec,
                 )
-                if row:
-                    stats["ok"] += 1
-                else:
-                    stats["skip"] += 1
-            except Exception as exc:  # noqa: BLE001 — fault-isolated per token
-                stats["err"] += 1
-                log.warning(
-                    "technical failed %s/%s: %s",
-                    chain_id,
-                    token_address[:12],
-                    exc,
+            return stats
+
+        interval = max(1, int(hot_interval_sec))
+        tail_index = 0
+        first_drain = True
+        while True:
+            drain_started = monotonic()
+            due = self._due_priority(
+                universe,
+                hot_interval_sec=hot_interval_sec,
+                warm_interval_sec=warm_interval_sec,
+                cold_interval_sec=cold_interval_sec,
+            )
+            if not first_drain and due:
+                log.info(
+                    "technical priority refresh due=%s tail_left=%s",
+                    len(due),
+                    max(0, len(tail) - tail_index),
+                )
+            first_drain = False
+            for _rank, _index, tok, tier in due:
+                self._process_token(
+                    tok,
+                    tier=tier,
+                    stats=stats,
+                    force_full=False,
+                    only_due=True,
+                    hot_interval_sec=hot_interval_sec,
+                    warm_interval_sec=warm_interval_sec,
+                    cold_interval_sec=cold_interval_sec,
+                )
+            if tail_index >= len(tail):
+                break
+            # One recency read for the slice. Tier can move while the tail
+            # runs; the next drain picks up hot/warm that became due.
+            # Deadline is anchored to the drain start so the next hot refresh
+            # is one hot interval later, inside the decision window (2×).
+            slice_now = datetime.now(timezone.utc)
+            slice_recency = self.store.map_token_recency()
+            deadline = drain_started + interval
+            advanced = 0
+            while tail_index < len(tail) and (
+                monotonic() < deadline or advanced == 0
+            ):
+                tok = tail[tail_index]
+                tail_index += 1
+                advanced += 1
+                tier = tier_from_token_row(
+                    _with_recency(tok, slice_recency),
+                    now=slice_now,
+                    hot_seen_window_sec=HOT_SEEN_WINDOW_SEC,
+                )
+                self._process_token(
+                    tok,
+                    tier=tier,
+                    stats=stats,
+                    force_full=False,
+                    only_due=True,
+                    hot_interval_sec=hot_interval_sec,
+                    warm_interval_sec=warm_interval_sec,
+                    cold_interval_sec=cold_interval_sec,
                 )
         return stats
