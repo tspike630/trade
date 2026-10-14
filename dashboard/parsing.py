@@ -189,6 +189,25 @@ def bucket_key(errors: str | None) -> str:
     return key
 
 
+def _receipt_reject_detail(receipt: dict[str, Any], receipt_status: str) -> str | None:
+    """Prefer fine-grained reason from pm_check / risk_check (matches order_events)."""
+    nested_key = {
+        "pm_rejected": "pm_check",
+        "risk_rejected": "risk_check",
+        "paper_failed": "paper_result",
+    }.get(receipt_status)
+    if not nested_key:
+        return None
+    nested = receipt.get(nested_key)
+    if not isinstance(nested, dict):
+        return None
+    for field in ("reason", "error", "code"):
+        value = nested.get(field)
+        if isinstance(value, str) and value.strip():
+            return clip(value.strip(), 80)
+    return None
+
+
 def rejection_key(
     validation_ok: int | None,
     validation_errors: str | None,
@@ -200,6 +219,9 @@ def rejection_key(
     Validation failures keep the first error segment. PM, risk, and paper
     denials are counted from ``execution_log.status`` and the receipt status
     even when ``validation_ok`` is 1 and ``validation_errors`` is empty.
+
+    When the receipt carries ``pm_check.reason`` (e.g. ``pm_rejected:max_open_per_strategy``),
+    that fine key is used so overview buckets match ``order_events.rejected``.
     """
     errors = validation_error_text(validation_errors)
     if validation_ok != 1 or errors.strip():
@@ -211,10 +233,23 @@ def rejection_key(
             receipt_status = raw_status.strip().lower()
     column = (status or "").strip().lower()
     if receipt_status in _REJECT_RECEIPT_STATUS:
+        if isinstance(receipt, dict):
+            detail = _receipt_reject_detail(receipt, receipt_status)
+            if detail:
+                return detail
         return receipt_status
     if column == "rejected":
         return "rejected"
     return None
+
+
+def liq_bucket_label(liquidity_usd: float | None, threshold: float = 50_000.0) -> str:
+    """Attribution bucket aligned with live min_liq=50k (observe-only)."""
+    if liquidity_usd is None:
+        return "liq_unknown"
+    if liquidity_usd < threshold:
+        return "liq_<50k"
+    return "liq_>=50k"
 
 
 def receipt_summary(receipt: dict[str, Any] | None, limit: int = 160) -> str:
