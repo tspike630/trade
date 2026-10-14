@@ -1000,7 +1000,9 @@ class DashboardSmokeTest(unittest.TestCase):
                 """
                 CREATE TABLE positions (
                     id TEXT PRIMARY KEY,
+                    pair_address TEXT,
                     status TEXT,
+                    opened_at TEXT,
                     closed_at TEXT,
                     exit_reason TEXT,
                     pnl_usd REAL,
@@ -1008,40 +1010,51 @@ class DashboardSmokeTest(unittest.TestCase):
                 )
                 """
             )
+            t0 = _iso(now - timedelta(hours=2))
+            t1 = _iso(now - timedelta(hours=1))
+            t2 = _iso(now)
             conn.executemany(
                 """
                 INSERT INTO positions
-                    (id, status, closed_at, exit_reason, pnl_usd, meta_json)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (id, pair_address, status, opened_at, closed_at, exit_reason, pnl_usd, meta_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         "a",
+                        "pairA",
                         "closed",
-                        _iso(now),
+                        t0,
+                        t0,
                         "stop_loss",
                         -84.3,
-                        json.dumps({"liquidity_usd": 11994.57}),
+                        json.dumps({"liquidity_usd": 11994.57, "decision_log_id": 1}),
                     ),
                     (
                         "b",
+                        "pairB",
                         "closed",
-                        _iso(now),
+                        t1,
+                        t1,
                         "max_hold",
                         10.5,
-                        json.dumps({"liquidity_usd": 191062.78}),
+                        json.dumps({"liquidity_usd": 191062.78, "decision_log_id": 2}),
                     ),
                     (
                         "c",
+                        "pairB",
                         "closed",
-                        _iso(now),
+                        t2,
+                        t2,
                         "max_hold",
                         -4.3,
-                        json.dumps({"liquidity_usd": 386822.33}),
+                        json.dumps({"liquidity_usd": 386822.33, "decision_log_id": 3}),
                     ),
                     (
                         "d",
+                        "pairC",
                         "open",
+                        None,
                         None,
                         None,
                         None,
@@ -1049,9 +1062,18 @@ class DashboardSmokeTest(unittest.TestCase):
                     ),
                 ],
             )
+        main = self.root / "main.db"
+        with sqlite3.connect(main) as conn:
+            conn.execute(
+                "CREATE TABLE decision_log (id INTEGER PRIMARY KEY, purpose TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO decision_log (id, purpose) VALUES (?, ?)",
+                [(1, "live_candidate"), (2, "live_candidate"), (3, "sample")],
+            )
         store = DataStore(
             DbPaths(
-                main=self.root / "missing-main.db",
+                main=main,
                 execution=self.root / "missing-exec.db",
                 paper=paper,
                 backtest=self.root / "missing-bt.db",
@@ -1071,6 +1093,12 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertAlmostEqual(report.data.win_rate or 0, 1 / 3, places=4)
         self.assertAlmostEqual(report.data.worst_pnl_usd or 0, -84.3, places=2)
         self.assertTrue(report.data.single_wipe)
+        # first closed per pair: pairA loss, pairB win (earliest of B is +10.5)
+        self.assertEqual(report.data.first_hit_n, 2)
+        self.assertEqual(report.data.first_hit_wins, 1)
+        self.assertAlmostEqual(report.data.first_hit_rate or 0, 0.5, places=4)
+        self.assertEqual(report.data.first_hit_live_n, 2)
+        self.assertEqual(report.data.first_hit_live_wins, 1)
 
     def test_chat_context_uses_newest_messages(self) -> None:
         sessions = SessionStore(self.root / "dashboard_state.db")

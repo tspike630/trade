@@ -339,6 +339,13 @@ class PaperClosedReport:
     worst_pnl_usd: float | None = None
     rest_pnl_usd: float | None = None
     single_wipe: bool = False
+    # First-trade hit rate (Prediction Arena P-1): earliest closed per pair.
+    first_hit_n: int = 0
+    first_hit_wins: int = 0
+    first_hit_rate: float | None = None
+    first_hit_live_n: int = 0
+    first_hit_live_wins: int = 0
+    first_hit_live_rate: float | None = None
 
 
 class MissingTable(LookupError):
@@ -1254,6 +1261,10 @@ class DataStore:
                 if absent:
                     return _unavail(f"{absent}（{path.name}）", started)
                 selected = ["status", "closed_at", "exit_reason", "pnl_usd"]
+                if "pair_address" in cols:
+                    selected.append("pair_address")
+                if "opened_at" in cols:
+                    selected.append("opened_at")
                 if "meta_json" in cols:
                     selected.append("meta_json")
                 rows = _exec(
@@ -1263,10 +1274,25 @@ class DataStore:
                 ).fetchall()
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        decision_ids: list[int] = []
+        for row in rows:
+            meta = parse_json(str(_cell(row, "meta_json") or ""))
+            if not isinstance(meta, dict):
+                continue
+            raw_id = meta.get("decision_log_id")
+            if isinstance(raw_id, bool):
+                continue
+            if isinstance(raw_id, (int, float)):
+                decision_ids.append(int(raw_id))
+            elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+                decision_ids.append(int(raw_id.strip()))
+        purposes = self._decision_purposes(decision_ids)
         agg: dict[tuple[str, str], list[float]] = defaultdict(list)
         closed = 0
         total_pnl = 0.0
         pnls: list[float] = []
+        # pair -> (opened_at sort key, closed_at, hit, purpose)
+        first_by_pair: dict[str, tuple[str, str, bool, str | None]] = {}
         for row in rows:
             if not _in_range(row["closed_at"], start, end, end_inclusive=True):
                 continue
@@ -1276,17 +1302,37 @@ class DataStore:
                 pnl = 0.0
             meta = parse_json(str(_cell(row, "meta_json") or ""))
             liq = None
+            purpose: str | None = None
             if isinstance(meta, dict):
                 liq = safe_float(meta.get("liquidity_usd"))
                 if liq is None:
                     extras = meta.get("extras")
                     if isinstance(extras, dict):
                         liq = safe_float(extras.get("liquidity_usd"))
+                raw_id = meta.get("decision_log_id")
+                did: int | None = None
+                if isinstance(raw_id, bool):
+                    did = None
+                elif isinstance(raw_id, (int, float)):
+                    did = int(raw_id)
+                elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+                    did = int(raw_id.strip())
+                if did is not None:
+                    purpose = purposes.get(did)
             bucket = liq_bucket_label(liq)
             agg[(reason, bucket)].append(pnl)
             pnls.append(pnl)
             closed += 1
             total_pnl += pnl
+            pair = str(_cell(row, "pair_address") or "").strip()
+            if pair:
+                opened = str(_cell(row, "opened_at") or "")
+                closed_at = str(_cell(row, "closed_at") or "")
+                sort_key = opened or closed_at
+                hit = pnl > 0
+                prev = first_by_pair.get(pair)
+                if prev is None or (sort_key, closed_at) < (prev[0], prev[1]):
+                    first_by_pair[pair] = (sort_key, closed_at, hit, purpose)
         ordered = tuple(
             PaperClosedBucket(
                 exit_reason=key[0],
@@ -1308,6 +1354,13 @@ class DataStore:
         single_wipe = bool(
             worst is not None and rest is not None and rest > 0 and total_pnl < 0
         )
+        first_n = len(first_by_pair)
+        first_wins = sum(1 for item in first_by_pair.values() if item[2])
+        first_rate = (first_wins / first_n) if first_n else None
+        live_items = [item for item in first_by_pair.values() if item[3] == "live_candidate"]
+        live_n = len(live_items)
+        live_wins = sum(1 for item in live_items if item[2])
+        live_rate = (live_wins / live_n) if live_n else None
         return _ok(
             PaperClosedReport(
                 window_days,
@@ -1320,9 +1373,51 @@ class DataStore:
                 worst_pnl_usd=round(worst, 4) if worst is not None else None,
                 rest_pnl_usd=round(rest, 4) if rest is not None else None,
                 single_wipe=single_wipe,
+                first_hit_n=first_n,
+                first_hit_wins=first_wins,
+                first_hit_rate=round(first_rate, 4) if first_rate is not None else None,
+                first_hit_live_n=live_n,
+                first_hit_live_wins=live_wins,
+                first_hit_live_rate=round(live_rate, 4) if live_rate is not None else None,
             ),
             started,
         )
+
+    def _decision_purposes(self, decision_ids: list[int]) -> dict[int, str | None]:
+        """Map decision_log.id -> purpose when the column exists; empty on miss."""
+        unique = sorted({int(item) for item in decision_ids if isinstance(item, int)})
+        if not unique:
+            return {}
+        path = self.paths.main
+        if not path.is_file():
+            return {}
+        try:
+            with ro_connect(path) as conn:
+                if _missing_table(conn, "decision_log", path.name):
+                    return {}
+                cols = _columns(conn, "decision_log")
+                if "id" not in cols or "purpose" not in cols:
+                    return {}
+                out: dict[int, str | None] = {}
+                chunk = 400
+                for index in range(0, len(unique), chunk):
+                    batch = unique[index : index + chunk]
+                    placeholders = ", ".join("?" for _ in batch)
+                    for row in _exec(
+                        conn,
+                        f"SELECT id, purpose FROM decision_log WHERE id IN ({placeholders})",
+                        tuple(batch),
+                    ).fetchall():
+                        raw = _cell(row, "purpose")
+                        if raw is None:
+                            out[int(row["id"])] = None
+                        else:
+                            text_purpose = str(raw).strip()
+                            out[int(row["id"])] = text_purpose or None
+                return out
+        except sqlite3.Error:
+            log.warning("decision purpose lookup failed")
+            return {}
 
     def _decision_ids_between(
         self,
