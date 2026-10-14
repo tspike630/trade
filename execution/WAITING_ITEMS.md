@@ -1,7 +1,7 @@
 # 执行层 — 挂起 / 观察登记
 
 **Time (HK / UTC+8):** 2026-10-15  
-**用途：** 执行层认领的观察项。C4 仍只登记、不实现。F-1 与 C3/F-3 只记账，不改退出默认，不启用新闸门，不改 loop，不写 `.env`。G-2 / G-11 是纪律，无新参数。G-3 是只读计算器，不接成闸门。I-3 只读滑点报告已接线；bot 份额等采集标记，不自动跳单。I-4 与 INTEL_LOOP 只登记。候选不等于生效。执行层本单不认领 I-1 / I-2。
+**用途：** 执行层认领的观察项。C4 仍只登记、不实现。F-1 与 C3/F-3 只记账，不改退出默认，不启用新闸门，不改 loop，不写 `.env`。G-2 / G-11 是纪律，无新参数。G-3 是只读计算器，不接成闸门。I-3 只读滑点报告已接线；`bot_trade_share` 已接采集 #81 `bot_fill_observations` 只读；高 bot 仍不接线，不自动跳单。I-4 与 INTEL_LOOP 只登记。候选不等于生效。执行层本单不认领 I-1 / I-2。
 
 仓库根没有 `WAITING_ITEMS_REGISTRY.md`。本文件是执行层登记，不代替复盘层文件。复盘 **P-2 / P-3** 口径不在这里。E-1 / E-4 / E-5 归指标；E-3 与 N 类无代码。
 
@@ -75,7 +75,7 @@
 | **不认领** | **I-1** 钱包标签 / dev 行为、**I-2** 持币集中度因子归采集与 factor_loop。这里不建表、不算因子。 |
 | **`slippage_1h`** | **已接线，只读。** `python -m execution.slippage_report`。聚合近 1 小时与 UTC 日桶的平均、p50、p90。来源是已有字段：`execution_log.receipt_json` 里 paper `exec_result` 的 `mid_price` / `fill_price` / `slippage`；paper 买入 `fills` 配 `positions.meta_json` 里同名的 mid / slippage。同一 `decision_log_id` + side 以回执为准。 |
 | **缺字段** | tick 平仓的 `fills` 只有成交价，没有 mid / slippage。卖出 fill 不借用开仓 meta 的滑点。没有字段就跳过并计数，不记成 0，也不补写交易库。 |
-| **`bot_trade_share`** | **阻断于采集。** 预留读取已有标签：`bot_tag` / `is_bot` / `bot_label` / `suspicious_bot` / `bot`（JSON 或同名列）。标记未到 = **data gap**，份额是 null，不当成「不是 bot」。不实现毫秒级重复成交、固定间隔、gas 竞标识别。 |
+| **`bot_trade_share`** | **已接采集 #81，只读。** `python -m execution.slippage_report` 优先读 crawler DB 的 `bot_fill_observations`（`--crawler-db`，默认 `dexscreener.db`，或环境变量 `CRAWLER_DB` / `DB_PATH`）。SQL 与采集 `Store.bot_share_inputs` 同义：1h 窗按 `recorded_at` 过滤；分母是已解析成交，分子是 `bot_reason` 非空；分母为 0 则 share 为 null。输出全局份额，并附按 token 摘要。表缺失或空表 = **data gap**，份额是 null，不当成「不是 bot」，也不写成 0。receipt 上的 `bot_tag` / `is_bot` / `bot_label` / `suspicious_bot` / `bot` 只作次要 fallback，主源已是 #81。不实现毫秒级重复成交、固定间隔、gas 竞标识别。 |
 | **高 bot 跳过** | **不接线。** 先记录，对拍后再 R2/R3。不接 PM，不接 gateway，不自动跳单，不熔断。报告里 `high_bot_skip.wired=false`。 |
 | **禁止** | 不改 TP/SL/hold、日亏、PM 数值，不开 live，不改滑点档。 |
 
