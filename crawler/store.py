@@ -285,6 +285,7 @@ class Store:
         self._migrate_quality_score()
         self._migrate_pair_created_at()
         self._migrate_market_cap_columns()
+        self._migrate_intel_loop_i1()
 
     def _migrate_add_pair_flags(self) -> None:
         cols = self._table_columns("tokens")
@@ -1413,6 +1414,83 @@ class Store:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN fdv REAL")
         self._conn.commit()
 
+    def _migrate_intel_loop_i1(self) -> None:
+        """Additive INTEL_LOOP I-1 tables. No backfill and no invented rows.
+
+        address_labels.token_mint is '' when the label is not token-scoped
+        (SQLite PRIMARY KEY cannot hold NULL). Holder rows for one snapshot_id
+        share recorded_at and the supply basis. Transfer edges are a light stub.
+        """
+        cur = self._conn.cursor()
+        cur.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS address_labels (
+                chain_id TEXT NOT NULL,
+                address TEXT NOT NULL,
+                label_type TEXT NOT NULL,
+                token_mint TEXT NOT NULL DEFAULT '',
+                pair_address TEXT,
+                source TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chain_id, address, label_type, token_mint)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_address_labels_mint
+                ON address_labels (chain_id, token_mint, label_type);
+
+            CREATE INDEX IF NOT EXISTS idx_address_labels_type
+                ON address_labels (label_type);
+
+            CREATE TABLE IF NOT EXISTS token_holder_snapshots (
+                chain_id TEXT NOT NULL,
+                token_address TEXT NOT NULL,
+                snapshot_id TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                holder_address TEXT NOT NULL,
+                address_kind TEXT NOT NULL,
+                amount_raw TEXT,
+                amount_ui REAL,
+                pct_of_supply REAL,
+                total_supply_raw TEXT,
+                total_supply_ui REAL,
+                source TEXT NOT NULL,
+                PRIMARY KEY (chain_id, token_address, snapshot_id, rank)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_holder_snapshots_token_time
+                ON token_holder_snapshots (chain_id, token_address, recorded_at);
+
+            CREATE TABLE IF NOT EXISTS token_transfer_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chain_id TEXT NOT NULL,
+                token_address TEXT NOT NULL,
+                from_address TEXT NOT NULL,
+                to_address TEXT NOT NULL,
+                amount_raw TEXT,
+                amount_ui REAL,
+                signature TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                source TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_transfer_edges_dedupe
+                ON token_transfer_edges (
+                    chain_id,
+                    signature,
+                    token_address,
+                    from_address,
+                    to_address,
+                    IFNULL(amount_raw, '')
+                );
+
+            CREATE INDEX IF NOT EXISTS idx_transfer_edges_token_time
+                ON token_transfer_edges (chain_id, token_address, recorded_at);
+            """
+        )
+        self._conn.commit()
+
     def _migrate_quality_score(self) -> None:
         cols = self._table_columns("tokens")
         cur = self._conn.cursor()
@@ -1715,4 +1793,365 @@ class Store:
 
     def count_pair_history(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM pair_history").fetchone()[0])
+
+    def _table_exists(self, name: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
+    def upsert_address_label(
+        self,
+        chain_id: str,
+        address: str,
+        label_type: str,
+        *,
+        token_mint: str | None = None,
+        pair_address: str | None = None,
+        source: str,
+        now: str | None = None,
+    ) -> str:
+        """Insert or refresh a label. first_seen_at is kept. Returns inserted|updated|skipped.
+
+        An empty address, label, or source is skipped. Nothing is invented.
+        """
+        chain_id = norm_chain(chain_id)
+        address = norm_address(address)
+        label_type = label_type.strip().lower()
+        source = source.strip()
+        if not address or not label_type or not source:
+            return "skipped"
+        mint = norm_address(token_mint) if token_mint else ""
+        pair = norm_address(pair_address) if pair_address else None
+        ts = now or _utc_now_iso()
+        cur = self._conn.cursor()
+        existing = cur.execute(
+            """
+            SELECT first_seen_at FROM address_labels
+            WHERE chain_id = ? AND address = ? AND label_type = ? AND token_mint = ?
+            """,
+            (chain_id, address, label_type, mint),
+        ).fetchone()
+        if existing is None:
+            cur.execute(
+                """
+                INSERT INTO address_labels (
+                    chain_id, address, label_type, token_mint, pair_address,
+                    source, first_seen_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (chain_id, address, label_type, mint, pair, source, ts, ts),
+            )
+            self._conn.commit()
+            return "inserted"
+        cur.execute(
+            """
+            UPDATE address_labels
+            SET pair_address = COALESCE(?, pair_address),
+                source = ?,
+                updated_at = ?
+            WHERE chain_id = ? AND address = ? AND label_type = ? AND token_mint = ?
+            """,
+            (pair, source, ts, chain_id, address, label_type, mint),
+        )
+        self._conn.commit()
+        return "updated"
+
+    def list_address_labels(
+        self,
+        chain_id: str,
+        *,
+        token_mint: str | None = None,
+        label_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Labels for a chain. Empty token_mint in the table is returned as None."""
+        sql = (
+            "SELECT chain_id, address, label_type, token_mint, pair_address, "
+            "source, first_seen_at, updated_at FROM address_labels WHERE chain_id = ?"
+        )
+        params: list[Any] = [norm_chain(chain_id)]
+        if token_mint is not None:
+            sql += " AND token_mint = ?"
+            params.append(norm_address(token_mint) if token_mint else "")
+        if label_type is not None:
+            sql += " AND label_type = ?"
+            params.append(label_type.strip().lower())
+        sql += " ORDER BY updated_at DESC, address ASC"
+        rows = self._conn.execute(sql, params).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            mint = row["token_mint"] or None
+            out.append(
+                {
+                    "chain_id": row["chain_id"],
+                    "address": row["address"],
+                    "label_type": row["label_type"],
+                    "token_mint": mint,
+                    "pair_address": row["pair_address"],
+                    "source": row["source"],
+                    "first_seen_at": row["first_seen_at"],
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return out
+
+    def insert_holder_snapshot(
+        self,
+        chain_id: str,
+        token_address: str,
+        snapshot: dict[str, Any],
+        *,
+        max_rank: int = 10,
+    ) -> int:
+        """Persist one top-holder snapshot. Returns rows written.
+
+        All rows share snapshot_id, recorded_at, and the supply basis.
+        pct_of_supply is recomputed from amount_ui and total_supply_ui.
+        A missing supply or amount leaves pct NULL. Empty input writes nothing.
+        """
+        if not isinstance(snapshot, dict):
+            return 0
+        snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
+        recorded_at = str(snapshot.get("recorded_at") or "").strip()
+        source = str(snapshot.get("source") or "").strip()
+        raw_rows = snapshot.get("rows")
+        if not snapshot_id or not recorded_at or not source or not isinstance(raw_rows, list):
+            return 0
+        chain_id = norm_chain(chain_id)
+        token_address = norm_address(token_address)
+        if not token_address:
+            return 0
+        supply_raw = snapshot.get("total_supply_raw")
+        if supply_raw is not None:
+            supply_raw = str(supply_raw).strip() or None
+        supply_ui = _optional_real(snapshot.get("total_supply_ui"))
+        cap = max(1, int(max_rank))
+        pending: list[tuple[Any, ...]] = []
+        seen_ranks: set[int] = set()
+        for item in raw_rows:
+            if not isinstance(item, dict):
+                continue
+            rank_value = item.get("rank")
+            if isinstance(rank_value, bool):
+                continue
+            try:
+                rank = int(rank_value)
+            except (TypeError, ValueError):
+                continue
+            if rank < 1 or rank > cap or rank in seen_ranks:
+                continue
+            holder = item.get("holder_address")
+            if not isinstance(holder, str) or not holder.strip():
+                continue
+            kind = str(item.get("address_kind") or "")
+            if kind not in ("owner", "token_account"):
+                continue
+            amount_ui = _optional_real(item.get("amount_ui"))
+            amount_raw = item.get("amount_raw")
+            if amount_raw is not None:
+                amount_raw = str(amount_raw).strip() or None
+            pending.append(
+                (
+                    chain_id,
+                    token_address,
+                    snapshot_id,
+                    recorded_at,
+                    rank,
+                    norm_address(holder),
+                    kind,
+                    amount_raw,
+                    amount_ui,
+                    _pct_of_supply(amount_ui, supply_ui),
+                    supply_raw,
+                    supply_ui,
+                    source,
+                )
+            )
+            seen_ranks.add(rank)
+        if not pending:
+            return 0
+        cur = self._conn.cursor()
+        try:
+            cur.executemany(
+                """
+                INSERT OR REPLACE INTO token_holder_snapshots (
+                    chain_id, token_address, snapshot_id, recorded_at, rank,
+                    holder_address, address_kind, amount_raw, amount_ui,
+                    pct_of_supply, total_supply_raw, total_supply_ui, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                pending,
+            )
+            self._conn.commit()
+        except sqlite3.Error:
+            self._conn.rollback()
+            raise
+        return len(pending)
+
+    def list_holder_snapshot_rows(
+        self,
+        chain_id: str,
+        token_address: str,
+        *,
+        snapshot_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT chain_id, token_address, snapshot_id, recorded_at, rank, "
+            "holder_address, address_kind, amount_raw, amount_ui, pct_of_supply, "
+            "total_supply_raw, total_supply_ui, source "
+            "FROM token_holder_snapshots WHERE chain_id = ? AND token_address = ?"
+        )
+        params: list[Any] = [norm_chain(chain_id), norm_address(token_address)]
+        if snapshot_id is not None:
+            sql += " AND snapshot_id = ?"
+            params.append(snapshot_id)
+        sql += " ORDER BY recorded_at ASC, snapshot_id ASC, rank ASC"
+        return [dict(row) for row in self._conn.execute(sql, params).fetchall()]
+
+    def latest_holder_snapshot(
+        self,
+        chain_id: str,
+        token_address: str,
+    ) -> list[dict[str, Any]]:
+        """Rows of the newest snapshot only, so a reader stays on one timestamp."""
+        row = self._conn.execute(
+            """
+            SELECT snapshot_id FROM token_holder_snapshots
+            WHERE chain_id = ? AND token_address = ?
+            ORDER BY recorded_at DESC, snapshot_id DESC
+            LIMIT 1
+            """,
+            (norm_chain(chain_id), norm_address(token_address)),
+        ).fetchone()
+        if row is None:
+            return []
+        return self.list_holder_snapshot_rows(
+            chain_id, token_address, snapshot_id=row["snapshot_id"]
+        )
+
+    def insert_transfer_edges(self, rows: list[dict[str, Any]]) -> int:
+        """Insert parsed transfer edges. Incomplete rows are skipped, not filled in."""
+        if not rows:
+            return 0
+        pending: list[tuple[Any, ...]] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            chain_id = norm_chain(str(item.get("chain_id") or ""))
+            token = item.get("token_address")
+            src = item.get("from_address")
+            dst = item.get("to_address")
+            signature = item.get("signature")
+            recorded_at = item.get("recorded_at")
+            source = item.get("source")
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (chain_id, token, src, dst, signature, recorded_at, source)
+            ):
+                continue
+            amount_raw = item.get("amount_raw")
+            if amount_raw is not None:
+                amount_raw = str(amount_raw).strip() or None
+            pending.append(
+                (
+                    chain_id,
+                    norm_address(str(token)),
+                    norm_address(str(src)),
+                    norm_address(str(dst)),
+                    amount_raw,
+                    _optional_real(item.get("amount_ui")),
+                    str(signature).strip(),
+                    str(recorded_at).strip(),
+                    str(source).strip(),
+                )
+            )
+        if not pending:
+            return 0
+        cur = self._conn.cursor()
+        before = cur.execute("SELECT COUNT(*) AS c FROM token_transfer_edges").fetchone()["c"]
+        cur.executemany(
+            """
+            INSERT OR IGNORE INTO token_transfer_edges (
+                chain_id, token_address, from_address, to_address,
+                amount_raw, amount_ui, signature, recorded_at, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            pending,
+        )
+        self._conn.commit()
+        after = cur.execute("SELECT COUNT(*) AS c FROM token_transfer_edges").fetchone()["c"]
+        return int(after) - int(before)
+
+    def intel_observe_counts(self) -> dict[str, Any]:
+        """I-1 observe counts. Missing tables are unavailable, not zeros that look filled."""
+        empty = {
+            "available": False,
+            "labeled_dev_n": 0,
+            "holder_snapshot_n": 0,
+            "holder_snapshot_rows": 0,
+            "tokens_with_top10": 0,
+            "transfer_edge_n": 0,
+        }
+        needed = ("address_labels", "token_holder_snapshots", "token_transfer_edges")
+        try:
+            for name in needed:
+                if not self._table_exists(name):
+                    return {**empty, "error": f"missing table {name}"}
+            dev = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM address_labels WHERE label_type = 'dev'"
+            ).fetchone()
+            snaps = self._conn.execute(
+                """
+                SELECT COUNT(DISTINCT snapshot_id) AS snaps,
+                       COUNT(DISTINCT chain_id || ':' || token_address) AS tokens,
+                       COUNT(*) AS rows
+                FROM token_holder_snapshots
+                """
+            ).fetchone()
+            edges = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM token_transfer_edges"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            return {**empty, "error": type(exc).__name__}
+        return {
+            "available": True,
+            "labeled_dev_n": int(dev["c"] or 0),
+            "holder_snapshot_n": int(snaps["snaps"] or 0),
+            "holder_snapshot_rows": int(snaps["rows"] or 0),
+            "tokens_with_top10": int(snaps["tokens"] or 0),
+            "transfer_edge_n": int(edges["c"] or 0),
+        }
+
+
+def _optional_real(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _pct_of_supply(amount_ui: float | None, supply_ui: float | None) -> float | None:
+    """Same-response ratio. Not a concentration factor. NULL if either side is missing."""
+    if amount_ui is None or supply_ui is None or supply_ui <= 0:
+        return None
+    return float(amount_ui) / float(supply_ui)
+
+
+def format_intel_observe_line(counts: dict[str, Any] | None) -> str:
+    """Hourly observe line. The counts are 10-19 side evidence, not validity."""
+    if not isinstance(counts, dict) or counts.get("error") or not counts.get("available"):
+        return "I-1 observe (旁证, 不计有效性): unavailable"
+    return (
+        "I-1 observe (旁证, 不计有效性): "
+        f"labeled_dev_n={int(counts.get('labeled_dev_n') or 0)} "
+        f"holder_snapshot_n={int(counts.get('holder_snapshot_n') or 0)} "
+        f"tokens_with_top10={int(counts.get('tokens_with_top10') or 0)}"
+    )
 

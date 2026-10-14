@@ -98,6 +98,16 @@ The ratio itself stays with indicators. This note does not score G-5.
 
 `daily_check` check「热层流动性覆盖」adds `mcap_hot_1h`: hot 1h NULL counts for those columns. The liquidity PASS/WARN/FAIL level does not use them. The count is **10-19 周检旁证**, not strategy validity. `ALERT_MIN_SCORE`, Telegram routing, and loop intervals stay as they are.
 
+## INTEL_LOOP I-1（钱包标签与持仓快照）
+
+I-1 已落地的是表和尽力填充，不是因子。`address_labels` 记地址标签（这次会写 `dev` 和 `whale_top10`；`token_mint` 可空，库里空串表示不绑代币）。`token_holder_snapshots` 记同一次 RPC 的前 10 持仓：同一 `snapshot_id` 与 `recorded_at`，每行带 `amount_raw` / `amount_ui`，以及同一笔 `total_supply_raw` / `total_supply_ui`。供应量或数量缺失时 `pct_of_supply` 与对应列为 NULL，不编造持仓或余额。`pct_of_supply` 只是这一行的数量除以同一响应里的供应，不是 `concentration_*`。`top10_share` 与 `dev_balance_delta` 的公式仍归指标。I-2 等指标来读这些表再算；本层不写因子、不降权、不改买卖。
+
+填充挂在已经在用的 Helius `getTransaction` 上（`_handle_notification` → `enqueue_solana_mints`）。确认过的 `initializeMint` / `initializeMint2` 若带 `mintAuthority`，且该地址不是已知程序或报价资产，写成 `dev`。没有该字段、或 authority 是程序地址，就不打标。日志正则命中的 mint 不打标。持仓快照走同一个 Helius HTTP endpoint 的 `getTokenLargestAccounts` + `getTokenSupply` + `getMultipleAccounts`（解析 owner）。仓库里没有 DAS 客户端，DexScreener 的 pair payload 也没有 holder 列表。`HOLDER_SNAPSHOT_ENABLED` 默认开，只在纸面观察；设为 `0` 则跳过这三次额外 RPC，dev 标签和下面的转账边仍从已拉取的交易里写。RPC 失败或空列表则跳过该代币，不造行。owner 解析失败时，行里留下 token account，`address_kind=token_account`，并且不打 `whale_top10`。
+
+`token_transfer_edges` 只记这笔已经拉下来的 `getTransaction` 里、且 mint 属于本次入队代币的 SPL `transfer` / `transferChecked`。没有 mint 的转账丢掉。全量转账图和历史回填是 Phase-2。
+
+`daily_check` 检查「INTEL_LOOP I-1」和小时报只计 `labeled_dev_n`、`holder_snapshot_n`、`tokens_with_top10`。空表是 PASS。查询失败是 WARN，不是 FAIL。这是 **10-19 旁证**，不算策略有效性。不改 `ALERT_MIN_SCORE`、cooldown、`min_liq`、Telegram 路由，也不动 LIVE 闸。I-3（bot share）与 I-4（OTC）不在这次。
+
 ## 警示事例 → 采集侧
 
 Polymarket 经验落地计划第四节的三条警示，映射到采集侧时只作旁证。**不算策略有效性。** 本文只记边界：docs-only，会话中不加参数。`ALERT_MIN_SCORE`、评分权重、现有 Telegram 路由、`history.extract_metrics` 的流动性写法保持原样。「热层流动性覆盖」那一节（#44）已经在跑，这里不另做监测。

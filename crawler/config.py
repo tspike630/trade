@@ -154,6 +154,15 @@ HELIUS_MENTIONS = os.environ.get("HELIUS_MENTIONS", "").strip() or None  # alias
 HELIUS_PING_INTERVAL_SEC = float(os.environ.get("HELIUS_PING_INTERVAL_SEC", "120"))
 HELIUS_RECONNECT_MAX_SEC = float(os.environ.get("HELIUS_RECONNECT_MAX_SEC", "60"))
 HELIUS_DISCONNECT_ALERT_AFTER = int(os.environ.get("HELIUS_DISCONNECT_ALERT_AFTER", "3"))
+# INTEL_LOOP I-1 paper observe. Extra RPC on confirmed new mints only.
+# 0 skips getTokenLargestAccounts / supply / owners. Does not gate buys.
+# Missing holders stay NULL. Default ON.
+HOLDER_SNAPSHOT_ENABLED = os.environ.get("HOLDER_SNAPSHOT_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # P2: multi-chain filter (comma-separated). Empty = all chains allowed.
 # Documented: solana, ethereum, bsc, base (plus any DexScreener chainId).
