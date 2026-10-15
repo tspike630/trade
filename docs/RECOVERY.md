@@ -58,6 +58,8 @@ G-13：采集在已有文案里看到宣传 APY/APR/yield ≥1000% 时打 `risk_
 
 10-14 纸面旁证与第二批文献的采集边界（供流正常不等于可调参；不新增 LLM 预测源、不做 agent 扇出）见同文「学习/反思（10-14）」。不算有效性，不盘中改参。
 
+完整角色记忆与口径见 [RECOVERY_COLLECTION.md](RECOVERY_COLLECTION.md)。
+
 ## 3. 指标层恢复（代码在 `crawler/indicators/`，与采集同仓同 venv）
 
 指标旁路只写 `token_indicators` / `indicator_history` / `jev_signals`，**不改**评分权重（`INDICATORS_WEIGHT_*=0`）。密钥可选：无 `JEV_API_KEY` 时走 `jevs.fun` 公开档。
