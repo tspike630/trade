@@ -81,9 +81,17 @@ nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
 
 完整角色记忆与口径见 [RECOVERY_INDICATORS.md](RECOVERY_INDICATORS.md)。
 
-## 4. 交易看板
 ## 4. 执行层恢复
-## 4. 复盘层
+
+代码：仓库根 `execution/`。换机步骤见下文「其它层」中的执行段（`--once` / `--loop`；paper/PM 默认关）。
+
+完整角色记忆与口径见 [RECOVERY_EXECUTION.md](RECOVERY_EXECUTION.md)。
+
+## 4b. 交易看板
+
+完整角色记忆与口径见 [RECOVERY_DASHBOARD.md](RECOVERY_DASHBOARD.md)。短安装见后文看板段。
+
+## 5. 复盘层
 
 只读旁路，不改策略参数、不开实盘闸门。完整步骤与注意见 [RECOVERY_REVIEW.md](RECOVERY_REVIEW.md)。
 
@@ -138,6 +146,8 @@ echo $! > logs/execution_loop.pid
 
 若有 `EXECUTION_*` / `PM_*` env，备份到私密配置包，与 `.env` 同级保管，不进仓。
 
+完整角色记忆与口径见 [RECOVERY_EXECUTION.md](RECOVERY_EXECUTION.md)。
+
 ## 5. 其它层（各层跟进提交后）
 
 完整角色记忆与口径见 [RECOVERY_DASHBOARD.md](RECOVERY_DASHBOARD.md)。
@@ -178,6 +188,7 @@ python -m dashboard.smoke_test
 - 决策：仓库根 `decision_engine/` → [DECISION_ENGINE_RESTORE.md](../DECISION_ENGINE_RESTORE.md)
 - 决策完整角色记忆与口径见 [RECOVERY_DECISION.md](RECOVERY_DECISION.md)
 - 执行：`execution/` → `--once` 再 `--loop`（paper/PM 默认关）
+- 执行完整角色记忆与口径见 [RECOVERY_EXECUTION.md](RECOVERY_EXECUTION.md)
 
 ## 6. 验收
 
