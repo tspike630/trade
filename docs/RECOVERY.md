@@ -136,6 +136,8 @@ echo $! > logs/execution_loop.pid
 
 ## 5. 其它层（各层跟进提交后）
 
+完整角色记忆与口径见 [RECOVERY_DASHBOARD.md](RECOVERY_DASHBOARD.md)。
+
 只读 NiceGUI 看板在仓库根 `dashboard/`（与 `crawler/` 同级）。只读本地 SQLite（主库、执行账本、模拟盘、回测、新闻），不写库，不提供开闸开关。`API_SECRET`、`.env`、`*.db`、日志不进 Git。
 
 依赖在仓库根 `requirements-dashboard.txt`（采集层用自己的 `crawler/requirements.txt`，两套 venv 分开）。`crawler/requirements-dashboard.txt` 内容相同，安装用根上这一份。
