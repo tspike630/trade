@@ -77,6 +77,8 @@ nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
 
 细节：`crawler/INDICATORS_AUDIT.md`、`AUTH_JEV.md`、`INDICATORS_STEP*.md`。
 
+完整角色记忆与口径见 [RECOVERY_INDICATORS.md](RECOVERY_INDICATORS.md)。
+
 ## 4. 交易看板
 ## 4. 执行层恢复
 ## 4. 复盘层
