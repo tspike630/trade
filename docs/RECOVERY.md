@@ -176,6 +176,7 @@ python -m dashboard.smoke_test
 - 看板：见上文「交易看板」
 - 决策：`decision_engine/` → dry-run 指只读 `DB_PATH`
 - 决策：仓库根 `decision_engine/` → [DECISION_ENGINE_RESTORE.md](../DECISION_ENGINE_RESTORE.md)
+- 决策完整角色记忆与口径见 [RECOVERY_DECISION.md](RECOVERY_DECISION.md)
 - 执行：`execution/` → `--once` 再 `--loop`（paper/PM 默认关）
 
 ## 6. 验收
@@ -199,5 +200,7 @@ python -m dashboard.smoke_test
 ## 决策引擎
 
 Step1 dry-run 与 Step2 回测在仓库根 `decision_engine/`，JEV 周检为 `scripts/jev_validity.py`。换机步骤、烟雾命令和上线闸门见 [DECISION_ENGINE_RESTORE.md](../DECISION_ENGINE_RESTORE.md)。
+
+完整角色记忆与口径见 [RECOVERY_DECISION.md](RECOVERY_DECISION.md)。
 
 不提交 `.env`、API Key、`*.db`（含 `dexscreener.db` / `backtest_ledger.db`）、`logs/`。虚拟环境用 `crawler/.venv`；主库用本机 `crawler/dexscreener.db`（或 `DB_PATH` / `DECISION_DB_PATH`）。
