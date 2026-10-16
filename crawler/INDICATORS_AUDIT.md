@@ -138,6 +138,7 @@ python -m api_server   # 只读 API + admin
 - **$0.95 黑天鹅 / 薄池打穿**（「那 5% 一旦出现，亏掉的不是 5% 而是 95%」；薄池单笔止损打穿、抹掉全部盈利）：tech 新鲜度与流动性字段是决策闸的输入。指标**不编造** liquidity（载荷缺 `liquidity` 就保持空）。`min_liq` fail-closed 归决策 [#41](https://github.com/tspike630/trade/pull/41)。本侧只保 hot tech 新鲜（[#40](https://github.com/tspike630/trade/pull/40) 已合）。
 - **洗盘 / 单点操纵**（书中约 25% 交易量虚假，外加预言机投票权集中翻转）：多源旁路（DexScreener + CCXT prior，见 `CCXT_SIDECHANNEL.md`）是防单点，不是加权重救曲线。
 - **因子质量 > 研究量**（Prediction Arena, arXiv 2604.07355）：纪律段在 `INDICATORS_FACTOR_CANDIDATES.md`。
+- **ALPHA_DECAY（2026-10-16，只观察）**：衰减两因是过拟合假因子与拥挤，只登记衰减风险。不写实锤，也不下「JEV 已被证伪」这类证伪判决。factor_loop 三门槛（新颖性 / 假设对齐 / 复杂度）对接已有 M-2 / M-3，不另开 LLM 挖因子闭环。半胜仍亏主因归 #72 退出质量，不与衰减混成一个故事。先做 M-A6 式滚动 IC / 衰减斜率（M-A5 / M-A6 均为设计候选 / 先决观察），再扩收候选。`INDICATORS_WEIGHT_*` 保持 **0**。全文见 `INDICATORS_FACTOR_CANDIDATES.md`「ALPHA_DECAY 学习批判」。
 - **方向与算子（M-2 / M-3）**：factor_loop 候选先做正反方向校准（`INDICATORS_FACTOR_CANDIDATES.md`）；时间序列只许用到当前 bar（`INDICATORS_OPERATORIZATION.md`）。两条都不把信号强度当成胜率（口径仍是上面的 **信号强度 ≠ 胜率**，`INDICATORS_STEP2.md` P-4，PR #46）。
 
 ### P-2（指针，不实现）
