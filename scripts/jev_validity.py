@@ -5,7 +5,9 @@ Forward 1h/4h returns for jev_strength_v1 buy signals, with liquidity /
 coverage / price filters and strength strata. Read-only on business tables;
 writes the optional markdown report, rewrites one trend CSV row under
 exports/reports/jev_validity_trend.csv (hard-evidence, F-1, and
-signal-crowding columns included), and prints a summary to stdout.
+signal-crowding columns included), prints a summary to stdout, and
+adds read-only delta_1h_win / slope_1h_win footnotes in「对比上周」
+(does not change the ≥55% gate).
 """
 
 from __future__ import annotations
@@ -811,6 +813,42 @@ def two_week_consecutive_ok(prior: list[dict[str, str]], current: dict[str, str]
     return all(week_gate_ok(row) for row in window)
 
 
+def _rolling_1h_win_footnote(
+    prior: list[dict[str, str]], current: dict[str, str], *, max_weeks: int = 4
+) -> tuple[Optional[float], Optional[float], int]:
+    """Near-week Δ1h_win and slope; observation only — does not change ≥55%.
+
+    Returns (delta_1h_win, slope_1h_win, n_points). Slope is ordinary least
+    squares on week index 0..n-1 over the last ``max_weeks`` rows that have a
+    parseable up_1h_rate (including current). Missing rates are skipped.
+    """
+    window = list(prior[-(max_weeks - 1) :]) + [current] if max_weeks > 1 else [current]
+    rates: list[float] = []
+    for row in window:
+        r = _parse_rate(row.get("up_1h_rate", ""))
+        if r is not None:
+            rates.append(r)
+    if not rates:
+        return None, None, 0
+    delta: Optional[float] = None
+    if len(prior) >= 1:
+        prev = _parse_rate(prior[-1].get("up_1h_rate", ""))
+        cur = _parse_rate(current.get("up_1h_rate", ""))
+        if prev is not None and cur is not None:
+            delta = cur - prev
+    slope: Optional[float] = None
+    n = len(rates)
+    if n >= 2:
+        xs = list(range(n))
+        x_mean = sum(xs) / n
+        y_mean = sum(rates) / n
+        num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, rates))
+        den = sum((x - x_mean) ** 2 for x in xs)
+        if den > 0:
+            slope = num / den
+    return delta, slope, n
+
+
 def compare_week_section(
     prior: list[dict[str, str]], current: dict[str, str]
 ) -> list[str]:
@@ -820,6 +858,11 @@ def compare_week_section(
     a("")
     if not prior:
         a("**首次记录**：尚无历史趋势行；本跑已写入 `exports/reports/jev_validity_trend.csv`。")
+        a("")
+        a(
+            "**观察脚注（不改 ≥55% 门槛）：** `delta_1h_win`=—；`slope_1h_win`=—"
+            "（近周滚动，点/周）。只读。"
+        )
         a("")
         return lines
     last = prior[-1]
@@ -860,6 +903,14 @@ def compare_week_section(
     a(
         f"| 0.19+ 层 n | {last.get('n_019plus', '—')} | "
         f"{current.get('n_019plus', '—')} | {_delta_int('n_019plus')} |"
+    )
+    a("")
+    delta, slope, n_pts = _rolling_1h_win_footnote(prior, current)
+    delta_s = f"{delta*100:+.1f}pp" if delta is not None else "—"
+    slope_s = f"{slope*100:+.2f}pp/周" if slope is not None else "—"
+    a(
+        f"**观察脚注（不改 ≥55% 门槛）：** `delta_1h_win`={delta_s}；"
+        f"`slope_1h_win`={slope_s}（近 {n_pts} 点滚动，只读；不单独否决）。"
     )
     a("")
     return lines

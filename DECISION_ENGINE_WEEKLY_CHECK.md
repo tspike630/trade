@@ -1,6 +1,6 @@
 # Decision Engine — JEV 周检 + 采样
 
-**Time (HK / UTC+8):** 更新于 2026-10-15 01:30 HKT  
+**Time (HK / UTC+8):** 更新于 2026-10-17 00:32 HKT  
 **Repo:** `/workspace/dexscreener-crawler`  
 **原则：** 本机无系统 crontab（无 root 装 cron），由决策引擎 bot 的 routines **直接执行**仓库脚本；不接 paper/live；不杀 dry-run / main / indicators。
 
@@ -92,6 +92,17 @@ python3 scripts/tests/test_signal_crowding.py
 | n≥15 且 unique_token≥10 且上涨率 <50% | JEV 单因子降级为评分加分项；Step 2 转向技术面 |
 | n<15，或 n≥15 但 unique_token<10，或 50–55% 边缘 | 继续攒样本，下周一再检 |
 
+
+## 旁证分栏（硬否决 vs 健康度）
+
+| 栏 | 来源 | 周检怎么用 | 改不改参 |
+|----|------|------------|----------|
+| **#71 / #72 硬旁证** | 止损占亏≥50% **或** 单日开仓≥20（`weekly_side_evidence` / 复盘同口径） | **Step2 硬否决**：样本门槛过了也不可启动 Step2 | **不改** strength / min_liq / cooldown / TP/SL |
+| **#78 拥挤度** | `signal_crowding`：`live_candidate` / `sample` 的 HKT 日均 buy、unique/buy、峰值小时密度 | **健康度旁证**：**强制写入当周笔记**；**仍不否决** Step2 | **不改**运行参；不熔断；不盘中降级 |
+| **滚动 1h 胜率斜率** | `scripts/jev_validity.py`「对比上周」观察脚注 | **只观察**。`delta_1h_win`（相对上周）+ `slope_1h_win`（近周 OLS，点/周）；**不改 ≥55% 门槛**，不单独否决 | 观察-only；不改运行参 |
+
+硬否决只认 #71/#72。#78 与斜率脚注进健康度，进笔记，**不算有效性**。
+
 ## 统计功效标注
 
 **不改样本门槛。** 上一张表照旧：有效样本优先 **unique_token≥10**（比 raw **n≥15** 更硬）；启动 Step 2 仍要 **连续 2 周** 1h 上涨率 **≥55%**，且两周都 unique_token≥10（同时 n≥15）。硬旁证（止损占亏≥50% 或 日开仓≥20）是额外否决，不降低也不替代这三道。本段只标注这些数字能主张什么。看板总览 JEV 闸的「统计功效旁证」与这里同一口径，都只解读。
@@ -143,7 +154,7 @@ Foresight Arena 的功效量级（已结算二元预测；相对市场共识的 
 | **G-4** `min_liq` 经典地板 | `DECISION_MIN_LIQ_USD`，回测 `FilterConfig.min_liq` | 经典回测地板 **50000** 已是买入闸（#41）。周检只记拒绝桶，不改 50000 |
 | **F-1** 连续 2 亏之后的第 3 笔 | 周检 md「F-1 信号连亏（只记不熔断）」 | 周检优先 `up_1h<0`（没有 1h 时用已平仓 pnl）。看板 F-1 卡只看已平仓 pnl。两边都只观察，不接入 RiskManager / PM pause。熔断留 R2/R3 |
 | **F-3 / C3** 出场 | `execution/exits.py`（C3 / E-2） | 出场归执行。决策层只指向，不改 hold / TP / SL |
-| **⑥ 信号拥挤** | `scripts/jev_validity.py`「信号拥挤度」；`decision_log` 同窗口 | **旁证，不算有效性，不否决 Step2。** `live_candidate` 与 `sample` 分列：HKT 日均 buy、unique/buy、峰值小时密度。不改强度 / min_liq / cooldown，不熔断，不盘中降级。激活留 R2/R3 |
+| **⑥ 信号拥挤** | `scripts/jev_validity.py`「信号拥挤度」；`decision_log` 同窗口 | **健康度旁证（#78），不算有效性，不否决 Step2；强制写入当周笔记。** `live_candidate` 与 `sample` 分列：HKT 日均 buy、unique/buy、峰值小时密度。不改强度 / min_liq / cooldown，不熔断，不盘中降级。激活留 R2/R3 |
 | 平仓归因三行 | paper 已平仓；看板 #45 旁证 | **胜率与期望分开**；**最差单笔**；**`liq_<50k` vs `≥50k`**（unknown 单列）。适用时标 **R2 规则缺口旁证**。不据此调 strength 或权重 |
 
 目录与上面「周检命令」相同（`/workspace/dexscreener-crawler`）。这是 10-19 首跑，不把 `--factor-layers` 改成常驻默认。
@@ -165,9 +176,9 @@ Foresight Arena 的功效量级（已结算二元预测；相对市场共识的 
 | **I-1 / I-2** | 只读，直到方向校准完成。不在本层建表、不写采集器、不改权重 |
 | **I-3** | 执行质量（`bot_trade_share` / `slippage_1h`）。归执行，决策周检不算 |
 | **I-4** | OTC / 解锁时间表。只登记，决策周检不算 |
-| **⑥ 信号拥挤** | 决策层观察。`live_candidate` 与 `sample` 分开。不是硬旁证 |
+| **⑥ 信号拥挤** | 决策层观察（#78）。`live_candidate` 与 `sample` 分开。**强制写入当周健康度笔记**；不是硬旁证，不否决 |
 | 候选 | 候选 ≠ 自动激活。`accepted` 仍不是 `activated` |
-| Step2 | 仍只由 #71 硬旁证否决（止损占亏≥50% 或单日开仓≥20）。拥挤度不否决 |
+| Step2 | 仍只由 #71/#72 硬旁证否决（止损占亏≥50% 或单日开仓≥20）。#78 拥挤度不否决，但须进健康度笔记 |
 
 ## 10-19 复盘硬证据（代码计算）
 

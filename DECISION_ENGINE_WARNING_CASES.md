@@ -1,6 +1,6 @@
 # Decision Engine — 警示事例（执行单 → 已有控制）
 
-**Time (HK / UTC+8):** 2026-10-14  
+**Time (HK / UTC+8):** 2026-10-17 00:32 HKT（假因子/拥挤加速衰减）  
 **用途：** 把执行单 / 看板平仓旁证里的三条警示，映射到**已经有的**控制。不新造阈值，不改代码默认。
 
 本文件**不算有效性**。不改 `JEV_MIN_STRENGTH`（仍是 **0.3**）、因子权重、`DECISION_COOLDOWN_SEC` 代码默认（仍是 **0**）、`DECISION_MIN_LIQ_USD` 默认（仍是 **50000**）。临时 `--min-jev-strength 0.15` 且 `purpose=live_candidate` 的行保持未标记，不得标成 accepted。2026-10-19 周检的 cooldown / `min_liq` 分桶 / 临时 0.15 三行仍是观察登记，见 `DECISION_ENGINE_WEEKLY_CHECK.md`。
@@ -61,6 +61,19 @@
 2. **变更记录** — 先改 `DECISION_ENGINE_FILTER_PARITY.md` 里对应的一行，写明回测、周检、live 是否一起动。
 3. **周检验证** — R1 周报 `python -m review.run`（`REVIEW_R1_SPEC.md`，`docs/` 与 `crawler/` 各一份）。R2 是完整归因，P-1 等它，决策层不在这里做。R3 寻优脚手架不改参（`REVIEW_R3_SCAFFOLD.md`，同两处）：历史 ≥7 天且周检跨门槛之后才谈正式寻优，见 `DECISION_ENGINE_WEEKLY_CHECK.md`。
 
+
+## 假因子 / 拥挤加速衰减（旁证）
+
+来源旁证：AlphaAgent（arXiv:2502.16789）指出 LLM/同质因子易挤进同一失效面，**拥挤会加速 alpha 衰减**；「回测好看」的假因子尤其危险。映射到本层**已有**观察，**不改运行参**。
+
+| 警示 | 看到什么 | 已有控制 / 登记 | 不要做 |
+|------|----------|-----------------|--------|
+| **假因子（回测好看≠有效）** | 短窗曲线好看、无原创性 / 无可证伪假设 / 过复杂 | 准入纪律见 `DECISION_ENGINE_RESEARCH_MAPPING.md`「AlphaAgent / 因子准入纪律」。有效性仍只走周检 + Step2 | 不要因回测好看把候选标成 accepted / activated；不要盘中改强度或权重 |
+| **拥挤加速衰减** | 同类策略信号扎堆（日均 buy↑、unique/buy↓、峰值小时密度↑） | **#78** `scripts/signal_crowding.py`：**只旁证**，**不否决 Step2**。但**强制写入当周周检健康度笔记**（见 `DECISION_ENGINE_WEEKLY_CHECK.md` 分栏） | 不要把拥挤度升格成硬否决；不要据此改 cooldown / min_liq / strength |
+| **INTEL 权重 0 裸跑风险** | `top10_share` / `dev_balance_delta` / `bot_trade_share` 等权重仍为 **0** 时若当盘中参用 | 权重 0 前**不接** INTEL 因子进盘中参（`docs/RECOVERY_DECISION.md` §7）。只读挂卡 ≠ 生效 | 不要在权重与周检流程打开前把 INTEL 候选当过滤或打分 |
+
+**不算有效性。** 不改 `JEV_MIN_STRENGTH`（0.3）、`DECISION_MIN_LIQ_USD`（50000）、`DECISION_COOLDOWN_SEC` 代码默认（0）、TP/SL。候选≠生效。
+
 ## 归属
 
 | 项 | 谁做 | 本文件 |
@@ -75,4 +88,5 @@
 - `scripts/jev_validity.py` 按 `strategy_id=jev_strength_v1` 的全部 buy 读取，**不按 purpose 过滤**，这些行会进入周检输入。报告里单独脚注，不要拿它们去过「连续 2 周 ≥55%」门槛。
 - 2026-10-19 的 cooldown 是否生效、`min_liq` 三桶、临时 0.15 观察行，三行都是观察登记。不改阈值、不改默认强度、不把临时观察标成 accepted。
 - **M-6**：高信心≠高收益，信号强度≠胜率（PolyBench / Prediction Arena）。只作解读，不加新过滤。临时 `purpose=live_candidate` 且 `--min-jev-strength 0.15` 的行保持未标记，**不算有效性**。第二批文献（Prophet Arena / LiveTradeBench / When Agents Trade / FinPos / PredictionMarketBench）同样只作解读：**校准好 ≠ 赚钱**，**回测好看 ≠ 有效**；已被本条与 M-1 功效脚注覆盖（`DECISION_ENGINE_WEEKLY_CHECK.md`「统计功效标注」，[#54](https://github.com/tspike630/trade/pull/54)）。**不加新过滤。**
-- 文献映射（第一批不上 LLM 决策主路径、不上 agent 栈；第二批只读）见 `DECISION_ENGINE_RESEARCH_MAPPING.md`（`crawler/` 同文）。
+- 文献映射（第一批不上 LLM 决策主路径、不上 agent 栈；第二批只读；**AlphaAgent 准入三门槛**）见 `DECISION_ENGINE_RESEARCH_MAPPING.md`（`crawler/` 同文）。
+- **假因子 / 拥挤加速衰减**（#78 健康度旁证强制入周检笔记；INTEL 权重0裸跑风险）：只旁证，不改运行参，不否决 Step2。
