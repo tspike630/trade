@@ -1,6 +1,6 @@
 # Decision Engine — 警示事例（执行单 → 已有控制）
 
-**Time (HK / UTC+8):** 2026-10-17 00:32 HKT（假因子/拥挤加速衰减）  
+**Time (HK / UTC+8):** 2026-10-17 ~10:15 HKT（假因子/拥挤 + Alpha衰减误判）  
 **用途：** 把执行单 / 看板平仓旁证里的三条警示，映射到**已经有的**控制。不新造阈值，不改代码默认。
 
 本文件**不算有效性**。不改 `JEV_MIN_STRENGTH`（仍是 **0.3**）、因子权重、`DECISION_COOLDOWN_SEC` 代码默认（仍是 **0**）、`DECISION_MIN_LIQ_USD` 默认（仍是 **50000**）。临时 `--min-jev-strength 0.15` 且 `purpose=live_candidate` 的行保持未标记，不得标成 accepted。2026-10-19 周检的 cooldown / `min_liq` 分桶 / 临时 0.15 三行仍是观察登记，见 `DECISION_ENGINE_WEEKLY_CHECK.md`。
@@ -74,6 +74,16 @@
 
 **不算有效性。** 不改 `JEV_MIN_STRENGTH`（0.3）、`DECISION_MIN_LIQ_USD`（50000）、`DECISION_COOLDOWN_SEC` 代码默认（0）、TP/SL。候选≠生效。
 
+## Alpha 衰减误判（2026-10-17 旁证）
+
+来源：`docs/ALPHA_DECAY_DIALECTIC_2026-10-17.md`（McLean–Pontiff / Falck et al. / Volpati crowding / Alpha Decay half-life / AlphaAgent）。**不算有效性。不改运行参。**
+
+| 警示 | 看到什么 | 已有控制 / 登记 | 不要做 |
+|------|----------|-----------------|--------|
+| **执行侵蚀误判为 Alpha 死亡** | 止损占亏主导（纸面旁证可至 ~71%）、半胜仍亏、图谱「滑点吞噬 Alpha」 | #71 硬旁证；上文「半胜仍亏」；滑点/止损 = **退出质量**，不是 JEV 信号失效 | 不要否决 JEV；不要盘中改 strength / hold / TP / SL；不要把执行亏写成「真衰减」去下线策略 |
+| **半衰期冲动缩仓** | 「信号只能持有更短 → 动态缩 hold / 拧 TP」 | hold60、cooldown 观察；文献半衰期多为**月级**，与我方 5s paper loop 不是同一调参证据 | 不要动态缩短 `max_hold`；不要拧 TP/SL |
+| **拥挤熔断冲动** | 日均 buy↑、unique/buy↓、图谱「高拥挤降杠杆」 | **#78** 只旁证、强制入周检健康度笔记；**不否决 Step2** | 不要升格硬否决；不要据此改 cooldown / min_liq / strength |
+
 ## 归属
 
 | 项 | 谁做 | 本文件 |
@@ -90,3 +100,4 @@
 - **M-6**：高信心≠高收益，信号强度≠胜率（PolyBench / Prediction Arena）。只作解读，不加新过滤。临时 `purpose=live_candidate` 且 `--min-jev-strength 0.15` 的行保持未标记，**不算有效性**。第二批文献（Prophet Arena / LiveTradeBench / When Agents Trade / FinPos / PredictionMarketBench）同样只作解读：**校准好 ≠ 赚钱**，**回测好看 ≠ 有效**；已被本条与 M-1 功效脚注覆盖（`DECISION_ENGINE_WEEKLY_CHECK.md`「统计功效标注」，[#54](https://github.com/tspike630/trade/pull/54)）。**不加新过滤。**
 - 文献映射（第一批不上 LLM 决策主路径、不上 agent 栈；第二批只读；**AlphaAgent 准入三门槛**）见 `DECISION_ENGINE_RESEARCH_MAPPING.md`（`crawler/` 同文）。
 - **假因子 / 拥挤加速衰减**（#78 健康度旁证强制入周检笔记；INTEL 权重0裸跑风险）：只旁证，不改运行参，不否决 Step2。
+- **Alpha 衰减误判**（执行侵蚀≠信号失效；半衰期勿缩 hold；拥挤勿熔断）：见上文「Alpha 衰减误判」；辩证笔记 `docs/ALPHA_DECAY_DIALECTIC_2026-10-17.md`。**不改** strength / min_liq / cooldown / TP/SL / hold / max_open。
