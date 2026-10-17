@@ -1,6 +1,6 @@
 # 决策层 — 调研映射（只读）
 
-**Time (HK / UTC+8):** 2026-10-17 ~10:15 HKT（AlphaAgent + Alpha衰减图谱辩证三块）  
+**Time (HK / UTC+8):** 2026-10-17 ~10:20 HKT（AlphaAgent + Alpha衰减三块 + 跨层交叉补丁）  
 **用途：** 两批文献在决策层怎么读。不改代码默认，不加过滤，不改门槛。  
 `crawler/DECISION_ENGINE_RESEARCH_MAPPING.md` 与本文同文。本文件**不算有效性**。
 
@@ -51,6 +51,22 @@ Prophet Arena、LiveTradeBench、When Agents Trade、FinPos、PredictionMarketBe
 | **LLM/假因子/自毁** | AlphaAgent（上文三门槛 / arXiv:2502.16789） | 自毁悖论成立为风险叙事；落点仍是三门槛准入 + **不上 LLM 决策主路径** | 不要把 LLM 挖因子当主路径；不要上 agent 挖因子栈 |
 
 **滑点/止损 vs 信号：** 执行侵蚀（止损占亏主导、半胜仍亏）**≠** 信号失效。勿据此否决 JEV / Step2（硬否决只认 **#71/#72**）。详见 `DECISION_ENGINE_WARNING_CASES.md`「Alpha 衰减误判」。
+
+
+## 跨层交叉辩证（2026-10-17）
+
+指针：`docs/ALPHA_DECAY_CROSS_LAYER_2026-10-17.md`（通读复盘/采集/执行落盘后的交叉补丁，**非**重写 #92）。**只读。不算有效性。不改运行参。**
+
+| 交叉块 | 他层锚点 | 决策怎么读 | 不要做 |
+|--------|----------|------------|--------|
+| 衰减≠证伪 | 复盘 McLean；采集 Falck | 与 #92 同向加固；半胜仍亏先查退出（#71） | 勿写 JEV 证伪；勿盘中改 strength |
+| Lou–Polk ↔ #78 | 复盘 CoMOM 共变 | 共变旁证**加固** #78 健康度；非替换公式 | 勿搬 CoMOM 公式；勿升格熔断 |
+| 商品化 / 假量 | 采集 Early Bird；Cong/Victor | 公开特征商品化后勿叠浅层量价；量飙升污染敏感 | 权重保持 0；**不接** `high_bot_skip` |
+| 执行侵蚀 / 容量 | 执行 CFM；FlashBoys/sandwich | 加固「执行侵蚀≠信号失效」；纸面下**降权** AUM 容量叙事 | 勿重复改 WARNING 主行；勿拧 hold/TP/SL |
+| Midsummer wash/LPI | arXiv:2507.01963（高收益 meme 82.8%） | 加固假量/人为增长警示；与 Cong/Victor 同向 | **勿拷 82.8%/LPI 进过滤**；不接 skip |
+| 衰减残差≠拥挤 | arXiv:2512.11913 | 残差不是 crowding 识别 | **#78 不升格** |
+
+**10-19 周检观察-only 脚注建议**见交叉文档 §3(h)。故意不改参清单见该文档 §4。
 
 ## 指针
 
