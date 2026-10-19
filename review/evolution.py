@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -168,6 +170,477 @@ def _r3_skip_evidence(
     return f"未跑 --optimize；按闸门预检将 skip：{reason}"
 
 
+
+# --- PRIOR / self_survival / baseline_history (read-only §10 observers) ---
+HK = timezone(timedelta(hours=8))
+STABLE_WINDOW_DAYS = 14
+STABLE_SURVIVE_4H_DELTA = 0.05
+
+
+def _parse_recorded_at(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        t = s.strip()
+        if t.endswith("Z"):
+            return datetime.fromisoformat(t.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=HK)
+        return dt
+    except Exception:
+        return None
+
+
+def _load_self_db_snapshot(db_root: Path) -> dict[str, Any]:
+    """Read baseline_params.json#self_db + latest self_survival_*.md (observation only)."""
+    bp = db_root / "data" / "prior" / "exports" / "baseline_params.json"
+    out: dict[str, Any] = {
+        "ok": False,
+        "note": "baseline_params.json 缺失",
+        "report": None,
+    }
+    if not bp.is_file():
+        return out
+    try:
+        data = json.loads(bp.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        out["note"] = f"baseline_params.json 读失败: {e}"
+        return out
+    self_db = data.get("self_db") or {}
+    if not self_db:
+        out["note"] = "baseline_params.json 无 self_db（先跑 scripts/self_survival.py）"
+        return out
+    exports = db_root / "data" / "prior" / "exports"
+    report_rel = None
+    if exports.is_dir():
+        cands = sorted(exports.glob("self_survival_*.md"), reverse=True)
+        if cands:
+            report_rel = f"data/prior/exports/{cands[0].name}"
+    span = self_db.get("span_min") or {}
+    survive = self_db.get("survive") or {}
+    out.update(
+        {
+            "ok": True,
+            "note": self_db.get("note") or "self_db 观测跨度存活",
+            "n": self_db.get("n"),
+            "survive": dict(survive),
+            "survive_n": dict(self_db.get("survive_n") or {}),
+            "crawler_window_h": self_db.get("crawler_window_h"),
+            "span_min": dict(span),
+            "sparse": bool(self_db.get("sparse")),
+            "warnings": list(self_db.get("warnings") or []),
+            "report": report_rel,
+            "source": "baseline_params.json#self_db",
+        }
+    )
+    return out
+
+
+def _self_survival_evidence(snap: dict[str, Any]) -> str:
+    if not snap.get("ok"):
+        return snap.get("note") or "self_db 不可得"
+    survive = snap.get("survive") or {}
+    span = snap.get("span_min") or {}
+    n = snap.get("n")
+    win = snap.get("crawler_window_h")
+    sparse = snap.get("sparse")
+    report = snap.get("report") or "—"
+
+    def _s(key: str) -> str:
+        v = survive.get(key)
+        return _pct(float(v), 1) if v is not None else "—"
+
+    bits = [
+        f"n={n}",
+        f"1h/4h/24h/7d={_s('1h')}/{_s('4h')}/{_s('24h')}/{_s('168h')}",
+    ]
+    if win is not None:
+        bits.append(f"窗长≈{float(win):.1f}h")
+    p50 = span.get("p50")
+    smax = span.get("max")
+    if p50 is not None:
+        bits.append(f"跨度 P50≈{float(p50) / 60.0:.2f}h")
+    if smax is not None:
+        bits.append(f"max≈{float(smax) / 60.0:.2f}h")
+    bits.append(f"sparse={'yes' if sparse else 'no'}")
+    bits.append("只读 pair_history；裁决前不调权")
+    bits.append(f"报告={report}")
+    return "；".join(bits)
+
+
+def _stability_verdict(rows: list[tuple]) -> tuple[str, str]:
+    """Align with scripts/prior_baseline_trend.print_stability (observational).
+
+    rows: (id, recorded_at, survive_4h, ...) ascending by id.
+    Returns (verdict, detail).
+    """
+    if not rows:
+        return "INSUFFICIENT_DATA", "no rows yet"
+    cutoff = datetime.now(HK) - timedelta(days=STABLE_WINDOW_DAYS)
+    in_win = []
+    for r in rows:
+        dt = _parse_recorded_at(r[1])
+        if dt is None:
+            continue
+        if dt.astimezone(HK) >= cutoff:
+            in_win.append(r)
+    sample = in_win if len(in_win) >= 2 else rows
+    s4 = [r[2] for r in sample if r[2] is not None]
+    detail_bits = [
+        f"window={STABLE_WINDOW_DAYS}d",
+        f"points_in_window={len(in_win)}",
+        f"used={len(sample)}",
+    ]
+    if len(s4) < 2:
+        return (
+            "INSUFFICIENT_DATA",
+            " · ".join(detail_bits) + f" · survive_4h points={len(s4)}",
+        )
+    first, last = s4[0], s4[-1]
+    delta = last - first
+    span = max(s4) - min(s4)
+    ok = abs(delta) <= STABLE_SURVIVE_4H_DELTA and span <= STABLE_SURVIVE_4H_DELTA
+    first_dt = _parse_recorded_at(sample[0][1])
+    last_dt = _parse_recorded_at(sample[-1][1])
+    calendar_days = None
+    if first_dt and last_dt:
+        calendar_days = (last_dt - first_dt).total_seconds() / 86400.0
+        detail_bits.append(f"calendar={calendar_days:.1f}d")
+        if calendar_days < STABLE_WINDOW_DAYS * 0.8:
+            ok = False
+    if len(in_win) < 2:
+        ok = False
+    detail_bits.append(
+        f"survive_4h {_pct(float(first), 2)}→{_pct(float(last), 2)} "
+        f"· Δ={delta:+.4f} · span={span:.4f}"
+    )
+    verdict = "STABLE" if ok else "UNSTABLE_OR_SHORT"
+    return verdict, " · ".join(detail_bits)
+
+
+def load_baseline_history_report(
+    db_root: Path, *, limit: int = 8
+) -> dict[str, Any]:
+    """Read prior.db.baseline_history recent rows + stability (skip on failure)."""
+    db_path = db_root / "data" / "prior" / "db" / "prior.db"
+    rel = "data/prior/db/prior.db"
+    if not db_path.is_file():
+        return {"ok": False, "skip": True, "note": f"{rel} 缺失，跳过基线滚动快照"}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM baseline_history").fetchone()[0]
+            recent = conn.execute(
+                """
+                SELECT id, recorded_at, source,
+                       survive_1h, survive_4h, survive_24h, survive_7d,
+                       crawler_window_hours, n_tokens
+                FROM baseline_history
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            all_rows = conn.execute(
+                """
+                SELECT id, recorded_at, survive_4h
+                FROM baseline_history
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "skip": True,
+            "note": f"读 baseline_history 失败，跳过：{e}",
+        }
+    verdict, detail = _stability_verdict(list(all_rows))
+    latest = recent[0] if recent else None
+    return {
+        "ok": True,
+        "skip": False,
+        "db": rel,
+        "total": int(total),
+        "recent": [
+            {
+                "id": r[0],
+                "recorded_at": r[1],
+                "source": r[2],
+                "survive_1h": r[3],
+                "survive_4h": r[4],
+                "survive_24h": r[5],
+                "survive_7d": r[6],
+                "crawler_window_hours": r[7],
+                "n_tokens": r[8],
+            }
+            for r in recent
+        ],
+        "latest": (
+            {
+                "id": latest[0],
+                "recorded_at": latest[1],
+                "source": latest[2],
+                "survive_1h": latest[3],
+                "survive_4h": latest[4],
+                "crawler_window_hours": latest[7],
+                "n_tokens": latest[8],
+            }
+            if latest
+            else None
+        ),
+        "verdict": verdict,
+        "verdict_detail": detail,
+    }
+
+
+def _baseline_history_evidence(rep: dict[str, Any]) -> str:
+    if not rep.get("ok"):
+        return rep.get("note") or "baseline_history 不可得"
+    latest = rep.get("latest") or {}
+    n_show = len(rep.get("recent") or [])
+    total = rep.get("total", 0)
+
+    def _sp(v: Any) -> str:
+        return _pct(float(v), 2) if v is not None else "—"
+
+    win = latest.get("crawler_window_hours")
+    win_s = f"{float(win):.2f}h" if win is not None else "—"
+    return (
+        f"最近 {n_show}/{total} 条；最新 survive_1h/4h="
+        f"{_sp(latest.get('survive_1h'))}/{_sp(latest.get('survive_4h'))} "
+        f"窗长={win_s}；n={latest.get('n_tokens')}；"
+        f"id={latest.get('id')} source={latest.get('source')}；"
+        f"稳定判定=`{rep.get('verdict')}`（{rep.get('verdict_detail')}）；"
+        "详见表下「基线滚动快照」小节"
+    )
+
+
+def format_baseline_history_section(rep: dict[str, Any]) -> str:
+    """Markdown subsection for §10 baseline rolling snapshot."""
+    lines: list[str] = []
+    lines.append("### 基线滚动快照（baseline_history，只观察）")
+    lines.append("")
+    if not rep.get("ok"):
+        lines.append(f"> 跳过：{rep.get('note') or 'prior.db 不可读'}")
+        lines.append("")
+        return "\n".join(lines)
+    lines.append(
+        "> PRIOR_STEP6 旁路：`prior.db.baseline_history` 只追加快照；"
+        "**不**调权、不进风控。稳定判定对齐 `prior_baseline_trend.py`"
+        "（近 14d survive_4h |Δ| 与 span ≤0.05 且日历跨度够约两周 → `STABLE`；"
+        "否则 `SHORT` / `UNSTABLE_OR_SHORT` / `INSUFFICIENT_DATA`）。"
+    )
+    lines.append("")
+    recent = rep.get("recent") or []
+    lines.append(
+        f"最近 **{len(recent)}** 条（共 {rep.get('total', 0)}）；"
+        f"库=`{rep.get('db')}`。"
+    )
+    lines.append("")
+    lines.append(
+        "| id | recorded_at | source | survive_1h | survive_4h | 窗长(h) | n_tokens |"
+    )
+    lines.append("|---:|---|---|---:|---:|---:|---:|")
+    for r in recent:
+        s1 = _pct(float(r["survive_1h"]), 2) if r.get("survive_1h") is not None else "—"
+        s4 = _pct(float(r["survive_4h"]), 2) if r.get("survive_4h") is not None else "—"
+        win = r.get("crawler_window_hours")
+        win_s = f"{float(win):.2f}" if win is not None else "—"
+        lines.append(
+            f"| {r.get('id')} | {r.get('recorded_at')} | {r.get('source')} | "
+            f"{s1} | {s4} | {win_s} | {r.get('n_tokens')} |"
+        )
+    lines.append("")
+    lines.append(
+        f"**稳定判定：** `{rep.get('verdict')}` — {rep.get('verdict_detail')}"
+        "（observational only）"
+    )
+    lines.append("")
+    lines.append("说明：只观察不调权；RISK_USE_PRIOR 默认关；稳定两周才谈进风控")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _normalize_price_behavior(data: dict[str, Any]) -> dict[str, Any]:
+    """Flatten price_behavior.json (or baseline_params#price_behavior) for §10."""
+    meta = data.get("meta") or {}
+    # Prefer full export schema; fall back to baseline_params summary keys
+    win = meta.get("crawler_window_h", data.get("crawler_window_h"))
+    short = meta.get("short", data.get("short"))
+    n_tok = data.get("n_tokens_analyzed", data.get("n_tokens"))
+    returns = data.get("returns") or {}
+    ret1 = returns.get("1h") or {}
+    # pump: export uses pump['4h']; summary uses pump_4h
+    pump_block = data.get("pump_4h")
+    if pump_block is None:
+        pump4 = ((data.get("pump") or {}).get("4h") or {})
+        mult = (pump4.get("multiple") or {}).get("median")
+        dur = (pump4.get("duration_min") or {}).get("median")
+        # n may sit on multiple or duration
+        n_pump = (pump4.get("multiple") or {}).get("n") or (pump4.get("duration_min") or {}).get("n")
+        pump_block = {
+            "multiple_p50": mult,
+            "duration_min_p50": dur,
+            "n": n_pump,
+        }
+    mdd_block = data.get("mdd_4h")
+    if mdd_block is None:
+        mdd = ((data.get("drawdown") or {}).get("mdd_4h") or {})
+        mdd_block = {
+            "p50": mdd.get("median", mdd.get("p50")),
+            "p90": mdd.get("p90"),
+            "n": mdd.get("n"),
+        }
+    jev = data.get("jev") or {}
+    jev_note = data.get("jev_cross_note") or jev.get("note")
+    if not jev_note and jev.get("n_with_series") is not None:
+        jev_note = (
+            f"小样本（n_signals={jev.get('n_signals')}，"
+            f"n_with_series={jev.get('n_with_series')}）；仅列表"
+        )
+    elif not jev_note and data.get("jev_n_with_series") is not None:
+        jev_note = f"jev_n_with_series={data.get('jev_n_with_series')}（小样本，仅列表）"
+    return {
+        "crawler_window_h": win,
+        "short": bool(short) if short is not None else False,
+        "n_tokens": n_tok,
+        "ret1": ret1,
+        "pump": pump_block,
+        "mdd": mdd_block,
+        "jev_note": jev_note,
+    }
+
+
+def _load_price_behavior_snapshot(db_root: Path) -> dict[str, Any]:
+    """Optional PRIOR_STEP7 observer; skip if json missing."""
+    p = db_root / "data" / "prior" / "exports" / "price_behavior.json"
+    if not p.is_file():
+        return {"ok": False, "skip": True, "note": "price_behavior.json 缺失，跳过价格行为先验"}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "skip": True, "note": f"price_behavior.json 读失败：{e}"}
+    return {
+        "ok": True,
+        "skip": False,
+        "norm": _normalize_price_behavior(data),
+        "path": "data/prior/exports/price_behavior.json",
+    }
+
+
+def _price_behavior_evidence(snap: dict[str, Any]) -> str:
+    if not snap.get("ok"):
+        return snap.get("note") or "price_behavior 不可得"
+    d = snap["norm"]
+    win = d.get("crawler_window_h")
+    short = d.get("short")
+    n_tok = d.get("n_tokens")
+    ret1 = d.get("ret1") or {}
+    pump = d.get("pump") or {}
+    mdd = d.get("mdd") or {}
+
+    def _rpct(v: Any) -> str:
+        if v is None:
+            return "—"
+        return f"{float(v) * 100:.1f}%"
+
+    bits = [
+        f"窗长≈{float(win):.1f}h" if win is not None else "窗长=—",
+        f"（{'SHORT' if short else 'OK'}）",
+        f"n_tokens={n_tok}",
+        (
+            f"1h median/P10/P90="
+            f"{_rpct(ret1.get('median'))}/{_rpct(ret1.get('p10'))}/{_rpct(ret1.get('p90'))}"
+            f"（n={ret1.get('n')}）"
+        ),
+        (
+            f"4h拉升 multiple P50={float(pump['multiple_p50']):.2f}× "
+            f"duration P50={float(pump['duration_min_p50']):.1f}min"
+            f"（n={pump.get('n')}）"
+            if pump.get("multiple_p50") is not None
+            else "4h拉升=—"
+        ),
+        (
+            f"mdd_4h P50/P90={_rpct(mdd.get('p50'))}/{_rpct(mdd.get('p90'))}"
+            f"（n={mdd.get('n')}）"
+        ),
+        "详见表下「价格行为先验」小节",
+    ]
+    return "；".join(bits)
+
+
+def format_price_behavior_section(snap: dict[str, Any]) -> str:
+    lines: list[str] = []
+    lines.append("### 价格行为先验（price_behavior，只观察）")
+    lines.append("")
+    if not snap.get("ok"):
+        lines.append(f"> 跳过：{snap.get('note') or 'price_behavior.json 不可读'}")
+        lines.append("")
+        return "\n".join(lines)
+    d = snap["norm"]
+    win = d.get("crawler_window_h")
+    short = bool(d.get("short"))
+    n_tok = d.get("n_tokens")
+    ret1 = d.get("ret1") or {}
+    pump = d.get("pump") or {}
+    mdd = d.get("mdd") or {}
+    jev_note = d.get("jev_note")
+
+    def _rpct(v: Any) -> str:
+        if v is None:
+            return "—"
+        return f"{float(v) * 100:.1f}%"
+
+    lines.append(
+        "> PRIOR_STEP7 旁路：`data/prior/exports/price_behavior.json` 只读拉升/收益/回撤分布；"
+        "**不**调权、不进风控。`RISK_USE_PRIOR` 默认关；SHORT 窗勿外推长期先验。"
+    )
+    lines.append("")
+    win_s = f"{float(win):.1f}h" if win is not None else "—"
+    n_s = f"{int(n_tok):,}" if n_tok is not None else "—"
+    lines.append(
+        f"窗长 ≈ **{win_s}**（**{'SHORT' if short else 'OK'}**）；"
+        f"n_tokens ≈ **{n_s}**；源=`{snap.get('path')}`。"
+    )
+    lines.append("")
+    lines.append("| 块 | 指标 | 值 |")
+    lines.append("|---|---|---|")
+    lines.append(
+        f"| A 收益 | 1h median / P10 / P90 / n | "
+        f"{_rpct(ret1.get('median'))} / {_rpct(ret1.get('p10'))} / "
+        f"{_rpct(ret1.get('p90'))} / {ret1.get('n')} |"
+    )
+    mult = pump.get("multiple_p50")
+    dur = pump.get("duration_min_p50")
+    lines.append(
+        f"| B 拉升 | 4h multiple P50 / duration_min P50 / n | "
+        f"{(f'{float(mult):.2f}×' if mult is not None else '—')} / "
+        f"{(f'{float(dur):.1f}min' if dur is not None else '—')} / "
+        f"{pump.get('n')} |"
+    )
+    lines.append(
+        f"| C 回撤 | mdd_4h P50 / P90 / n | "
+        f"{_rpct(mdd.get('p50'))} / {_rpct(mdd.get('p90'))} / {mdd.get('n')} |"
+    )
+    lines.append("")
+    if jev_note:
+        lines.append(f"**JEV 交叉：** {jev_note}")
+        lines.append("")
+    lines.append(
+        "**纪律：** 只观察不调权；`RISK_USE_PRIOR` 默认关；"
+        "勿外推长期先验（SHORT）；落地须走 R4。"
+    )
+    lines.append("")
+    lines.append(
+        "说明：只观察不调权；RISK_USE_PRIOR 默认关；SHORT 窗勿外推长期先验；落地须走 R4"
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def build_evolution_suggestions(
     *,
     chain: Sequence[SignalChainRow],
@@ -263,6 +736,45 @@ def build_evolution_suggestions(
             ),
         )
     )
+
+    # --- 指标：自库存活 / 基线滚动 / 价格行为（只观察，不调权） ---
+    self_snap = _load_self_db_snapshot(root)
+    suggestions.append(
+        _suggestion(
+            layer="指标",
+            item="自库存活曲线（self_survival）",
+            status=STATUS_WATCH,
+            evidence=_self_survival_evidence(self_snap),
+            action_hint="与 JEV 周检并排对照；裁决前不调权；只观察不改闸",
+        )
+    )
+
+    bh_rep = load_baseline_history_report(root)
+    suggestions.append(
+        _suggestion(
+            layer="指标",
+            item="基线滚动历史（baseline_history）",
+            status=STATUS_WATCH,
+            evidence=_baseline_history_evidence(bh_rep),
+            action_hint=(
+                "只观察不调权；稳定两周（STABLE）后再谈进风控；落地须走 R4"
+            ),
+        )
+    )
+
+    pb_snap = _load_price_behavior_snapshot(root)
+    if pb_snap.get("ok") or not pb_snap.get("skip"):
+        suggestions.append(
+            _suggestion(
+                layer="指标",
+                item="价格行为（拉升/回撤）",
+                status=STATUS_WATCH,
+                evidence=_price_behavior_evidence(pb_snap),
+                action_hint=(
+                    "只观察不调权；RISK_USE_PRIOR 默认关；SHORT 勿外推；落地须走 R4"
+                ),
+            )
+        )
 
     # --- 决策 ---
     suggestions.append(
@@ -360,8 +872,15 @@ def build_evolution_suggestions(
     return suggestions
 
 
-def format_evolution_section(suggestions: Sequence[dict[str, str]]) -> str:
-    """Markdown body for §10 (without the ## heading)."""
+def format_evolution_section(
+    suggestions: Sequence[dict[str, str]],
+    *,
+    db_root: Optional[str | Path] = None,
+) -> str:
+    """Markdown body for §10 (without the ## heading).
+
+    Appends PRIOR_STEP6 基线滚动快照 + PRIOR_STEP7 价格行为先验 when readable.
+    """
     lines: list[str] = []
     lines.append(
         "> **钉死：** 本节只建议，**不**自动改参 / 开闸 / 写配置；"
@@ -371,20 +890,25 @@ def format_evolution_section(suggestions: Sequence[dict[str, str]]) -> str:
     if not suggestions:
         lines.append("_本期无进化建议（各层数据未交来）。_")
         lines.append("")
-        return "\n".join(lines)
-
-    lines.append("| 层 | 项 | 状态 | 证据 | 行动提示 |")
-    lines.append("|---|---|---|---|---|")
-    for s in suggestions:
+    else:
+        lines.append("| 层 | 项 | 状态 | 证据 | 行动提示 |")
+        lines.append("|---|---|---|---|---|")
+        for s in suggestions:
+            lines.append(
+                f"| {s.get('layer', '')} | {s.get('item', '')} | "
+                f"**{s.get('status', '')}** | {s.get('evidence', '')} | "
+                f"{s.get('action_hint', '')} |"
+            )
+        lines.append("")
         lines.append(
-            f"| {s.get('layer', '')} | {s.get('item', '')} | "
-            f"**{s.get('status', '')}** | {s.get('evidence', '')} | "
-            f"{s.get('action_hint', '')} |"
+            f"共 {len(suggestions)} 条；状态词汇：`观察中` / `建议落地` / `裁决`。"
+            "自动填充项默认为「观察中」。"
         )
-    lines.append("")
-    lines.append(
-        f"共 {len(suggestions)} 条；状态词汇：`观察中` / `建议落地` / `裁决`。"
-        "自动填充项默认为「观察中」。"
-    )
-    lines.append("")
+        lines.append("")
+
+    root = Path(db_root) if db_root else Path(__file__).resolve().parents[1]
+    bh = load_baseline_history_report(root)
+    lines.append(format_baseline_history_section(bh))
+    pb = _load_price_behavior_snapshot(root)
+    lines.append(format_price_behavior_section(pb))
     return "\n".join(lines)
