@@ -1149,6 +1149,13 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     tools=("不跳单",),
                 )
                 _v2_comp(
+                    ("代币", "年龄"),
+                    "span-6",
+                    lambda: _v2_token_age(store),
+                    foot="旁证观察 · 不算有效性 · 不进盘中参 · extras.pairCreatedAt",
+                    tools=("只读",),
+                )
+                _v2_comp(
                     ("回测", "新闻"),
                     "span-6",
                     lambda: _v2_btnews(store),
@@ -2355,6 +2362,52 @@ def _v2_intel_holders(store: DataStore) -> None:
         ui.label(_v2_text(getattr(crowd.data, "line", None))).classes("v2-note")
     else:
         ui.label("拥挤旁证 data gap · 不否决 · 不算有效性").classes("v2-note")
+
+
+def _v2_token_age(store: DataStore) -> None:
+    result = store.token_age_observe()
+    if not result.available or result.data is None:
+        ui.label(result.reason or "data gap").classes("v2-note")
+        ui.label("旁证观察 · 不算有效性 · 不进盘中参").classes("v2-note")
+        return
+    report = result.data
+    total = _as_int(getattr(report, "total", 0))
+    unknown = _as_int(getattr(report, "unknown", 0))
+    ratio = getattr(report, "unknown_ratio", None)
+    if isinstance(ratio, (int, float)) and not isinstance(ratio, bool):
+        ratio_text = f"{float(ratio) * 100:.1f}%"
+    else:
+        ratio_text = "—"
+    unknown_text = f"{unknown}/{total}" if total else "—"
+    _v2_kv([
+        ("近端", str(total), "mute"),
+        ("有字段", str(_as_int(getattr(report, "with_field", 0))), "mute"),
+        ("unknown", unknown_text, "mute"),
+        ("unknown 占比", ratio_text, "mute"),
+    ])
+    buckets = getattr(report, "buckets", ()) or ()
+    _v2_table(
+        [("桶", ""), ("笔数", "num")],
+        [
+            [_v2_text(getattr(item, "label", None)), str(_as_int(getattr(item, "count", 0)))]
+            for item in buckets
+        ],
+    )
+    samples = getattr(report, "samples", ()) or ()
+    sample_rows: list[list[str]] = []
+    for item in samples:
+        age_days = getattr(item, "age_days", None)
+        if isinstance(age_days, bool) or not isinstance(age_days, (int, float)):
+            continue
+        sample_rows.append([str(_as_int(getattr(item, "decision_id", 0))), f"{float(age_days):.2f}"])
+    if sample_rows:
+        _v2_table([("id", "num"), ("age_days", "num")], sample_rows)
+    if total == 0:
+        ui.label("近端无决策行").classes("v2-note")
+    ui.label(
+        f"近 {_as_int(getattr(report, 'limit', 0))} 行 · 旁证观察 · 不算有效性 · 不进盘中参 · "
+        "源 decision_log.raw_json.extras.pairCreatedAt · 旧行无字段计入 unknown · 不改闸/不改权"
+    ).classes("v2-note")
 
 
 def _v2_intel_slippage(store: DataStore) -> None:

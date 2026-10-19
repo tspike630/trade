@@ -516,6 +516,7 @@ class DashboardSmokeTest(unittest.TestCase):
             empty.intel_holder_observe(),
             empty.intel_slippage_observe(),
             empty.intel_crowding_note(),
+            empty.token_age_observe(),
             empty.latest_backtest(),
             empty.latest_news(),
             empty.process_liveness(),
@@ -1953,6 +1954,151 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("data gap", holder_src)
         self.assertIn("data gap", slip_src)
         self.assertIn("不跳单", slip_src)
+
+    def test_token_age_observe_buckets(self) -> None:
+        missing = DataStore(
+            DbPaths(
+                main=self.root / "missing-main.db",
+                execution=self.root / "missing-exec.db",
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        absent = missing.token_age_observe()
+        self.assertFalse(absent.available)
+        self.assertIn("数据库文件不存在", absent.reason)
+
+        bare = self.root / "bare-age.db"
+        sqlite3.connect(bare).close()
+        bare_store = DataStore(
+            DbPaths(main=bare, execution=bare, paper=bare, backtest=bare, news=bare)
+        )
+        bare_age = bare_store.token_age_observe()
+        self.assertFalse(bare_age.available, bare_age.reason)
+        self.assertIn("缺少数据表", bare_age.reason)
+
+        thin = self.root / "thin-age.db"
+        with sqlite3.connect(thin) as conn:
+            conn.execute("CREATE TABLE decision_log (id INTEGER PRIMARY KEY, ts TEXT)")
+        thin_store = DataStore(
+            DbPaths(main=thin, execution=thin, paper=thin, backtest=thin, news=thin)
+        )
+        thin_age = thin_store.token_age_observe()
+        self.assertFalse(thin_age.available, thin_age.reason)
+        self.assertIn("缺少字段", thin_age.reason)
+        self.assertIn("raw_json", thin_age.reason)
+
+        corrupt = self.root / "corrupt-age.db"
+        corrupt.write_text("{not json and not sqlite", encoding="utf-8")
+        corrupt_store = DataStore(
+            DbPaths(main=corrupt, execution=corrupt, paper=corrupt, backtest=corrupt, news=corrupt)
+        )
+        corrupt_age = corrupt_store.token_age_observe()
+        self.assertFalse(corrupt_age.available, corrupt_age.reason)
+        self.assertIn("查询失败", corrupt_age.reason)
+
+        signal = datetime(2026, 10, 18, tzinfo=timezone.utc)
+        signal_ms = int(signal.timestamp() * 1000)
+
+        def stamped(age_days: float, *, seconds: bool = False, as_text: bool = False) -> str:
+            delta_ms = int(round(age_days * 86_400_000))
+            created_ms = signal_ms - delta_ms
+            value: object = int(created_ms / 1000) if seconds else created_ms
+            if as_text:
+                value = str(value)
+            return json.dumps({"extras": {"pairCreatedAt": value}})
+
+        main = self.root / "age-main.db"
+        with sqlite3.connect(main) as conn:
+            conn.execute(
+                """
+                CREATE TABLE decision_log (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT,
+                    raw_json TEXT
+                )
+                """
+            )
+            conn.executemany(
+                "INSERT INTO decision_log (id, ts, raw_json) VALUES (?, ?, ?)",
+                [
+                    (1, _iso(signal), "{}"),
+                    (2, _iso(signal), stamped(0.5, as_text=True)),
+                    (3, _iso(signal), stamped(1)),
+                    (4, _iso(signal), stamped(7)),
+                    (5, _iso(signal), stamped(7 + 1 / 24)),
+                    (6, _iso(signal), "not-json"),
+                    (7, _iso(signal), json.dumps({"pairCreatedAt": signal_ms - 86_400_000})),
+                    (8, _iso(signal), json.dumps({"extras": {"pairCreatedAt": ""}})),
+                    (9, _iso(signal), json.dumps({"extras": {"pairCreatedAt": 0}})),
+                    (10, _iso(signal), json.dumps({"extras": {"pairCreatedAt": signal_ms + 3_600_000}})),
+                    (11, _iso(signal), stamped(2, seconds=True)),
+                ],
+            )
+        store = DataStore(
+            DbPaths(main=main, execution=main, paper=main, backtest=main, news=main)
+        )
+        before = main.stat().st_mtime_ns
+        report = store.token_age_observe()
+        self.assertTrue(report.available, report.reason)
+        data = report.data
+        self.assertEqual(data.total, 11)
+        self.assertEqual(data.with_field, 6)
+        self.assertEqual(data.unknown, 6)
+        self.assertNotEqual(data.unknown, data.total)
+        self.assertAlmostEqual(data.unknown_ratio or 0.0, round(6 / 11, 4))
+        counts = {item.label: item.count for item in data.buckets}
+        self.assertEqual(list(counts), ["<1d", "1-7d", ">7d", "unknown"])
+        self.assertEqual(counts["<1d"], 1)
+        self.assertEqual(counts["1-7d"], 3)
+        self.assertEqual(counts[">7d"], 1)
+        self.assertEqual(counts["unknown"], 6)
+        self.assertEqual(sum(counts.values()), data.total)
+        self.assertEqual([item.decision_id for item in data.samples], [11, 5, 4, 3, 2])
+        by_id = {item.decision_id: item.age_days for item in data.samples}
+        self.assertAlmostEqual(by_id[2], 0.5, places=4)
+        self.assertAlmostEqual(by_id[3], 1.0, places=4)
+        self.assertAlmostEqual(by_id[4], 7.0, places=4)
+        self.assertAlmostEqual(by_id[11], 2.0, places=4)
+        self.assertGreater(by_id[5], 7.0)
+        self.assertEqual(main.stat().st_mtime_ns, before)
+
+        narrowed = store.token_age_observe(limit=2)
+        self.assertTrue(narrowed.available, narrowed.reason)
+        self.assertEqual(narrowed.data.total, 2)
+        self.assertEqual(narrowed.data.with_field, 2)
+        self.assertEqual(narrowed.data.unknown, 1)
+        self.assertNotEqual(narrowed.data.unknown, narrowed.data.total)
+        narrow_counts = {item.label: item.count for item in narrowed.data.buckets}
+        self.assertEqual(narrow_counts["1-7d"], 1)
+        self.assertEqual(narrow_counts["unknown"], 1)
+        self.assertEqual(narrowed.data.samples[0].decision_id, 11)
+
+        empty = self.root / "empty-age.db"
+        with sqlite3.connect(empty) as conn:
+            conn.execute(
+                "CREATE TABLE decision_log (id INTEGER PRIMARY KEY, ts TEXT, raw_json TEXT)"
+            )
+        empty_store = DataStore(
+            DbPaths(main=empty, execution=empty, paper=empty, backtest=empty, news=empty)
+        )
+        empty_age = empty_store.token_age_observe()
+        self.assertTrue(empty_age.available, empty_age.reason)
+        self.assertEqual(empty_age.data.total, 0)
+        self.assertEqual(empty_age.data.with_field, 0)
+        self.assertEqual(empty_age.data.unknown, 0)
+        self.assertIsNone(empty_age.data.unknown_ratio)
+        self.assertEqual(empty_age.data.samples, ())
+
+        app_text = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+        self.assertIn('("代币", "年龄")', app_text)
+        self.assertIn("extras.pairCreatedAt", app_text)
+        age_src = inspect.getsource(app_module._v2_token_age)
+        self.assertIn("不算有效性", age_src)
+        self.assertIn("不进盘中参", age_src)
+        self.assertIn("pairCreatedAt", age_src)
+        self.assertIn("unknown", age_src)
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
