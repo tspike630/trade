@@ -43,6 +43,14 @@ from review.factor_layers import (
     performance_matrix,
 )
 from review.factor_ic_history import load_history, summarize_all, upsert_row
+from review.structure_check import structure_check
+from review.structure_history import (
+    default_fp_log_path,
+    default_history_path,
+    ensure_fp_log,
+    load_history as load_structure_history,
+    upsert_layer_rows,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PERIOD_RE = re.compile(r"^(\d+)([dDhHmM])$")
@@ -198,6 +206,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="IC history CSV path (default exports/reports/factor_ic_history.csv; "
         "only with --factor-layers)",
     )
+    parser.add_argument(
+        "--structure-check",
+        action="store_true",
+        help="append §13 SIGNAL_STRUCTURE_CHECK "
+        "(default off; read-only; does not change gates, weights, TP/SL/hold, "
+        "or the decision main chain; same discipline as --factor-layers)",
+    )
     args = parser.parse_args(argv)
 
     if args.start or args.end:
@@ -335,6 +350,29 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"不改参、不写配置。"
             )
 
+    structure_result: Optional[dict[str, Any]] = None
+    if args.structure_check:
+        # Read-only score. History/fp log are the only new files, both under exports/.
+        hist_path = default_history_path(db_root)
+        ensure_fp_log(default_fp_log_path(db_root))
+        structure_result = structure_check(
+            chain=chain,
+            jev_rows=jev_rows,
+            paths=paths,
+            period_start=period_start,
+            period_end=period_end,
+            strategy_id=args.strategy,
+            history=load_structure_history(hist_path),
+        )
+        upsert_layer_rows(hist_path, structure_result.get("history_rows") or [])
+        layer_map = structure_result.get("layers") or {}
+        print(
+            "structure-check: "
+            f"decision={(layer_map.get('decision') or {}).get('verdict')} "
+            f"execution={(layer_map.get('execution') or {}).get('verdict')} "
+            f"history={hist_path}"
+        )
+
     if args.dump_chain:
         dump_path = Path(args.dump_chain)
         if not dump_path.is_absolute():
@@ -433,6 +471,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             evolution_suggestions=evo,
             factor_layers=factor_layer_result,
             weekly_evidence=weekly_evidence,
+            structure_check=structure_result,
         )
         written = write_report(md, str(out_path))
         print(f"report: {written}")
