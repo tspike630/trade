@@ -361,16 +361,24 @@ class IndicatorDataAdapter:
                 out["price_usd"] = None
         return out
 
-    def _liquidity_by_pair(
+    def _pair_meta_by_pair(
         self, keys: list[tuple[str, str]]
-    ) -> dict[tuple[str, str], float | None]:
-        """Batch pairs.raw_json → liquidity_usd. One query per chunk, not per token."""
-        found: dict[tuple[str, str], float | None] = {}
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """Batch pairs → liquidity_usd + pair_created_at (ms epoch when present).
+
+        ``pair_created_at`` is the pairs column (DexScreener pairCreatedAt, ms).
+        Omitted from the meta dict when the column is missing or the value is NULL.
+        """
+        found: dict[tuple[str, str], dict[str, Any]] = {}
         if not keys:
             return found
         columns = self._table_columns("pairs")
         if not {"chain_id", "pair_address", "raw_json"} <= columns:
             return found
+        want_created = "pair_created_at" in columns
+        select_cols = "chain_id, pair_address, raw_json"
+        if want_created:
+            select_cols += ", pair_created_at"
         chunk_size = 80
         for start in range(0, len(keys), chunk_size):
             chunk = keys[start : start + chunk_size]
@@ -380,20 +388,41 @@ class IndicatorDataAdapter:
                 params.extend((chain_id, pair_address))
             try:
                 fetched = self.conn.execute(
-                    f"SELECT chain_id, pair_address, raw_json FROM pairs WHERE {clause}",
+                    f"SELECT {select_cols} FROM pairs WHERE {clause}",
                     params,
                 ).fetchall()
             except sqlite3.OperationalError as exc:
-                log.warning("liquidity lookup failed: %s", exc)
+                log.warning("pair meta lookup failed: %s", exc)
                 return found
             for row in fetched:
-                found[(str(row["chain_id"]), str(row["pair_address"]))] = (
-                    liquidity_usd_from_raw(row["raw_json"])
-                )
+                meta: dict[str, Any] = {
+                    "liquidity_usd": liquidity_usd_from_raw(row["raw_json"]),
+                }
+                if want_created:
+                    raw_created = row["pair_created_at"]
+                    if raw_created is not None:
+                        try:
+                            meta["pair_created_at"] = int(raw_created)
+                        except (TypeError, ValueError):
+                            pass
+                found[(str(row["chain_id"]), str(row["pair_address"]))] = meta
         return found
 
+    def _liquidity_by_pair(
+        self, keys: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], float | None]:
+        """Batch pairs.raw_json → liquidity_usd. Thin wrapper over ``_pair_meta_by_pair``."""
+        return {
+            key: meta.get("liquidity_usd")
+            for key, meta in self._pair_meta_by_pair(keys).items()
+        }
+
     def _attach_liquidity(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Set liquidity_usd on scanned indicator rows. Missing pair/usd → None."""
+        """Set liquidity_usd (+ pair_created_at when known) on scanned indicator rows.
+
+        Missing pair/usd → liquidity_usd None. ``pair_created_at`` is only set when
+        the pairs column has a value (ms epoch); otherwise the key is left unset.
+        """
         if not rows:
             return rows
         keys: list[tuple[str, str]] = []
@@ -407,22 +436,29 @@ class IndicatorDataAdapter:
             if key not in seen:
                 seen.add(key)
                 keys.append(key)
-        found = self._liquidity_by_pair(keys)
+        found = self._pair_meta_by_pair(keys)
         with_liq = 0
+        with_created = 0
         for row in rows:
             chain_id = str(row.get("chain_id") or "")
             pair = row.get("primary_pair_address")
             if not chain_id or pair is None or str(pair).strip() == "":
                 row["liquidity_usd"] = None
                 continue
-            liquidity = found.get((chain_id, str(pair)))
+            meta = found.get((chain_id, str(pair))) or {}
+            liquidity = meta.get("liquidity_usd")
             row["liquidity_usd"] = liquidity
             if liquidity is not None:
                 with_liq += 1
+            created = meta.get("pair_created_at")
+            if created is not None:
+                row["pair_created_at"] = created
+                with_created += 1
         log.info(
-            "liquidity_usd attached rows=%s with_liq=%s missing=%s",
+            "liquidity_usd attached rows=%s with_liq=%s missing=%s with_pair_created_at=%s",
             len(rows),
             with_liq,
             len(rows) - with_liq,
+            with_created,
         )
         return rows
