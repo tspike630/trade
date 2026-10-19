@@ -641,6 +641,328 @@ def format_price_behavior_section(snap: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+
+# --- 指标加工层·周观察（read-only §10；只观察不调权） ---
+
+def _indicator_week_observe_exports_dir(db_root: Path) -> Path:
+    return db_root / "data" / "prior" / "exports"
+
+
+def _pick_latest_indicator_week_observe(exports: Path) -> Optional[Path]:
+    """Pick latest indicator_week_observe_YYYYMMDD.json by filename date, else mtime."""
+    if not exports.is_dir():
+        return None
+    cands = list(exports.glob("indicator_week_observe_*.json"))
+    if not cands:
+        return None
+
+    def _key(p: Path) -> tuple:
+        stem = p.stem  # indicator_week_observe_YYYYMMDD
+        date_part = stem.rsplit("_", 1)[-1]
+        if len(date_part) == 8 and date_part.isdigit():
+            return (1, date_part, p.stat().st_mtime)
+        return (0, "", p.stat().st_mtime)
+
+    return sorted(cands, key=_key, reverse=True)[0]
+
+
+def load_indicator_week_observe(db_root: Path) -> dict[str, Any]:
+    """Read latest indicator_week_observe_*.json; skip gracefully if missing."""
+    exports = _indicator_week_observe_exports_dir(db_root)
+    path = _pick_latest_indicator_week_observe(exports)
+    if path is None:
+        return {
+            "ok": False,
+            "skip": True,
+            "note": (
+                "indicator_week_observe_*.json 缺失，跳过指标加工层·周观察"
+                f"（期望路径 `{exports.as_posix()}/indicator_week_observe_YYYYMMDD.json`）"
+            ),
+        }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "skip": True,
+            "note": f"读 {path.name} 失败，跳过：{e}",
+            "path": f"data/prior/exports/{path.name}",
+        }
+    if not isinstance(data, dict):
+        return {
+            "ok": False,
+            "skip": True,
+            "note": f"{path.name} 根节点非 object，跳过",
+            "path": f"data/prior/exports/{path.name}",
+        }
+    return {
+        "ok": True,
+        "skip": False,
+        "path": f"data/prior/exports/{path.name}",
+        "data": data,
+    }
+
+
+def _status_from_row(raw: Any) -> str:
+    s = str(raw or "").strip()
+    if s in (STATUS_WATCH, STATUS_SUGGEST, STATUS_DECIDE):
+        return s
+    if "裁决" in s:
+        return STATUS_DECIDE
+    if "建议落地" in s:
+        return STATUS_SUGGEST
+    return STATUS_WATCH
+
+
+def _indicator_week_observe_suggestions(obs: dict[str, Any]) -> list[dict[str, str]]:
+    """Map week-observe JSON into §10 suggestion rows (never mutates weights)."""
+    if not obs.get("ok"):
+        return []
+    data = obs.get("data") or {}
+    meta = data.get("sample_meta") or {}
+    window = data.get("window") or {}
+    rows = data.get("rows") or []
+    out: list[dict[str, str]] = []
+
+    # Group rows into a few summary suggestion lines (stable §10 shape).
+    up_items = [
+        r for r in rows
+        if str(r.get("category") or "").startswith("可上调")
+        or str(r.get("category") or "") == "旁路可上调观察"
+    ]
+    down_items = [
+        r for r in rows
+        if "降权" in str(r.get("category") or "") or "维持0" in str(r.get("category") or "")
+    ]
+    watch_items = [
+        r for r in rows
+        if str(r.get("category") or "") == "观察中"
+        or (
+            _status_from_row(r.get("status")) == STATUS_WATCH
+            and r not in up_items
+            and r not in down_items
+        )
+    ]
+
+    win_label = window.get("label") or "—"
+    n_snap = meta.get("layer_snapshots")
+    n_pair = meta.get("valid_fwd_pairs")
+    n_tok = meta.get("tokens")
+    up_rate = meta.get("overall_up_rate")
+    sample_bit = (
+        f"窗={win_label}；分层快照={n_snap}→有效配对={n_pair}/token={n_tok}；"
+        f"全体上涨率={_pct(float(up_rate), 1) if up_rate is not None else '—'}"
+    )
+
+    if up_items:
+        bits = []
+        for r in up_items:
+            bits.append(f"{r.get('item')}（{r.get('evidence') or '—'}）")
+        out.append(
+            _suggestion(
+                layer="指标",
+                item="周观察·可上调观察（仍须 R4）",
+                status=STATUS_SUGGEST,
+                evidence=(
+                    f"来源=指标加工层周观察；{sample_bit}；"
+                    + "；".join(bits)
+                    + "。「建议落地」≠自动开权；本周维持权重 0"
+                ),
+                action_hint=(
+                    "可上调仅记观察；禁止本周接闸；权重保持 0；落地须走 R4"
+                ),
+            )
+        )
+
+    # Explicit short-window / down-weight lines for success-criteria coverage.
+    short_down = [
+        r for r in down_items
+        if "change_5m" in str(r.get("item") or "") or "15m" in str(r.get("item") or "")
+    ]
+    other_down = [r for r in down_items if r not in short_down]
+    if short_down or any("change_5m" in str(r.get("item") or "") for r in rows):
+        ev = "；".join(
+            f"{r.get('item')}: {r.get('evidence') or '—'}" for r in (short_down or [
+                {"item": "change_5m/15m", "evidence": "短窗混乱"}
+            ])
+        )
+        out.append(
+            _suggestion(
+                layer="指标",
+                item="周观察·change 短窗勿上调（5m/15m）",
+                status=STATUS_SUGGEST,
+                evidence=f"来源=指标加工层周观察；{ev}",
+                action_hint="勿线性上调短窗 change；降权/维持 0；落地须走 R4",
+            )
+        )
+
+    vol_macd = [
+        r for r in other_down
+        if any(
+            k in str(r.get("item") or "")
+            for k in ("volume_strength", "macd_hist", "volatility_24h")
+        )
+    ]
+    if vol_macd:
+        ev = "；".join(f"{r.get('item')}: {r.get('evidence') or '—'}" for r in vol_macd)
+        out.append(
+            _suggestion(
+                layer="指标",
+                item="周观察·volume_strength / volatility_24h / macd_hist 降权维持0",
+                status=STATUS_SUGGEST,
+                evidence=(
+                    f"来源=指标加工层周观察；{ev}；"
+                    "volume 高档警示、volatility 高波差（风险分层旁路）、macd 混乱"
+                ),
+                action_hint=(
+                    "可降权线性信任；volatility 作风险分层旁路；本周维持 0；落地须走 R4"
+                ),
+            )
+        )
+
+    # Remaining down items not covered above
+    covered = set(id(x) for x in short_down) | set(id(x) for x in vol_macd)
+    rest_down = [r for r in other_down if id(r) not in covered]
+    if rest_down:
+        ev = "；".join(f"{r.get('item')}: {r.get('evidence') or '—'}" for r in rest_down)
+        out.append(
+            _suggestion(
+                layer="指标",
+                item="周观察·其他降权/维持0项",
+                status=STATUS_SUGGEST,
+                evidence=f"来源=指标加工层周观察；{ev}",
+                action_hint="维持权重 0；落地须走 R4",
+            )
+        )
+
+    watch_names = [str(r.get("item") or "") for r in watch_items]
+    if any("sentiment" in n or "spike" in n for n in watch_names) or watch_items:
+        ev = "；".join(
+            f"{r.get('item')}: {r.get('evidence') or '—'}" for r in watch_items
+        ) or "sentiment / spike 样本或信号弱"
+        out.append(
+            _suggestion(
+                layer="指标",
+                item="周观察·sentiment / spike 样本不足",
+                status=STATUS_WATCH,
+                evidence=f"来源=指标加工层周观察；{ev}",
+                action_hint="继续攒样本；突热只观察；不调权、不告警、不进决策；落地须走 R4",
+            )
+        )
+
+    rsi_rows = [
+        r for r in rows
+        if "rsi_14" in str(r.get("item") or "")
+    ]
+    if rsi_rows:
+        r0 = rsi_rows[0]
+        out.append(
+            _suggestion(
+                layer="指标",
+                item="周观察·rsi_14 旁路观察",
+                status=_status_from_row(r0.get("status")),
+                evidence=(
+                    f"来源=指标加工层周观察；{r0.get('evidence') or '—'}；"
+                    f"倾向={r0.get('tendency') or '旁路观察不进权重'}"
+                ),
+                action_hint="登记旁路观察，不进权重；维持 0；落地须走 R4",
+            )
+        )
+
+    # Always emit verdict row when observe file present.
+    verdict = data.get("verdict") or (
+        "本周不对任何 INDICATORS_WEIGHT_* 改值；权重保持全 0，待 R4"
+    )
+    footnote = data.get("self_survival_footnote") or ""
+    out.append(
+        _suggestion(
+            layer="指标",
+            item="本周无权重裁决（指标加工层）",
+            status=STATUS_DECIDE,
+            evidence=(
+                f"来源=指标加工层周观察（{obs.get('path')}）；{sample_bit}；"
+                f"裁决={verdict}"
+                + (f"；脚注={footnote}" if footnote else "")
+            ),
+            action_hint=(
+                "纪律钉死：权重仍全 0；「建议落地」≠自动开权；"
+                "不改仓/不改闸；禁止本周接闸；落地须走 R4"
+            ),
+        )
+    )
+    return out
+
+
+def format_indicator_week_observe_section(obs: dict[str, Any]) -> str:
+    """Markdown subsection「指标加工层·周观察（只读）」."""
+    lines: list[str] = []
+    lines.append("### 指标加工层·周观察（只读）")
+    lines.append("")
+    if not obs.get("ok"):
+        lines.append(f"> 跳过：{obs.get('note') or 'indicator_week_observe 不可读'}")
+        lines.append("")
+        return "\n".join(lines)
+
+    data = obs.get("data") or {}
+    meta = data.get("sample_meta") or {}
+    window = data.get("window") or {}
+    rows = data.get("rows") or []
+    path = obs.get("path") or "data/prior/exports/indicator_week_observe_*.json"
+
+    win_label = window.get("label") or "—"
+    fwd = window.get("fwd_horizon") or meta.get("fwd_horizon") or "≈1h"
+    n_snap = meta.get("layer_snapshots")
+    n_pair = meta.get("valid_fwd_pairs")
+    n_tok = meta.get("tokens")
+    up_rate = meta.get("overall_up_rate")
+    up_s = _pct(float(up_rate), 1) if up_rate is not None else "—"
+
+    lines.append(
+        "> 来源=指标加工层周观察；输入=`"
+        + path
+        + "`；**只观察不调权**。"
+        "「建议落地」≠允许自动开权；权重 `INDICATORS_WEIGHT_*=0`。"
+    )
+    lines.append("")
+    lines.append(
+        f"窗 **{win_label}**；fwd≈**{fwd}**；分层快照 **{n_snap}** → "
+        f"有效配对 **{n_pair}** / token **{n_tok}**；全体上涨率 **{up_s}**。"
+    )
+    if meta.get("note"):
+        lines.append("")
+        lines.append(f"样本注记：{meta.get('note')}")
+    lines.append("")
+    lines.append("| 类别 | 指标 | 观察要点 | 状态 |")
+    lines.append("|---|---|---|---|")
+    for r in rows:
+        cat = r.get("category") or "—"
+        item = r.get("item") or "—"
+        # backtick multi-names lightly
+        item_s = f"`{item}`" if " " not in str(item) or "/" in str(item) else str(item)
+        if "/" in str(item) or str(item).replace("_", "").isalnum():
+            item_s = f"`{item}`"
+        ev = r.get("evidence") or "—"
+        tend = r.get("tendency") or ""
+        point = ev if not tend else f"{ev}；{tend}"
+        st = _status_from_row(r.get("status"))
+        lines.append(f"| {cat} | {item_s} | {point} | **{st}** |")
+    lines.append("")
+
+    verdict = data.get("verdict") or "权重保持全 0，待 R4"
+    lines.append(f"**裁决：** {verdict}")
+    lines.append("")
+    footnote = data.get("self_survival_footnote")
+    if footnote:
+        lines.append(f"**脚注（self_survival）：** {footnote}")
+        lines.append("")
+    lines.append(
+        "**纪律：** 权重仍全 0；不改仓/不改闸；只观察；"
+        "高档 mean 常被左尾拖累，禁止本周接闸；落地须走 **R4**。"
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def build_evolution_suggestions(
     *,
     chain: Sequence[SignalChainRow],
@@ -776,6 +1098,11 @@ def build_evolution_suggestions(
             )
         )
 
+    # --- 指标：加工层周观察（只读；缺文件则跳过，不崩） ---
+    iwo = load_indicator_week_observe(root)
+    if iwo.get("ok"):
+        suggestions.extend(_indicator_week_observe_suggestions(iwo))
+
     # --- 决策 ---
     suggestions.append(
         _suggestion(
@@ -879,7 +1206,7 @@ def format_evolution_section(
 ) -> str:
     """Markdown body for §10 (without the ## heading).
 
-    Appends PRIOR_STEP6 基线滚动快照 + PRIOR_STEP7 价格行为先验 when readable.
+    Appends PRIOR_STEP6 基线滚动快照 + PRIOR_STEP7 价格行为先验 + 指标加工层·周观察 when readable.
     """
     lines: list[str] = []
     lines.append(
@@ -911,4 +1238,6 @@ def format_evolution_section(
     lines.append(format_baseline_history_section(bh))
     pb = _load_price_behavior_snapshot(root)
     lines.append(format_price_behavior_section(pb))
+    iwo = load_indicator_week_observe(root)
+    lines.append(format_indicator_week_observe_section(iwo))
     return "\n".join(lines)
