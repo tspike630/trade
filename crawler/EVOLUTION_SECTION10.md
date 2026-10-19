@@ -12,7 +12,7 @@
 
 每条建议为字典：`layer`（采集/指标/决策/执行/复盘）、`item`、`status`（观察中|建议落地|裁决）、`evidence`、`action_hint`。
 
-自动观察项（有则填，无则占位）：采集 token_age 覆盖率（接 `pairs.pair_created_at`，观察 unknown 占比下降）与 `news_events.db` 条数；指标权重全 0 + 归因 liq 区分度；决策 JEV unique_token/门槛距离与退役规则提醒；执行 executed=0/paper 未开闸与拒绝分布；复盘 R3 skip 原因。
+自动观察项（有则填，无则占位）：采集 token_age 覆盖率（接 `pairs.pair_created_at`，观察 unknown 占比下降）与 `news_events.db` 条数；指标权重全 0 + 归因 liq 区分度 + **自库存活曲线（self_survival）**（`baseline_params.json#self_db` + 最新 `self_survival_*.md`）+ 基线滚动历史（`prior.db.baseline_history`）+ 价格行为先验；决策 JEV unique_token/门槛距离与退役规则提醒；执行 executed=0/paper 未开闸与拒绝分布；复盘 R3 skip 原因。
 
 ```bash
 .venv/bin/python -m review.run --period 7d --report
@@ -29,7 +29,9 @@
 
 ## §10 小节：指标加工层·周观察
 
-`build_evolution_suggestions` 可并入指标层周观察行（`change_*` 区分度、`volatility_24h` 风险分层、`volume_strength`/`macd_hist` 可降权倾向、sentiment/spike 样本不足、本周无权重裁决）；`format_evolution_section` 表后追加「指标加工层·周观察」小节。**只观察不调权**；权重仍全 0；落地须走 R4。
+输入：`data/prior/exports/indicator_week_observe_YYYYMMDD.json`（按文件名日期取最新；缺文件则跳过并注明，不崩）。可选旁注 `indicator_week_observe_YYYYMMDD.md`。
+
+`build_evolution_suggestions` 读最新 JSON，在指标块追加周观察行（可上调观察仍须 R4、短窗/降权维持 0、sentiment/spike 观察中、rsi_14 旁路、本周无权重裁决）；`format_evolution_section` 在基线快照/价格行为附近追加「### 指标加工层·周观察（只读）」小节（表：类别/指标/观察要点/状态；含样本口径与裁决句）。**只观察不调权**；权重仍全 0；「建议落地」≠自动开权；落地须走 R4。
 
 ## §6b：CEX 市场基准第二参照（CCXT 旁挂）
 
