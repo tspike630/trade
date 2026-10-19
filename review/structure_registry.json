@@ -1,0 +1,147 @@
+{
+  "id": "SIGNAL_STRUCTURE_CHECK",
+  "version": "r1-2026-10-19",
+  "title": "S2C-FW",
+  "param_freeze_until": "2026-10-28",
+  "sparse_n_lt": 5,
+  "red_consecutive_weeks": 2,
+  "consecutive_gap_days_max": 8,
+  "footnotes": [
+    "样本不足格（n<5）不解读；单周不算数；连续 2 周同向才升红。",
+    "旁证≠改闸。#71=Step2 硬否决旁证（stop_loss_share dashboard 口径 + 日开仓峰）；#72=退出质量（giveback/peak）。分栏不混。",
+    "决策格只用 fwd（up_1h）。执行格只用 realized/exit/shadow，禁止 up_1h / fwd_*。",
+    "决策对照基线=同期 JEV 过滤全样本 up_1h，不用指标窗全体上涨率。",
+    "滑点轴首期只建基线，冻结黄；不改 TP/SL 去凑阈值。",
+    "collection / indicator / meta 保持 pending；本模块不写激活路径。",
+    "红复核单在参数冻结期内只建议，不落地改 TP/SL/hold。"
+  ],
+  "fp_log": {
+    "path": "exports/structure_fp_log.csv",
+    "scope": "global",
+    "columns": [
+      "period_end",
+      "layer",
+      "axis",
+      "bucket",
+      "n",
+      "signal",
+      "observed",
+      "falsified",
+      "note"
+    ],
+    "definition": "假阳性：某格曾标黄且随后一周同格反向或信号消失。R1 只留空表与口径，不自动填行。全局一张表。"
+  },
+  "history": {
+    "path": "exports/structure_history.csv",
+    "mode": "append-only",
+    "upsert_key": ["period_end", "layer"],
+    "note": "只追加到 exports。同期 (period_end, layer) 重跑覆盖该键，避免把同周记成连续两周。不写业务库。"
+  },
+  "layers": [
+    {
+      "id": "collection",
+      "status": "pending",
+      "note": "采集层未激活。复盘不写激活代码路径，直到主 Agent 确认不少于 2 期。"
+    },
+    {
+      "id": "indicator",
+      "status": "pending",
+      "note": "指标层未激活。权重保持 0；不计算 IC，不进首屏。"
+    },
+    {
+      "id": "decision",
+      "status": "active",
+      "population": "jev_filtered",
+      "baseline": "jev_filtered_up_1h",
+      "age_resolver": "review.attribution.resolve_token_age_hours",
+      "core_axes": ["token_age", "liq", "strength"],
+      "experimental_axes": ["token_age_fine"],
+      "yellow": {
+        "min_n": 15,
+        "min_unique": 10,
+        "min_abs_delta_up_1h": 0.10
+      }
+    },
+    {
+      "id": "execution",
+      "status": "active",
+      "population": "paper.positions status=closed AND closed_at in window",
+      "forbid_fields": [
+        "up_1h",
+        "up_4h",
+        "fwd_1h",
+        "fwd_4h",
+        "med_1h",
+        "median_1h",
+        "median_4h",
+        "up_1h_rate",
+        "jev_strength"
+      ],
+      "cell_metrics": [
+        "n",
+        "realized_pnl_usd",
+        "win_rate",
+        "mean_peak_pnl_pct",
+        "mean_giveback_from_peak",
+        "stop_loss_share",
+        "stop_loss_share_of_neg"
+      ],
+      "yellow": {
+        "stop_loss_share_gte": 0.5,
+        "require_net_pnl_negative": true,
+        "mean_giveback_over_peak_gt": 2.0,
+        "slippage_gt_15_share_gte": 0.30,
+        "slippage_yellow_frozen": true
+      },
+      "axes": [
+        {
+          "id": "exit_reason",
+          "status": "ok",
+          "screen": "summary",
+          "buckets": ["stop_loss", "max_hold", "take_profit", "manual", "unknown"]
+        },
+        {
+          "id": "daily_opens",
+          "status": "ok",
+          "screen": "summary",
+          "buckets": ["1-5", "6-10", "11-19", "≥20"],
+          "scalar": "peak_daily_opens"
+        },
+        {
+          "id": "peak_giveback",
+          "status": "degraded",
+          "screen": "summary",
+          "buckets": ["<1x", "1-2x", ">2x"],
+          "folded_buckets": ["peak_nonpositive", "no_shadow"],
+          "null_mean_when_no_shadow": true
+        },
+        {
+          "id": "slippage",
+          "status": "baseline_only",
+          "screen": "summary",
+          "yellow_frozen": true,
+          "buckets": ["<5%", "5-15%", ">15%"],
+          "source": "positions.meta_json.slippage (entry fraction ×100 = percent). First period is baseline only."
+        },
+        {
+          "id": "size_band",
+          "status": "degraded",
+          "screen": "folded",
+          "buckets": ["<$250", "$250-500", ">$500"]
+        },
+        {
+          "id": "hold_duration",
+          "status": "degraded",
+          "screen": "folded",
+          "buckets": ["<30m", "30m-2h", ">2h"],
+          "empty_by_design": [">2h"]
+        }
+      ]
+    },
+    {
+      "id": "meta",
+      "status": "pending",
+      "note": "meta 层未激活。不与 decision/execution 混读。"
+    }
+  ]
+}
