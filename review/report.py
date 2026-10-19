@@ -400,6 +400,174 @@ def _render_factor_layer_section(
     return lines
 
 
+def _verdict_mark(verdict: Optional[str]) -> str:
+    if verdict == "green":
+        return "🟢"
+    if verdict == "yellow":
+        return "🟡"
+    if verdict == "red":
+        return "🔴"
+    return "—"
+
+
+def _render_structure_section(result: Optional[dict[str, Any]]) -> list[str]:
+    """§13 S2C-FW. None → omit, so the default report stays §1–§12."""
+    if not result:
+        return []
+    layers = result.get("layers") or {}
+    decision = layers.get("decision") or {}
+    execution = layers.get("execution") or {}
+    lines: list[str] = []
+    lines.append("## 13. 信号结构检查（S2C-FW，只读）")
+    lines.append("")
+    lines.append(
+        "只读聚合。不改闸、不改权、不动 TP/SL/hold，不写决策主链。"
+        "collection / indicator / meta = pending，无激活路径。"
+    )
+    lines.append("")
+    pending_bits: list[str] = []
+    for name in ("collection", "indicator", "meta"):
+        layer = layers.get(name) or {}
+        state = layer.get("status", "pending")
+        suffix = "" if layer.get("activated") else "（未激活）"
+        pending_bits.append(f"`{name}`={state}{suffix}")
+    lines.append("未激活层：" + " · ".join(pending_bits) + "。")
+    lines.append("")
+
+    lines.append(f"### 决策核心交叉 · {_verdict_mark(decision.get('verdict'))}")
+    lines.append("")
+    lines.append(
+        f"样本=JEV 过滤切片；基线 `{decision.get('baseline_name', 'jev_filtered_up_1h')}`"
+        f"={_pct(decision.get('baseline_up_1h'))}。"
+        "对照不用指标窗全体上涨率。n<5 为 sparse，不解读。"
+    )
+    lines.append("")
+    cells = decision.get("core_cross") or []
+    if not cells:
+        lines.append("_本期无决策核心交叉格。_")
+        lines.append("")
+    else:
+        lines.append("| token_age | liq | strength | n | unique | up_1h | Δpp | 读法 |")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---|")
+        for cell in cells:
+            if cell.get("sparse") or not cell.get("interpret", True):
+                reading = "sparse 不解读"
+                delta = "—"
+                rate = "—"
+            elif cell.get("yellow"):
+                reading = "🟡 候选"
+                delta_v = cell.get("delta_up_1h")
+                delta = "—" if delta_v is None else f"{delta_v * 100:+.1f}"
+                rate = _pct(cell.get("up_1h_rate"))
+            else:
+                reading = "记录"
+                delta_v = cell.get("delta_up_1h")
+                delta = "—" if delta_v is None else f"{delta_v * 100:+.1f}"
+                rate = _pct(cell.get("up_1h_rate"))
+            lines.append(
+                f"| {cell.get('age', '—')} | {cell.get('liq', '—')} | {cell.get('strength', '—')} | "
+                f"{cell.get('n', 0)} | {cell.get('unique_token', 0)} | {rate} | {delta} | {reading} |"
+            )
+        lines.append("")
+    conclusions = result.get("conclusions") or {}
+    lines.append(f"**结论（决策）：** {conclusions.get('decision', '—')}")
+    lines.append("")
+
+    lines.append(f"### 执行 6 轴摘要 · {_verdict_mark(execution.get('verdict'))}")
+    lines.append("")
+    lines.append(
+        "执行格只用 realized / exit / shadow。不填前向收益。"
+        f"open 不计 realized（open_count={execution.get('open_count', 0)}）。"
+    )
+    lines.append("")
+    exec_metrics = execution.get("metrics") or {}
+    lines.append(
+        f"`stop_loss_share`（dashboard）={_pct(exec_metrics.get('stop_loss_share'))}；"
+        f"`stop_loss_share_of_neg`（占负）={_pct(exec_metrics.get('stop_loss_share_of_neg'))}。"
+        "两字段并存，不合并。"
+    )
+    lines.append("")
+    lines.append("| 轴 | 状态 | 摘要 |")
+    lines.append("|---|---|---|")
+    axes = execution.get("axes") or []
+    if not axes:
+        lines.append("| — | — | 无执行轴（数据缺口或未计算） |")
+    for axis in axes:
+        lines.append(
+            f"| `{axis.get('id', '')}` | {axis.get('status', '')} | {axis.get('summary', '')} |"
+        )
+    lines.append("")
+    note_71 = execution.get("note_71")
+    note_72 = execution.get("note_72")
+    if note_71:
+        lines.append(f"- #71 {note_71}")
+    if note_72:
+        lines.append(f"- #72 {note_72}")
+    if note_71 or note_72:
+        lines.append("")
+    lines.append(f"**结论（执行）：** {conclusions.get('execution', '—')}")
+    lines.append("")
+    for ticket_layer in (decision, execution):
+        ticket = ticket_layer.get("review_ticket")
+        if ticket:
+            lines.append(f"**复核单（{ticket_layer.get('id', '')}）：** {ticket}")
+            lines.append("")
+
+    lines.append("### 脚注")
+    lines.append("")
+    for note in result.get("footnotes") or []:
+        lines.append(f"- {note}")
+    lines.append("")
+
+    lines.append("<details>")
+    lines.append("<summary>experimental / 降级轴明细（默认折叠，sparse 不解读）</summary>")
+    lines.append("")
+    experimental = decision.get("experimental") or {}
+    fine = experimental.get("token_age_fine") or {}
+    lines.append("#### 决策 token_age 细桶（只记覆盖，不出黄）")
+    lines.append("")
+    lines.append(str(fine.get("note") or "细桶样本不足时只记覆盖。"))
+    lines.append("")
+    lines.append("| bucket | n |")
+    lines.append("|---|---:|")
+    for bucket in fine.get("buckets") or []:
+        lines.append(f"| {bucket.get('bucket', '')} | {bucket.get('n', 0)} |")
+    lines.append("")
+    lines.append("执行层首期单维 6 轴；轴间交叉折叠，防假阳性。")
+    lines.append("")
+    for axis in axes:
+        lines.append(f"#### `{axis.get('id', '')}`")
+        lines.append("")
+        lines.append(
+            "| bucket | n | realized_pnl_usd | win_rate | mean_peak_pnl_pct | "
+            "mean_giveback_from_peak | stop_loss_share | stop_loss_share_of_neg | 读法 |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---|")
+        for bucket in axis.get("buckets") or []:
+            bucket_metrics = bucket.get("metrics") or {}
+            if bucket.get("empty_by_design"):
+                reading = "empty_by_design"
+            elif bucket.get("empty") or bucket_metrics.get("n", 0) == 0:
+                reading = "空"
+            elif bucket.get("sparse") or not bucket.get("interpret", True):
+                reading = "sparse 不解读"
+            else:
+                reading = "记录"
+            lines.append(
+                f"| {bucket.get('bucket', '')} | {bucket_metrics.get('n', 0)} | "
+                f"{_num(bucket_metrics.get('realized_pnl_usd'))} | "
+                f"{_pct(bucket_metrics.get('win_rate'))} | "
+                f"{_num(bucket_metrics.get('mean_peak_pnl_pct'))} | "
+                f"{_num(bucket_metrics.get('mean_giveback_from_peak'))} | "
+                f"{_pct(bucket_metrics.get('stop_loss_share'))} | "
+                f"{_pct(bucket_metrics.get('stop_loss_share_of_neg'))} | {reading} |"
+            )
+        lines.append("")
+    lines.append("</details>")
+    lines.append("")
+    return lines
+
+
 def render_weekly_md(
     *,
     period_start: str,
@@ -417,8 +585,9 @@ def render_weekly_md(
     evolution_suggestions: Optional[list[dict[str, Any]]] = None,
     factor_layers: Optional[dict[str, Any]] = None,
     weekly_evidence: Optional[dict[str, Any]] = None,
+    structure_check: Optional[dict[str, Any]] = None,
 ) -> str:
-    """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议 + 可选§11 因子分层 + §12 因子进化指针）。"""
+    """返回 markdown 字符串（§1–8 + 可选§9 R3 + §10 进化建议 + 可选§11 因子分层 + §12 因子进化指针 + 可选§13 结构检查）。"""
     n = len(chain)
     n_exec = sum(1 for r in chain if r.exec_id is not None)
     n_pos = sum(1 for r in chain if r.position_id is not None)
@@ -635,6 +804,9 @@ def render_weekly_md(
         "过门槛只记 status=accepted（待人工激活），不自动启用策略、不自动调参。"
     )
     lines.append("")
+
+    # 13. 结构检查（默认关；不改 §1–§12）
+    lines.extend(_render_structure_section(structure_check))
 
     lines.append("---")
     lines.append("")
