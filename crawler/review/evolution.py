@@ -1082,27 +1082,22 @@ def build_evolution_suggestions(
         if n_unk == n_tot:
             age_ev = (
                 f"归因 token_age 桶 unknown={n_unk}/{n_tot}"
-                f"（创建时间仍缺，全样本 unknown；pairs.pair_created_at 回填后应下降）"
-            )
-            age_hint = (
-                "确认 pairs.pair_created_at 回填与信号 chain_id+pair_address 对齐；"
-                "复盘侧仅观察 unknown 占比下降，不改桶边界"
+                f"（raw 与 pairs 均无创建时间；不编造）"
             )
         else:
             age_ev = (
-                f"归因 token_age 已接 pairs.pair_created_at；"
-                f"unknown={n_unk}/{n_tot}（{unk_pct:.1f}%），"
-                f"相对此前全 unknown 已下降；仍观察中"
+                f"归因 token_age raw 优先、pairs 回退；"
+                f"unknown={n_unk}/{n_tot}（{unk_pct:.1f}%），仍观察中"
             )
-            age_hint = (
-                "继续观察 unknown 占比与分桶稳定性；"
-                "不改桶边界，落地须走 R4"
-            )
-    else:
-        age_ev = "归因未提供 token_age 分桶，等采集/信号层交来创建时间覆盖率"
         age_hint = (
-            "确认 pairs.pair_created_at 回填与 annotate_token_age 接线；"
-            "复盘侧仅观察 unknown 占比下降，不改桶边界"
+            "补齐后观察 unknown 占比下降；"
+            "不改桶边界、不调参"
+        )
+    else:
+        age_ev = "归因未提供 token_age 分桶"
+        age_hint = (
+            "补齐后观察 unknown 占比下降；"
+            "不改桶边界、不调参"
         )
     suggestions.append(
         _suggestion(
