@@ -456,12 +456,98 @@ class IntelCrowdingNote:
     line: str
 
 
+@dataclass(frozen=True)
+class TokenAgeBucket:
+    """One token_age bucket. Counts are observe-only, not a validity score."""
+
+    label: str
+    count: int
+
+
+@dataclass(frozen=True)
+class TokenAgeSample:
+    """A recent decision that carried a usable extras.pairCreatedAt."""
+
+    decision_id: int
+    age_days: float
+
+
+@dataclass(frozen=True)
+class TokenAgeReport:
+    """Near-term decision_log token age. Not wired into gates or weights."""
+
+    total: int
+    with_field: int
+    unknown: int
+    unknown_ratio: float | None
+    buckets: tuple[TokenAgeBucket, ...]
+    samples: tuple[TokenAgeSample, ...]
+    limit: int
+
+
 _INTEL_HOLDER_SAMPLE = 8
 _INTEL_HOLDER_SHOW = 5
 _INTEL_CROWD_STRATEGY = "jev_strength_v1"
+_TOKEN_AGE_LIMIT = 300
+_TOKEN_AGE_SAMPLES = 5
+_TOKEN_AGE_LABELS = ("<1d", "1-7d", ">7d", "unknown")
+_MS_PER_DAY = 86_400_000.0
 _HOLDER_METRICS: Any = None
 _CROWDING_MOD: Any = None
 
+
+
+def _coerce_created_ms(value: Any) -> int | None:
+    """Normalize a creation stamp to ms. Missing or unusable values stay None."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if number != number or number == float("inf") or number == float("-inf"):
+        return None
+    if number > 1e12:
+        return int(number)
+    if number > 1e9:
+        return int(number * 1000.0)
+    return None
+
+
+def _extras_pair_created_ms(raw: dict[str, Any]) -> int | None:
+    """Read only raw_json.extras.pairCreatedAt. Other keys are not a fallback."""
+    extras = raw.get("extras")
+    if not isinstance(extras, dict) or "pairCreatedAt" not in extras:
+        return None
+    return _coerce_created_ms(extras.get("pairCreatedAt"))
+
+
+def _token_age_days(signal_ts: Any, created_ms: int) -> float | None:
+    """Days from pair creation to the decision timestamp. Negative age is unknown."""
+    try:
+        stamp = parse_ts(signal_ts)
+    except (TypeError, ValueError):
+        return None
+    age_ms = stamp.timestamp() * 1000.0 - float(created_ms)
+    if age_ms < 0:
+        return None
+    return age_ms / _MS_PER_DAY
+
+
+def _token_age_label(age_days: float | None) -> str:
+    """Coarse buckets: <1d / 1-7d / >7d. Exactly 1d and 7d stay in 1-7d."""
+    if age_days is None:
+        return "unknown"
+    if age_days < 1:
+        return "<1d"
+    if age_days <= 7:
+        return "1-7d"
+    return ">7d"
 
 
 def _hkt_day(ts: str | None) -> str:
@@ -973,6 +1059,20 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed intel_crowding_note: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "intel_crowding_note")
+
+    def token_age_observe(self, limit: int = _TOKEN_AGE_LIMIT) -> DataResult:
+        """Observe-only token age from decision_log.raw_json extras.pairCreatedAt.
+
+        Reads the newest rows on the main DB. A missing field or unusable stamp
+        is the unknown bucket. Missing table or column stays unavailable.
+        Not a validity score and not wired into gates, weights, or live params.
+        """
+        started = time.perf_counter()
+        try:
+            return _finish(self._token_age_observe(started, limit), "token_age_observe")
+        except Exception as exc:
+            log.warning("read failed token_age_observe: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "token_age_observe")
 
     def risk_daily_loss_today(self) -> DataResult:
 
@@ -1897,6 +1997,60 @@ class DataStore:
             line=_crowding_line(_INTEL_CROWD_STRATEGY, live_n, sample_n, peak),
         )
         return _ok(note, started)
+
+    def _token_age_observe(self, started: float, limit: int) -> DataResult:
+        path = self.paths.main
+        window = _clamp(limit, 1, 2000)
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "decision_log", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "decision_log")
+                absent = _require(cols, ("id", "ts", "raw_json"))
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                rows = _exec(
+                    conn,
+                    "SELECT id, ts, raw_json FROM decision_log ORDER BY id DESC LIMIT ?",
+                    (window,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        counts = {label: 0 for label in _TOKEN_AGE_LABELS}
+        with_field = 0
+        samples: list[TokenAgeSample] = []
+        for row in rows:
+            raw_text = _cell(row, "raw_json")
+            raw = parse_json(None if raw_text is None else str(raw_text))
+            created = _extras_pair_created_ms(raw)
+            age_days = _token_age_days(_cell(row, "ts"), created) if created is not None else None
+            if created is not None:
+                with_field += 1
+            label = _token_age_label(age_days)
+            counts[label] += 1
+            if age_days is not None and len(samples) < _TOKEN_AGE_SAMPLES:
+                decision_id = _as_int(_cell(row, "id"))
+                if decision_id is not None:
+                    samples.append(TokenAgeSample(decision_id, age_days))
+        total = len(rows)
+        unknown = counts["unknown"]
+        ratio = (unknown / total) if total else None
+        buckets = tuple(TokenAgeBucket(label, counts[label]) for label in _TOKEN_AGE_LABELS)
+        return _ok(
+            TokenAgeReport(
+                total=total,
+                with_field=with_field,
+                unknown=unknown,
+                unknown_ratio=round(ratio, 4) if ratio is not None else None,
+                buckets=buckets,
+                samples=tuple(samples),
+                limit=window,
+            ),
+            started,
+        )
 
     def _risk_daily_loss_today(self, started: float) -> DataResult:
         path = self.paths.execution
