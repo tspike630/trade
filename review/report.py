@@ -249,7 +249,7 @@ def _render_attribution_section(
             ("strength", "strength（jev_strength）"),
             ("coverage", "coverage（jev_coverage，0–100）"),
             ("liq", "liq（liquidity_at_signal，USD）"),
-            ("token_age", "token_age（raw_json 创建时间）"),
+            ("token_age", "token_age（raw 优先，pairs 回退）"),
             ("market_regime", "market_regime（同期 hot 基准）"),
         ]
         for key, title in dim_titles:

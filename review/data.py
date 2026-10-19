@@ -62,6 +62,8 @@ class SignalChainRow:
     # 信号特征补充（周检过滤口径用；缺则 None）
     liquidity_at_signal: Optional[float] = None
     jev_coverage: Optional[float] = None
+    # pairs.pair_created_at（ms）。归因优先 raw_json，缺失才用此回退；不编造。
+    pair_created_at_ms: Optional[int] = None
     # 内部：同一 decision 多条 execution 时标记
     exec_dup: bool = False
 
@@ -372,7 +374,106 @@ def load_signal_chain(
                 exec_dup=int(d["id"]) in exec_dup_ids,
             )
         )
-    return rows
+    return annotate_pair_created_at(rows, paths)
+
+
+def _stamp_to_ms(value: Any) -> Optional[int]:
+    """Parse pairs.pair_created_at into epoch ms. Invalid/missing → None.
+
+    Does not invent a timestamp. Values ≤ 1e9 are rejected. Seconds-sized
+    stamps (>1e9 and ≤1e12) are scaled to ms; larger values are already ms.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(n) or math.isinf(n) or n <= 0:
+        return None
+    if n > 1e12:
+        return int(n)
+    if n > 1e9:
+        return int(n * 1000.0)
+    return None
+
+
+def annotate_pair_created_at(
+    rows: list[SignalChainRow],
+    paths: DbPaths,
+) -> list[SignalChainRow]:
+    """Read-only join: pairs (chain_id, pair_address) → pair_created_at.
+
+    Attaches ``pair_created_at_ms`` after the chain is built. NULL stamps,
+    missing pair_address, or a missing column stay None. Does not read
+    ``pairs.raw_json`` and does not write.
+    """
+    if not rows:
+        return rows
+
+    keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for r in rows:
+        chain = (r.chain_id or "").strip()
+        pair = (r.pair_address or "").strip()
+        if not chain or not pair:
+            continue
+        key = (chain, pair)
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    if not keys:
+        return rows
+
+    created_by_pair: dict[tuple[str, str], int] = {}
+    try:
+        conn = connect_ro(paths.main)
+    except FileNotFoundError:
+        return rows
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        cols = set(_table_columns(conn, "pairs"))
+        if not {"chain_id", "pair_address", "pair_created_at"} <= cols:
+            return rows
+        chunk = 400
+        for i in range(0, len(keys), chunk):
+            part = keys[i : i + chunk]
+            clauses = " OR ".join(
+                "(chain_id = ? AND pair_address = ?)" for _ in part
+            )
+            params: list[Any] = []
+            for chain, pair in part:
+                params.extend([chain, pair])
+            fetched = conn.execute(
+                f"""
+                SELECT chain_id, pair_address, pair_created_at
+                FROM pairs
+                WHERE pair_created_at IS NOT NULL
+                  AND ({clauses})
+                """,
+                params,
+            ).fetchall()
+            for row in fetched:
+                key = (str(row["chain_id"]), str(row["pair_address"]))
+                if key in created_by_pair:
+                    continue
+                ms = _stamp_to_ms(row["pair_created_at"])
+                if ms is None:
+                    continue
+                created_by_pair[key] = ms
+    except sqlite3.Error:
+        return rows
+    finally:
+        conn.close()
+
+    out: list[SignalChainRow] = []
+    for r in rows:
+        chain = (r.chain_id or "").strip()
+        pair = (r.pair_address or "").strip()
+        ms = created_by_pair.get((chain, pair)) if chain and pair else None
+        out.append(replace(r, pair_created_at_ms=ms))
+    return out
 
 
 def _nearest_snap(

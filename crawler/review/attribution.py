@@ -152,23 +152,68 @@ def _extract_created_ms(raw: dict[str, Any]) -> Optional[float]:
     return None
 
 
-def _token_age_bucket_computed(r: SignalChainRow) -> str:
-    """Coarse bucket from token_age_hours (pairs.pair_created_at) or raw_json fallback."""
-    age_hours = r.token_age_hours
-    if age_hours is None:
-        # fallback: creation ms from signal raw_json (legacy)
-        created_ms = _extract_created_ms(r.raw or {})
-        if created_ms is None:
-            return "unknown"
+def _stamp_ms(value: Any) -> Optional[float]:
+    """Numeric creation stamp → ms. Unusable values stay None (never invent)."""
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if n > 1e12:
+        return n
+    if n > 1e9:
+        return n * 1000.0
+    return None
+
+
+def resolve_created_ms(r: SignalChainRow) -> Optional[float]:
+    """Creation time in ms. raw_json first, else the pairs stamp on the row.
+
+    raw includes extras.pairCreatedAt (#95). A present raw stamp is not
+    replaced when the resulting age is negative; callers treat that as unknown.
+    """
+    created = _extract_created_ms(r.raw or {})
+    if created is not None:
+        return created
+    for attr in ("pair_created_at_ms", "pair_created_at"):
+        stamped = _stamp_ms(getattr(r, attr, None))
+        if stamped is not None:
+            return stamped
+    return None
+
+
+def resolve_token_age_hours(r: SignalChainRow) -> Optional[float]:
+    """Hours since creation. Same order as the coarse token_age buckets.
+
+    raw_json first; else pairs stamp; else a precomputed ``token_age_hours``
+    that itself came from pairs. Missing or negative → None (unknown).
+    """
+    created_ms = resolve_created_ms(r)
+    if created_ms is not None:
         try:
             signal_dt = parse_ts(r.ts)
         except (TypeError, ValueError):
-            return "unknown"
-        age_hours = (
-            signal_dt.timestamp() * 1000.0 - float(created_ms)
-        ) / 3600000.0
+            return None
+        age = (signal_dt.timestamp() * 1000.0 - float(created_ms)) / 3600000.0
+        if age < 0:
+            return None
+        return age
+    age = getattr(r, "token_age_hours", None)
+    if age is None:
+        return None
+    try:
+        age_f = float(age)
+    except (TypeError, ValueError):
+        return None
+    if age_f < 0:
+        return None
+    return age_f
+
+
+def _coarse_age_bucket(age_hours: float) -> str:
+    """<1d / 1–7d / >7d. Edges are unchanged."""
     if age_hours < 0:
-        # clock skew / future createdAt → treat as unknown rather than negative age
         return "unknown"
     age_days = age_hours / 24.0
     if age_days < 1:
@@ -176,6 +221,14 @@ def _token_age_bucket_computed(r: SignalChainRow) -> str:
     if age_days <= 7:
         return "1-7d"
     return ">7d"
+
+
+def _token_age_bucket_computed(r: SignalChainRow) -> str:
+    """Coarse bucket: raw_json first, else pairs.pair_created_at. Edges unchanged."""
+    age_hours = resolve_token_age_hours(r)
+    if age_hours is None:
+        return "unknown"
+    return _coarse_age_bucket(age_hours)
 
 
 def _token_age_bucket(
@@ -298,16 +351,17 @@ def signal_attribution(
         age_note = (
             f"分桶源={bucket_source}（prior.db.decision_prior_tags.age_bucket 细→粗；"
             f"本期 {n_tagged}/{n_period}）；"
-            "与现算 token_age 交叉校验；"
+            "与现算 token_age 交叉校验（raw 优先，pairs 回退）；"
             "pairs.pair_created_at via chain_id+pair_address (fallback token_address)"
         )
         if age_mismatch:
             age_note += f"；不一致 {len(age_mismatch)} 条"
     else:
         age_note = (
-            "分桶源=computed；pairs.pair_created_at via chain_id+pair_address "
-            "(fallback token_address); age_hours=(signal_ts_ms-pair_created_at)/3600000; "
-            "missing → unknown"
+            "raw 优先，pairs 回退；"
+            "分桶源=computed；raw_json（含 extras.pairCreatedAt）优先，"
+            "缺失则 pairs.pair_created_at via chain_id+pair_address "
+            "(fallback token_address)；仍无则 unknown"
         )
 
     return {

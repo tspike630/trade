@@ -198,19 +198,19 @@ def build_evolution_suggestions(
     if n_tot > 0:
         age_ev = (
             f"归因 token_age 桶 unknown={n_unk}/{n_tot}"
-            + ("（创建时间字段缺口，全样本 unknown）" if n_unk == n_tot else "")
+            "（raw 优先，pairs.pair_created_at 回退）"
         )
     else:
-        age_ev = "归因未提供 token_age 分桶，等采集/信号层交来创建时间字段覆盖率"
+        age_ev = "归因未提供 token_age 分桶"
     suggestions.append(
         _suggestion(
             layer="采集",
-            item="token_age 字段缺口",
+            item="token_age 覆盖率观察",
             status=STATUS_WATCH,
             evidence=age_ev,
             action_hint=(
-                "在 crawl/raw_json 补齐 pairCreatedAt（或等价创建时间）；"
-                "复盘侧仅观察 unknown 占比下降，不改桶边界"
+                "补齐后观察 unknown 占比下降；"
+                "不改桶边界、不调参"
             ),
         )
     )

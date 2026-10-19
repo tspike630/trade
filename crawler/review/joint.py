@@ -12,8 +12,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from review.attribution import _extract_created_ms
-from review.data import SignalChainRow, get_prior_tag_buckets, parse_ts
+from review.attribution import resolve_token_age_hours
+from review.data import SignalChainRow, get_prior_tag_buckets
 
 # Fine token_age edges (hours-based; replaces coarse <1d with <1h / 1-24h)
 TOKEN_AGE_FINE_EDGES = "<1h / 1-24h / 1-7d / >7d / unknown"
@@ -150,17 +150,8 @@ def _rate(num: int, den: int) -> Optional[float]:
 
 
 def token_age_hours(r: SignalChainRow) -> Optional[float]:
-    """Resolve age in hours from annotate_token_age or raw_json fallback."""
-    if r.token_age_hours is not None:
-        return float(r.token_age_hours)
-    created_ms = _extract_created_ms(r.raw or {})
-    if created_ms is None:
-        return None
-    try:
-        signal_dt = parse_ts(r.ts)
-    except (TypeError, ValueError):
-        return None
-    return (signal_dt.timestamp() * 1000.0 - float(created_ms)) / 3600000.0
+    """Age in hours. raw_json first, else pairs — same order as §8 coarse buckets."""
+    return resolve_token_age_hours(r)
 
 
 def token_age_fine_bucket(r: SignalChainRow) -> str:
@@ -436,7 +427,8 @@ def joint_jev_age_prior(
     else:
         note = (
             "分桶源=computed（prior.db.decision_prior_tags 不可用/空）；"
-            "细桶用 token_age_hours：<1h / 1-24h / 1-7d / >7d / unknown；"
+            "细桶用 token_age_hours（raw 优先，pairs 回退）："
+            "<1h / 1-24h / 1-7d / >7d / unknown；"
             "JEV 切片与周检同口径（strength/liq/coverage/price）；"
             "先验旁挂 self_db 观测跨度存活（非链上寿命）"
         )
