@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "20261012",
+    "date": "20261019",
     "sources": [
       "redpump",
       "solrpds",
@@ -73,38 +73,36 @@
     "monitor_span_min_p50": 1.6
   },
   "self_db": {
-    "n": 9317,
-    "n_history_rows": 250013,
+    "n": 65094,
+    "n_history_rows": 3448895,
     "db": "dexscreener.db",
     "table": "pair_history",
     "survive_basis": "last_seen - first_seen > t  (MIN/MAX recorded_at per chain_id+token_address)",
     "survive": {
-      "1h": 0.9271,
-      "4h": 0.7529,
-      "24h": 0.0,
-      "168h": 0.0
+      "1h": 0.9941,
+      "4h": 0.9816,
+      "24h": 0.5773,
+      "168h": 0.0857
     },
     "survive_n": {
-      "1h": 8638,
-      "4h": 7015,
-      "24h": 0,
-      "168h": 0
+      "1h": 64713,
+      "4h": 63894,
+      "24h": 37579,
+      "168h": 5577
     },
     "span_min": {
-      "p25": 247.3,
-      "p50": 758.5,
-      "p75": 1030.5,
-      "max": 1283.5
+      "p25": 1346.2,
+      "p50": 1478.5,
+      "p75": 4704.6,
+      "max": 13299.6
     },
-    "crawler_window_h": 27.75,
+    "crawler_window_h": 228.07,
     "recorded_at_range": [
       "2026-10-09T12:00:00Z",
-      "2026-10-10T15:45:08Z"
+      "2026-10-19T00:04:22Z"
     ],
-    "sparse": true,
-    "warnings": [
-      "crawler 总观测窗口仅约 27.8h（2026-10-09T12:00:00Z → 2026-10-10T15:45:08Z）；7d 存活必然受覆盖上限约束，≠ 链上真实 7d 死亡率"
-    ],
+    "sparse": false,
+    "warnings": [],
     "note": "观测跨度≠链上寿命；短 crawler 窗口会压低 7d；anti-假象已扫描"
   },
   "price_behavior": {

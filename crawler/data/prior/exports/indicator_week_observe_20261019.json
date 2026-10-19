@@ -1,0 +1,105 @@
+{
+  "asof": "2026-10-19T08:56:00+08:00",
+  "window": {
+    "start": "2026-10-12T09:05:00+08:00",
+    "end": "2026-10-19T09:05:00+08:00",
+    "label": "2026-10-12～19 HKT（≈7d）",
+    "fwd_horizon": "≈1h"
+  },
+  "sample_meta": {
+    "layer_snapshots": 19338,
+    "valid_fwd_pairs": 13328,
+    "tokens": 3066,
+    "overall_up_rate": 0.431,
+    "weights_all_zero": true,
+    "note": "分层快照 19338 → 有效配对 13328 / token 3066；全体上涨率 43.1%；INDICATORS_WEIGHT_* 全 0；高档 mean 常被左尾拖累，禁止本周接闸"
+  },
+  "rows": [
+    {
+      "item": "change_4h",
+      "status": "建议落地",
+      "category": "可上调观察",
+      "evidence": "lift_up≈1.36；§10 指标→fwd≈1h 分层",
+      "tendency": "可上调观察，仍须 R4；本周维持权重 0，禁止接闸"
+    },
+    {
+      "item": "change_24h",
+      "status": "建议落地",
+      "category": "可上调观察",
+      "evidence": "lift_up≈1.37；§10 指标→fwd≈1h 分层",
+      "tendency": "可上调观察，仍须 R4；本周维持权重 0，禁止接闸"
+    },
+    {
+      "item": "change_1h",
+      "status": "建议落地",
+      "category": "可上调观察",
+      "evidence": "lift_up≈1.19；§10 指标→fwd≈1h 分层",
+      "tendency": "可上调观察，仍须 R4；本周维持权重 0，禁止接闸"
+    },
+    {
+      "item": "jev_strength",
+      "status": "建议落地",
+      "category": "可上调观察",
+      "evidence": "lift_up≈1.15；§10 指标→fwd≈1h 分层",
+      "tendency": "可上调观察，仍须 R4；本周维持权重 0，禁止接闸；不盘中追认"
+    },
+    {
+      "item": "rsi_14",
+      "status": "建议落地",
+      "category": "旁路可上调观察",
+      "evidence": "lift_up≈1.45；旁路候选",
+      "tendency": "登记旁路观察，不进权重；仍须 R4；维持 0"
+    },
+    {
+      "item": "change_5m/15m",
+      "status": "建议落地",
+      "category": "降权/维持0",
+      "evidence": "分层混乱；短窗勿线性上调",
+      "tendency": "降权/勿线性加权，维持 0"
+    },
+    {
+      "item": "volume_strength",
+      "status": "建议落地",
+      "category": "降权/维持0",
+      "evidence": "高档警示；非线性",
+      "tendency": "可降权/勿线性加权，维持 0"
+    },
+    {
+      "item": "volatility_24h",
+      "status": "建议落地",
+      "category": "降权/维持0",
+      "evidence": "高波差；高档更差倾向",
+      "tendency": "风险分层旁路候选，不调权；维持 0"
+    },
+    {
+      "item": "macd_hist",
+      "status": "建议落地",
+      "category": "降权/维持0",
+      "evidence": "分层混乱；线性高值不可信",
+      "tendency": "可降权线性信任，维持 0"
+    },
+    {
+      "item": "sentiment_heat_score",
+      "status": "观察中",
+      "category": "观察中",
+      "evidence": "离散/弱 lift",
+      "tendency": "继续攒样本；不调权"
+    },
+    {
+      "item": "spike",
+      "status": "观察中",
+      "category": "观察中",
+      "evidence": "突热只观察",
+      "tendency": "继续观察；不调权、不告警、不进决策"
+    },
+    {
+      "item": "spike_ratio",
+      "status": "观察中",
+      "category": "观察中",
+      "evidence": "突热只观察",
+      "tendency": "继续观察；不调权"
+    }
+  ],
+  "verdict": "本周不对任何 INDICATORS_WEIGHT_* 改值；权重保持全 0，待 R4；高档 mean 常被左尾拖累，禁止本周接闸。「建议落地」≠允许自动开权。",
+  "self_survival_footnote": "self_survival 9.50d n=65094 存活 1h/4h/24h/7d=99.4%/98.2%/57.7%/8.6%；baseline=UNSTABLE_OR_SHORT；与 JEV up_1h 口径不同只脚注"
+}

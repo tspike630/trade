@@ -1,0 +1,171 @@
+{
+  "meta": {
+    "date": "20261019",
+    "sources": [
+      "redpump",
+      "solrpds",
+      "coingecko",
+      "gmgn",
+      "self_db",
+      "price_behavior",
+      "cex_listing_join"
+    ],
+    "note": "RED-PUMP last_ts is 24h judgment window end, NOT death time; fine-grained survival/lifespan from timeouts are invalid. RED-PUMP 结局标签为 24h 判定窗口，不提供细粒度存活曲线；基线存活率引用 CoinGecko 统计; gmgn 完整数据集 n=956: death_reason=监控终止≠归零; early-window coverage limits 1h/4h/24h survival",
+    "invalidity_note_zh": "RED-PUMP 结局标签为 24h 判定窗口，不提供细粒度存活曲线；基线存活率引用 CoinGecko 统计",
+    "gmgn_n": 956,
+    "gmgn_pack": "完整数据集",
+    "gmgn_acceptance_unique": 956
+  },
+  "redpump": {
+    "graduation_rate": 0.001983,
+    "graduated_n": 1652,
+    "total_n": 832956,
+    "paper_primary_graduation_rate": 0.00213,
+    "usable": [
+      "graduation_rate"
+    ],
+    "deprecated": {
+      "survive_1h": null,
+      "survive_4h": null,
+      "survive_24h": null,
+      "survive_168h": null,
+      "median_life_min": null,
+      "reason_zh": "RED-PUMP 结局标签为 24h 判定窗口，不提供细粒度存活曲线；基线存活率引用 CoinGecko 统计"
+    }
+  },
+  "coingecko": {
+    "same_day_death_rate": 0.6867,
+    "n_tokens_millions": 18.67,
+    "source": "CoinGecko Research, “The Average Lifespan of Pump.fun Memecoins Is Less Than a Day”, updated 2026-06-23; also reported crypto.news 2026-06-25. URL: https://www.coingecko.com/research/publications/average-lifespan-of-pumpfun-tokens",
+    "source_short": "crypto.news 2026-06-25 / CoinGecko Research 2026-06-23",
+    "role": "market survival baseline (same-day death proxy)"
+  },
+  "solrpds": {
+    "pool_rows": 116304,
+    "unique_tokens": 33358,
+    "remove_gt_add_n": 69931,
+    "remove_gt_add_rate": 0.6013,
+    "inactive_n": 22555,
+    "inactive_rate": 0.1939
+  },
+  "weekly_baseline_trio": {
+    "graduation_rate": 0.001983,
+    "same_day_death_rate": 0.6867,
+    "solrpds_remove_gt_add_rate": 0.6013
+  },
+  "gmgn": {
+    "n": 956,
+    "complete_pack": true,
+    "sample": false,
+    "note": "完整数据集 n=956（Kaggle v3 combined_tokens.csv；无更大 pack）；death_reason=监控终止≠归零；early-window ~1.6m median → 1h/4h/24h survival≈0% is coverage limit",
+    "acceptance_unique_tokens": 956,
+    "survive": {
+      "1h": 0.0,
+      "4h": 0.0,
+      "24h": 0.0,
+      "168h": 0.0
+    },
+    "survive_basis": "ohlcv_last_ts > discovery_ts + t",
+    "median_peak_min": 1.0,
+    "peak_min_p25": 0.4,
+    "peak_min_p75": 1.4,
+    "median_peak_return_x": 1.35,
+    "monitor_span_min_p50": 1.6
+  },
+  "self_db": {
+    "n": 65094,
+    "n_history_rows": 3448895,
+    "db": "dexscreener.db",
+    "table": "pair_history",
+    "survive_basis": "last_seen - first_seen > t  (MIN/MAX recorded_at per chain_id+token_address)",
+    "survive": {
+      "1h": 0.9941,
+      "4h": 0.9816,
+      "24h": 0.5773,
+      "168h": 0.0857
+    },
+    "survive_n": {
+      "1h": 64713,
+      "4h": 63894,
+      "24h": 37579,
+      "168h": 5577
+    },
+    "span_min": {
+      "p25": 1346.2,
+      "p50": 1478.5,
+      "p75": 4704.6,
+      "max": 13299.6
+    },
+    "crawler_window_h": 228.07,
+    "recorded_at_range": [
+      "2026-10-09T12:00:00Z",
+      "2026-10-19T00:04:22Z"
+    ],
+    "sparse": false,
+    "warnings": [],
+    "note": "观测跨度≠链上寿命；短 crawler 窗口会压低 7d；anti-假象已扫描"
+  },
+  "price_behavior": {
+    "date": "20261011",
+    "short": true,
+    "crawler_window_h": 44.19,
+    "n_tokens": 15575,
+    "returns": {
+      "15m": {
+        "n": 15493,
+        "median": 0.0,
+        "p10": -0.815941,
+        "p90": 0.096246
+      },
+      "1h": {
+        "n": 14985,
+        "median": -0.000167,
+        "p10": -0.892121,
+        "p90": 0.060768
+      },
+      "4h": {
+        "n": 13912,
+        "median": -0.003388,
+        "p10": -0.92439,
+        "p90": 0.056692
+      }
+    },
+    "pump_4h": {
+      "n": 3249,
+      "multiple_p50": 1.442444,
+      "duration_min_p50": 26.633333
+    },
+    "mdd_4h": {
+      "n": 13912,
+      "p50": 0.012042,
+      "p90": 0.920061
+    },
+    "jev_n_with_series": 40,
+    "export_json": "data/prior/exports/price_behavior.json",
+    "export_md": "data/prior/exports/price_behavior_20261011.md",
+    "note": "crawler-observation; see price_behavior.json for full口径"
+  },
+  "cex_listing_join": {
+    "date": "20261012",
+    "n_listings": 100,
+    "n_eligible": 95,
+    "match_rate_pair_eligible": 0.9053,
+    "match_rate_prior_eligible": 0.1684,
+    "match_rate_either_eligible": 0.9053,
+    "n_matched_pair": 86,
+    "n_matched_prior_ohlcv": 16,
+    "latency_pair_h_median": 784.8706,
+    "latency_prior_h_median": 7055.9398,
+    "cex_ret_1h_n": 35,
+    "cex_ret_1h_median": 0.019014,
+    "pair_ret_1h_n": 34,
+    "pair_ret_1h_median": 0.0,
+    "export_json": "data/prior/exports/cex_prior_join_20261012.json",
+    "export_md": "data/prior/exports/cex_prior_join_20261012.md",
+    "observe_only": true,
+    "default_off": true,
+    "no_weight_change": true,
+    "weekly_hook": "deferred_to_review",
+    "note": "ccxt_listings.first_seen≠official listing; small-n; symbol collision"
+  }
+}
