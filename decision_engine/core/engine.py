@@ -73,6 +73,7 @@ class DecisionEngine:
         # Shared buy choke point: every strategy's candidates pass through
         # RiskManager before SignalBus.emit. Liquidity comes from the scanned
         # rows (adapter batch lookup), so tech/combined/jev do not each filter.
+        # Also stamp pairCreatedAt (ms) for decision_log extras / token_age.
         self._stamp_buy_liquidity(candidates, hot)
         passed = self.risk.filter(candidates)
         emitted = self.bus.publish_many(passed)
@@ -95,23 +96,43 @@ class DecisionEngine:
         candidates: list[dict[str, Any]],
         hot: list[dict[str, Any]],
     ) -> None:
-        """Copy scanned-row liquidity onto buys. Missing row → leave unset (fail closed)."""
-        by_token: dict[tuple[str, str], Any] = {}
+        """Copy scanned-row liquidity onto buys; stamp pairCreatedAt on all actions.
+
+        Liquidity: Missing row → leave unset (fail closed for the buy floor).
+        pairCreatedAt: ms epoch from pairs.pair_created_at when the hot row has
+        it. Does not invent values; SignalBus may still look up pairs at write
+        time if this stamp is absent. No gate / weight change.
+        """
+        by_token: dict[tuple[str, str], dict[str, Any]] = {}
         for row in hot:
             key = (
                 str(row.get("chain_id") or ""),
                 str(row.get("token_address") or ""),
             )
-            by_token[key] = row.get("liquidity_usd")
+            meta: dict[str, Any] = {"liquidity_usd": row.get("liquidity_usd")}
+            if row.get("pair_created_at") is not None:
+                meta["pair_created_at"] = row.get("pair_created_at")
+            by_token[key] = meta
         for sig in candidates:
-            if str(sig.get("action") or "").lower() != "buy":
-                continue
             key = (
                 str(sig.get("chain_id") or ""),
                 str(sig.get("token_address") or ""),
             )
-            if key in by_token:
-                sig["liquidity_usd"] = by_token[key]
+            meta = by_token.get(key)
+            if meta is None:
+                continue
+            if str(sig.get("action") or "").lower() == "buy":
+                sig["liquidity_usd"] = meta.get("liquidity_usd")
+            # Attribution reads extras.pairCreatedAt (ms). Prefer camelCase once.
+            if (
+                sig.get("pairCreatedAt") is None
+                and sig.get("pair_created_at") is None
+                and meta.get("pair_created_at") is not None
+            ):
+                try:
+                    sig["pairCreatedAt"] = int(meta["pair_created_at"])
+                except (TypeError, ValueError):
+                    pass
 
     def run(
         self,

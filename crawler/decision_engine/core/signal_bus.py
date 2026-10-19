@@ -15,6 +15,12 @@ Storage contract (what execution reads):
 - Top-level ``purpose`` inside ``raw_json``. The gateway SELECT already loads
   ``raw_json``, so ``json.loads(raw_json)["purpose"]`` is visible before the
   gateway adds the column to its SELECT.
+
+``extras.pairCreatedAt`` (optional, ms epoch int): copied from the signal when
+present, else looked up from ``pairs.pair_created_at`` at write time. Same unit
+as the DexScreener / pairs column. Review ``token_age`` reads this from
+``decision_log.raw_json``; historical rows without it stay unknown (join pairs
+as a fallback outside this writer). No gate / weight / run-param change.
 """
 
 from __future__ import annotations
@@ -103,6 +109,32 @@ def resolve_run_purpose(
     if min_jev_strength is not None and float(min_jev_strength) < float(live_min_strength):
         return PURPOSE_SAMPLE
     return PURPOSE_LIVE_CANDIDATE
+
+
+def coerce_pair_created_at_ms(value: Any) -> int | None:
+    """Normalize pair creation time to ms epoch int, matching pairs.pair_created_at.
+
+    Accepts int/float ms (or seconds heuristically), or numeric strings.
+    Returns None for missing / invalid — never invents a timestamp.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        n = float(value)
+    elif isinstance(value, str):
+        try:
+            n = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if n > 1e12:  # already ms
+        return int(n)
+    if n > 1e9:  # seconds → ms
+        return int(n * 1000.0)
+    return None
 
 
 def normalize_signal(
@@ -219,6 +251,7 @@ class SignalBus:
         return list(self._emitted)
 
     def publish(self, signal: dict[str, Any]) -> dict[str, Any] | None:
+        self._ensure_pair_created_at(signal)
         norm = normalize_signal(signal, mode=self.mode, purpose=self.purpose)
         log.info(
             "SIGNAL strategy=%s action=%s chain=%s token=%s size_pct=%s risk=%s "
@@ -245,6 +278,63 @@ class SignalBus:
             if norm is not None:
                 out.append(norm)
         return out
+
+    def _ensure_pair_created_at(self, signal: dict[str, Any]) -> None:
+        """Ensure ``pairCreatedAt`` (ms) is on the signal so it lands in extras.
+
+        Prefer an already-stamped value (engine / strategy). Otherwise look up
+        ``pairs.pair_created_at`` by chain_id + pair_address on this bus DB.
+        Does not invent; leaves the key absent when unknown. Not a gate.
+        """
+        existing = coerce_pair_created_at_ms(signal.get("pairCreatedAt"))
+        if existing is None:
+            existing = coerce_pair_created_at_ms(signal.get("pair_created_at"))
+        if existing is not None:
+            signal["pairCreatedAt"] = existing
+            # Avoid duplicating snake_case into extras alongside camelCase.
+            signal.pop("pair_created_at", None)
+            return
+        chain = signal.get("chain_id")
+        pair = signal.get("pair_address")
+        if not chain or pair is None or str(pair).strip() == "":
+            return
+        looked = self._lookup_pair_created_at(str(chain), str(pair))
+        if looked is not None:
+            signal["pairCreatedAt"] = looked
+            signal.pop("pair_created_at", None)
+
+    def _lookup_pair_created_at(self, chain_id: str, pair_address: str) -> int | None:
+        assert self._rw is not None
+        try:
+            cols = {
+                row[1]
+                for row in self._rw.execute("PRAGMA table_info(pairs)").fetchall()
+            }
+        except sqlite3.Error:
+            return None
+        if "pair_created_at" not in cols:
+            return None
+        try:
+            row = self._rw.execute(
+                """
+                SELECT pair_created_at FROM pairs
+                WHERE chain_id=? AND pair_address=?
+                  AND pair_created_at IS NOT NULL
+                LIMIT 1
+                """,
+                (chain_id, pair_address),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            log.warning(
+                "pair_created_at lookup failed chain=%s pair=%s err=%s",
+                chain_id,
+                pair_address[:16],
+                exc,
+            )
+            return None
+        if row is None or row[0] is None:
+            return None
+        return coerce_pair_created_at_ms(row[0])
 
     def _persist(self, norm: dict[str, Any]) -> bool:
         """Write one row. On failure, retry once and warn — do not abort the batch."""
