@@ -311,6 +311,12 @@ JEV_ON_NEW_LISTING = os.environ.get("JEV_ON_NEW_LISTING", "0").strip().lower() i
 JEV_REQUEST_TIMEOUT_SEC = float(os.environ.get("JEV_REQUEST_TIMEOUT_SEC", "30"))
 JEV_RAW_MAX_CHARS = int(os.environ.get("JEV_RAW_MAX_CHARS", "8000"))  # truncate raw JSON
 JEV_PENDING_PATH = os.environ.get("JEV_PENDING_PATH", "exports/jev_pending.jsonl")
+# Refresh/new split for list_due_hot (pinned positions always first).
+JEV_REFRESH_SHARE = float(os.environ.get("JEV_REFRESH_SHARE", "0.5"))
+# Even pacing: minimum seconds between two JEV calls (hard floor 10s => <=6/min).
+JEV_MIN_GAP_SEC = float(os.environ.get("JEV_MIN_GAP_SEC", "10"))
+# Pinned (open position) tokens: max share of slots per pass.
+JEV_PIN_MAX_SHARE = float(os.environ.get("JEV_PIN_MAX_SHARE", "0.3"))
 
 
 # ---------------------------------------------------------------------------
