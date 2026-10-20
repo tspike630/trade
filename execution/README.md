@@ -59,7 +59,7 @@ Reject reason format: `pm_rejected:<rule_name>` (e.g. `pm_rejected:token_dedup`)
 Startup logs the parsed fractions (`PM_MAX_*` are percent points: `1` means 1%, not 100%).
 
 Pre-trade risk stays **off** (`EXECUTION_RISK_ENABLED` accepts `1/true/yes/on`, default off).
-When it is on, SELL skips `max_open` so a full book can still close. `EXECUTION_DAILY_LOSS_USD` is unset by default (daily-loss check stays off). A missing book fails closed only while the risk gate is on.
+When it is on, SELL skips `max_open` so a full book can still close. `EXECUTION_DAILY_LOSS_USD` is unset by default (daily-loss check stays off). When it is set, realized PnL sums closed positions whose `closed_at` (UTC ISO) falls on the current Asia/Hong_Kong date, and the order is rejected only when that sum is `< -limit`. A missing book fails closed only while the risk gate is on.
 
 ### Paper fill rules (Step B)
 

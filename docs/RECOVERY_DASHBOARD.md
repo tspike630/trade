@@ -70,7 +70,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8081/
 - **权益/现金**：`paper_trading.db` → `account.cash_usd`；持仓 `positions`（`status=open|closed`）。
 - **实现盈亏**：已平 `SUM(pnl_usd)`；胜负按 `pnl_usd>0`。
 - **主损旁证**：`exit_reason` 分桶——历史常是少数 `stop_loss` 打穿（与 Step2 硬旁证同口径）。
-- **日亏闸**：执行 `order_events` 里 `reason=daily_loss`；限额在执行侧；**闸按 UTC 日切**（约 HKT 08:00 滚日）。看板 **G-1 交易频率日切是 HKT**（#75）——两套日切并记，不盘中改闸。
+- **日亏闸**：执行 `order_events` 里 `reason=daily_loss`；限额在执行侧仍是 **200**；**闸按 HKT 日切**（与看板 G-1 同一日历）。纠错日切不是松闸，不盘中改限额。
 - **拒因**：`risk[]` 要细分为 `daily_loss` 等（#60）；勿只显示笼统 risk。
 - 回答群时带头数字 +「不算有效性」；不改参。
 
@@ -96,7 +96,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8081/
 只交观察，不算有效性：
 
 1. 止损占亏 / 退出分桶（现网可读）
-2. 日开仓 **HKT**（G-1）+ 与执行 UTC 日亏闸错位旁证
+2. 日开仓 **HKT**（G-1）；日亏闸日界已对齐 HKT（限额仍 200）
 3. F-1 **实现盈亏行**（与决策 `up_1h` 并记，不熔断）
 4. 日亏闸拒因分桶
 5. INTEL 旁证卡读数（可空=data gap）
@@ -129,7 +129,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8081/
 - [ ] 能说出：只读、不盘中改参、禁推密钥/db  
 - [ ] `smoke_test` 绿；`:8081` 200  
 - [ ] 能从 `paper_trading.db` 报体现金/已平盈亏/开仓数  
-- [ ] 知 UTC 日亏闸 vs G-1 HKT 日切差异  
+- [ ] 知日亏闸与 G-1 同为 HKT 日切（限额仍 200，纠错日切≠松闸）
 - [ ] 知 #83 INTEL 卡与 10-19 交件列表  
 - [ ] 改码后双路径同步并推 `tspike630/trade`  
 
