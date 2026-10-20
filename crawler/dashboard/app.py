@@ -55,6 +55,24 @@ from dashboard.c_exit_shadow import (
     tag_line as c_exit_tag_line,
     verdict_line as c_exit_verdict_line,
 )
+from dashboard.entry_c_exit_joint import (
+    JOINT_DISCIPLINE,
+    JOINT_LIQ_LIVE,
+    JOINT_LIQ_NAIL,
+    JOINT_NAIL,
+    JOINT_PNL_NOTE,
+    JOINT_SHARE,
+    LIQ_SPLIT_HEADERS,
+    TABLE_HEADERS,
+    liq_risk_line as joint_liq_risk_line,
+    liq_split_rows as joint_liq_split_rows,
+    load_entry_c_exit_joint,
+    nail_line as joint_nail_line,
+    nine_line as joint_nine_line,
+    peak_line as joint_peak_line,
+    table_rows as joint_table_rows,
+    verdict_line as joint_verdict_line,
+)
 from dashboard.phase1_counterfactual import (
     PHASE1_CANDIDATE,
     PHASE1_CF_NAIL,
@@ -1192,6 +1210,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                 _mount_phase0_shadow()
                 _mount_phase1_counterfactual()
                 _mount_c_exit_shadow()
+                _mount_entry_c_exit_joint()
                 _mount_m7_shadow(store)
                 _v2_comp(
                     ("回测", "新闻"),
@@ -2561,6 +2580,47 @@ def _v2_c_exit_shadow() -> None:
     hit = rollback_hit_line(report)
     if hit:
         ui.label(hit).classes("v2-note")
+    if report.note:
+        ui.label(report.note).classes("v2-note")
+
+
+def _mount_entry_c_exit_joint() -> None:
+    """Read-only OVERVIEW card for the entry-shadow × C-exit joint, after C-exit."""
+    _v2_comp(
+        ("实验A", "入口×C出口"),
+        "span-12",
+        _v2_entry_c_exit_joint,
+        foot=JOINT_DISCIPLINE,
+        tools=("只读",),
+    )
+
+
+def _v2_entry_c_exit_joint() -> None:
+    try:
+        report = load_entry_c_exit_joint()
+    except Exception:
+        log.warning("entry c exit joint card failed")
+        ui.label("联合表不可读").classes("v2-note")
+        ui.label(JOINT_NAIL).classes("v2-note")
+        ui.label(JOINT_LIQ_NAIL).classes("v2-note")
+        ui.label(JOINT_LIQ_LIVE).classes("v2-note")
+        ui.label(JOINT_DISCIPLINE).classes("v2-note")
+        return
+    ui.label(joint_nail_line(report)).classes("v2-note")
+    ui.label(JOINT_LIQ_NAIL).classes("v2-note")
+    ui.label(JOINT_LIQ_LIVE).classes("v2-note")
+    ui.label(JOINT_DISCIPLINE).classes("v2-note")
+    ui.label(JOINT_SHARE).classes("v2-note")
+    ui.label(joint_nine_line(report)).classes("v2-note")
+    split_rows, split_tones = joint_liq_split_rows(report)
+    _v2_table(list(LIQ_SPLIT_HEADERS), split_rows, split_tones)
+    ui.label(joint_liq_risk_line(report)).classes("v2-note")
+    rows, tones = joint_table_rows(report)
+    _v2_table(list(TABLE_HEADERS), rows, tones)
+    ui.label("★ = R3 × c_sl5_h60、c_sl5_h90 主旁证 · liq† = missing 风险").classes("v2-note")
+    ui.label(joint_peak_line(report)).classes("v2-note")
+    ui.label(JOINT_PNL_NOTE).classes("v2-note")
+    ui.label(joint_verdict_line(report)).classes("v2-note")
     if report.note:
         ui.label(report.note).classes("v2-note")
 

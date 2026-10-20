@@ -60,6 +60,7 @@ from dashboard.panels.shell import (
 )
 import dashboard.app as app_module
 import dashboard.c_exit_shadow as c_exit_module
+import dashboard.entry_c_exit_joint as joint_module
 import dashboard.phase1_counterfactual as phase1_module
 from dashboard.c_exit_shadow import (
     C_EXIT_DISCIPLINE,
@@ -69,6 +70,21 @@ from dashboard.c_exit_shadow import (
     C_EXIT_VERDICT,
     load_c_exit_shadow,
     tag_line as c_exit_tag_line,
+)
+from dashboard.entry_c_exit_joint import (
+    JOINT_DISCIPLINE,
+    JOINT_LIQ_LIVE,
+    JOINT_LIQ_NAIL,
+    JOINT_NAIL,
+    JOINT_PNL_NOTE,
+    JOINT_VERDICT,
+    contrast_cells as joint_contrast_cells,
+    liq_risk_line as joint_liq_risk_line,
+    load_entry_c_exit_joint,
+    nail_line as joint_nail_line,
+    nine_line as joint_nine_line,
+    peak_line as joint_peak_line,
+    verdict_line as joint_verdict_line,
 )
 from dashboard.phase1_counterfactual import (
     PHASE1_CANDIDATE,
@@ -106,6 +122,7 @@ _TOUCHED = (
     "SHADOW_PHASE0_CSV",
     "PHASE1_CF_CSV",
     "C_EXIT_SHADOW_DB",
+    "ENTRY_C_EXIT_JOINT_CSV",
     "DB_PATH",
     "PAPER_DB_PATH",
     "HEARTBEAT_STALE_SEC",
@@ -3005,6 +3022,397 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("C_EXIT_NAIL", card_src)
         self.assertNotIn("place_order", mount_src)
         self.assertNotIn("place_order", card_src)
+
+    def test_entry_c_exit_joint_card_sample_in_and_liq_gap(self) -> None:
+        names = [name for name in dir(DashboardSmokeTest) if name.startswith("test_")]
+        self.assertGreaterEqual(len(names), 27)
+        self.assertEqual(JOINT_NAIL, "样本内假设 · 旁簿成交=0 · ≠升主/≠抬权/≠Phase1")
+        self.assertEqual(JOINT_LIQ_NAIL, "liq：NULL/missing ≠ 真<150k · R3 优先")
+        self.assertIn("38.9%", JOINT_LIQ_LIVE)
+        self.assertIn("采集缺口", JOINT_LIQ_LIVE)
+        self.assertIn("不改 .env", JOINT_DISCIPLINE)
+        self.assertIn("不升主", JOINT_DISCIPLINE)
+        self.assertIn("不 Phase1", JOINT_DISCIPLINE)
+        module_src = inspect.getsource(joint_module)
+        self.assertIn(JOINT_NAIL, module_src)
+        self.assertIn(JOINT_LIQ_NAIL, module_src)
+        self.assertNotIn("sqlite3.connect", module_src)
+        self.assertNotIn("place_order", module_src)
+        self.assertNotIn("LIVE_TRADING_ENABLED", module_src)
+        self.assertNotIn("sum_pnl", joint_module.JointReport.__dataclass_fields__)
+
+        here = Path(__file__).resolve()
+        repo = here.parents[2] if here.parent.parent.name == "crawler" else here.parents[1]
+        for name in (
+            "entry_c_exit_joint.py",
+            "app.py",
+            "smoke_test.py",
+            "fixtures/shadow_entry_x_c_exit_joint_2026-10-20.csv",
+        ):
+            left = repo / "dashboard" / name
+            right = repo / "crawler" / "dashboard" / name
+            self.assertEqual(left.read_bytes(), right.read_bytes(), name)
+
+        missing = self.root / "no-such-joint.csv"
+        os.environ["ENTRY_C_EXIT_JOINT_CSV"] = str(missing)
+        os.environ.pop("C_EXIT_SHADOW_DB", None)
+        report = load_entry_c_exit_joint()
+        self.assertEqual(report.source, "packaged")
+        self.assertTrue(report.sample_in)
+        self.assertEqual(report.side_fills, 0)
+        self.assertEqual(report.closed, 142)
+        self.assertIn("旁簿/live joint 空", report.note)
+        self.assertEqual(joint_nail_line(report), JOINT_NAIL)
+        self.assertEqual(joint_verdict_line(report), JOINT_VERDICT)
+        self.assertEqual(report.ge_count, 9)
+        self.assertEqual(report.key_ge_count, 4)
+        self.assertEqual(report.key_n, 4)
+        self.assertEqual(report.r3_n, 30)
+        self.assertEqual(report.liq_true_n, 27)
+        self.assertEqual(report.liq_missing_n, 0)
+        self.assertEqual(report.liq_excluded_n, 0)
+        self.assertTrue(report.liq_column)
+        self.assertEqual(report.main_sl_r3, 5)
+        self.assertEqual(report.main_sl_liq, 5)
+        self.assertEqual(report.main_sl_total, 10)
+        self.assertEqual(report.main_peak1, Decimal("-491.72"))
+        self.assertEqual(report.main_peak0, Decimal("-313.91"))
+        by_key = {(row.flag, row.tag): row for row in report.contrasts}
+        r3_h90 = by_key[("R3", "c_sl5_h90")]
+        r3_h60 = by_key[("R3", "c_sl5_h60")]
+        liq_h90 = by_key[("liq", "c_sl5_h90")]
+        liq_h60 = by_key[("liq", "c_sl5_h60")]
+        self.assertEqual(r3_h90.n1, 30)
+        self.assertEqual(r3_h90.n0, 112)
+        self.assertEqual(r3_h90.share1, Decimal("97.3"))
+        self.assertEqual(r3_h90.share0, Decimal("79.2"))
+        self.assertEqual(r3_h90.delta_pp, Decimal("18.1"))
+        self.assertEqual(r3_h90.sl_n1, 5)
+        self.assertEqual(r3_h90.sl_n0, 10)
+        self.assertEqual(r3_h60.share1, Decimal("93.6"))
+        self.assertEqual(r3_h60.share0, Decimal("69.2"))
+        self.assertEqual(r3_h60.delta_pp, Decimal("24.5"))
+        self.assertEqual(liq_h90.share1, Decimal("93.4"))
+        self.assertEqual(liq_h90.share0, Decimal("81.3"))
+        self.assertEqual(liq_h60.share1, Decimal("96.8"))
+        self.assertEqual(liq_h60.share0, Decimal("67.1"))
+        self.assertEqual(joint_contrast_cells(r3_h60)[0], "★ R3")
+        self.assertEqual(joint_contrast_cells(liq_h60)[0], "liq†")
+        self.assertEqual(joint_contrast_cells(by_key[("R3", "c_sl4_h90")])[0], "R3")
+        self.assertIn("真<150k 27", joint_liq_risk_line(report))
+        self.assertIn("NULL/missing 0", joint_liq_risk_line(report))
+        self.assertEqual(
+            joint_nine_line(report),
+            "止损占负 flag=1 ≥ flag=0：9/9 · R3/liq × c_sl5_h60、c_sl5_h90 为 4/4",
+        )
+        self.assertEqual(
+            joint_peak_line(report),
+            "峰 −491 vs −314 · 重放 −$491.67 vs −$313.95 · "
+            "主簿 −$491.72 vs −$313.91 · n_SL 薄（主簿 R3 5/10 · liq 5/10）",
+        )
+        self.assertNotIn("515.61", joint_peak_line(report))
+        self.assertNotIn("sum_pnl", module_src)
+
+        gap_texts = _rendered_card_texts(lambda: app_module._mount_entry_c_exit_joint())
+        gap_joined = "\n".join(gap_texts)
+        self.assertIn("实验A", gap_texts)
+        self.assertIn("入口×C出口", gap_texts)
+        self.assertIn(JOINT_NAIL, gap_texts)
+        self.assertIn(JOINT_LIQ_NAIL, gap_texts)
+        self.assertIn(JOINT_LIQ_LIVE, gap_texts)
+        self.assertIn(JOINT_DISCIPLINE, gap_texts)
+        self.assertIn("9/9", gap_joined)
+        self.assertIn("4/4", gap_joined)
+        self.assertIn("−491 vs −314", gap_joined)
+        self.assertIn("n_SL 薄", gap_joined)
+        self.assertIn(JOINT_VERDICT, gap_texts)
+        self.assertIn("不升主、不抬权、不 Phase1", gap_joined)
+        self.assertIn("旁簿攒成交后再重跑", gap_joined)
+        self.assertIn("97.3%", gap_joined)
+        self.assertIn("93.6%", gap_joined)
+        self.assertIn("96.8%", gap_joined)
+        self.assertIn("★ R3", gap_joined)
+        self.assertIn("liq†", gap_joined)
+        self.assertIn("真<150k", gap_joined)
+        self.assertIn("NULL/missing", gap_joined)
+        self.assertIn("liq flag=1 旁注", gap_joined)
+        self.assertIn(JOINT_PNL_NOTE, gap_texts)
+        self.assertIn("旁簿/live joint 空", gap_joined)
+        self.assertNotIn("515.61", gap_joined)
+        self.assertNotIn("761.71", gap_joined)
+        self.assertNotIn("place_order", gap_joined)
+
+        def write_joint(path: Path, records: list[dict[str, object]], *, liq_column: bool) -> None:
+            tags = ("c_sl5_h60", "c_sl5_h90", "c_sl4_h90")
+            fields = [
+                "opened_at",
+                "tagged_at",
+                "shadow_R3_vol_chg_rsi",
+                "shadow_liq_lt_150k",
+                "main_exit_reason",
+                "main_pnl_usd",
+            ]
+            if liq_column:
+                fields.append("liq_usd")
+            for tag in tags:
+                fields.extend((f"{tag}_hit", f"{tag}_exit_reason", f"{tag}_pnl_usd"))
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for record in records:
+                    row = {
+                        "opened_at": record.get("opened_at", "2026-10-14T00:00:00Z"),
+                        "tagged_at": record.get("tagged_at", "2026-10-20T05:09:46Z"),
+                        "shadow_R3_vol_chg_rsi": record["r3"],
+                        "shadow_liq_lt_150k": record["liq"],
+                        "main_exit_reason": record.get("main_reason", "max_hold"),
+                        "main_pnl_usd": record.get("main_pnl", "-1"),
+                    }
+                    if liq_column:
+                        row["liq_usd"] = record.get("liq_usd", "")
+                    reason = str(record.get("reason", "max_hold"))
+                    pnl = record.get("pnl", "-1")
+                    for tag in tags:
+                        row[f"{tag}_hit"] = record.get("hit", "1")
+                        row[f"{tag}_exit_reason"] = reason
+                        row[f"{tag}_pnl_usd"] = pnl
+                    row["opened_at"] = record.get("opened_at", row["opened_at"])
+                    writer.writerow(row)
+
+        blank = self.root / "blank-joint.csv"
+        blank.write_text("", encoding="utf-8")
+        empty = load_entry_c_exit_joint(blank)
+        self.assertEqual(empty.source, "packaged")
+        self.assertIn("联合表空", empty.note)
+        self.assertEqual(empty.closed, 142)
+        self.assertEqual(joint_nail_line(empty), JOINT_NAIL)
+
+        bad = self.root / "bad-joint.csv"
+        write_joint(
+            bad,
+            [{"r3": "1", "liq": "1", "liq_usd": "1000", "hit": "1", "pnl": "", "reason": "stop_loss"}],
+            liq_column=True,
+        )
+        broken = load_entry_c_exit_joint(bad)
+        self.assertIn("联合表坏数据", broken.note)
+        self.assertEqual(broken.liq_true_n, 27)
+
+        shaped = self.root / "columns-joint.csv"
+        shaped.write_text("position_id\n1\n", encoding="utf-8")
+        self.assertIn("联合表缺列", load_entry_c_exit_joint(shaped).note)
+
+        corrupt = self.root / "corrupt-joint.csv"
+        corrupt.write_bytes(b"\xff\xfe not csv")
+        self.assertIn("联合表不可读", load_entry_c_exit_joint(corrupt).note)
+
+        gap_only = self.root / "null-liq-joint.csv"
+        write_joint(
+            gap_only,
+            [
+                {
+                    "r3": "1",
+                    "liq": "1",
+                    "liq_usd": "",
+                    "reason": "stop_loss",
+                    "pnl": "-20",
+                    "main_reason": "stop_loss",
+                    "main_pnl": "-20",
+                },
+                {
+                    "r3": "0",
+                    "liq": "1",
+                    "liq_usd": "10000",
+                    "reason": "max_hold",
+                    "pnl": "-4",
+                    "main_reason": "max_hold",
+                    "main_pnl": "-4",
+                },
+                {
+                    "r3": "0",
+                    "liq": "0",
+                    "liq_usd": "400000",
+                    "reason": "stop_loss",
+                    "pnl": "-8",
+                    "main_reason": "stop_loss",
+                    "main_pnl": "-8",
+                },
+            ],
+            liq_column=True,
+        )
+        guarded = load_entry_c_exit_joint(gap_only)
+        self.assertEqual(guarded.source, "export")
+        self.assertEqual(guarded.r3_n, 1)
+        self.assertEqual(guarded.liq_true_n, 1)
+        self.assertEqual(guarded.liq_missing_n, 1)
+        self.assertEqual(guarded.liq_excluded_n, 1)
+        guarded_flags = {(row.flag, row.tag): row for row in guarded.contrasts}
+        self.assertEqual(guarded_flags[("R3", "c_sl5_h90")].n1, 1)
+        self.assertEqual(guarded_flags[("liq", "c_sl5_h90")].n1, 1)
+        self.assertEqual(guarded_flags[("R3∨liq", "c_sl5_h90")].n1, 2)
+        self.assertIn("NULL/missing 1 不入列", joint_liq_risk_line(guarded))
+        self.assertIn("剔出 1", joint_liq_risk_line(guarded))
+        self.assertIn(JOINT_LIQ_NAIL, _rendered_card_texts(lambda: app_module._v2_entry_c_exit_joint()))
+
+        os.environ["ENTRY_C_EXIT_JOINT_CSV"] = str(gap_only)
+        null_texts = _rendered_card_texts(lambda: app_module._v2_entry_c_exit_joint())
+        null_joined = "\n".join(null_texts)
+        self.assertIn(JOINT_LIQ_NAIL, null_texts)
+        self.assertIn(JOINT_LIQ_LIVE, null_texts)
+        self.assertIn("liq†", null_joined)
+        self.assertIn("NULL/missing", null_joined)
+        self.assertNotIn("97.3%", null_joined)
+
+        no_value = self.root / "no-liq-column.csv"
+        write_joint(
+            no_value,
+            [
+                {"r3": "1", "liq": "1", "reason": "stop_loss", "pnl": "-5", "main_pnl": "-5"},
+                {"r3": "0", "liq": "1", "reason": "max_hold", "pnl": "-2", "main_pnl": "-2"},
+            ],
+            liq_column=False,
+        )
+        unverified = load_entry_c_exit_joint(no_value)
+        self.assertFalse(unverified.liq_column)
+        self.assertEqual(unverified.r3_n, 1)
+        self.assertEqual(unverified.liq_true_n, 0)
+        self.assertEqual(unverified.liq_missing_n, 2)
+        self.assertEqual(unverified.liq_excluded_n, 2)
+        self.assertIn("无 liq_usd", joint_liq_risk_line(unverified))
+        self.assertIn(JOINT_LIQ_NAIL, joint_liq_risk_line(unverified))
+
+        weak = self.root / "weak-joint.csv"
+        write_joint(
+            weak,
+            [
+                {
+                    "r3": "1",
+                    "liq": "1",
+                    "liq_usd": "1000",
+                    "reason": "max_hold",
+                    "pnl": "-10",
+                    "main_pnl": "-10",
+                },
+                {
+                    "r3": "0",
+                    "liq": "0",
+                    "liq_usd": "800000",
+                    "reason": "stop_loss",
+                    "pnl": "-10",
+                    "main_reason": "stop_loss",
+                    "main_pnl": "-10",
+                },
+            ],
+            liq_column=True,
+        )
+        opposed = load_entry_c_exit_joint(weak)
+        self.assertEqual(opposed.ge_count, 0)
+        self.assertNotIn("部分支持", joint_verdict_line(opposed))
+        self.assertIn("不升主、不抬权、不 Phase1", joint_verdict_line(opposed))
+        os.environ["ENTRY_C_EXIT_JOINT_CSV"] = str(weak)
+        weak_joined = "\n".join(_rendered_card_texts(lambda: app_module._v2_entry_c_exit_joint()))
+        self.assertIn("0/9", weak_joined)
+        self.assertIn(JOINT_LIQ_NAIL, weak_joined)
+        self.assertNotIn("部分支持", weak_joined)
+
+        forward = self.root / "forward-joint.csv"
+        write_joint(
+            forward,
+            [
+                {
+                    "r3": "1",
+                    "liq": "0",
+                    "liq_usd": "900000",
+                    "opened_at": "2026-10-21T00:00:00Z",
+                    "tagged_at": "2026-10-20T00:00:00Z",
+                    "reason": "stop_loss",
+                    "pnl": "-3",
+                    "main_reason": "stop_loss",
+                    "main_pnl": "-3",
+                },
+                {
+                    "r3": "0",
+                    "liq": "0",
+                    "liq_usd": "900000",
+                    "opened_at": "2026-10-21T00:00:00Z",
+                    "tagged_at": "2026-10-20T00:00:00Z",
+                    "reason": "max_hold",
+                    "pnl": "-1",
+                    "main_pnl": "-1",
+                },
+            ],
+            liq_column=True,
+        )
+        later = load_entry_c_exit_joint(forward)
+        self.assertFalse(later.sample_in)
+        self.assertNotEqual(joint_nail_line(later), JOINT_NAIL)
+        self.assertIn("含打标后新开", joint_nail_line(later))
+        self.assertIn("不升主", joint_verdict_line(later))
+
+        side = self.root / "side-joint.db"
+        conn = sqlite3.connect(side)
+        conn.execute("CREATE TABLE positions (id INTEGER PRIMARY KEY, status TEXT)")
+        conn.execute("INSERT INTO positions (status) VALUES ('closed')")
+        conn.commit()
+        conn.close()
+        before = side.stat().st_mtime_ns
+        os.environ["C_EXIT_SHADOW_DB"] = str(side)
+        os.environ["ENTRY_C_EXIT_JOINT_CSV"] = str(missing)
+        held = load_entry_c_exit_joint()
+        self.assertEqual(side.stat().st_mtime_ns, before)
+        self.assertEqual(held.side_fills, 1)
+        self.assertEqual(held.closed, 142)
+        self.assertEqual(held.liq_true_n, 27)
+        self.assertIn("旁簿/live joint 空", held.note)
+        self.assertIn("旁簿库 1 笔", held.note)
+        self.assertNotEqual(joint_nail_line(held), JOINT_NAIL)
+        self.assertIn("旁簿成交=1", joint_nail_line(held))
+        self.assertIn("样本内假设", joint_nail_line(held))
+        self.assertEqual(joint_verdict_line(held), JOINT_VERDICT)
+
+        export_root = self.root / "export-root"
+        older = export_root / "exports" / "shadow_entry_x_c_exit_joint_2026-10-01.csv"
+        newer = export_root / "exports" / "shadow_entry_x_c_exit_joint_2026-11-01.csv"
+        older.parent.mkdir(parents=True)
+        write_joint(
+            older,
+            [{"r3": "0", "liq": "0", "liq_usd": "900000", "reason": "max_hold", "pnl": "-1", "main_pnl": "-1"}],
+            liq_column=True,
+        )
+        write_joint(
+            newer,
+            [
+                {"r3": "1", "liq": "0", "liq_usd": "900000", "reason": "stop_loss", "pnl": "-2", "main_pnl": "-2"},
+                {"r3": "1", "liq": "0", "liq_usd": "900000", "reason": "stop_loss", "pnl": "-2", "main_pnl": "-2"},
+            ],
+            liq_column=True,
+        )
+        os.utime(older, (1_700_000_000, 1_700_000_000))
+        os.utime(newer, (1_800_000_000, 1_800_000_000))
+        os.environ.pop("ENTRY_C_EXIT_JOINT_CSV", None)
+        os.environ["DASHBOARD_DB_ROOT"] = str(export_root)
+        picked = load_entry_c_exit_joint()
+        self.assertEqual(picked.source, "export")
+        self.assertEqual(picked.closed, 2)
+        self.assertEqual(picked.r3_n, 2)
+        os.environ["ENTRY_C_EXIT_JOINT_CSV"] = str(missing)
+        forced = load_entry_c_exit_joint()
+        self.assertEqual(forced.source, "packaged")
+        self.assertEqual(forced.closed, 142)
+        self.assertIn("旁簿/live joint 空", forced.note)
+
+        overview = inspect.getsource(app_module._render_dashboard)
+        c_exit_at = overview.index("_mount_c_exit_shadow")
+        joint_at = overview.index("_mount_entry_c_exit_joint")
+        m7_at = overview.index("_mount_m7_shadow")
+        self.assertLess(c_exit_at, joint_at)
+        self.assertLess(joint_at, m7_at)
+        card_src = inspect.getsource(app_module._v2_entry_c_exit_joint)
+        mount_src = inspect.getsource(app_module._mount_entry_c_exit_joint)
+        self.assertIn("JOINT_NAIL", card_src)
+        self.assertIn("JOINT_LIQ_NAIL", card_src)
+        self.assertIn("JOINT_LIQ_LIVE", card_src)
+        self.assertNotIn("place_order", card_src)
+        self.assertNotIn("place_order", mount_src)
 
     def test_m7_s0_s1_shadow_card(self) -> None:
         missing_csv = self.root / "no-such-m7.csv"
