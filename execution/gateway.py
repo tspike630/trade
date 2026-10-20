@@ -54,6 +54,7 @@ PURPOSE_SAMPLE = "sample"
 PURPOSE_REJECT_SAMPLE = "purpose_sample"
 PURPOSE_REJECT_MISSING = "purpose_missing"
 PURPOSE_REJECT_INVALID = "purpose_invalid"
+PURPOSE_REJECT_SHADOW = "purpose_shadow"  # shadow_* (e.g. shadow_010) never reaches the main book
 _DECISION_LOG_COLUMNS = (
     "id",
     "ts",
@@ -153,6 +154,8 @@ def purpose_reject_reason(purpose: str | None) -> str | None:
         return None
     if purpose == PURPOSE_SAMPLE:
         return PURPOSE_REJECT_SAMPLE
+    if purpose.startswith("shadow_"):
+        return PURPOSE_REJECT_SHADOW
     return PURPOSE_REJECT_INVALID
 
 

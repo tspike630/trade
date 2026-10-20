@@ -46,30 +46,102 @@ log = get_logger("decision_engine.run")
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
-def _read_budget_regime() -> str:
-    """Read-only lookup of X_HOURLY_BUDGET_REQUESTS (process env, else crawler .env)."""
-    import os
+_REGIME_FILE = _ENV_FILE.parent / "exports" / "regime" / "x_budget_regime.json"
 
-    val = os.environ.get("X_HOURLY_BUDGET_REQUESTS")
-    if val is None:
+
+def _parse_utc(text):
+    from datetime import datetime, timezone
+
+    if not text:
+        return None
+    dt = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def x_budget_regime_at(ts, regime_file: Path = _REGIME_FILE) -> str | None:
+    """Time-based X budget regime from exports/regime/x_budget_regime.json (read-only).
+
+    Segments sorted by effective_at_utc; first one (null effective) covers earlier ts.
+    For a regime with first_fresh_budget_day_utc, ts in [effective_at, that day 00:00Z)
+    is 'exhausted' (daily budget already spent under the previous regime).
+    """
+    import json
+
+    try:
+        data = json.loads(Path(regime_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    t = _parse_utc(ts) if isinstance(ts, str) else ts
+    chosen = None
+    segs = sorted(
+        data.get("regimes") or [],
+        key=lambda r: (_parse_utc(r.get("effective_at_utc")) is not None,
+                       _parse_utc(r.get("effective_at_utc")) or 0),
+    )
+    for seg in segs:
+        eff = _parse_utc(seg.get("effective_at_utc"))
+        if eff is None or t >= eff:
+            chosen = seg
+    if chosen is None:
+        return None
+    fresh = chosen.get("first_fresh_budget_day_utc")
+    if fresh and t < _parse_utc(fresh + "T00:00:00Z"):
+        return "exhausted"
+    return str(chosen.get("regime"))
+
+
+def gap_risk_features(conn, chain_id, pair_address, pair_created_ms, now_ms) -> dict:
+    """Read-only gap-risk extras; None when unavailable."""
+    out = {"pool_age_min": None, "liq_to_mcap": None, "liq_to_fdv": None,
+           "max_snapshot_drop_pct_60m": None}
+    if pair_created_ms:
         try:
-            for line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("export "):
-                    line = line[7:].strip()
-                if line.startswith("X_HOURLY_BUDGET_REQUESTS="):
-                    val = line.split("=", 1)[1].split("#", 1)[0].strip().strip("'\"")
-        except OSError:
-            val = None
-    if val in (None, "", "20"):
-        return "20h"
-    if val == "4":
-        return "4h"
-    return f"{val}h"
+            out["pool_age_min"] = round((now_ms - int(pair_created_ms)) / 60000.0, 1)
+        except (TypeError, ValueError):
+            pass
+    if conn is None or not chain_id or not pair_address:
+        return out
+    from datetime import datetime, timedelta, timezone
+
+    since = (datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+             - timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        rows = conn.execute(
+            "SELECT price_usd, liquidity_usd, market_cap, fdv FROM pair_history "
+            "WHERE chain_id=? AND pair_address=? AND recorded_at>=? "
+            "ORDER BY recorded_at ASC",
+            (chain_id, pair_address, since),
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return out
+    if rows:
+        _p, liq, mcap, fdv = rows[-1]
+        if liq and mcap:
+            out["liq_to_mcap"] = round(liq / mcap, 4)
+        if liq and fdv:
+            out["liq_to_fdv"] = round(liq / fdv, 4)
+        prices = [r[0] for r in rows if r[0]]
+        drops = [b / a - 1 for a, b in zip(prices, prices[1:]) if a > 0]
+        if drops:
+            out["max_snapshot_drop_pct_60m"] = round(min(0.0, min(drops)) * 100, 2)
+    return out
 
 
 class ShadowCohortRisk(RiskManager):
-    """Tag liq_bucket/budget_regime; let missing-liquidity buys through as control."""
+    """Tag liq_bucket/x_budget_regime/gap-risk; let missing-liquidity buys through as control."""
+
+    read_db: str | None = None
+    _conn = None
+
+    def _ro(self):
+        import sqlite3
+
+        if self._conn is None and self.read_db:
+            try:
+                self._conn = sqlite3.connect(f"file:{self.read_db}?mode=ro", uri=True, timeout=10)
+            except sqlite3.Error:
+                self._conn = None
+        return self._conn
 
     def check(self, signal):  # type: ignore[override]
         sig = dict(signal)
@@ -80,7 +152,15 @@ class ShadowCohortRisk(RiskManager):
             except (TypeError, ValueError):
                 missing = True
             sig["liq_bucket"] = "missing" if missing else "present"
-            sig["budget_regime"] = _read_budget_regime()
+            import time as _time
+            from datetime import datetime, timezone
+
+            now = datetime.now(timezone.utc)
+            sig["x_budget_regime"] = x_budget_regime_at(now)
+            sig.update(gap_risk_features(
+                self._ro(), sig.get("chain_id"), sig.get("pair_address"),
+                sig.get("pairCreatedAt") or sig.get("pair_created_at"),
+                int(_time.time() * 1000)))
             if missing:
                 # bypass only the no_liquidity fail-closed check (cooldown still applies)
                 sig["liquidity_usd"] = float("inf")
@@ -197,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         "--shadow-liq-cohorts",
         action="store_true",
         help="opt-in shadow: tag buys with liq_bucket (present/missing) and "
-        "budget_regime; missing-liquidity buys are kept as control cohort. "
+        "x_budget_regime; missing-liquidity buys are kept as control cohort. "
         "Requires --output-db different from --db.",
     )
     parser.add_argument(
@@ -264,7 +344,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.shadow_liq_cohorts and out_db == db_path:
         log.error("--shadow-liq-cohorts requires --output-db != --db (isolation)")
         return 2
+    if args.shadow_liq_cohorts or out_db != db_path:
+        if purpose != "shadow_010":
+            log.warning("shadow mode: forcing purpose=shadow_010 (was %s)", purpose)
+        purpose = "shadow_010"
     risk = ShadowCohortRisk() if args.shadow_liq_cohorts else RiskManager()
+    if isinstance(risk, ShadowCohortRisk):
+        risk.read_db = db_path
     log.info("output_db=%s shadow_liq_cohorts=%s", out_db, args.shadow_liq_cohorts)
     adapter = IndicatorDataAdapter(db_path)
     bus = SignalBus(out_db, dry_run=dry_run, purpose=purpose)
