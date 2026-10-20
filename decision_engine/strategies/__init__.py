@@ -110,3 +110,15 @@ def get_strategy(strategy_id: str, **kwargs) -> "BaseStrategy":
 
 def list_strategies() -> list[str]:
     return sorted(STRATEGY_REGISTRY)
+
+# Buy factors that run the shared jev_gate (jev_strategy.jev_gate: jev_stale /
+# jev_stance_not_bullish, emitting jev_age_min / jev_stance_raw extras).
+JEV_GATED_BUY_FACTORS: frozenset[str] = frozenset({"jev_strength", "combined_jev_tech"})
+
+# Canonical list of strategy ids whose buys are JEV-gated and carry the jev
+# extras. execution/gateway.JEV_GUARD_STRATEGIES should equal this set.
+# Derived from the registry so new jev combos are picked up automatically.
+JEV_GATED_STRATEGIES: frozenset[str] = frozenset(
+    {JevStrengthStrategy.strategy_id, CombinedJevTechStrategy.strategy_id}
+    | {sid for sid, (buy, *_r) in _FACTOR_COMBOS.items() if JEV_GATED_BUY_FACTORS & set(buy)}
+)
