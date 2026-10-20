@@ -19,7 +19,8 @@ import types
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import quote
@@ -485,6 +486,38 @@ class TokenAgeReport:
     limit: int
 
 
+# Paper pace vs the stated $20k mark. Observe-only; not a forecast or a gate.
+GOAL_TARGET_USD = 20_000.0
+GOAL_START_DAY = date(2026, 10, 20)
+GOAL_DEADLINE_DAY = date(2026, 10, 30)
+_HKT = ZoneInfo("Asia/Hong_Kong")
+
+
+@dataclass(frozen=True)
+class GoalPaceReport:
+    """Rough paper equity versus the $20k / 10-day mark.
+
+    ``equity_usd`` is account cash plus open position ``size_usd``. It is not
+    mark-to-market. ``daily_need_usd`` is None when no calendar days remain.
+    Not wired into gates, weights, size, or live params.
+    """
+
+    cash_usd: float
+    open_size_usd: float
+    open_count: int
+    size_gap_count: int
+    equity_usd: float
+    target_usd: float
+    gap_usd: float
+    as_of_day: str
+    start_day: str
+    deadline_day: str
+    days_left: int
+    daily_need_usd: float | None
+    mark_to_market: bool
+    note: str
+
+
 _INTEL_HOLDER_SAMPLE = 8
 _INTEL_HOLDER_SHOW = 5
 _INTEL_CROWD_STRATEGY = "jev_strength_v1"
@@ -548,6 +581,26 @@ def _token_age_label(age_days: float | None) -> str:
     if age_days <= 7:
         return "1-7d"
     return ">7d"
+
+
+def _goal_as_of(now: datetime | None) -> date:
+    """Calendar day in Asia/Hong_Kong. Naive clocks are treated as UTC."""
+    clock = now if now is not None else datetime.now(_HKT)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=timezone.utc)
+    return clock.astimezone(_HKT).date()
+
+
+def _goal_days_left(as_of: date, deadline: date = GOAL_DEADLINE_DAY) -> int:
+    """Whole calendar days from ``as_of`` until the deadline. Never negative."""
+    return max(0, (deadline - as_of).days)
+
+
+def _goal_daily_need(gap_usd: float, days_left: int) -> float | None:
+    """Gap per remaining day. Zero days left has no rate."""
+    if days_left <= 0:
+        return None
+    return round(gap_usd / days_left, 2)
 
 
 def _hkt_day(ts: str | None) -> str:
@@ -1073,6 +1126,19 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed token_age_observe: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "token_age_observe")
+
+    def paper_goal_pace(self, *, now: datetime | None = None) -> DataResult:
+        """Observe-only paper equity versus $20k by 2026-10-30 HKT.
+
+        Reads ``account.cash_usd`` and open ``positions.size_usd`` only.
+        Equity is not mark-to-market. Does not change gates or live params.
+        """
+        started = time.perf_counter()
+        try:
+            return _finish(self._paper_goal_pace(started, now), "paper_goal_pace")
+        except Exception as exc:
+            log.warning("read failed paper_goal_pace: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_goal_pace")
 
     def risk_daily_loss_today(self) -> DataResult:
 
@@ -2048,6 +2114,67 @@ class DataStore:
                 buckets=buckets,
                 samples=tuple(samples),
                 limit=window,
+            ),
+            started,
+        )
+
+    def _paper_goal_pace(self, started: float, now: datetime | None) -> DataResult:
+        path = self.paths.paper
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        as_of = _goal_as_of(now)
+        try:
+            with ro_connect(path) as conn:
+                cash, cash_note = _read_cash(conn, path.name)
+                if cash is None:
+                    return _unavail(cash_note or "账户无现金记录", started)
+                missing = _missing_table(conn, "positions", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "positions")
+                absent = _require(cols, ("size_usd",))
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                selected = [name for name in ("size_usd", "status", "closed_at") if name in cols]
+                rows = _exec(
+                    conn,
+                    f"SELECT {', '.join(selected)} FROM positions",
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        fetched = set(selected)
+        open_size = 0.0
+        open_count = 0
+        size_gaps = 0
+        for row in rows:
+            if not _is_open(row, fetched):
+                continue
+            open_count += 1
+            size = safe_float(_cell(row, "size_usd"))
+            if size is None:
+                size_gaps += 1
+                continue
+            open_size += float(size)
+        equity = round(float(cash) + open_size, 4)
+        gap = round(GOAL_TARGET_USD - equity, 4)
+        days_left = _goal_days_left(as_of)
+        note = f"{size_gaps} 笔未平缺 size_usd，未计入名义" if size_gaps else ""
+        return _ok(
+            GoalPaceReport(
+                cash_usd=float(cash),
+                open_size_usd=round(open_size, 4),
+                open_count=open_count,
+                size_gap_count=size_gaps,
+                equity_usd=equity,
+                target_usd=GOAL_TARGET_USD,
+                gap_usd=gap,
+                as_of_day=as_of.isoformat(),
+                start_day=GOAL_START_DAY.isoformat(),
+                deadline_day=GOAL_DEADLINE_DAY.isoformat(),
+                days_left=days_left,
+                daily_need_usd=_goal_daily_need(gap, days_left),
+                mark_to_market=False,
+                note=note,
             ),
             started,
         )

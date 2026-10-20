@@ -9,6 +9,7 @@ missing databases degrade instead of raising. Run from the project root::
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 import io
 import json
 import logging
@@ -22,11 +23,20 @@ import time
 import unittest
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from dashboard.auth import SecretFilter, attach_secret_filters, verify_api_key
 from dashboard.chat.sessions import SessionStore
-from dashboard.data import DataStore, DbPaths, _WRITE_RE, connect_ro
+from dashboard.data import (
+    GOAL_DEADLINE_DAY,
+    GOAL_START_DAY,
+    GOAL_TARGET_USD,
+    DataStore,
+    DbPaths,
+    _WRITE_RE,
+    connect_ro,
+)
 from dashboard.format_util import fmt_hold, fmt_liq, fmt_pct, fmt_usd
 from dashboard.panels.evolution import (
     find_latest_weekly_report,
@@ -47,6 +57,8 @@ from dashboard.panels.shell import (
     select_top_tab,
 )
 import dashboard.app as app_module
+from nicegui.client import Client
+from nicegui.page import page as ng_page
 from dashboard.app import backtest_equity_tone, jev_gate_view, prior_pulse_tone
 from dashboard.parsing import bucket_key, extract_jev_strength, liq_bucket_label, rejection_key
 from dashboard.settings import (
@@ -93,6 +105,22 @@ _WRITE_SQL = re.compile(
 
 def _iso(stamp: datetime) -> str:
     return stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _rendered_card_texts(build: Callable[[], None]) -> list[str]:
+    """Render one overview card in a NiceGUI client and collect label text."""
+    client = Client(ng_page("/_goal_20k_smoke"), request=None)
+    try:
+        with client:
+            build()
+        texts: list[str] = []
+        for element in client.elements.values():
+            text = getattr(element, "text", None)
+            if isinstance(text, str) and text.strip():
+                texts.append(text)
+        return texts
+    finally:
+        client.delete()
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -2111,6 +2139,218 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("不进盘中参", age_src)
         self.assertIn("pairCreatedAt", age_src)
         self.assertIn("unknown", age_src)
+
+    def test_goal_20k_pace_card_renders(self) -> None:
+        missing = DataStore(
+            DbPaths(
+                main=self.root / "missing-main.db",
+                execution=self.root / "missing-exec.db",
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        absent = missing.paper_goal_pace()
+        self.assertFalse(absent.available)
+        self.assertIn("数据库文件不存在", absent.reason)
+
+        bare = self.root / "bare-goal.db"
+        sqlite3.connect(bare).close()
+        bare_store = DataStore(
+            DbPaths(main=bare, execution=bare, paper=bare, backtest=bare, news=bare)
+        )
+        bare_goal = bare_store.paper_goal_pace()
+        self.assertFalse(bare_goal.available, bare_goal.reason)
+        self.assertIn("缺少数据表", bare_goal.reason)
+
+        cash_only = self.root / "cash-only-goal.db"
+        with sqlite3.connect(cash_only) as conn:
+            conn.execute("CREATE TABLE account (id INTEGER PRIMARY KEY, cash_usd REAL)")
+            conn.execute("INSERT INTO account (id, cash_usd) VALUES (1, 1000)")
+        cash_store = DataStore(
+            DbPaths(main=cash_only, execution=cash_only, paper=cash_only, backtest=cash_only, news=cash_only)
+        )
+        cash_goal = cash_store.paper_goal_pace()
+        self.assertFalse(cash_goal.available, cash_goal.reason)
+        self.assertIn("positions", cash_goal.reason)
+
+        thin = self.root / "thin-goal.db"
+        with sqlite3.connect(thin) as conn:
+            conn.execute("CREATE TABLE account (id INTEGER PRIMARY KEY, cash_usd REAL)")
+            conn.execute("INSERT INTO account (id, cash_usd) VALUES (1, 1000)")
+            conn.execute("CREATE TABLE positions (id INTEGER PRIMARY KEY, status TEXT)")
+            conn.execute("INSERT INTO positions (id, status) VALUES (1, 'open')")
+        thin_store = DataStore(
+            DbPaths(main=thin, execution=thin, paper=thin, backtest=thin, news=thin)
+        )
+        thin_goal = thin_store.paper_goal_pace()
+        self.assertFalse(thin_goal.available, thin_goal.reason)
+        self.assertIn("size_usd", thin_goal.reason)
+
+        corrupt = self.root / "corrupt-goal.db"
+        corrupt.write_text("{not json and not sqlite", encoding="utf-8")
+        corrupt_store = DataStore(
+            DbPaths(main=corrupt, execution=corrupt, paper=corrupt, backtest=corrupt, news=corrupt)
+        )
+        corrupt_goal = corrupt_store.paper_goal_pace()
+        self.assertFalse(corrupt_goal.available, corrupt_goal.reason)
+        self.assertIn("查询失败", corrupt_goal.reason)
+
+        paper = self.root / "goal-paper.db"
+        with sqlite3.connect(paper) as conn:
+            conn.execute(
+                "CREATE TABLE account (id INTEGER PRIMARY KEY, cash_usd REAL, updated_at TEXT)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE positions (
+                    id TEXT PRIMARY KEY,
+                    size_usd REAL,
+                    status TEXT,
+                    closed_at TEXT
+                )
+                """
+            )
+            conn.execute("INSERT INTO account (id, cash_usd, updated_at) VALUES (1, 8000, '2026-10-20')")
+            conn.execute("INSERT INTO account (id, cash_usd, updated_at) VALUES (2, 1, '2026-10-20')")
+            conn.executemany(
+                "INSERT INTO positions (id, size_usd, status, closed_at) VALUES (?, ?, ?, ?)",
+                [
+                    ("open-a", 450, "open", None),
+                    ("open-b", 254, "OPEN", ""),
+                    ("closed", 999, "closed", "2026-10-19T00:00:00Z"),
+                    ("closed-at", 500, "open", "2026-10-19T00:00:00Z"),
+                    ("cancelled", 80, "cancelled", None),
+                ],
+            )
+        store = DataStore(
+            DbPaths(main=paper, execution=paper, paper=paper, backtest=paper, news=paper)
+        )
+        hkt = ZoneInfo("Asia/Hong_Kong")
+        start = datetime(2026, 10, 20, 4, 0, tzinfo=hkt)
+        before = paper.stat().st_mtime_ns
+        report = store.paper_goal_pace(now=start)
+        self.assertTrue(report.available, report.reason)
+        data = report.data
+        self.assertEqual(data.cash_usd, 8000)
+        self.assertEqual(data.open_count, 2)
+        self.assertAlmostEqual(data.open_size_usd, 704)
+        self.assertAlmostEqual(data.equity_usd, 8704)
+        self.assertEqual(data.target_usd, GOAL_TARGET_USD)
+        self.assertEqual(data.target_usd, 20_000)
+        self.assertAlmostEqual(data.gap_usd, 11_296)
+        self.assertEqual(data.as_of_day, "2026-10-20")
+        self.assertEqual(data.start_day, GOAL_START_DAY.isoformat())
+        self.assertEqual(data.deadline_day, GOAL_DEADLINE_DAY.isoformat())
+        self.assertEqual(data.days_left, 10)
+        self.assertAlmostEqual(data.daily_need_usd or 0, 1129.6)
+        self.assertFalse(data.mark_to_market)
+        self.assertEqual(data.size_gap_count, 0)
+        self.assertEqual(data.note, "")
+        self.assertEqual(paper.stat().st_mtime_ns, before)
+
+        just_before_hkt = datetime(2026, 10, 19, 15, 59, tzinfo=timezone.utc)
+        eve = store.paper_goal_pace(now=just_before_hkt)
+        self.assertTrue(eve.available, eve.reason)
+        self.assertEqual(eve.data.as_of_day, "2026-10-19")
+        self.assertEqual(eve.data.days_left, 11)
+
+        hkt_midnight = datetime(2026, 10, 19, 16, 0, tzinfo=timezone.utc)
+        opened = store.paper_goal_pace(now=hkt_midnight)
+        self.assertEqual(opened.data.as_of_day, "2026-10-20")
+        self.assertEqual(opened.data.days_left, 10)
+
+        last_day = datetime(2026, 10, 29, 15, 59, tzinfo=timezone.utc)
+        near = store.paper_goal_pace(now=last_day)
+        self.assertEqual(near.data.as_of_day, "2026-10-29")
+        self.assertEqual(near.data.days_left, 1)
+        self.assertAlmostEqual(near.data.daily_need_usd or 0, 11296)
+
+        deadline = datetime(2026, 10, 30, 0, 0, tzinfo=hkt)
+        ended = store.paper_goal_pace(now=deadline)
+        self.assertTrue(ended.available, ended.reason)
+        self.assertEqual(ended.data.days_left, 0)
+        self.assertIsNone(ended.data.daily_need_usd)
+        self.assertEqual(ended.data.as_of_day, "2026-10-30")
+
+        ahead_paper = self.root / "ahead-goal.db"
+        with sqlite3.connect(ahead_paper) as conn:
+            conn.execute("CREATE TABLE account (id INTEGER PRIMARY KEY, cash_usd REAL)")
+            conn.execute("INSERT INTO account (id, cash_usd) VALUES (1, 21000)")
+            conn.execute("CREATE TABLE positions (id TEXT PRIMARY KEY, size_usd REAL, status TEXT)")
+        ahead_store = DataStore(
+            DbPaths(
+                main=ahead_paper,
+                execution=ahead_paper,
+                paper=ahead_paper,
+                backtest=ahead_paper,
+                news=ahead_paper,
+            )
+        )
+        ahead = ahead_store.paper_goal_pace(now=start)
+        self.assertTrue(ahead.available, ahead.reason)
+        self.assertAlmostEqual(ahead.data.gap_usd, -1000)
+        self.assertAlmostEqual(ahead.data.daily_need_usd or 0, -100)
+
+        gap_paper = self.root / "gap-goal.db"
+        with sqlite3.connect(gap_paper) as conn:
+            conn.execute("CREATE TABLE account (id INTEGER PRIMARY KEY, cash_usd REAL)")
+            conn.execute("INSERT INTO account (id, cash_usd) VALUES (1, 1000)")
+            conn.execute(
+                "CREATE TABLE positions (id TEXT PRIMARY KEY, size_usd REAL, status TEXT, closed_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO positions (id, size_usd, status, closed_at) VALUES ('x', NULL, 'open', NULL)"
+            )
+        gap_store = DataStore(
+            DbPaths(main=gap_paper, execution=gap_paper, paper=gap_paper, backtest=gap_paper, news=gap_paper)
+        )
+        partial = gap_store.paper_goal_pace(now=start)
+        self.assertTrue(partial.available, partial.reason)
+        self.assertEqual(partial.data.open_count, 1)
+        self.assertEqual(partial.data.size_gap_count, 1)
+        self.assertAlmostEqual(partial.data.equity_usd, 1000)
+        self.assertIn("未计入名义", partial.data.note)
+
+        texts = _rendered_card_texts(lambda: app_module._mount_goal_20k(store))
+        self.assertIn("距", texts)
+        self.assertIn("$20k", texts)
+        self.assertEqual(texts[texts.index("权益粗算") + 1], "$8,704")
+        self.assertEqual(texts[texts.index("目标") + 1], "$20,000")
+        self.assertEqual(texts[texts.index("缺口") + 1], "+$11,296")
+        self.assertEqual(texts[texts.index("剩余天") + 1], "10")
+        self.assertEqual(texts[texts.index("日均需") + 1], "+$1,130")
+        joined = "\n".join(texts)
+        self.assertIn("未盯市 · cash + 未平 size_usd", joined)
+        self.assertIn("口径日 2026-10-20 HKT", joined)
+        self.assertIn("10日目标旁证", joined)
+        self.assertIn("起点 2026-10-20", joined)
+        self.assertIn("截止 2026-10-30 HKT", joined)
+        self.assertIn(app_module._GOAL_NAIL, joined)
+        self.assertIn("目标跟踪≠会赚会亏；不改闸", joined)
+        self.assertEqual(app_module._GOAL_NAIL, "目标跟踪≠会赚会亏；不改闸")
+
+        ended_texts = _rendered_card_texts(lambda: app_module._v2_goal_20k(ahead_store))
+        ended_store_texts = _rendered_card_texts(lambda: app_module._v2_goal_20k(store, now=deadline))
+        self.assertEqual(ended_store_texts[ended_store_texts.index("剩余天") + 1], "0")
+        self.assertEqual(ended_store_texts[ended_store_texts.index("日均需") + 1], "—")
+        self.assertIn(app_module._GOAL_NAIL, ended_store_texts)
+
+        gap_texts = _rendered_card_texts(lambda: app_module._v2_goal_20k(missing))
+        self.assertIn("数据库文件不存在", "\n".join(gap_texts))
+        self.assertIn(app_module._GOAL_NAIL, gap_texts)
+
+        overview = inspect.getsource(app_module._render_dashboard)
+        self.assertIn("_mount_goal_20k", overview)
+        goal_src = inspect.getsource(app_module._v2_goal_20k)
+        self.assertIn("_GOAL_NAIL", goal_src)
+        self.assertIn("未盯市", goal_src)
+        self.assertIn("日均需", goal_src)
+        self.assertNotIn("place_order", goal_src)
+        self.assertNotIn("MAX_OPEN", goal_src)
+        self.assertIn("权益粗算", ended_texts)
+        self.assertEqual(ended_texts[ended_texts.index("缺口") + 1], "-$1,000")
+        self.assertIn(app_module._GOAL_NAIL, ended_texts)
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
