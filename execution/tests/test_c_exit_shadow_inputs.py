@@ -117,3 +117,28 @@ class TestAcceptPurpose(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDedup(unittest.TestCase):
+    def test_same_token_rewritten_is_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            dec = Path(d) / "decision_shadow_entry_010.db"
+            _mk_decisions(dec, ["shadow_010", "shadow_010"])
+            c = sqlite3.connect(dec)  # second row: same token, different pair
+            c.execute("UPDATE decision_log SET token_address='tok1' WHERE id=2")
+            raw = json.loads(c.execute("SELECT raw_json FROM decision_log WHERE id=2").fetchone()[0])
+            raw["token_address"] = "tok1"
+            c.execute("UPDATE decision_log SET raw_json=? WHERE id=2", (json.dumps(raw),))
+            c.commit(); c.close()
+            with mock.patch.object(run, "_latest_mid", return_value=(1.0, 1e6)), \
+                 CExitShadowLedger(Path(d) / "c.db") as led:
+                out = run.process_once(led, decision_db=dec, crawler_db=dec,
+                                       accept_purposes=("shadow_010",))
+                self.assertEqual(out["raw_buys"], 2)
+                self.assertEqual(out["opened"], 8)
+                self.assertEqual(out["dedup_skipped"], 8)
+                # close all, still within 60 min → still blocked
+                for pos in led.list_open():
+                    led.close_position(pos["id"], price=1.0, reason="t")
+                self.assertEqual(run._dedup_block(led, "c_sl5_h60", "solana", "x", "tok1"), "dup_recent")
+                self.assertIsNone(run._dedup_block(led, "c_sl5_h60", "solana", "x", "tok1", window_min=-1))

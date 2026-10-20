@@ -447,6 +447,15 @@ def _close_fill(store: Any, chain_id: str, pair_address: str, mid: float) -> tup
     return sell_fill_price(mid, slip), slip
 
 
+def _make_main_confirmer():
+    from execution.price_confirm import StopPriceConfirmer
+
+    return StopPriceConfirmer()
+
+
+_MAIN_STOP_CONFIRMER = _make_main_confirmer()
+
+
 def tick(
     ledger: PaperLedger,
     store: Store,
@@ -468,6 +477,29 @@ def tick(
 
     def price_lookup(p: dict[str, Any]) -> float | None:
         return latest_price(store, p["chain_id"], p["pair_address"], now=now)
+
+    from execution import price_confirm as _pc
+
+    if _pc.main_book_enabled():
+        raw_lookup = price_lookup
+        cache: dict[tuple[str, str], float | None] = {}
+
+        def price_lookup(p: dict[str, Any]) -> float | None:  # noqa: F811
+            key = (p["chain_id"], p["pair_address"])
+            if key in cache:
+                return cache[key]
+            px = raw_lookup(p)
+            liq = None
+            conn = getattr(store, "_conn", None)
+            if conn is not None and px is not None:
+                try:
+                    q = _pc.latest_quote(conn, p["chain_id"], p["pair_address"])
+                    liq = float(q["liquidity_usd"]) if q and q["liquidity_usd"] is not None else None
+                except Exception:  # noqa: BLE001
+                    liq = None
+            mark, _verdict = _MAIN_STOP_CONFIRMER.check(key, px, liq, px)
+            cache[key] = mark
+            return mark
 
     refresh_open_peaks(ledger, price_lookup)
 

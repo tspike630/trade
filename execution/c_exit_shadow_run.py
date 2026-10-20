@@ -42,6 +42,7 @@ from execution.gateway import (  # noqa: E402
     purpose_reject_reason,
     read_decision_purpose,
 )
+from execution.price_confirm import StopPriceConfirmer, latest_quote  # noqa: E402
 from execution.pricing import buy_fill_price, slippage_rate  # noqa: E402
 from store import fetch_latest_pair_price, norm_address, norm_chain  # noqa: E402
 
@@ -146,6 +147,44 @@ def _already_open(ledger: CExitShadowLedger, tag: str, chain_id: str, pair: str)
     return row is not None
 
 
+# Pre-stop anomaly confirmation: shadow default ON (C_EXIT_STOP_CONFIRM=0 to disable).
+STOP_CONFIRM_ENABLED = os.environ.get("C_EXIT_STOP_CONFIRM", "1").strip() not in ("0", "false", "no")
+CONFIRMER = StopPriceConfirmer()
+
+DEDUP_WINDOW_MIN = float(os.environ.get("C_EXIT_DEDUP_WINDOW_MIN", "60"))
+
+
+def _dedup_block(
+    ledger: CExitShadowLedger,
+    tag: str,
+    chain_id: str,
+    pair: str,
+    token: str | None,
+    window_min: float = DEDUP_WINDOW_MIN,
+) -> str | None:
+    """Per cell: same token/pair already open, or opened within window → skip."""
+    from datetime import datetime, timedelta, timezone
+
+    since = (datetime.now(timezone.utc) - timedelta(minutes=float(window_min))).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    keys = [pair] + ([token] if token else [])
+    q = ",".join("?" for _ in keys)
+    row = ledger.conn.execute(
+        f"""
+        SELECT status FROM positions
+        WHERE grid_tag=? AND chain_id=?
+          AND (pair_address IN ({q}) OR token_address IN ({q}))
+          AND (status='open' OR opened_at >= ?)
+        ORDER BY status='open' DESC LIMIT 1
+        """,
+        (tag, chain_id, *keys, *keys, since),
+    ).fetchone()
+    if row is None:
+        return None
+    return "dup_open" if row["status"] == "open" else "dup_recent"
+
+
 def process_once(
     ledger: CExitShadowLedger,
     *,
@@ -157,12 +196,14 @@ def process_once(
     max_loss_usd: float | None = None,
 ) -> dict[str, Any]:
     if ledger.is_halted():
-        return {"halted": True, "processed": 0, "opened": 0, "tick_closed": []}
+        return {"halted": True, "processed": 0, "opened": 0, "raw_buys": 0, "dedup_skipped": 0, "cursor": ledger.get_last_processed_id(), "tick_closed": []}
 
     since = ledger.get_last_processed_id()
     rows = _fetch_pending(decision_db, since, limit)
     opened = 0
     skipped = 0
+    raw_buys = 0
+    dedup_skipped = 0
     last_id = since
 
     for row in rows:
@@ -195,6 +236,7 @@ def process_once(
             skipped += 1
             continue
 
+        raw_buys += 1
         mid, liq = _latest_mid(crawler_db, chain_id, pair)
         if mid is None or mid <= 0:
             skipped += 1
@@ -205,8 +247,12 @@ def process_once(
         # size vs first tag cash (同口径 size_pct * equity); each tag sized on its own cash
         results = []
         for cell in cells():
-            if _already_open(ledger, cell.tag, chain_id, pair):
-                results.append({"ok": False, "tag": cell.tag, "error": "already_open"})
+            dup = _dedup_block(
+                ledger, cell.tag, chain_id, pair, norm_address(token) if token else None
+            )
+            if dup:
+                results.append({"ok": False, "tag": cell.tag, "error": dup})
+                dedup_skipped += 1
                 continue
             cash = ledger.get_cash(cell.tag)
             # equity ≈ cash + open notional; skeleton uses cash as equity proxy (flat book)
@@ -274,10 +320,35 @@ def process_once(
         ledger.set_last_processed_id(last_id)
 
     def price_lookup(pos: dict[str, Any]) -> float | None:
-        mid, _liq = _latest_mid(
-            crawler_db, pos["chain_id"], pos["pair_address"]
+        if not STOP_CONFIRM_ENABLED:
+            mid, _liq = _latest_mid(crawler_db, pos["chain_id"], pos["pair_address"])
+            return mid
+        try:
+            con = _open_ro(crawler_db)
+            try:
+                q = latest_quote(con, pos["chain_id"], pos["pair_address"])
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return None
+        if not q:
+            return None
+        try:
+            liq = float(q["liquidity_usd"]) if q["liquidity_usd"] is not None else None
+        except (TypeError, ValueError):
+            liq = None
+        mark, verdict = CONFIRMER.check(
+            (pos["chain_id"], pos["pair_address"]),
+            float(q["price_usd"]),
+            liq,
+            q["recorded_at"],
         )
-        return mid
+        if verdict in ("suspect_hold", "rug_immediate", "confirmed"):
+            log.warning(
+                "stop-confirm pair=%s px=%s liq=%s verdict=%s",
+                pos["pair_address"][:12], q["price_usd"], liq, verdict,
+            )
+        return mark
 
     tick_closed = ledger.tick(price_lookup)
     return {
@@ -285,6 +356,8 @@ def process_once(
         "processed": len(rows),
         "skipped": skipped,
         "opened": opened,
+        "raw_buys": raw_buys,
+        "dedup_skipped": dedup_skipped,
         "cursor": ledger.get_last_processed_id(),
         "tick_closed": tick_closed,
     }
@@ -414,9 +487,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(json.dumps(summary, ensure_ascii=False, default=str), flush=True)
                 else:
                     log.info(
-                        "shadow tick processed=%s opened=%s closed=%s cursor=%s halted=%s",
+                        "shadow tick processed=%s raw_buys=%s opened=%s dedup_skipped=%s closed=%s cursor=%s halted=%s",
                         summary["processed"],
+                        summary["raw_buys"],
                         summary["opened"],
+                        summary["dedup_skipped"],
                         len(summary["tick_closed"]),
                         summary["cursor"],
                         summary["halted"],
