@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
 CRAWLER = ROOT / "crawler"
@@ -45,6 +46,10 @@ def _iso(dt: datetime) -> str:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _hkt_today() -> str:
+    return _now().astimezone(ZoneInfo("Asia/Hong_Kong")).date().isoformat()
 
 
 class _PriceDB:
@@ -768,7 +773,7 @@ class RiskAndPmTests(unittest.TestCase):
             self.assertGreaterEqual(stats.processed, 2)
 
     def test_daily_loss_reason_is_stable_key(self) -> None:
-        today = _now().date().isoformat()
+        today = _hkt_today()
 
         class _Closed:
             def __init__(self, rows: list[dict]) -> None:
@@ -869,7 +874,7 @@ class RiskAndPmTests(unittest.TestCase):
                 self.assertNotIn(":", item["reason"])
                 self.assertEqual(item["detail"]["limit"], 200.0)
                 self.assertLess(item["detail"]["pnl"], -200.0)
-                self.assertEqual(item["detail"]["today"], _now().date().isoformat())
+                self.assertEqual(item["detail"]["today"], _hkt_today())
                 self.assertEqual(
                     rejection_key(1, "", "rejected", receipt),
                     "risk_rejected:daily_loss",

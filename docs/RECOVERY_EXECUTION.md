@@ -98,12 +98,12 @@ cd /workspace/dexscreener-crawler
 | `EXECUTION_MAX_OPEN` | `5` | 全局开仓上限 |
 | `EXECUTION_DAILY_LOSS_USD` | `200` | 日亏限额（USD） |
 
-### 日亏闸 · 日切（G-1 错位）
+### 日亏闸 · 日切（HKT）
 
-- 执行 `check_daily_loss` 按 **UTC 日历日**切（约 **08:00 HKT** 滚日）。
-- 看板 G-1 / 复盘日开仓旁证按 **HKT**。
-- 两套日切**并记**；滚日前无成交可能是闸门按设计挡住，不是 loop 挂了或策略停发。
-- **不盘中改限额**来「对齐 HKT」；记入 10-19 旁证。
+- 执行 `check_daily_loss` 按 **Asia/Hong_Kong 日历日**切。`closed_at` 仍是 UTC ISO，归日用该时刻的 HKT 日期。
+- 看板 G-1 / 复盘日开仓旁证也按 **HKT**。日界对齐。
+- **纠错日切 ≠ 松闸**：`EXECUTION_DAILY_LOSS_USD` 仍是 **200**；仍是当日 pnl `< -limit` 才拒。00:00–08:00 HKT 不再把上一 HKT 日的亏损算进今天。
+- 滚日后无成交仍可能是闸门按限额挡住，不是 loop 挂了或策略停发。**不盘中改限额**。
 
 ### purpose 闸
 
@@ -167,7 +167,7 @@ cd /workspace/dexscreener-crawler
 4. **拒因分桶**：`order_events`（含 `daily_loss` 与 PM 拒）
 5. **slippage_1h** + **bot_trade_share**（#77/#82）
 6. 可选：INTEL_LOOP 缺口扫描填空（候选登记≠激活）
-7. 重申：G-1 **UTC 日切 vs HKT** 错位只旁证；live 仍关
+7. 重申：日亏闸日界已对齐 **HKT**（限额仍 200，纠错日切≠松闸）；live 仍关
 
 导出命令见 §3。
 
@@ -187,7 +187,7 @@ cd /workspace/dexscreener-crawler
 - [ ] 能从仓定位：`execution/`、`WAITING_ITEMS.md`、`slippage_report.py`、`f1_streak_report`、`shadow_c3_report`、`risk/bankruptcy.py`
 - [ ] 能复述金律：意图不可见→行为代理；情报只观察；候选≠生效；不算有效性
 - [ ] 知默认 paper/PM/RISK/live **关**；杨授权最小 PM 表在 §5；exits 默认 10/5/60 **不盘中改**
-- [ ] 知日亏闸 **UTC 日切**（≈08:00 HKT 滚日）与看板 HKT 并记
+- [ ] 知日亏闸 **HKT 日切**（限额仍 200，纠错日切≠松闸）；决策侧不停发、只观察拒单
 - [ ] 知 purpose：只做 `live_candidate`；sample 拒
 - [ ] 知 I-3：滑点/bot 份额只读；**高 bot 不跳单**
 - [ ] 知 E-2/C4 只 WAITING；F-1 只记不熔断；C3 影子不改 exits

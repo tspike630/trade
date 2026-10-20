@@ -80,7 +80,7 @@ python -m decision_engine.backtest.run --strategy all --days 7 --dry-run
 - **流动性**：`DECISION_MIN_LIQ=50000`；临时 `min=0.15`（口径以现网/config 为准，**不盘中改** TP/SL/冷却/日亏）。
 - **purpose**：区分 `live_candidate` vs `sample`（采样/周检样本 ≠ 可上线候选）。
 - **Step2**：正式跑须 `--strict-coverage`。**否决只看 #71/#72 硬旁证**；**#78 拥挤度不进否决**（只旁证）。
-- **日亏闸属执行**（UTC 日切，约 08:00 HKT 滚日）——决策**不停发**指令，只**观察拒单**（执行侧 `daily_loss` 等）。
+- **日亏闸属执行**（HKT 日切，限额仍约 200）——决策**不停发**指令，只**观察拒单**（执行侧 `daily_loss` 等）。纠错日切不是松闸。
 - 回答群时带头结论 +「不算有效性」；不盘中改参。
 
 ---
@@ -149,7 +149,7 @@ python -m decision_engine.backtest.run --strategy all --days 7 --dry-run
 - [ ] 能复述 Step2 否决口径：只认 #71/#72 硬旁证；#78 不进否决；正式跑须 `--strict-coverage`
 - [ ] 能说明：权重 0 前不接 `top10_share` / `dev_balance_delta` / `bot_trade_share`
 - [ ] 知默认 dry-run、live 关、冷却 per-(strategy,chain,token)、不盘中改 TP/SL/冷却/日亏
-- [ ] 知日亏闸在执行（UTC 日切≈08:00 HKT）；决策不停发、只观察拒单
+- [ ] 知日亏闸在执行（HKT 日切，限额仍约 200）；决策不停发、只观察拒单
 - [ ] 知例行：日检 10:51、JEV 周检周一 09:15、采样周一三五 10:19、防漏读 09:46/15:46
 - [ ] 改码后推 `tspike630/trade`；合后同步 `dexscreener-crawler`；禁推密钥/db
 - [ ] 资料包回群前附 URL 状态清单 + 一句机制摘录；未列清单不写已学完
