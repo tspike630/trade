@@ -25,7 +25,12 @@ from fastapi import Request
 from nicegui import app, ui
 
 from dashboard.auth import attach_secret_filters, verify_api_key
-from dashboard.data import GOAL_DEADLINE_DAY, GOAL_START_DAY, DataStore
+from dashboard.data import (
+    GOAL_DEADLINE_DAY,
+    GOAL_START_DAY,
+    KPI_WINDOW_DAYS,
+    DataStore,
+)
 from dashboard.format_util import fmt_age, fmt_rate, liveness_label
 from dashboard.panels import risk as risk_panel
 from dashboard.panels.common import panel_box, panel_guard, show_unavailable
@@ -1207,6 +1212,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     tools=("只读",),
                 )
                 _mount_goal_20k(store)
+                _mount_kpi_reverse(store)
                 _mount_phase0_shadow()
                 _mount_phase1_counterfactual()
                 _mount_c_exit_shadow()
@@ -2165,6 +2171,8 @@ def _v2_reject(store: DataStore) -> None:
 _EVIDENCE_NAIL = "信号或胜率方向≠盈亏；旁证只记分布缝，不算有效性"
 # 目标旁证短钉：跟踪缺口不是盈亏承诺，也不改闸。
 _GOAL_NAIL = "目标跟踪≠会赚会亏；不改闸"
+# KPI 倒推短钉：只把缺口拆成每笔期望，不碰闸、环境和杠杆。
+_KPI_NAIL = "只读倒推 · 不改闸 · 不改 .env · 开杠杆由五层互批"
 # M7 影簿短钉：S0 对照只有注册时的 8 笔，不能拿薄样本改闸。
 _M7_NAIL = "影簿≠已改闸 · S0 历史仅 8 笔对照极薄 · 勿用薄样本批改闸"
 _M7_PHASE0_NOTE = "与 Phase0 双列并存 · 不算有效性"
@@ -2444,11 +2452,11 @@ def _goal_short_text(value: object) -> tuple[str, str]:
     return text, "mute"
 
 
-def _mount_goal_20k(store: DataStore) -> None:
+def _mount_goal_20k(store: DataStore, *, now: datetime | None = None) -> None:
     _v2_comp(
         ("距", "$20k"),
         "span-6",
-        lambda: _v2_goal_20k(store),
+        lambda: _v2_goal_20k(store, now=now),
         foot=(
             f"10日目标旁证 · 起点 {GOAL_START_DAY.isoformat()} · "
             f"截止 {GOAL_DEADLINE_DAY.isoformat()} HKT · {_GOAL_NAIL}"
@@ -2504,6 +2512,151 @@ def _v2_goal_20k(store: DataStore, *, now: datetime | None = None) -> None:
     if note:
         ui.label(_v2_text(note)).classes("v2-note")
     ui.label(_GOAL_NAIL).classes("v2-note")
+
+
+def _kpi_signed_cents(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    if value > 0:
+        return f"+${value:,.2f}"
+    if value < 0:
+        return f"-${abs(value):,.2f}"
+    return "$0.00"
+
+
+def _kpi_need_text(value: object) -> tuple[str, str]:
+    """Required dollars. A positive need (still short) is down."""
+    text = _kpi_signed_cents(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—", "mute"
+    if value > 0:
+        return text, "down"
+    if value < 0:
+        return text, "up"
+    return text, "mute"
+
+
+def _kpi_pnl_text(value: object) -> tuple[str, str]:
+    text = _kpi_signed_cents(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—", "mute"
+    if value > 0:
+        return text, "up"
+    if value < 0:
+        return text, "down"
+    return text, "mute"
+
+
+def _kpi_count_text(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    number = float(value)
+    if number == int(number):
+        return str(int(number))
+    return f"{number:.4f}".rstrip("0").rstrip(".")
+
+
+def _kpi_pace_label(item: object) -> str:
+    label = str(getattr(item, "label", "") or "")
+    per = getattr(item, "closes_per_day", None)
+    if label == "近7日":
+        return f"近7日 {_kpi_count_text(per)}"
+    if label in {"5", "10", "20"}:
+        return f"{label} 笔"
+    return label or "—"
+
+
+def _kpi_line_text(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    return f"${float(value):,.0f}"
+
+
+def _mount_kpi_reverse(store: DataStore, *, now: datetime | None = None) -> None:
+    _v2_comp(
+        ("KPI", "倒推"),
+        "span-6",
+        lambda: _v2_kpi_reverse(store, now=now),
+        foot=(
+            f"硬 KPI 倒推 · 截止 {GOAL_DEADLINE_DAY.isoformat()} HKT · {_KPI_NAIL}"
+        ),
+        tools=("只读",),
+    )
+
+
+def _v2_kpi_reverse(store: DataStore, *, now: datetime | None = None) -> None:
+    result = store.paper_kpi_reverse(now=now)
+    if not result.available or result.data is None:
+        ui.label(result.reason or "data gap").classes("v2-note")
+        ui.label(_KPI_NAIL).classes("v2-note")
+        return
+    report = result.data
+    gap_text, gap_tone = _kpi_need_text(getattr(report, "gap_usd", None))
+    days = getattr(report, "days_left", None)
+    daily = getattr(report, "daily_need_usd", None)
+    if isinstance(days, bool) or not isinstance(days, int):
+        days_text = "—"
+        daily_text, daily_tone = "—", "mute"
+    elif days <= 0:
+        days_text = "0"
+        daily_text, daily_tone = "—", "mute"
+    else:
+        days_text = str(days)
+        daily_text, daily_tone = _kpi_need_text(daily)
+    closed_n = getattr(report, "closed_n", None)
+    if isinstance(closed_n, bool) or not isinstance(closed_n, int):
+        closed_text = "—"
+    else:
+        closed_text = str(closed_n)
+    avg_text, avg_tone = _kpi_pnl_text(getattr(report, "avg_pnl_usd", None))
+    _v2_kv([
+        ("缺口", gap_text, gap_tone),
+        ("剩余天", days_text, "mute"),
+        ("日需", daily_text, daily_tone),
+        ("已平", closed_text, "mute"),
+        ("每笔均", avg_text, avg_tone),
+        ("近7日均笔", _kpi_count_text(getattr(report, "avg_closes_per_day", None)), "mute"),
+    ])
+    rows: list[list[str]] = []
+    tones: list[list[str]] = []
+    for item in getattr(report, "pace_rows", ()) or ():
+        need_text, need_tone = _kpi_need_text(getattr(item, "need_per_trade_usd", None))
+        live_text, live_tone = _kpi_pnl_text(getattr(item, "live_avg_pnl_usd", None))
+        contrast = str(getattr(item, "contrast", "") or "") or "—"
+        rows.append([_kpi_pace_label(item), need_text, live_text, contrast])
+        contrast_tone = "down" if contrast == "符号相反" else "mute"
+        tones.append(["", need_tone, live_tone, contrast_tone])
+    _v2_table(
+        [("日笔数", ""), ("每笔需", "num"), ("现网每笔", "num"), ("对照", "")],
+        rows,
+        tones,
+    )
+    if getattr(report, "negative_expectancy", None) is True:
+        ui.label("负期望 × 杠杆 = 放大亏损").classes("v2-note")
+    line = _kpi_line_text(getattr(report, "daily_loss_line_usd", None))
+    max_stop = getattr(report, "max_stop_usd", None)
+    if isinstance(max_stop, bool) or not isinstance(max_stop, (int, float)):
+        ui.label("单笔最大止损 —").classes("v2-note")
+    else:
+        ui.label(f"单笔最大止损 ${max_stop:,.2f}").classes("v2-note")
+    for item in getattr(report, "leverage_rows", ()) or ():
+        multiple = getattr(item, "multiple", None)
+        stop = getattr(item, "stop_usd", None)
+        vs = str(getattr(item, "vs_line", "") or "") or "—"
+        if isinstance(stop, bool) or not isinstance(stop, (int, float)):
+            stop_text = "—"
+        else:
+            stop_text = f"${stop:,.2f}"
+        ui.label(f"{multiple}× {stop_text} · 日亏线 {line} · {vs}").classes("v2-note")
+    ui.label(
+        f"止损 = size_usd×sl_pct/100 · 不含撤单 · 近{KPI_WINDOW_DAYS}个 HKT 日含零成交日"
+    ).classes("v2-note")
+    note = getattr(report, "gap_note", "") or ""
+    if note:
+        ui.label(_v2_text(note)).classes("v2-note")
+    as_of = _v2_text(getattr(report, "as_of_day", None))
+    ui.label(f"口径日 {as_of} HKT").classes("v2-note")
+    ui.label(_KPI_NAIL).classes("v2-note")
 
 
 def _mount_phase0_shadow() -> None:

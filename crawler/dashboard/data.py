@@ -519,6 +519,67 @@ class GoalPaceReport:
     note: str
 
 
+# Reverse the $20k pace into a per-close requirement. Observe-only.
+KPI_WINDOW_DAYS = 7
+KPI_PACE_COUNTS = (5, 10, 20)
+KPI_LEVERAGE_STEPS = (1, 2, 3)
+# Stated daily-loss line for the leverage footnote. Not read from the environment.
+KPI_DAILY_LOSS_LINE_USD = 200.0
+_KpiVsLine = Literal["低于线", "触线", "超线"]
+
+
+@dataclass(frozen=True)
+class KpiPaceRow:
+    """One assumed closes-per-day and the average pnl that pace would require.
+
+    ``need_per_trade_usd`` is daily need divided by ``closes_per_day``. It stays
+    None when the day count or the daily need is missing, including a zero rate.
+    ``contrast`` is ``符号相反``, ``差 N 倍``, or empty when the comparison has a gap.
+    """
+
+    label: str
+    closes_per_day: float | None
+    need_per_trade_usd: float | None
+    live_avg_pnl_usd: float | None
+    contrast: str
+
+
+@dataclass(frozen=True)
+class KpiLeverageRow:
+    """Configured stop scaled by a leverage step, beside the $200 daily-loss line."""
+
+    multiple: int
+    stop_usd: float | None
+    vs_line: str
+
+
+@dataclass(frozen=True)
+class KpiReverseReport:
+    """$20k pace turned into per-close pnl, next to live closed trades.
+
+    Gap, days left, and daily need are the ``GoalPaceReport`` fields. Live
+    averages use closed positions only. A missing pnl or an unreadable HKT day
+    stays None. Stop dollars are ``size_usd * sl_pct / 100`` and exclude
+    cancels. Not a gate, not an env write, and not a leverage change.
+    """
+
+    gap_usd: float
+    days_left: int
+    daily_need_usd: float | None
+    as_of_day: str
+    closed_n: int
+    pnl_sum_usd: float | None
+    avg_pnl_usd: float | None
+    avg_closes_per_day: float | None
+    window_days: int
+    pace_rows: tuple[KpiPaceRow, ...]
+    max_stop_usd: float | None
+    leverage_rows: tuple[KpiLeverageRow, ...]
+    negative_expectancy: bool | None
+    daily_loss_line_usd: float
+    gap_note: str
+
+
 # M7 shadow register. Observe-only buckets; the live floor stays where it is.
 _M7_S0_MIN = 50_000.0
 _M7_S1_MIN = 100_000.0
@@ -653,6 +714,195 @@ def _goal_daily_need(gap_usd: float, days_left: int) -> float | None:
     if days_left <= 0:
         return None
     return round(gap_usd / days_left, 2)
+
+
+def _hkt_date(ts: object) -> date | None:
+    """Calendar day in Asia/Hong_Kong. Naive clocks are UTC. Unreadable stays None."""
+    raw = str(ts or "").strip()
+    if not raw:
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(_HKT).date()
+
+
+def _kpi_status(row: sqlite3.Row, cols: set[str]) -> str:
+    if "status" not in cols:
+        return ""
+    raw = _cell(row, "status")
+    if raw is None:
+        return ""
+    return str(raw).strip().lower()
+
+
+def _kpi_is_closed(row: sqlite3.Row, cols: set[str]) -> bool:
+    """Closed trade. Cancels are not closes. Same open rule as the $20k card."""
+    if _kpi_status(row, cols) in {"cancelled", "canceled"}:
+        return False
+    return not _is_open(row, cols)
+
+
+def _kpi_contrast(need: float | None, live: float | None) -> str:
+    """How far the required per-close pnl sits from the live average."""
+    if need is None or live is None or live == 0:
+        return ""
+    if need == 0 or (need > 0) == (live > 0):
+        ratio = abs(need / live)
+        return f"差 {ratio:.2f} 倍"
+    return "符号相反"
+
+
+def _kpi_vs_line(stop_usd: float, line: float = KPI_DAILY_LOSS_LINE_USD) -> _KpiVsLine:
+    if stop_usd > line:
+        return "超线"
+    if stop_usd < line:
+        return "低于线"
+    return "触线"
+
+
+def _kpi_notes(*parts: str) -> str:
+    return " · ".join(part for part in parts if part)
+
+
+def _kpi_pace_rows(
+    daily_need: float | None,
+    live_avg: float | None,
+    window_avg: float | None,
+) -> tuple[KpiPaceRow, ...]:
+    specs: list[tuple[str, float | None]] = [("近7日", window_avg)]
+    for count in KPI_PACE_COUNTS:
+        specs.append((str(count), float(count)))
+    rows: list[KpiPaceRow] = []
+    for label, per_day in specs:
+        need: float | None = None
+        if daily_need is not None and per_day is not None and per_day > 0:
+            need = round(daily_need / per_day, 4)
+        rows.append(
+            KpiPaceRow(
+                label=label,
+                closes_per_day=None if per_day is None else round(per_day, 4),
+                need_per_trade_usd=need,
+                live_avg_pnl_usd=live_avg,
+                contrast=_kpi_contrast(need, live_avg),
+            )
+        )
+    return tuple(rows)
+
+
+def _kpi_max_stop(rows: list[sqlite3.Row], cols: set[str]) -> tuple[float | None, str]:
+    """Largest configured stop. Missing size or sl stays out of the max."""
+    absent = [name for name in ("size_usd", "sl_pct") if name not in cols]
+    if absent:
+        return None, "缺少字段：" + ", ".join(absent)
+    found: list[float] = []
+    skipped = 0
+    for row in rows:
+        if _kpi_status(row, cols) in {"cancelled", "canceled"}:
+            continue
+        size = safe_float(_cell(row, "size_usd"))
+        sl = safe_float(_cell(row, "sl_pct"))
+        if size is None or sl is None:
+            skipped += 1
+            continue
+        if size <= 0 or sl == 0:
+            continue
+        found.append(abs(float(size) * float(sl) / 100.0))
+    if not found:
+        if skipped:
+            return None, f"{skipped} 笔缺 size_usd 或 sl_pct"
+        return None, "无可用止损"
+    note = f"{skipped} 笔缺 size_usd 或 sl_pct，未计入最大" if skipped else ""
+    return round(max(found), 2), note
+
+
+def _kpi_leverage_rows(max_stop: float | None) -> tuple[KpiLeverageRow, ...]:
+    rows: list[KpiLeverageRow] = []
+    for step in KPI_LEVERAGE_STEPS:
+        if max_stop is None:
+            rows.append(KpiLeverageRow(step, None, ""))
+            continue
+        scaled = round(max_stop * step, 2)
+        rows.append(KpiLeverageRow(step, scaled, _kpi_vs_line(scaled)))
+    return tuple(rows)
+
+
+def _kpi_reverse_from_rows(
+    pace: GoalPaceReport,
+    rows: list[sqlite3.Row],
+    cols: set[str],
+) -> KpiReverseReport:
+    """Build the reverse report from rows already read. Does not touch the file."""
+    closed = [row for row in rows if _kpi_is_closed(row, cols)]
+    closed_n = len(closed)
+    pnl_note = ""
+    pnl_sum: float | None = None
+    avg: float | None = None
+    if "pnl_usd" not in cols:
+        if closed_n:
+            pnl_note = "缺少字段：pnl_usd"
+    elif closed_n == 0:
+        avg = None
+    else:
+        missing = 0
+        total = 0.0
+        for row in closed:
+            pnl = safe_float(_cell(row, "pnl_usd"))
+            if pnl is None:
+                missing += 1
+                continue
+            total += float(pnl)
+        if missing:
+            pnl_note = f"{missing} 笔已平缺 pnl_usd"
+        else:
+            pnl_sum = round(total, 4)
+            avg = round(total / closed_n, 4)
+    window_note = ""
+    window_avg: float | None
+    if closed_n == 0:
+        window_avg = 0.0
+    elif "closed_at" not in cols:
+        window_avg = None
+        window_note = "缺少字段：closed_at"
+    else:
+        as_of = date.fromisoformat(pace.as_of_day)
+        window_start = as_of - timedelta(days=KPI_WINDOW_DAYS - 1)
+        undated = 0
+        in_window = 0
+        for row in closed:
+            day = _hkt_date(_cell(row, "closed_at"))
+            if day is None:
+                undated += 1
+                continue
+            if window_start <= day <= as_of:
+                in_window += 1
+        if undated:
+            window_avg = None
+            window_note = f"{undated} 笔已平无法按 HKT 切日"
+        else:
+            window_avg = round(in_window / KPI_WINDOW_DAYS, 4)
+    max_stop, stop_note = _kpi_max_stop(rows, cols)
+    negative: bool | None = None if avg is None else avg < 0
+    return KpiReverseReport(
+        gap_usd=pace.gap_usd,
+        days_left=pace.days_left,
+        daily_need_usd=pace.daily_need_usd,
+        as_of_day=pace.as_of_day,
+        closed_n=closed_n,
+        pnl_sum_usd=pnl_sum,
+        avg_pnl_usd=avg,
+        avg_closes_per_day=window_avg,
+        window_days=KPI_WINDOW_DAYS,
+        pace_rows=_kpi_pace_rows(pace.daily_need_usd, avg, window_avg),
+        max_stop_usd=max_stop,
+        leverage_rows=_kpi_leverage_rows(max_stop),
+        negative_expectancy=negative,
+        daily_loss_line_usd=KPI_DAILY_LOSS_LINE_USD,
+        gap_note=_kpi_notes(pace.note, pnl_note, window_note, stop_note),
+    )
 
 
 def _hkt_day(ts: str | None) -> str:
@@ -1458,6 +1708,21 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed paper_goal_pace: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_goal_pace")
+
+    def paper_kpi_reverse(self, *, now: datetime | None = None) -> DataResult:
+        """Observe-only reverse of the $20k pace into per-close pnl.
+
+        Reuses ``GoalPaceReport`` for the gap, days left, and daily need.
+        Closed pnl and configured stops are read from the paper DB with
+        ``ro_connect``. A missing pnl or an unreadable HKT close day stays
+        empty. Does not write the database, the environment, or any gate.
+        """
+        started = time.perf_counter()
+        try:
+            return _finish(self._paper_kpi_reverse(started, now), "paper_kpi_reverse")
+        except Exception as exc:
+            log.warning("read failed paper_kpi_reverse: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_kpi_reverse")
 
     def m7_shadow_register(self, *, csv_path: Path | None = None) -> DataResult:
         """Observe-only M7 S0 / S1 / liq_missing counts.
@@ -2512,6 +2777,35 @@ class DataStore:
             ),
             started,
         )
+
+    def _paper_kpi_reverse(self, started: float, now: datetime | None) -> DataResult:
+        pace = self._paper_goal_pace(started, now)
+        if not pace.available or not isinstance(pace.data, GoalPaceReport):
+            return pace
+        path = self.paths.paper
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "positions", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "positions")
+                selected = [
+                    name
+                    for name in ("size_usd", "status", "closed_at", "pnl_usd", "sl_pct")
+                    if name in cols
+                ]
+                if not selected:
+                    rows: list[sqlite3.Row] = []
+                else:
+                    rows = list(
+                        _exec(
+                            conn,
+                            f"SELECT {', '.join(selected)} FROM positions",
+                        ).fetchall()
+                    )
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        return _ok(_kpi_reverse_from_rows(pace.data, rows, set(selected)), started)
 
     def _m7_csv_candidates(self) -> list[Path]:
         root = db_root()
