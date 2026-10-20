@@ -680,8 +680,9 @@ body { margin: 0; }
 .v2-foot {
   padding: 4px 10px; border-top: 1px solid var(--v2-border); font-size: 10px;
   color: var(--v2-mute); display: flex; gap: 10px; flex-shrink: 0; font-family: var(--v2-mono);
-  white-space: nowrap; overflow: hidden;
+  white-space: normal; overflow: hidden;
 }
+.v2-foot > * { min-width: 0; white-space: normal; }
 
 /* ---- kv 行 ---- */
 .v2-kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; }
@@ -742,6 +743,7 @@ body { margin: 0; }
 .v2-wrap::-webkit-scrollbar-thumb:hover { background: var(--v2-border-strong); }
 
 .v2-note { color: var(--v2-mute); font-size: 10px; font-style: italic; }
+.v2-note-warn { color: var(--v2-warn); font-style: normal; font-weight: 650; }
 
 @media (max-width: 720px) {
   .v2-grid { grid-template-columns: repeat(2, 1fr); }
@@ -1110,49 +1112,49 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     ("平仓", "旁证"),
                     "span-6",
                     lambda: _v2_closed(store),
-                    foot="首笔命中 + exit×liq · 观察旁证 · 不算有效性",
+                    foot=f"首笔命中 + exit×liq · {_EVIDENCE_NAIL}",
                     tools=("14d",),
                 )
                 _v2_comp(
                     ("交易", "频率"),
                     "span-6",
                     lambda: _v2_trade_freq(store),
-                    foot="G-1 江恩：日开仓次数 vs 实现盈亏 · 日切 HKT · 旁证",
+                    foot=f"G-1 多样本可取 · 日开↑常伴损耗↑ · 观察峰≠加仓频 · {_EVIDENCE_NAIL}",
                     tools=("14d",),
                 )
                 _v2_comp(
                     ("信号", "连亏"),
                     "span-6",
                     lambda: _v2_signal_streak(store),
-                    foot="F-1 只记录不熔断 · P(第3亏|连2亏) · 旁证",
+                    foot=f"F-1 只记录不熔断 · P(第3亏|连2亏) · {_EVIDENCE_NAIL}",
                     tools=("14d",),
                 )
                 _v2_comp(
                     ("退出", "持仓"),
                     "span-6",
                     lambda: _v2_exit_hold(store),
-                    foot="F-3 / C3：exit×持仓分钟 vs max_hold · 旁证",
+                    foot=f"F-3 / C3：exit×持仓分钟 vs max_hold · {_EVIDENCE_NAIL}",
                     tools=("14d",),
                 )
                 _v2_comp(
                     ("持仓", "集中"),
                     "span-6",
                     lambda: _v2_intel_holders(store),
-                    foot="旁证观察 · 不算有效性 · 不进盘中参 · 高 bot 不跳单",
+                    foot=f"{_EVIDENCE_NAIL} · 不进盘中参 · 高 bot 不跳单",
                     tools=("权重0",),
                 )
                 _v2_comp(
                     ("滑点", "bot"),
                     "span-6",
                     lambda: _v2_intel_slippage(store),
-                    foot="旁证观察 · 不算有效性 · 不进盘中参 · 高 bot 不跳单",
+                    foot=f"{_EVIDENCE_NAIL} · 不进盘中参 · 高 bot 不跳单",
                     tools=("不跳单",),
                 )
                 _v2_comp(
                     ("代币", "年龄"),
                     "span-6",
                     lambda: _v2_token_age(store),
-                    foot="旁证观察 · 不算有效性 · 不进盘中参 · extras.pairCreatedAt",
+                    foot=f"{_EVIDENCE_NAIL} · 不进盘中参 · extras.pairCreatedAt",
                     tools=("只读",),
                 )
                 _v2_comp(
@@ -2104,6 +2106,10 @@ def _v2_reject(store: DataStore) -> None:
 
 
 
+# 旁证短钉：信号或胜率方向不是盈亏结论；只记分布缝，不算有效性。
+_EVIDENCE_NAIL = "信号或胜率方向≠盈亏；旁证只记分布缝，不算有效性"
+
+
 def _v2_signal_streak(store: DataStore) -> None:
     result = store.paper_signal_streaks(days=14)
     if not result.available or result.data is None:
@@ -2129,8 +2135,9 @@ def _v2_signal_streak(store: DataStore) -> None:
         rows,
     )
     ui.label(
-        "F-1 旁证：paper 只记连亏，不自动熔断；"
-        "周检看条件概率有增益再进 PM（R2/R3），不算有效性。"
+        "F-1：paper 只记连亏，不自动熔断；"
+        "周检看条件概率有增益再进 PM（R2/R3）。"
+        + _EVIDENCE_NAIL
     ).classes("v2-note")
 
 
@@ -2164,8 +2171,9 @@ def _v2_exit_hold(store: DataStore) -> None:
         tones,
     )
     ui.label(
-        "F-3/C3 旁证：对照同步/快速退出 vs max_hold 硬时间；"
-        "现网 stop_loss 持仓更短但亏更大——退出快≠亏得小，不算有效性。"
+        "F-3/C3：对照同步/快速退出 vs max_hold 硬时间；"
+        "现网 stop_loss 持仓更短但亏更大——退出快≠亏得小。"
+        + _EVIDENCE_NAIL
     ).classes("v2-note")
 
 def _v2_trade_freq(store: DataStore) -> None:
@@ -2207,8 +2215,9 @@ def _v2_trade_freq(store: DataStore) -> None:
         tones,
     )
     ui.label(
-        "G-1 旁证：日切 HKT；交易次数↑通常损耗↑（江恩）；"
-        "对照冷却/max_open，不盘中改参，不算有效性。"
+        "G-1：日切 HKT；多样本可取，但日开↑常伴随损耗↑——观察峰，不解读为应加仓频。"
+        "对照冷却/max_open，不盘中改参。"
+        + _EVIDENCE_NAIL
     ).classes("v2-note")
 
 def _v2_closed(store: DataStore) -> None:
@@ -2267,6 +2276,10 @@ def _v2_closed(store: DataStore) -> None:
             ),
         ),
     ])
+    ui.label(
+        "半胜仍亏：止损可抹盈，常由少数 stop_loss 打穿主导；"
+        "日亏闸触发是保护不是失效——对齐 min_liq/冷却，不盘中改 TP·SL。"
+    ).classes("v2-note v2-note-warn")
     rows: list[list[str]] = []
     for item in buckets[:12]:
         pnl = getattr(item, "pnl_usd", None)
@@ -2297,15 +2310,10 @@ def _v2_closed(store: DataStore) -> None:
         ui.label("退出合计：" + "；".join(parts)).classes("v2-note")
     ui.label(
         f"已平 {getattr(report, 'closed', 0)} · 合计 "
-        f"{_v2_money(total) if isinstance(total, (int, float)) else '—'} · 旁证非有效性"
+        f"{_v2_money(total) if isinstance(total, (int, float)) else '—'} · {_EVIDENCE_NAIL}"
     ).classes("v2-note")
     ui.label(
-        "反思旁证：半胜仍亏时常由少数 stop_loss 打穿主导；"
-        "日亏闸触发是保护不是失效——对齐 min_liq/冷却，不盘中改 TP·SL。"
-    ).classes("v2-note")
-    ui.label(
-        "首笔命中：按 pair 最早一笔已平仓；live_candidate 另列；"
-        "旁证/不算有效性（n 仍小，对照周检）。"
+        "首笔命中：按 pair 最早一笔已平仓；live_candidate 另列（n 仍小，对照周检）。"
     ).classes("v2-note")
 
 
@@ -2356,19 +2364,19 @@ def _v2_intel_holders(store: DataStore) -> None:
             rows,
         )
     ui.label("权重0 / 不接决策").classes("v2-note")
-    ui.label("旁证观察 · 不算有效性 · 不进盘中参 · 高 bot 不跳单").classes("v2-note")
+    ui.label(f"{_EVIDENCE_NAIL} · 不进盘中参 · 高 bot 不跳单").classes("v2-note")
     crowd = store.intel_crowding_note()
     if crowd.available and crowd.data is not None:
         ui.label(_v2_text(getattr(crowd.data, "line", None))).classes("v2-note")
     else:
-        ui.label("拥挤旁证 data gap · 不否决 · 不算有效性").classes("v2-note")
+        ui.label(f"拥挤旁证 data gap · 不否决 · {_EVIDENCE_NAIL}").classes("v2-note")
 
 
 def _v2_token_age(store: DataStore) -> None:
     result = store.token_age_observe()
     if not result.available or result.data is None:
         ui.label(result.reason or "data gap").classes("v2-note")
-        ui.label("旁证观察 · 不算有效性 · 不进盘中参").classes("v2-note")
+        ui.label(f"{_EVIDENCE_NAIL} · 不进盘中参").classes("v2-note")
         return
     report = result.data
     total = _as_int(getattr(report, "total", 0))
@@ -2405,7 +2413,7 @@ def _v2_token_age(store: DataStore) -> None:
     if total == 0:
         ui.label("近端无决策行").classes("v2-note")
     ui.label(
-        f"近 {_as_int(getattr(report, 'limit', 0))} 行 · 旁证观察 · 不算有效性 · 不进盘中参 · "
+        f"近 {_as_int(getattr(report, 'limit', 0))} 行 · {_EVIDENCE_NAIL} · 不进盘中参 · "
         "源 decision_log.raw_json.extras.pairCreatedAt · 旧行无字段计入 unknown · 不改闸/不改权"
     ).classes("v2-note")
 
@@ -2435,7 +2443,7 @@ def _v2_intel_slippage(store: DataStore) -> None:
     ])
     if getattr(report, "high_bot_skip_wired", False):
         ui.label("high_bot_skip 标记异常 · 仍不跳单").classes("v2-note")
-    ui.label("旁证观察 · 不算有效性 · 不进盘中参 · 高 bot 不跳单").classes("v2-note")
+    ui.label(f"{_EVIDENCE_NAIL} · 不进盘中参 · 高 bot 不跳单").classes("v2-note")
 
 
 def _v2_btnews(store: DataStore) -> None:
