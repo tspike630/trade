@@ -25,7 +25,7 @@ from fastapi import Request
 from nicegui import app, ui
 
 from dashboard.auth import attach_secret_filters, verify_api_key
-from dashboard.data import DataStore
+from dashboard.data import GOAL_DEADLINE_DAY, GOAL_START_DAY, DataStore
 from dashboard.format_util import fmt_age, fmt_rate, liveness_label
 from dashboard.panels import risk as risk_panel
 from dashboard.panels.common import panel_box, panel_guard, show_unavailable
@@ -1157,6 +1157,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     foot=f"{_EVIDENCE_NAIL} · 不进盘中参 · extras.pairCreatedAt",
                     tools=("只读",),
                 )
+                _mount_goal_20k(store)
                 _v2_comp(
                     ("回测", "新闻"),
                     "span-6",
@@ -2108,6 +2109,8 @@ def _v2_reject(store: DataStore) -> None:
 
 # 旁证短钉：信号或胜率方向不是盈亏结论；只记分布缝，不算有效性。
 _EVIDENCE_NAIL = "信号或胜率方向≠盈亏；旁证只记分布缝，不算有效性"
+# 目标旁证短钉：跟踪缺口不是盈亏承诺，也不改闸。
+_GOAL_NAIL = "目标跟踪≠会赚会亏；不改闸"
 
 
 def _v2_signal_streak(store: DataStore) -> None:
@@ -2370,6 +2373,80 @@ def _v2_intel_holders(store: DataStore) -> None:
         ui.label(_v2_text(getattr(crowd.data, "line", None))).classes("v2-note")
     else:
         ui.label(f"拥挤旁证 data gap · 不否决 · {_EVIDENCE_NAIL}").classes("v2-note")
+
+
+def _goal_short_text(value: object) -> tuple[str, str]:
+    """Signed dollars. A positive gap (still short of the mark) is down."""
+    text, _tone = _signed_usd(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—", "mute"
+    if value > 0:
+        return text, "down"
+    if value < 0:
+        return text, "up"
+    return text, "mute"
+
+
+def _mount_goal_20k(store: DataStore) -> None:
+    _v2_comp(
+        ("距", "$20k"),
+        "span-6",
+        lambda: _v2_goal_20k(store),
+        foot=(
+            f"10日目标旁证 · 起点 {GOAL_START_DAY.isoformat()} · "
+            f"截止 {GOAL_DEADLINE_DAY.isoformat()} HKT · {_GOAL_NAIL}"
+        ),
+        tools=("只读",),
+    )
+
+
+def _v2_goal_20k(store: DataStore, *, now: datetime | None = None) -> None:
+    result = store.paper_goal_pace(now=now)
+    if not result.available or result.data is None:
+        ui.label(result.reason or "data gap").classes("v2-note")
+        ui.label(_GOAL_NAIL).classes("v2-note")
+        return
+    report = result.data
+    equity = getattr(report, "equity_usd", None)
+    gap = getattr(report, "gap_usd", None)
+    days = getattr(report, "days_left", None)
+    daily = getattr(report, "daily_need_usd", None)
+    target = getattr(report, "target_usd", None)
+    gap_text, gap_tone = _goal_short_text(gap)
+    if isinstance(days, bool) or not isinstance(days, int):
+        days_text = "—"
+        daily_text, daily_tone = "—", "mute"
+    elif days <= 0:
+        days_text = "0"
+        daily_text, daily_tone = "—", "mute"
+    else:
+        days_text = str(days)
+        daily_text, daily_tone = _goal_short_text(daily)
+    if isinstance(equity, bool) or not isinstance(equity, (int, float)):
+        equity_text = "—"
+    else:
+        equity_text = _v2_money(equity)
+    if isinstance(target, bool) or not isinstance(target, (int, float)):
+        target_text = "$20,000"
+    else:
+        target_text = _v2_money(target)
+    _v2_kv([
+        ("权益粗算", equity_text, "mute"),
+        ("目标", target_text, "mute"),
+        ("缺口", gap_text, gap_tone),
+        ("剩余天", days_text, "mute"),
+        ("日均需", daily_text, daily_tone),
+    ])
+    if getattr(report, "mark_to_market", False):
+        basis = "盯市口径异常 · 本卡只读粗算"
+    else:
+        basis = "未盯市 · cash + 未平 size_usd"
+    as_of = _v2_text(getattr(report, "as_of_day", None))
+    ui.label(f"{basis} · 口径日 {as_of} HKT").classes("v2-note")
+    note = getattr(report, "note", "") or ""
+    if note:
+        ui.label(_v2_text(note)).classes("v2-note")
+    ui.label(_GOAL_NAIL).classes("v2-note")
 
 
 def _v2_token_age(store: DataStore) -> None:
