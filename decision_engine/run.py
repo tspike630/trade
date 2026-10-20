@@ -42,6 +42,54 @@ from decision_engine.strategies import get_strategy, list_strategies  # noqa: E4
 log = get_logger("decision_engine.run")
 
 
+# --- Opt-in shadow cohort path (default behavior unchanged) -----------------
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
+
+def _read_budget_regime() -> str:
+    """Read-only lookup of X_HOURLY_BUDGET_REQUESTS (process env, else crawler .env)."""
+    import os
+
+    val = os.environ.get("X_HOURLY_BUDGET_REQUESTS")
+    if val is None:
+        try:
+            for line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if line.startswith("X_HOURLY_BUDGET_REQUESTS="):
+                    val = line.split("=", 1)[1].split("#", 1)[0].strip().strip("'\"")
+        except OSError:
+            val = None
+    if val in (None, "", "20"):
+        return "20h"
+    if val == "4":
+        return "4h"
+    return f"{val}h"
+
+
+class ShadowCohortRisk(RiskManager):
+    """Tag liq_bucket/budget_regime; let missing-liquidity buys through as control."""
+
+    def check(self, signal):  # type: ignore[override]
+        sig = dict(signal)
+        if str(sig.get("action") or "").lower() == "buy":
+            liq = sig.get("liquidity_usd")
+            try:
+                missing = liq is None or float(liq) != float(liq)
+            except (TypeError, ValueError):
+                missing = True
+            sig["liq_bucket"] = "missing" if missing else "present"
+            sig["budget_regime"] = _read_budget_regime()
+            if missing:
+                # bypass only the no_liquidity fail-closed check (cooldown still applies)
+                sig["liquidity_usd"] = float("inf")
+                out = super().check(sig)
+                out["liquidity_usd"] = None
+                return out
+        return super().check(sig)
+
+
 def build_strategies(args: argparse.Namespace) -> list:
     ids: list[str]
     if args.all:
@@ -140,6 +188,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--output-db",
+        default=None,
+        help="opt-in: write decision_log to this SQLite file instead of --db "
+        "(indicators still read from --db). Default: same as --db.",
+    )
+    parser.add_argument(
+        "--shadow-liq-cohorts",
+        action="store_true",
+        help="opt-in shadow: tag buys with liq_bucket (present/missing) and "
+        "budget_regime; missing-liquidity buys are kept as control cohort. "
+        "Requires --output-db different from --db.",
+    )
+    parser.add_argument(
         "--position-pct",
         type=float,
         default=de_config.JEV_POSITION_PCT,
@@ -199,14 +260,20 @@ def main(argv: list[str] | None = None) -> int:
         de_config.DECISION_MIN_LIQ_USD,
     )
 
+    out_db = str(Path(args.output_db).expanduser().resolve()) if args.output_db else db_path
+    if args.shadow_liq_cohorts and out_db == db_path:
+        log.error("--shadow-liq-cohorts requires --output-db != --db (isolation)")
+        return 2
+    risk = ShadowCohortRisk() if args.shadow_liq_cohorts else RiskManager()
+    log.info("output_db=%s shadow_liq_cohorts=%s", out_db, args.shadow_liq_cohorts)
     adapter = IndicatorDataAdapter(db_path)
-    bus = SignalBus(db_path, dry_run=dry_run, purpose=purpose)
+    bus = SignalBus(out_db, dry_run=dry_run, purpose=purpose)
     try:
         engine = DecisionEngine(
             adapter,
             bus,
             strategies,
-            risk=RiskManager(),
+            risk=risk,
             hot_limit=hot_limit,
         )
         results = engine.run(
