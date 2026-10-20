@@ -34,7 +34,7 @@ class StanceTest(unittest.TestCase):
     def test_negated_and_neutral_rejected(self):
         s, out = _run([_row(stance="NOT BULLISH"), _row(stance="NEUTRAL"), _row(stance=None)])
         self.assertEqual(out, [])
-        self.assertEqual(s.rejected["stance"], 3)
+        self.assertEqual(s.rejected["jev_stance_not_bullish"], 3)
 
     def test_bullish_fresh_passes_with_extras(self):
         _, out = _run([_row()])
@@ -51,7 +51,7 @@ class FreshnessTest(unittest.TestCase):
     def test_stale_rejected(self):
         s, out = _run([_row(age_h=48)])
         self.assertEqual(out, [])
-        self.assertEqual(s.rejected["stale"], 1)
+        self.assertEqual(s.rejected["jev_stale"], 1)
 
     def test_missing_ts_with_column_rejected(self):
         _, out = _run([_row(jev_updated_at=None)])

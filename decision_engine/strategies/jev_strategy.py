@@ -66,7 +66,7 @@ class JevStrengthStrategy(BaseStrategy):
         self.require_bullish_stance = (
             de_config.JEV_REQUIRE_BULLISH_STANCE
             if require_bullish_stance is None else bool(require_bullish_stance))
-        self.rejected = {"stale": 0, "stance": 0}
+        self.rejected = {"jev_stale": 0, "jev_stance_not_bullish": 0}
 
     def on_tick(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         self._pending.clear()
@@ -85,13 +85,13 @@ class JevStrengthStrategy(BaseStrategy):
                 age = jev_age_min(row)
                 has_age_col = "jev_updated_at" in row or "jev_age_min" in row
                 if self.max_age_min > 0 and has_age_col and (age is None or age > self.max_age_min):
-                    self.rejected["stale"] += 1
-                    log.info("jev reject stale token=%s age_min=%s max=%s",
+                    self.rejected["jev_stale"] += 1
+                    log.info("jev reject reason=jev_stale token=%s age_min=%s max=%s",
                              str(row.get("token_address") or "")[:16], age, self.max_age_min)
                     continue
                 if self.require_bullish_stance and "jev_stance" in row and not stance_is_bullish(row.get("jev_stance")):
-                    self.rejected["stance"] += 1
-                    log.info("jev reject stance token=%s stance=%r signal=%s",
+                    self.rejected["jev_stance_not_bullish"] += 1
+                    log.info("jev reject reason=jev_stance_not_bullish token=%s stance=%r signal=%s",
                              str(row.get("token_address") or "")[:16], row.get("jev_stance"), row.get("jev_signal"))
                     continue
                 self.buy(
