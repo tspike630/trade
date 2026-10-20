@@ -39,53 +39,6 @@ def _default_paper_db() -> str | None:
     )
 
 
-_SHADOW_EXTRA_KEYS = ("budget_regime", "x_budget_regime", "liq_bucket")
-
-
-def shadow_decision_db_reason(db: str | os.PathLike | None) -> str | None:
-    """Return a reason if ``db`` looks like a shadow-entry decision DB, else None.
-
-    Main loop must never consume a shadow stream (its purpose is also
-    live_candidate). Checks file name and raw_json.extras shadow labels.
-    """
-    import json as _json
-    import sqlite3 as _sqlite3
-    from pathlib import Path as _Path
-
-    if db is None:
-        try:
-            from decision_engine.config import DB_PATH as _DB
-
-            db = _DB
-        except Exception:  # noqa: BLE001
-            return None
-    p = _Path(db)
-    if "shadow" in p.name.lower():
-        return f"decision db name contains 'shadow': {p.name}"
-    if not p.exists():
-        return None
-    try:
-        con = _sqlite3.connect(f"file:{p}?mode=ro", uri=True)
-        try:
-            rows = con.execute(
-                "SELECT raw_json FROM decision_log ORDER BY id DESC LIMIT 200"
-            ).fetchall()
-        finally:
-            con.close()
-    except Exception:  # noqa: BLE001
-        return None
-    for (raw,) in rows:
-        try:
-            ex = (_json.loads(raw or "{}") or {}).get("extras") or {}
-        except (ValueError, TypeError, AttributeError):
-            continue
-        if isinstance(ex, dict):
-            hit = [k for k in _SHADOW_EXTRA_KEYS if k in ex]
-            if hit:
-                return f"decision_log raw_json.extras has shadow labels {hit}"
-    return None
-
-
 def _shadow_isolation_guard(explicit_db) -> str | None:
     """Main book must read dexscreener.db and never a shadow_* signal store.
 
@@ -232,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         pm_enabled,
     )
 
-    guard_err = _shadow_isolation_guard(args.db) or shadow_decision_db_reason(args.db)
+    guard_err = _shadow_isolation_guard(args.db)
     if guard_err:
         log.error("refusing to start: %s", guard_err)
         return 2
