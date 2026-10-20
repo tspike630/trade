@@ -54,6 +54,7 @@ PURPOSE_SAMPLE = "sample"
 PURPOSE_REJECT_SAMPLE = "purpose_sample"
 PURPOSE_REJECT_MISSING = "purpose_missing"
 PURPOSE_REJECT_INVALID = "purpose_invalid"
+PURPOSE_REJECT_SHADOW = "purpose_shadow"  # shadow_* (e.g. shadow_010) never reaches the main book
 _DECISION_LOG_COLUMNS = (
     "id",
     "ts",
@@ -142,6 +143,24 @@ def read_decision_purpose(
     return text or None
 
 
+PAPER_OPEN_PAUSED_REASON = "paper_open_paused"
+PAPER_OPEN_PAUSE_FLAG = Path(__file__).resolve().parents[1] / "PAPER_OPEN_PAUSED"
+
+
+def paper_open_paused(flag: str | Path | None = None) -> bool:
+    """Main paper book: refuse new opens while the flag file exists.
+
+    Flag path: env EXECUTION_PAPER_OPEN_PAUSE_FLAG or <repo>/PAPER_OPEN_PAUSED.
+    Also honours EXECUTION_PAPER_OPEN_PAUSED=1. Checked on every decision, so
+    creating/removing the file takes effect without restart. Closes / ticks are
+    unaffected.
+    """
+    if _env_bool("EXECUTION_PAPER_OPEN_PAUSED", False):
+        return True
+    path = Path(flag or os.environ.get("EXECUTION_PAPER_OPEN_PAUSE_FLAG") or PAPER_OPEN_PAUSE_FLAG)
+    return path.exists()
+
+
 def purpose_reject_reason(purpose: str | None) -> str | None:
     """None only for executable ``live_candidate``. Otherwise a reject code.
 
@@ -153,6 +172,8 @@ def purpose_reject_reason(purpose: str | None) -> str | None:
         return None
     if purpose == PURPOSE_SAMPLE:
         return PURPOSE_REJECT_SAMPLE
+    if purpose.startswith("shadow_"):
+        return PURPOSE_REJECT_SHADOW
     return PURPOSE_REJECT_INVALID
 
 
@@ -886,7 +907,11 @@ class ExecutionGateway:
             "reason": reason,
             "error": reason,
             "purpose": sig.get("purpose"),
-            "note": "purpose gate; not executed",
+            "note": (
+                "paper open paused (flag); not executed"
+                if reason == PAPER_OPEN_PAUSED_REASON
+                else "purpose gate; not executed"
+            ),
             "paper_enabled": self.paper_enabled,
             "pm_enabled": self.pm_enabled,
         }
@@ -958,6 +983,11 @@ class ExecutionGateway:
             reason = purpose_reject_reason(sig.get("purpose"))
             if reason is not None:
                 return self._reject_purpose(sig, reason)
+            if (
+                str(sig.get("action") or "").strip().lower() == "buy"
+                and paper_open_paused()
+            ):
+                return self._reject_purpose(sig, PAPER_OPEN_PAUSED_REASON)
             return self._process_one_claimed(sig)
         except Exception as exc:  # noqa: BLE001 — bad message must not wedge the cursor
             log.exception(

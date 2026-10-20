@@ -39,6 +39,37 @@ def _default_paper_db() -> str | None:
     )
 
 
+def _shadow_isolation_guard(explicit_db) -> str | None:
+    """Main book must read dexscreener.db and never a shadow_* signal store.
+
+    Set EXECUTION_ALLOW_NONSTANDARD_DECISION_DB=1 to skip the filename check
+    (tests / smoke runs on temp DBs). The shadow_* purpose check always applies.
+    """
+    import os
+    import sqlite3
+
+    from execution.gateway import resolve_decision_db
+
+    path = resolve_decision_db(explicit_db)
+    allow = os.environ.get("EXECUTION_ALLOW_NONSTANDARD_DECISION_DB", "").strip() in ("1", "true", "yes")
+    if path.name != "dexscreener.db" and not allow:
+        return f"decision db {path} is not dexscreener.db"
+    if path.exists():
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                hit = con.execute(
+                    "SELECT 1 FROM decision_log WHERE purpose LIKE 'shadow\\_%' ESCAPE '\\' LIMIT 1"
+                ).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            hit = None
+        if hit:
+            return f"decision db {path} contains shadow_* purpose rows"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -153,6 +184,11 @@ def main(argv: list[str] | None = None) -> int:
         paper_tick,
         pm_enabled,
     )
+
+    guard_err = _shadow_isolation_guard(args.db)
+    if guard_err:
+        log.error("refusing to start: %s", guard_err)
+        return 2
 
     with ExecutionGateway(
         decision_db=args.db,
