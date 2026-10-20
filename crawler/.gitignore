@@ -10,3 +10,5 @@ proxies.txt
 backtest_ledger.db
 execution_ledger.db
 news_events.db
+# Phase0 observe export (runtime; do not commit)
+exports/shadow_skip_stop_prone_live.csv
