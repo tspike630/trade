@@ -63,7 +63,8 @@ class ReasonTests(unittest.TestCase):
                  ({"jev_age_min": 5, "jev_stance_raw": "NEUTRAL"}, JEV_STANCE_NOT_BULLISH),
                  ({"jev_age_min": 5, "jev_stance_raw": "BULLISH"}, None)]
         for ex, want in cases:
-            for strat in ("jev_strength_v1", "factor_jev_strength_v1"):
+            for strat in ("jev_strength_v1", "factor_jev_strength_v1",
+                          "combined_jev_tech_v1", "factor_combined_jev_tech_v1"):
                 self.assertEqual(jev_guard_reason(ex, strat), want, (ex, strat))
         # stale wins over stance
         self.assertEqual(jev_guard_reason({"jev_age_min": 5000, "jev_stance_raw": "BEARISH"}), JEV_STALE)
@@ -76,6 +77,36 @@ class ReasonTests(unittest.TestCase):
                 "assert jev_guard_enabled() is True\n")
         proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class StrategyListParityTests(unittest.TestCase):
+    """Execution list must match decision_engine's JEV strategies (PR #111 scope)."""
+
+    def _decision_side(self):
+        import decision_engine.strategies as de
+        from decision_engine.strategies.combined_strategy import CombinedJevTechStrategy
+        from decision_engine.strategies.jev_strategy import JevStrengthStrategy
+
+        legacy = {JevStrengthStrategy.strategy_id, CombinedJevTechStrategy.strategy_id}
+        single = {sid for sid, (buy, sell, _p, _m) in de._FACTOR_COMBOS.items()
+                  if buy in (["jev_strength"], ["combined_jev_tech"]) and sell == ["noop"]}
+        others = {sid for sid, (buy, *_r) in de._FACTOR_COMBOS.items()
+                  if {"jev_strength", "combined_jev_tech"} & set(buy)} - single
+        return legacy | single, others
+
+    def test_exec_list_equals_decision_jev_strategies(self):
+        from execution.gateway import JEV_GUARD_STRATEGIES
+
+        covered, _ = self._decision_side()
+        self.assertEqual(set(JEV_GUARD_STRATEGIES), covered)
+        for sid in covered:
+            self.assertIn(sid, __import__("decision_engine.strategies", fromlist=["x"]).STRATEGY_REGISTRY)
+
+    def test_known_jev_combos_outside_guard(self):
+        # Combos that also use the jev_strength factor but are not gated here.
+        # If decision_engine adds/removes one, this fails so the list is revisited.
+        _, others = self._decision_side()
+        self.assertEqual(others, {"factor_jev_timeexit_v1", "factor_jev_trail_v1", "factor_jev_rsi_and_v1"})
 
 
 class GatewayTests(unittest.TestCase):
@@ -92,6 +123,10 @@ class GatewayTests(unittest.TestCase):
                           extras={"jev_age_min": 5, "jev_stance_raw": "BEARISH"})
             sell = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE, action="sell", extras={})
             other = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE, strategy_id="combined_v1", extras={})
+            comb = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE, strategy_id="combined_jev_tech_v1",
+                          extras={"jev_age_min": 5, "jev_stance_raw": "NEUTRAL"})
+            fcomb = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE, strategy_id="factor_combined_jev_tech_v1",
+                           extras={})
             fjev = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE, strategy_id="factor_jev_strength_v1",
                           extras={"jev_age_min": 3000})
             db.close()
@@ -107,6 +142,7 @@ class GatewayTests(unittest.TestCase):
             finally:
                 gateway_mod.EXECUTION_RISK_ENABLED = prev
             for did, reason in ((stale, JEV_STALE), (missing, JEV_AGE_MISSING), (fjev, JEV_STALE),
+                                (comb, JEV_STANCE_NOT_BULLISH), (fcomb, JEV_AGE_MISSING),
                                 (bear, JEV_STANCE_NOT_BULLISH)):
                 self.assertEqual(rows[did]["status"], "rejected")
                 self.assertEqual(rows[did]["executed"], 0)
