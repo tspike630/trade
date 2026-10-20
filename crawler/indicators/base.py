@@ -53,6 +53,8 @@ TOKEN_INDICATOR_COLS = [
     "jev_signal",
     "jev_confidence",
     "jev_strength",
+    "jev_age_min",
+    "jev_stance_raw",
     "sentiment_score",
     "sentiment_mentions_1h",
     "sentiment_mentions_6h",
@@ -92,6 +94,8 @@ _HISTORY_FILL_IF_ABSENT = (
     "boll_lower",
     "jev_score",
     "jev_strength",
+    "jev_age_min",
+    "jev_stance_raw",
     "sentiment_score",
     "sentiment_mentions_1h",
     "sentiment_heat_score",
@@ -129,6 +133,9 @@ _MIGRATE_TOKEN_INDICATORS = [
     ("spike", "INTEGER"),
     # Technical freshness. Funding/sentiment/composite must not write this.
     ("tech_updated_at", "TEXT"),
+    # JEV freshness (2026-10-21): age at compute time + verbatim stance
+    ("jev_age_min", "REAL"),
+    ("jev_stance_raw", "TEXT"),
 ]
 _MIGRATE_INDICATOR_HISTORY = [
     ("rsi_14", "REAL"),
@@ -144,8 +151,9 @@ _MIGRATE_INDICATOR_HISTORY = [
     ("sentiment_polarity", "REAL"),
     ("spike_ratio", "REAL"),
     ("spike", "INTEGER"),
+    ("jev_age_min", "REAL"),
+    ("jev_stance_raw", "TEXT"),
 ]
-
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -585,13 +593,13 @@ class IndicatorStore:
                 volatility_24h, volume_strength,
                 rsi_14, macd, macd_signal, macd_hist,
                 boll_upper, boll_mid, boll_lower,
-                jev_score, jev_strength,
+                jev_score, jev_strength, jev_age_min, jev_stance_raw,
                 sentiment_score, sentiment_mentions_1h,
                 sentiment_heat_score, sentiment_polarity,
                 spike_ratio, spike,
                 composite_score,
                 tier, primary_pair_address
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chain_id,
@@ -613,6 +621,8 @@ class IndicatorStore:
                 payload.get("boll_lower"),
                 payload.get("jev_score"),
                 payload.get("jev_strength"),
+                payload.get("jev_age_min"),
+                payload.get("jev_stance_raw"),
                 payload.get("sentiment_score"),
                 payload.get("sentiment_mentions_1h"),
                 payload.get("sentiment_heat_score"),
