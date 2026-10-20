@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from history import extract_metrics, pair_history_column_sql
+from history import TXN_FLOW_COLUMNS, extract_metrics, pair_history_column_sql
 
 
 def _utc_now_iso() -> str:
@@ -282,6 +282,7 @@ class Store:
         self._migrate_lowercase_addresses()
         self._migrate_x_social()
         self._migrate_pair_history()
+        self._migrate_txn_flow_columns()
         self._migrate_quality_score()
         self._migrate_pair_created_at()
         self._migrate_market_cap_columns()
@@ -1398,6 +1399,19 @@ class Store:
             cur.execute("ALTER TABLE pairs ADD COLUMN last_history_at TEXT")
         self._conn.commit()
 
+    def _migrate_txn_flow_columns(self) -> None:
+        """Nullable order-flow columns on pair_history (idempotent).
+
+        volume_h1 already exists and is reused. No backfill: raw_json only
+        holds the latest body. Missing values stay NULL, never 0.
+        """
+        cur = self._conn.cursor()
+        cols = self._table_columns("pair_history")
+        for name, typ in TXN_FLOW_COLUMNS:
+            if name not in cols:
+                cur.execute(f"ALTER TABLE pair_history ADD COLUMN {name} {typ}")
+        self._conn.commit()
+
     def _migrate_market_cap_columns(self) -> None:
         """Nullable market_cap / fdv on pair_history and pairs.
 
@@ -1630,6 +1644,11 @@ class Store:
         fdv: float | None = None,
         tier: str | None = None,
         recorded_at: str | None = None,
+        txns_m5_buys: int | None = None,
+        txns_m5_sells: int | None = None,
+        txns_h1_buys: int | None = None,
+        txns_h1_sells: int | None = None,
+        volume_m5: float | None = None,
     ) -> int:
         chain_id = norm_chain(chain_id)
         pair_address = norm_address(pair_address)
@@ -1641,13 +1660,15 @@ class Store:
             INSERT INTO pair_history (
                 chain_id, pair_address, token_address, recorded_at,
                 price_usd, volume_h24, volume_h1, liquidity_usd, txns_h24, tier,
-                market_cap, fdv
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                market_cap, fdv,
+                txns_m5_buys, txns_m5_sells, txns_h1_buys, txns_h1_sells, volume_m5
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chain_id, pair_address, tok, now,
                 price_usd, volume_h24, volume_h1, liquidity_usd, txns_h24, tier,
                 market_cap, fdv,
+                txns_m5_buys, txns_m5_sells, txns_h1_buys, txns_h1_sells, volume_m5,
             ),
         )
         cur.execute(

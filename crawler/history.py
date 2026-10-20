@@ -148,6 +148,45 @@ def history_due(store: Any, chain_id: str, pair_address: str, tier: str) -> bool
     return age >= interval_for_tier(tier)
 
 
+# Order-flow columns added to pair_history (volume_h1 pre-existed, reused).
+TXN_FLOW_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("txns_m5_buys", "INTEGER"),
+    ("txns_m5_sells", "INTEGER"),
+    ("txns_h1_buys", "INTEGER"),
+    ("txns_h1_sells", "INTEGER"),
+    ("volume_m5", "REAL"),
+)
+
+
+def _opt_count(v: Any) -> int | None:
+    """Non-negative int count or None. Missing/invalid never becomes 0."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f < 0 or f != int(f):
+        return None
+    return int(f)
+
+
+def extract_txn_flow(pair: dict[str, Any]) -> dict[str, Any]:
+    """txns m5/h1 buys/sells and volume m5 from one DexScreener pair body.
+
+    Each field is independent: an absent window or key is None (NULL), not 0.
+    """
+    txns = pair.get("txns") if isinstance(pair.get("txns"), dict) else {}
+    vol = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
+    out: dict[str, Any] = {}
+    for win in ("m5", "h1"):
+        w = txns.get(win) if isinstance(txns.get(win), dict) else {}
+        out[f"txns_{win}_buys"] = _opt_count(w.get("buys"))
+        out[f"txns_{win}_sells"] = _opt_count(w.get("sells"))
+    out["volume_m5"] = _optional_float(vol.get("m5")) if "m5" in vol else None
+    return out
+
+
 def extract_metrics(pair: dict[str, Any]) -> dict[str, Any]:
     """Copy numeric fields from a pair payload.
 
@@ -180,6 +219,14 @@ def extract_metrics(pair: dict[str, Any]) -> dict[str, Any]:
         "market_cap": _root_optional_float(pair, "marketCap", "market_cap"),
         "fdv": _root_optional_float(pair, "fdv"),
     }
+
+
+def _txn_flow_kwargs(pair: dict[str, Any]) -> dict[str, Any]:
+    import config
+
+    if not getattr(config, "HISTORY_TXN_FLOW", True):
+        return {}
+    return extract_txn_flow(pair)
 
 
 def maybe_snapshot_pair(
@@ -215,6 +262,7 @@ def maybe_snapshot_pair(
         market_cap=m["market_cap"],
         fdv=m["fdv"],
         tier=tier,
+        **_txn_flow_kwargs(pair),
     )
     log.debug(
         "pair_history snap chain=%s pair=%s tier=%s price=%s",
