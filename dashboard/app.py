@@ -43,6 +43,18 @@ from dashboard.panels.shell import (
     session_clock,
 )
 from dashboard.settings import allow_insecure, api_secret, bind_host, db_root, port, read_gates, refresh_seconds
+from dashboard.c_exit_shadow import (
+    C_EXIT_DISCIPLINE,
+    C_EXIT_GRID,
+    C_EXIT_NAIL,
+    C_EXIT_ROLLBACK,
+    C_EXIT_THRESHOLD,
+    load_c_exit_shadow,
+    main_line as c_exit_main_line,
+    rollback_hit_line,
+    tag_line as c_exit_tag_line,
+    verdict_line as c_exit_verdict_line,
+)
 from dashboard.phase1_counterfactual import (
     PHASE1_CANDIDATE,
     PHASE1_CF_NAIL,
@@ -1179,6 +1191,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                 _mount_goal_20k(store)
                 _mount_phase0_shadow()
                 _mount_phase1_counterfactual()
+                _mount_c_exit_shadow()
                 _mount_m7_shadow(store)
                 _v2_comp(
                     ("回测", "新闻"),
@@ -2486,7 +2499,7 @@ def _mount_phase0_shadow() -> None:
 
 
 def _mount_phase1_counterfactual() -> None:
-    """Read-only OVERVIEW card, directly between the Phase0 dual column and M7."""
+    """Read-only OVERVIEW card, directly after the Phase0 dual column."""
     _v2_comp(
         ("Phase1", "soft-skip 反事实"),
         "span-12",
@@ -2514,6 +2527,42 @@ def _v2_phase1_counterfactual() -> None:
         ui.label(report.note).classes("v2-note")
     ui.label("只读旁证 · 不 soft-skip · 不改闸").classes("v2-note")
     ui.label(PHASE1_CF_NAIL).classes("v2-note")
+
+
+def _mount_c_exit_shadow() -> None:
+    """Read-only OVERVIEW card for the C-exit shadow book, beside Phase1."""
+    _v2_comp(
+        ("C 出口", "旁簿"),
+        "span-12",
+        _v2_c_exit_shadow,
+        foot=f"{C_EXIT_DISCIPLINE} · {C_EXIT_NAIL}",
+        tools=("只读",),
+    )
+
+
+def _v2_c_exit_shadow() -> None:
+    try:
+        report = load_c_exit_shadow()
+    except Exception:
+        log.warning("c exit shadow card failed")
+        ui.label("旁簿不可读").classes("v2-note")
+        ui.label(C_EXIT_DISCIPLINE).classes("v2-note")
+        ui.label(C_EXIT_NAIL).classes("v2-note")
+        return
+    ui.label(C_EXIT_NAIL).classes("v2-note")
+    ui.label(C_EXIT_DISCIPLINE).classes("v2-note")
+    ui.label(C_EXIT_GRID).classes("v2-note")
+    for row in report.tags:
+        ui.label(c_exit_tag_line(row)).classes("v2-note")
+    ui.label(c_exit_main_line(report)).classes("v2-note")
+    ui.label(c_exit_verdict_line(report)).classes("v2-note")
+    ui.label(C_EXIT_THRESHOLD).classes("v2-note")
+    ui.label(C_EXIT_ROLLBACK).classes("v2-note")
+    hit = rollback_hit_line(report)
+    if hit:
+        ui.label(hit).classes("v2-note")
+    if report.note:
+        ui.label(report.note).classes("v2-note")
 
 
 def _mount_m7_shadow(store: DataStore) -> None:
