@@ -1169,6 +1169,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                 )
                 _mount_goal_20k(store)
                 _mount_phase0_shadow()
+                _mount_m7_shadow(store)
                 _v2_comp(
                     ("回测", "新闻"),
                     "span-6",
@@ -2122,6 +2123,9 @@ def _v2_reject(store: DataStore) -> None:
 _EVIDENCE_NAIL = "信号或胜率方向≠盈亏；旁证只记分布缝，不算有效性"
 # 目标旁证短钉：跟踪缺口不是盈亏承诺，也不改闸。
 _GOAL_NAIL = "目标跟踪≠会赚会亏；不改闸"
+# M7 影簿短钉：S0 对照只有注册时的 8 笔，不能拿薄样本改闸。
+_M7_NAIL = "影簿≠已改闸 · S0 历史仅 8 笔对照极薄 · 勿用薄样本批改闸"
+_M7_PHASE0_NOTE = "与 Phase0 双列并存 · 不算有效性"
 
 
 def _v2_signal_streak(store: DataStore) -> None:
@@ -2471,6 +2475,16 @@ def _mount_phase0_shadow() -> None:
     )
 
 
+def _mount_m7_shadow(store: DataStore) -> None:
+    _v2_comp(
+        ("M7", "S0|S1|liq_missing"),
+        "span-6",
+        lambda: _v2_m7_shadow(store),
+        foot=f"{_M7_NAIL} · {_M7_PHASE0_NOTE}",
+        tools=("只读",),
+    )
+
+
 def _v2_phase0_shadow() -> None:
     try:
         report = load_shadow_phase0()
@@ -2497,6 +2511,34 @@ def _v2_phase0_shadow() -> None:
     ui.label(f"closed {report.closed} · NULL liq {null_text} 不打 liq 标").classes("v2-note")
     ui.label("源 exports/shadow_skip_stop_prone_live.csv · 不 soft-skip").classes("v2-note")
     ui.label(PHASE0_NAIL).classes("v2-note")
+
+
+def _v2_m7_shadow(store: DataStore) -> None:
+    result = store.m7_shadow_register()
+    if not result.available or result.data is None:
+        ui.label(result.reason or "data gap").classes("v2-note")
+        ui.label(_M7_NAIL).classes("v2-note")
+        ui.label(_M7_PHASE0_NOTE).classes("v2-note")
+        return
+    report = result.data
+    _v2_kv([
+        ("S1", str(_as_int(getattr(report, "n_s1", 0))), "mute"),
+        ("S0", str(_as_int(getattr(report, "n_s0", 0))), "mute"),
+        ("liq_missing", str(_as_int(getattr(report, "n_missing", 0))), "mute"),
+        ("would_open_S0", str(_as_int(getattr(report, "would_open_s0", 0))), "mute"),
+        ("would_open_S1", str(_as_int(getattr(report, "would_open_s1", 0))), "mute"),
+        ("leak", str(_as_int(getattr(report, "n_leak", 0))), "mute"),
+        ("Phase0", str(_as_int(getattr(report, "n_phase0", 0))), "mute"),
+    ])
+    cohort = _v2_text(getattr(report, "cohort", ""))
+    source = _v2_text(getattr(report, "source", ""))
+    ui.label(f"{cohort} · 来源 {source}").classes("v2-note")
+    ui.label("leak 不并进 S0 / S1 / liq_missing").classes("v2-note")
+    note = getattr(report, "note", "") or ""
+    if note:
+        ui.label(_v2_text(note)).classes("v2-note")
+    ui.label(_M7_NAIL).classes("v2-note")
+    ui.label(_M7_PHASE0_NOTE).classes("v2-note")
 
 
 def _v2_token_age(store: DataStore) -> None:
