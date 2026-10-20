@@ -57,6 +57,7 @@ from dashboard.panels.shell import (
     select_top_tab,
 )
 import dashboard.app as app_module
+from dashboard.shadow_phase0 import FLAG_LIQ, FLAG_R3, PHASE0_NAIL, load_shadow_phase0
 from nicegui.client import Client
 from nicegui.page import page as ng_page
 from dashboard.app import backtest_equity_tone, jev_gate_view, prior_pulse_tone
@@ -83,6 +84,7 @@ _TOUCHED = (
     "DASHBOARD_BACKTEST_DB",
     "DASHBOARD_NEWS_DB",
     "JEV_TREND_CSV",
+    "SHADOW_PHASE0_CSV",
     "DB_PATH",
     "PAPER_DB_PATH",
     "HEARTBEAT_STALE_SEC",
@@ -2351,6 +2353,146 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("权益粗算", ended_texts)
         self.assertEqual(ended_texts[ended_texts.index("缺口") + 1], "-$1,000")
         self.assertIn(app_module._GOAL_NAIL, ended_texts)
+
+    def test_phase0_shadow_card_reads_csv_and_gaps(self) -> None:
+        missing = self.root / "no-such-shadow.csv"
+        os.environ["SHADOW_PHASE0_CSV"] = str(missing)
+        absent = load_shadow_phase0()
+        self.assertFalse(absent.available)
+        self.assertEqual(absent.reason, "CSV 缺失")
+        self.assertIsNone(absent.both)
+        gap_texts = _rendered_card_texts(lambda: app_module._v2_phase0_shadow())
+        self.assertIn("CSV 缺失", gap_texts)
+        self.assertIn(PHASE0_NAIL, gap_texts)
+        self.assertIn("不 soft-skip", "\n".join(gap_texts))
+
+        empty = self.root / "empty-shadow.csv"
+        empty.write_text("", encoding="utf-8")
+        os.environ["SHADOW_PHASE0_CSV"] = str(empty)
+        blank = load_shadow_phase0()
+        self.assertFalse(blank.available)
+        self.assertEqual(blank.reason, "CSV 空")
+
+        bad = self.root / "bad-shadow.csv"
+        bad.write_bytes(b"\xff\xfe not-utf8")
+        os.environ["SHADOW_PHASE0_CSV"] = str(bad)
+        broken = load_shadow_phase0()
+        self.assertFalse(broken.available)
+        self.assertEqual(broken.reason, "CSV 不可读")
+        bad_texts = _rendered_card_texts(lambda: app_module._v2_phase0_shadow())
+        self.assertIn("CSV 不可读", bad_texts)
+        self.assertIn(PHASE0_NAIL, bad_texts)
+
+        alias_only = self.root / "alias-shadow.csv"
+        alias_only.write_text(
+            "status,exit_reason,liq_usd,shadow_R3,shadow_skip_stop_prone\n"
+            "closed,stop_loss,1000,1,1\n",
+            encoding="utf-8",
+        )
+        os.environ["SHADOW_PHASE0_CSV"] = str(alias_only)
+        alias = load_shadow_phase0()
+        self.assertTrue(alias.available, alias.reason)
+        self.assertEqual(alias.closed, 1)
+        self.assertFalse(alias.r3.present)
+        self.assertFalse(alias.liq.present)
+        self.assertIsNone(alias.both)
+        self.assertEqual(alias.r3.name, FLAG_R3)
+        self.assertEqual(alias.liq.name, FLAG_LIQ)
+
+        null_liq = self.root / "null-liq-shadow.csv"
+        null_liq.write_text(
+            "status,exit_reason,liq_usd,shadow_R3_vol_chg_rsi,shadow_liq_lt_150k\n"
+            "closed,stop_loss,,1,1\n"
+            "closed,take_profit,NULL,0,1\n"
+            "closed,max_hold,1000,0,1\n"
+            "open,stop_loss,,1,1\n",
+            encoding="utf-8",
+        )
+        os.environ["SHADOW_PHASE0_CSV"] = str(null_liq)
+        guarded = load_shadow_phase0()
+        self.assertTrue(guarded.available, guarded.reason)
+        self.assertEqual(guarded.closed, 3)
+        self.assertEqual(guarded.liq_null, 2)
+        self.assertEqual(guarded.r3.n, 1)
+        self.assertEqual(guarded.r3.sl_hit, 1)
+        self.assertEqual(guarded.r3.sl_total, 1)
+        self.assertEqual(guarded.r3.tp_false, 0)
+        self.assertEqual(guarded.liq.n, 1)
+        self.assertEqual(guarded.liq.sl_hit, 0)
+        self.assertEqual(guarded.liq.tp_false, 0)
+        self.assertEqual(guarded.liq.tp_total, 1)
+        self.assertEqual(guarded.both, 0)
+
+        anchor = self.root / "anchor-shadow.csv"
+        lines = ["status,exit_reason,liq_usd,shadow_R3_vol_chg_rsi,shadow_liq_lt_150k\n"]
+
+        def add(count: int, status: str, reason: str, liq: str, r3: int, liq_flag: int) -> None:
+            for _ in range(count):
+                lines.append(f"{status},{reason},{liq},{r3},{liq_flag}\n")
+
+        add(5, "closed", "stop_loss", "10000", 1, 1)
+        add(5, "closed", "stop_loss", "200000", 0, 0)
+        add(3, "closed", "take_profit", "200000", 0, 0)
+        add(11, "closed", "max_hold", "10000", 1, 1)
+        add(14, "closed", "max_hold", "200000", 1, 0)
+        add(11, "closed", "max_hold", "10000", 0, 1)
+        add(93, "closed", "max_hold", "200000", 0, 0)
+        add(1, "open", "stop_loss", "10000", 1, 1)
+        anchor.write_text("".join(lines), encoding="utf-8")
+        before = anchor.stat().st_mtime_ns
+        os.environ["SHADOW_PHASE0_CSV"] = str(anchor)
+        report = load_shadow_phase0()
+        self.assertEqual(anchor.stat().st_mtime_ns, before)
+        self.assertTrue(report.available, report.reason)
+        self.assertEqual(report.closed, 142)
+        self.assertEqual(report.liq_null, 0)
+        self.assertEqual(report.r3.n, 30)
+        self.assertEqual((report.r3.sl_hit, report.r3.sl_total), (5, 10))
+        self.assertEqual(report.r3.tp_false, 0)
+        self.assertEqual(report.r3.tp_total, 3)
+        self.assertEqual(report.liq.n, 27)
+        self.assertEqual((report.liq.sl_hit, report.liq.sl_total), (5, 10))
+        self.assertEqual(report.liq.tp_false, 0)
+        self.assertEqual(report.both, 16)
+
+        texts = _rendered_card_texts(lambda: app_module._mount_phase0_shadow())
+        self.assertIn("止损", texts)
+        self.assertIn("影子", texts)
+        self.assertIn(FLAG_R3, texts)
+        self.assertIn(FLAG_LIQ, texts)
+        self.assertNotIn("shadow_R3", texts)
+        self.assertEqual(texts[texts.index("命中 n") + 1], "30")
+        self.assertEqual(texts[texts.index("命中 n") + 2], "27")
+        self.assertEqual(texts[texts.index("抓 SL") + 1], "5/10")
+        self.assertEqual(texts[texts.index("抓 SL") + 2], "5/10")
+        self.assertEqual(texts[texts.index("误伤 TP") + 1], "0/3")
+        self.assertEqual(texts[texts.index("误伤 TP") + 2], "0/3")
+        joined = "\n".join(texts)
+        self.assertIn("同为 1：16", joined)
+        self.assertIn("closed 142", joined)
+        self.assertIn("NULL liq 0 不打 liq 标", joined)
+        self.assertIn("不 soft-skip", joined)
+        self.assertIn(PHASE0_NAIL, joined)
+        self.assertEqual(
+            PHASE0_NAIL,
+            "Phase0 只打标≠有效性；NULL liq 不打 liq 标；48h 后再批 Phase1",
+        )
+
+        overview = inspect.getsource(app_module._render_dashboard)
+        self.assertIn("_mount_phase0_shadow", overview)
+        self.assertIn("_mount_goal_20k", overview)
+        self.assertIn('("平仓", "旁证")', overview)
+        phase_src = inspect.getsource(app_module._mount_phase0_shadow)
+        goal_src = inspect.getsource(app_module._mount_goal_20k)
+        self.assertNotIn("_mount_goal_20k", phase_src)
+        self.assertNotIn("_v2_phase0_shadow", goal_src)
+        self.assertNotIn("place_order", inspect.getsource(app_module._v2_phase0_shadow))
+        card_src = inspect.getsource(app_module._v2_phase0_shadow)
+        self.assertIn("FLAG_R3", card_src)
+        self.assertIn("FLAG_LIQ", card_src)
+        self.assertNotIn("soft_skip", card_src)
+        self.assertNotIn('"shadow_R3"', card_src)
+        self.assertNotIn("'shadow_R3'", card_src)
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
