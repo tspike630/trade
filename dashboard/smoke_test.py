@@ -58,6 +58,13 @@ from dashboard.panels.shell import (
     select_top_tab,
 )
 import dashboard.app as app_module
+import dashboard.phase1_counterfactual as phase1_module
+from dashboard.phase1_counterfactual import (
+    PHASE1_CANDIDATE,
+    PHASE1_CF_NAIL,
+    PHASE1_WINDOW,
+    load_phase1_counterfactual,
+)
 from dashboard.shadow_phase0 import FLAG_LIQ, FLAG_R3, PHASE0_NAIL, load_shadow_phase0
 from nicegui.client import Client
 from nicegui.page import page as ng_page
@@ -86,6 +93,7 @@ _TOUCHED = (
     "DASHBOARD_NEWS_DB",
     "JEV_TREND_CSV",
     "SHADOW_PHASE0_CSV",
+    "PHASE1_CF_CSV",
     "DB_PATH",
     "PAPER_DB_PATH",
     "HEARTBEAT_STALE_SEC",
@@ -2495,6 +2503,219 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertNotIn("soft_skip", card_src)
         self.assertNotIn('"shadow_R3"', card_src)
         self.assertNotIn("'shadow_R3'", card_src)
+
+    def test_phase1_counterfactual_card_copy_and_csv_fallback(self) -> None:
+        baseline = "基线：closed=142 · ΣPnL≈−$1295.71 · 权益≈$8704"
+        line_a = "A R3 skip30：抓 SL 5/10、TP 0 → 剩余 Σ≈−$474（Δ+$822）"
+        line_b = "B liq<150k skip27：抓 SL 5/10、TP 0 → 剩余 Σ≈−$450（Δ+$846）"
+        line_c = "C 并集 skip41：抓 SL 5/10、TP 0 → 剩余 Σ≈−$425（Δ+$871）"
+        honest = "即使最优 C 权益也只≈$9.6k，填不满 $20k"
+        packaged_lines = (baseline, line_a, line_b, line_c, honest)
+
+        missing = self.root / "no-such-phase1.csv"
+        os.environ["PHASE1_CF_CSV"] = str(missing)
+        absent = load_phase1_counterfactual()
+        self.assertEqual(absent.source, "packaged")
+        self.assertEqual(absent.closed, 142)
+        self.assertIn("CSV 缺失", absent.note)
+        self.assertIn("回退", absent.note)
+        gap_texts = _rendered_card_texts(lambda: app_module._mount_phase1_counterfactual())
+        gap_joined = "\n".join(gap_texts)
+        for line in packaged_lines:
+            self.assertIn(line, gap_texts)
+        self.assertIn("Phase1", gap_texts)
+        self.assertIn("soft-skip 反事实", gap_texts)
+        self.assertIn(PHASE1_CF_NAIL, gap_texts)
+        self.assertIn(PHASE1_WINDOW, gap_texts)
+        self.assertIn(PHASE1_CANDIDATE, gap_texts)
+        self.assertIn("候选", gap_joined)
+        self.assertIn("填不满 $20k", gap_joined)
+        self.assertIn("$9.6k", gap_joined)
+        self.assertIn("5–6h", gap_joined)
+        self.assertIn("不 soft-skip", gap_joined)
+        self.assertIn("#71/权0/日亏200 不动", gap_joined)
+        self.assertNotIn("已接", gap_joined)
+
+        empty = self.root / "empty-phase1.csv"
+        empty.write_text("", encoding="utf-8")
+        os.environ["PHASE1_CF_CSV"] = str(empty)
+        blank = load_phase1_counterfactual()
+        self.assertEqual(blank.source, "packaged")
+        self.assertIn("CSV 空", blank.note)
+        self.assertIn("回退", blank.note)
+        empty_texts = _rendered_card_texts(lambda: app_module._v2_phase1_counterfactual())
+        empty_joined = "\n".join(empty_texts)
+        self.assertIn("CSV 空", empty_joined)
+        self.assertIn(line_a, empty_texts)
+        self.assertIn(PHASE1_CF_NAIL, empty_texts)
+
+        bad = self.root / "bad-phase1.csv"
+        bad.write_bytes(b"\xff\xfe not-utf8")
+        os.environ["PHASE1_CF_CSV"] = str(bad)
+        broken = load_phase1_counterfactual()
+        self.assertEqual(broken.source, "packaged")
+        self.assertEqual(broken.note, "CSV 不可读 · 回退证据包总表 2026-10-20")
+        bad_texts = _rendered_card_texts(lambda: app_module._v2_phase1_counterfactual())
+        bad_joined = "\n".join(bad_texts)
+        self.assertIn("CSV 不可读", bad_joined)
+        self.assertIn("回退", bad_joined)
+        self.assertIn(line_b, bad_texts)
+        self.assertIn(line_c, bad_texts)
+        self.assertIn(honest, bad_texts)
+        self.assertIn(PHASE1_CF_NAIL, bad_texts)
+
+        alias_only = self.root / "alias-phase1.csv"
+        alias_only.write_text(
+            "status,exit_reason,pnl_usd,shadow_skip_stop_prone\n"
+            "closed,stop_loss,-10,1\n",
+            encoding="utf-8",
+        )
+        os.environ["PHASE1_CF_CSV"] = str(alias_only)
+        alias = load_phase1_counterfactual()
+        self.assertEqual(alias.source, "packaged")
+        self.assertIn("CSV 缺列", alias.note)
+        self.assertEqual(alias.closed, 142)
+
+        garbage = self.root / "garbage-phase1.csv"
+        garbage.write_text(
+            "status,exit_reason,pnl_usd,liq_usd,shadow_R3_vol_chg_rsi,shadow_liq_lt_150k\n"
+            "closed,stop_loss,nope,1000,1,0\n",
+            encoding="utf-8",
+        )
+        os.environ["PHASE1_CF_CSV"] = str(garbage)
+        junk = load_phase1_counterfactual()
+        self.assertEqual(junk.source, "packaged")
+        self.assertEqual(junk.note, "CSV 坏数据 · 回退证据包总表 2026-10-20")
+        junk_texts = _rendered_card_texts(lambda: app_module._v2_phase1_counterfactual())
+        junk_joined = "\n".join(junk_texts)
+        self.assertIn("CSV 坏数据", junk_joined)
+        self.assertIn("回退", junk_joined)
+        self.assertIn(baseline, junk_texts)
+        self.assertIn(line_c, junk_texts)
+        self.assertIn(PHASE1_CANDIDATE, junk_texts)
+        self.assertNotIn("已接", junk_joined)
+
+        header_only = self.root / "header-phase1.csv"
+        header_only.write_text(
+            "status,exit_reason,pnl_usd,liq_usd,shadow_R3_vol_chg_rsi,shadow_liq_lt_150k\n",
+            encoding="utf-8",
+        )
+        os.environ["PHASE1_CF_CSV"] = str(header_only)
+        bare = load_phase1_counterfactual()
+        self.assertEqual(bare.note, "CSV 无 closed · 回退证据包总表 2026-10-20")
+        self.assertIn(line_a, _rendered_card_texts(lambda: app_module._v2_phase1_counterfactual()))
+
+        null_liq = self.root / "null-liq-phase1.csv"
+        null_liq.write_text(
+            "status,exit_reason,pnl_usd,liq_usd,shadow_R3_vol_chg_rsi,shadow_liq_lt_150k\n"
+            "closed,stop_loss,-10,,1,1\n"
+            "open,stop_loss,-999,1000,1,1\n",
+            encoding="utf-8",
+        )
+        os.environ["PHASE1_CF_CSV"] = str(null_liq)
+        guarded = load_phase1_counterfactual()
+        self.assertEqual(guarded.source, "csv")
+        self.assertEqual(guarded.closed, 1)
+        self.assertEqual(guarded.cases[0].key, "A")
+        self.assertEqual(guarded.cases[0].skip_n, 1)
+        self.assertEqual(guarded.cases[1].key, "B")
+        self.assertEqual(guarded.cases[1].skip_n, 0)
+        self.assertEqual(guarded.cases[2].key, "C")
+        self.assertEqual(guarded.cases[2].skip_n, 1)
+        self.assertEqual(guarded.note, "与证据包总表不一致 · 以 CSV 重算")
+        null_texts = _rendered_card_texts(lambda: app_module._v2_phase1_counterfactual())
+        null_joined = "\n".join(null_texts)
+        self.assertIn("以 CSV 重算", null_joined)
+        self.assertIn("B liq<150k skip0", null_joined)
+        self.assertIn(PHASE1_CF_NAIL, null_texts)
+        self.assertIn("填不满 $20k", null_joined)
+        self.assertNotIn("closed=142", null_joined)
+        self.assertNotIn("回退证据包总表", null_joined)
+        self.assertNotIn("已接", null_joined)
+
+        anchor = self.root / "anchor-phase1.csv"
+        lines = ["status,exit_reason,pnl_usd,liq_usd,shadow_R3_vol_chg_rsi,shadow_liq_lt_150k\n"]
+
+        def add(count: int, reason: str, pnl: str, liq: str, r3: int, liq_flag: int) -> None:
+            for index in range(count):
+                cell = pnl if index == 0 else "0"
+                lines.append(f"closed,{reason},{cell},{liq},{r3},{liq_flag}\n")
+
+        add(5, "stop_loss", "-854.70", "10000", 1, 1)
+        add(11, "max_hold", "58.48", "10000", 1, 1)
+        add(14, "max_hold", "-25.38", "200000", 1, 0)
+        add(11, "max_hold", "-49.29", "10000", 0, 1)
+        add(5, "stop_loss", "-686.19", "200000", 0, 0)
+        add(3, "take_profit", "437.66", "200000", 0, 0)
+        add(93, "max_hold", "-176.29", "200000", 0, 0)
+        lines.append("open,stop_loss,-99999,10000,1,1\n")
+        anchor.write_text("".join(lines), encoding="utf-8")
+        before = anchor.stat().st_mtime_ns
+        os.environ.pop("PHASE1_CF_CSV", None)
+        os.environ["SHADOW_PHASE0_CSV"] = str(anchor)
+        report = load_phase1_counterfactual()
+        self.assertEqual(anchor.stat().st_mtime_ns, before)
+        self.assertEqual(report.source, "csv")
+        self.assertEqual(report.note, "CSV 与证据包总表一致")
+        self.assertEqual(report.closed, 142)
+        matched = _rendered_card_texts(lambda: app_module._mount_phase1_counterfactual())
+        matched_joined = "\n".join(matched)
+        for line in packaged_lines:
+            self.assertIn(line, matched)
+        self.assertIn("CSV 与证据包总表一致", matched_joined)
+        self.assertNotIn("以 CSV 重算", matched_joined)
+        self.assertNotIn("回退", matched_joined)
+        self.assertIn(PHASE1_CF_NAIL, matched)
+        self.assertIn("候选", matched_joined)
+        self.assertNotIn("已接", matched_joined)
+
+        shifted = self.root / "shifted-phase1.csv"
+        shifted.write_text(
+            "status,exit_reason,pnl_usd,liq_usd,shadow_R3_vol_chg_rsi,shadow_liq_lt_150k\n"
+            "closed,max_hold,-1.00,200000,1,0\n",
+            encoding="utf-8",
+        )
+        os.environ["PHASE1_CF_CSV"] = str(shifted)
+        moved = load_phase1_counterfactual()
+        self.assertEqual(moved.source, "csv")
+        self.assertEqual(moved.note, "与证据包总表不一致 · 以 CSV 重算")
+        self.assertEqual(moved.cases[0].skip_n, 1)
+        self.assertEqual(moved.cases[1].skip_n, 0)
+        shifted_texts = _rendered_card_texts(lambda: app_module._v2_phase1_counterfactual())
+        shifted_joined = "\n".join(shifted_texts)
+        self.assertIn("A R3 skip1：抓 SL 0/0、TP 0 → 剩余 Σ≈$0（Δ+$1）", shifted_joined)
+        self.assertIn("以 CSV 重算", shifted_joined)
+        self.assertNotIn("skip30", shifted_joined)
+        self.assertIn("填不满 $20k", shifted_joined)
+        self.assertIn(PHASE1_CF_NAIL, shifted_texts)
+
+        overview = inspect.getsource(app_module._render_dashboard)
+        phase0_at = overview.index("_mount_phase0_shadow")
+        card_at = overview.index("_mount_phase1_counterfactual")
+        m7_at = overview.index("_mount_m7_shadow")
+        self.assertLess(phase0_at, card_at)
+        self.assertLess(card_at, m7_at)
+        card_src = inspect.getsource(app_module._v2_phase1_counterfactual)
+        mount_src = inspect.getsource(app_module._mount_phase1_counterfactual)
+        self.assertIn("honest_line", card_src)
+        self.assertIn("PHASE1_CF_NAIL", card_src)
+        self.assertIn("PHASE1_CANDIDATE", card_src)
+        self.assertNotIn("已接", card_src)
+        self.assertNotIn("已接", mount_src)
+        self.assertNotIn("place_order", card_src)
+        self.assertNotIn("place_order", mount_src)
+        module_src = inspect.getsource(phase1_module)
+        self.assertNotIn("sqlite3", module_src)
+        self.assertNotIn("DECISION_MIN_LIQ", module_src)
+        self.assertNotIn("place_order", module_src)
+        self.assertNotIn("paper_trading", module_src)
+        self.assertEqual(
+            PHASE1_CF_NAIL,
+            "影簿/反事实≠已改闸 · 不算有效性 · 不 soft-skip · 薄样本勿批改闸 · "
+            "与 Phase0 双列并存 · #71/权0/日亏200 不动",
+        )
+        self.assertIn("候选", PHASE1_CANDIDATE)
+        self.assertNotIn("已接", PHASE1_CANDIDATE)
 
     def test_m7_s0_s1_shadow_card(self) -> None:
         missing_csv = self.root / "no-such-m7.csv"
