@@ -43,6 +43,16 @@ from dashboard.panels.shell import (
     session_clock,
 )
 from dashboard.settings import allow_insecure, api_secret, bind_host, db_root, port, read_gates, refresh_seconds
+from dashboard.shadow_phase0 import (
+    FLAG_LIQ,
+    FLAG_R3,
+    PHASE0_NAIL,
+    format_both,
+    format_count,
+    format_sl,
+    format_tp,
+    load_shadow_phase0,
+)
 
 try:
     # Optional module: AI CHAT stays a stub when dashboard.chat is absent.
@@ -1158,6 +1168,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     tools=("只读",),
                 )
                 _mount_goal_20k(store)
+                _mount_phase0_shadow()
                 _v2_comp(
                     ("回测", "新闻"),
                     "span-6",
@@ -2447,6 +2458,45 @@ def _v2_goal_20k(store: DataStore, *, now: datetime | None = None) -> None:
     if note:
         ui.label(_v2_text(note)).classes("v2-note")
     ui.label(_GOAL_NAIL).classes("v2-note")
+
+
+def _mount_phase0_shadow() -> None:
+    """Own OVERVIEW card, mounted beside the other evidence cards."""
+    _v2_comp(
+        ("止损", "影子"),
+        "span-12",
+        _v2_phase0_shadow,
+        foot=f"Phase0 双列 · exports/shadow_skip_stop_prone_live.csv · 不 soft-skip · {PHASE0_NAIL}",
+        tools=("只读",),
+    )
+
+
+def _v2_phase0_shadow() -> None:
+    try:
+        report = load_shadow_phase0()
+    except Exception:
+        log.warning("phase0 shadow card failed")
+        ui.label("CSV 不可读").classes("v2-note")
+        ui.label(PHASE0_NAIL).classes("v2-note")
+        return
+    if not report.available:
+        ui.label(report.reason or "CSV 缺失").classes("v2-note")
+        ui.label("不 soft-skip · 不改闸").classes("v2-note")
+        ui.label(PHASE0_NAIL).classes("v2-note")
+        return
+    _v2_table(
+        [("", ""), (FLAG_R3, "num"), (FLAG_LIQ, "num")],
+        [
+            ["命中 n", format_count(report.r3), format_count(report.liq)],
+            ["抓 SL", format_sl(report.r3), format_sl(report.liq)],
+            ["误伤 TP", format_tp(report.r3), format_tp(report.liq)],
+        ],
+    )
+    null_text = "—" if report.liq_null is None else str(report.liq_null)
+    ui.label(f"同为 1：{format_both(report)}").classes("v2-note")
+    ui.label(f"closed {report.closed} · NULL liq {null_text} 不打 liq 标").classes("v2-note")
+    ui.label("源 exports/shadow_skip_stop_prone_live.csv · 不 soft-skip").classes("v2-note")
+    ui.label(PHASE0_NAIL).classes("v2-note")
 
 
 def _v2_token_age(store: DataStore) -> None:
