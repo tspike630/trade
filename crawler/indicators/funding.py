@@ -13,7 +13,9 @@ from typing import Any
 from history import history_tier_for_token
 from logging_setup import get_logger
 
-from indicators.base import IndicatorStore, utc_now_iso
+from datetime import datetime, timezone
+
+from indicators.base import IndicatorStore, parse_iso, utc_now_iso
 
 log = get_logger("indicators.funding")
 
@@ -31,26 +33,36 @@ def map_jev_signal(stance: str | None, raw_score: float | None) -> str:
     """
     Map stance / score → bullish | bearish | neutral.
 
-    Rules (documented in INDICATORS_STEP2.md):
+    Rules (2026-10-21 fix; was: non-directional stance fell through to score
+    bands, so NOT BULLISH + score>=65 became bullish):
     1. stance matches SELL/BEARISH/SHORT (and not NOT BEARISH) → bearish
-    2. stance matches BUY/BULLISH/LONG (and not NOT BULLISH) → bullish
-    3. else if raw_score >= 65 → bullish
-    4. else if raw_score <= 35 → bearish
-    5. else → neutral  (includes INSUFFICIENT EVIDENCE / NOT BULLISH / None score)
+    2. stance matches BUY/BULLISH/LONG (and not NOT BULLISH) → bullish only if
+       raw_score is missing or >= BULLISH_SCORE_MIN; else neutral
+    3. any other stance (NOT BULLISH / NEUTRAL / INSUFFICIENT EVIDENCE / empty /
+       None / unknown) → never bullish. raw_score <= BEARISH_SCORE_MAX → bearish,
+       else neutral.
     """
     s = (stance or "").strip()
-    if s:
-        if _BEARISH_RE.search(s) and not _NOT_BEARISH_RE.search(s):
-            return "bearish"
-        if _BULLISH_RE.search(s) and not _NOT_BULLISH_RE.search(s):
+    if s and _BEARISH_RE.search(s) and not _NOT_BEARISH_RE.search(s):
+        return "bearish"
+    if s and _BULLISH_RE.search(s) and not _NOT_BULLISH_RE.search(s):
+        if raw_score is None or raw_score >= BULLISH_SCORE_MIN:
             return "bullish"
-        # Explicit non-directional stances fall through to score bands
-    if raw_score is not None:
-        if raw_score >= BULLISH_SCORE_MIN:
-            return "bullish"
-        if raw_score <= BEARISH_SCORE_MAX:
-            return "bearish"
+        return "neutral"
+    if raw_score is not None and raw_score <= BEARISH_SCORE_MAX:
+        return "bearish"
     return "neutral"
+
+
+def jev_age_minutes(fetched_at: str | None, now: datetime | None = None) -> float | None:
+    """Minutes between ``now`` (UTC) and the JEV fetch time; None if unparseable."""
+    t = parse_iso(fetched_at) if fetched_at else None
+    if t is None:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return round(max(0.0, (now - t).total_seconds() / 60.0), 2)
 
 
 def direction_coef(signal: str) -> float:
@@ -61,7 +73,9 @@ def direction_coef(signal: str) -> float:
     return 0.0
 
 
-def compute_funding_fields(sig: dict[str, Any]) -> dict[str, Any] | None:
+def compute_funding_fields(
+    sig: dict[str, Any], now: datetime | None = None
+) -> dict[str, Any] | None:
     """
     Derive token_indicators funding columns from a jev_signals row.
 
@@ -73,7 +87,9 @@ def compute_funding_fields(sig: dict[str, Any]) -> dict[str, Any] | None:
                         # range approx [-1, 1]; 0 when neutral or missing inputs
       jev_score       = jev_raw_score                   # compat alias
       jev_funding_bias = direction_coef                 # -1 / 0 / +1
-      jev_updated_at  = fetched_at or analyzed_at
+      jev_updated_at  = fetched_at or analyzed_at   # JEV clock, not row updated_at
+      jev_age_min     = now - jev fetch time (minutes)
+      jev_stance_raw  = jev_signals.stance verbatim
     """
     if sig.get("error") and sig.get("jev_score") is None:
         # Still allow mapping nulls so consumers see a refresh timestamp
@@ -107,7 +123,9 @@ def compute_funding_fields(sig: dict[str, Any]) -> dict[str, Any] | None:
         conf = confidence if confidence is not None else 0.0
         strength = round((raw_f / 100.0) * conf * coef, 6)
 
-    updated = sig.get("fetched_at") or sig.get("analyzed_at") or utc_now_iso()
+    jev_ts = sig.get("fetched_at") or sig.get("analyzed_at")
+    updated = jev_ts or utc_now_iso()
+    age_min = jev_age_minutes(jev_ts, now)
 
     return {
         "jev_raw_score": raw_f,
@@ -117,6 +135,8 @@ def compute_funding_fields(sig: dict[str, Any]) -> dict[str, Any] | None:
         "jev_strength": strength,
         "jev_funding_bias": coef,
         "jev_updated_at": updated,
+        "jev_age_min": age_min,
+        "jev_stance_raw": sig.get("stance"),
     }
 
 
@@ -181,6 +201,8 @@ class FundingIndicators:
                             "volume_strength": prev.get("volume_strength"),
                             "jev_score": row.get("jev_raw_score"),
                             "jev_strength": row.get("jev_strength"),
+                            "jev_age_min": row.get("jev_age_min"),
+                            "jev_stance_raw": row.get("jev_stance_raw"),
                             "sentiment_score": prev.get("sentiment_score"),
                             "composite_score": prev.get("composite_score"),
                             "tier": tier,
