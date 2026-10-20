@@ -39,7 +39,7 @@ class StanceTest(unittest.TestCase):
     def test_bullish_fresh_passes_with_extras(self):
         _, out = _run([_row()])
         self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["jev_stance"], "BULLISH")
+        self.assertEqual(out[0]["jev_stance_raw"], "BULLISH")
         self.assertAlmostEqual(out[0]["jev_age_min"], 60.0, delta=2)
 
     def test_stance_check_can_be_disabled(self):

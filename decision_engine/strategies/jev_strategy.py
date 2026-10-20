@@ -106,8 +106,8 @@ class JevStrengthStrategy(BaseStrategy):
                     jev_strength=s,
                     jev_signal=row.get("jev_signal"),
                     jev_score=row.get("jev_score"),
-                    jev_age_min=None if age is None else round(age, 1),
-                    jev_stance=row.get("jev_stance"),
+                    jev_age_min=None if age is None else round(age, 1),  # null if unknown; gateway may reject >1440
+                    jev_stance_raw=row.get("jev_stance"),
                 )
         signals = self.drain()
         log.info(
