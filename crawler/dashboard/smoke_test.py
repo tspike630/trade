@@ -4599,6 +4599,12 @@ class DashboardSmokeTest(unittest.TestCase):
             self.assertNotIn(column, prod, column)
         self.assertEqual(prod.count("C4 单流"), 2)
         self.assertEqual(prod.count("C4"), 4)
+        self.assertEqual(
+            app_module.C4_FLOW_BLIND_LINE,
+            "C4 单流：预登记 10-21 12:00 HKT 锁定·窗口 10-21 07:08–10-24 07:00·固定切点 10-23 02:15（前60/后40）·截止前不看数",
+        )
+        self.assertNotIn("数据自 07:08", prod)
+        self.assertNotIn("切 60/40", prod)
         self.assertNotRegex(prod, r"闪烁.{0,24}21")
         self.assertNotRegex(prod, r"21.{0,24}闪烁")
         self.assertNotIn("tp_not_held", prod)
