@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -36,10 +37,14 @@ from dashboard.data import (
     GOAL_TARGET_USD,
     KPI_DAILY_LOSS_LINE_USD,
     KPI_WINDOW_DAYS,
+    SLIP_SUSPICIOUS_TABLES,
+    SOURCE_TABLE_DAMAGE_BANNER,
     DataStore,
+    source_table_banner,
     DbPaths,
     _WRITE_RE,
     connect_ro,
+    dedup_token_count,
 )
 from dashboard.format_util import fmt_hold, fmt_liq, fmt_pct, fmt_usd
 from dashboard.panels.evolution import (
@@ -473,6 +478,7 @@ class DashboardSmokeTest(unittest.TestCase):
         week = store.week_decision_stats()
         self.assertTrue(week.available, week.reason)
         self.assertEqual(week.data.n_decisions, 2)
+        self.assertEqual(week.data.n_decisions_dedup, 2)
         self.assertEqual(week.data.n_with_exec, 2)
         self.assertEqual(week.data.n_ok, 1)
         self.assertEqual(week.data.n_executed, 0)
@@ -1185,6 +1191,8 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertAlmostEqual(report.data.first_hit_rate or 0, 0.5, places=4)
         self.assertEqual(report.data.first_hit_live_n, 2)
         self.assertEqual(report.data.first_hit_live_wins, 1)
+        self.assertEqual(report.data.first_hit_dedup, 2)
+        self.assertEqual(report.data.first_hit_live_dedup, 2)
 
     def test_chat_context_uses_newest_messages(self) -> None:
         sessions = SessionStore(self.root / "dashboard_state.db")
@@ -1552,6 +1560,7 @@ class DashboardSmokeTest(unittest.TestCase):
         buckets = store.strategy_buckets()
         self.assertTrue(buckets.available, buckets.reason)
         self.assertEqual([(row.strategy_id, row.n, row.ok_rate) for row in buckets.data.rows], [("alpha", 2, "50.0%")])
+        self.assertEqual(buckets.data.rows[0].n_dedup, 2)
 
         now = datetime.now(timezone.utc)
         old = now - timedelta(days=3)
@@ -2125,6 +2134,7 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertTrue(report.available, report.reason)
         data = report.data
         self.assertEqual(data.total, 11)
+        self.assertEqual(data.total_dedup, 11)
         self.assertEqual(data.with_field, 6)
         self.assertEqual(data.unknown, 6)
         self.assertNotEqual(data.unknown, data.total)
@@ -2365,11 +2375,28 @@ class DashboardSmokeTest(unittest.TestCase):
         joined = "\n".join(texts)
         self.assertIn("未盯市 · cash + 未平 size_usd", joined)
         self.assertIn("口径日 2026-10-20 HKT", joined)
-        self.assertIn("10日目标旁证", joined)
-        self.assertIn("起点 2026-10-20", joined)
-        self.assertIn("截止 2026-10-30 HKT", joined)
-        self.assertIn(app_module._GOAL_NAIL, joined)
-        self.assertIn("目标跟踪≠会赚会亏；不改闸", joined)
+        self.assertIn("保守 $8,283.14 · 缺口 ≈$11.7k", joined)
+        self.assertIn(app_module.KPI_GAP_PRIMARY_NOTE, joined)
+        self.assertIn("原账 $8,704.00 · 缺口 ≈$11.3k", joined)
+        book_texts = _rendered_card_texts(lambda: app_module._v2_equity_book_row(data))
+        book_joined = "\n".join(book_texts)
+        self.assertEqual(book_texts[book_texts.index("原账") + 1], "$8,704.00")
+        self.assertEqual(book_texts[book_texts.index("保守") + 1], "$8,283.14 · 待定")
+        self.assertIn("$8,530.57（代理 $8,356.48 参考）", book_texts)
+        self.assertIn("$8,886.49", book_texts)
+        self.assertNotIn("仅剔向下", book_joined)
+        self.assertIn(app_module.V_MARK_NOTE, book_texts)
+        self.assertIn(app_module.EQUITY_RULER_NOTE, book_texts)
+        self.assertIn("真止盈 0/143（3 笔止盈均为向上假报价）", book_joined)
+        mount_texts = _rendered_card_texts(lambda: app_module._mount_goal_20k(store))
+        mount_joined = "\n".join(mount_texts)
+        self.assertIn("距", mount_texts)
+        self.assertIn("$20k", mount_texts)
+        self.assertIn("10日目标旁证", mount_joined)
+        self.assertIn("起点 2026-10-20", mount_joined)
+        self.assertIn("截止 2026-10-30 HKT", mount_joined)
+        self.assertIn(app_module._GOAL_NAIL, mount_joined)
+        self.assertIn("目标跟踪≠会赚会亏；不改闸", mount_joined)
         self.assertEqual(app_module._GOAL_NAIL, "目标跟踪≠会赚会亏；不改闸")
 
         ended_texts = _rendered_card_texts(lambda: app_module._v2_goal_20k(ahead_store))
@@ -2402,7 +2429,7 @@ class DashboardSmokeTest(unittest.TestCase):
             "只读倒推 · 不改闸 · 不改 .env · 开杠杆由五层互批",
         )
         cases = [name for name in DashboardSmokeTest.__dict__ if name.startswith("test_")]
-        self.assertEqual(len(cases), 28)
+        self.assertEqual(len(cases), 31)
 
         missing = DataStore(
             DbPaths(
@@ -2546,6 +2573,8 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("止损 = size_usd×sl_pct/100 · 不含撤单", joined)
         self.assertIn("近7个 HKT 日含零成交日", joined)
         self.assertIn("口径日 2026-10-20 HKT", joined)
+        self.assertIn("保守 $8,283.14 · 缺口 ≈$11.7k", joined)
+        self.assertIn(app_module.KPI_GAP_PRIMARY_NOTE, joined)
         self.assertIn("硬 KPI 倒推", joined)
         self.assertIn("截止 2026-10-30 HKT", joined)
         self.assertIn(app_module._KPI_NAIL, joined)
@@ -2736,7 +2765,15 @@ class DashboardSmokeTest(unittest.TestCase):
         gap_texts = _rendered_card_texts(lambda: app_module._v2_phase0_shadow())
         self.assertIn("CSV 缺失", gap_texts)
         self.assertIn(PHASE0_NAIL, gap_texts)
+        self.assertIn(app_module._ENTRY_JEV_BANNER, gap_texts)
         self.assertIn("不 soft-skip", "\n".join(gap_texts))
+        phase_joined = "\n".join(gap_texts)
+        self.assertIn("比随机好多少 · TP10/SL5/h60 · 扣成本前 −1.46% · 扣1.2% −2.65% · 分档成本 −4.92%", phase_joined)
+        self.assertIn("新币低liq(<5万)切片 已淘汰", phase_joined)
+        self.assertIn("exports/random_entry_shared_seed20261021_v2_ulj.csv", phase_joined)
+        self.assertIn(app_module.RETIRED_GRID_LINE, gap_texts)
+        self.assertIn(app_module.REMAINING_ENTRY_LINE, gap_texts)
+        self.assertIn(app_module.C4_FLOW_BLIND_LINE, gap_texts)
 
         empty = self.root / "empty-shadow.csv"
         empty.write_text("", encoding="utf-8")
@@ -2889,6 +2926,7 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("Phase1", gap_texts)
         self.assertIn("soft-skip 反事实", gap_texts)
         self.assertIn(PHASE1_CF_NAIL, gap_texts)
+        self.assertIn(app_module._ENTRY_JEV_BANNER, gap_texts)
         self.assertIn(PHASE1_WINDOW, gap_texts)
         self.assertIn(PHASE1_CANDIDATE, gap_texts)
         self.assertIn("候选", gap_joined)
@@ -3130,6 +3168,12 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("旁簿", gap_texts)
         self.assertIn(C_EXIT_NAIL, gap_texts)
         self.assertIn(C_EXIT_DISCIPLINE, gap_texts)
+        self.assertIn(app_module._ENTRY_JEV_BANNER, gap_texts)
+        self.assertIn(app_module.bonferroni_grid_label(), gap_texts)
+        self.assertIn(app_module.RETIRED_GRID_LINE, gap_texts)
+        self.assertIn(app_module.REMAINING_ENTRY_LINE, gap_texts)
+        self.assertIn(app_module.C4_FLOW_BLIND_LINE, gap_texts)
+        self.assertNotIn("样本不足", gap_joined)
         self.assertIn(C_EXIT_THRESHOLD, gap_texts)
         self.assertIn(C_EXIT_ROLLBACK, gap_texts)
         self.assertIn(line_60, gap_texts)
@@ -3343,6 +3387,40 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("停旁簿", breach_joined)
         self.assertIn(line_60, breach_texts)
         self.assertIn(C_EXIT_NAIL, breach_texts)
+        self.assertIn("c_sl4_h60 · 样本不足", breach_joined)
+
+        dupes = self.root / "dup-token-c-exit.db"
+        conn = sqlite3.connect(dupes)
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, grid_tag TEXT, status TEXT, exit_reason TEXT, "
+            "pnl_usd REAL, token_address TEXT)"
+        )
+        dup_rows: list[tuple[str, str, str, float, str]] = []
+        for index in range(40):
+            dup_rows.append(("c_sl4_h60", "closed", "max_hold", -1, f"tok-{index % 10}"))
+        for index in range(35):
+            dup_rows.append(("c_sl5_h60", "closed", "max_hold", -1, f"wide-{index}"))
+        dup_rows.append(("c_sl5_h60", "closed", "max_hold", -1, "wide-0"))
+        conn.executemany(
+            "INSERT INTO positions (grid_tag, status, exit_reason, pnl_usd, token_address) "
+            "VALUES (?, ?, ?, ?, ?)",
+            dup_rows,
+        )
+        conn.commit()
+        conn.close()
+        distinct = load_c_exit_shadow(dupes)
+        self.assertEqual(distinct.tags[0].live_n, 10)
+        self.assertEqual(distinct.tags[0].origin, "packaged")
+        self.assertEqual(distinct.tags[0].n, 141)
+        self.assertEqual(distinct.tags[1].live_n, 35)
+        self.assertEqual(distinct.tags[1].origin, "live")
+        self.assertEqual(distinct.tags[1].n, 35)
+        os.environ["C_EXIT_SHADOW_DB"] = str(dupes)
+        dup_joined = "\n".join(_rendered_card_texts(lambda: app_module._v2_c_exit_shadow()))
+        self.assertIn("c_sl4_h60 · 样本不足", dup_joined)
+        self.assertNotIn("c_sl5_h60 · 样本不足", dup_joined)
+        self.assertIn("n=35", dup_joined)
 
         overview = inspect.getsource(app_module._render_dashboard)
         phase1_at = overview.index("_mount_phase1_counterfactual")
@@ -3389,7 +3467,12 @@ class DashboardSmokeTest(unittest.TestCase):
 
         missing = self.root / "no-such-joint.csv"
         os.environ["ENTRY_C_EXIT_JOINT_CSV"] = str(missing)
-        os.environ.pop("C_EXIT_SHADOW_DB", None)
+        empty_side = self.root / "empty-side-joint.db"
+        side_conn = sqlite3.connect(empty_side)
+        side_conn.execute("CREATE TABLE positions (id INTEGER PRIMARY KEY, status TEXT)")
+        side_conn.commit()
+        side_conn.close()
+        os.environ["C_EXIT_SHADOW_DB"] = str(empty_side)
         report = load_entry_c_exit_joint()
         self.assertEqual(report.source, "packaged")
         self.assertTrue(report.sample_in)
@@ -3472,6 +3555,8 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("liq flag=1 旁注", gap_joined)
         self.assertIn(JOINT_PNL_NOTE, gap_texts)
         self.assertIn("旁簿/live joint 空", gap_joined)
+        self.assertNotIn("只读对照", gap_joined)
+        self.assertIn(app_module._ENTRY_JEV_BANNER, gap_texts)
         self.assertNotIn("515.61", gap_joined)
         self.assertNotIn("761.71", gap_joined)
         self.assertNotIn("place_order", gap_joined)
@@ -3702,6 +3787,13 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("旁簿成交=1", joint_nail_line(held))
         self.assertIn("样本内假设", joint_nail_line(held))
         self.assertEqual(joint_verdict_line(held), JOINT_VERDICT)
+        compare_texts = _rendered_card_texts(lambda: app_module._v2_entry_c_exit_joint())
+        compare_joined = "\n".join(compare_texts)
+        self.assertIn("只读对照 · 旁簿成交=1", compare_texts)
+        self.assertIn("旁簿成交=1", compare_joined)
+        self.assertNotIn(JOINT_NAIL, compare_texts)
+        self.assertIn(JOINT_DISCIPLINE, compare_texts)
+        self.assertIn(app_module._ENTRY_JEV_BANNER, compare_texts)
 
         export_root = self.root / "export-root"
         older = export_root / "exports" / "shadow_entry_x_c_exit_joint_2026-10-01.csv"
@@ -4112,13 +4204,14 @@ class DashboardSmokeTest(unittest.TestCase):
         texts = _rendered_card_texts(lambda: app_module._mount_m7_shadow(store))
         self.assertIn("M7", texts)
         self.assertIn("S0|S1|liq_missing", texts)
-        self.assertEqual(texts[texts.index("S1") + 1], "538")
-        self.assertEqual(texts[texts.index("S0") + 1], "8")
-        self.assertEqual(texts[texts.index("liq_missing") + 1], "68")
-        self.assertEqual(texts[texts.index("would_open_S0") + 1], "546")
-        self.assertEqual(texts[texts.index("would_open_S1") + 1], "538")
-        self.assertEqual(texts[texts.index("leak") + 1], "3")
-        self.assertEqual(texts[texts.index("Phase0") + 1], "2")
+        self.assertEqual(texts[texts.index("S1") + 1], app_module._raw_dedup(538, 1))
+        self.assertEqual(texts[texts.index("S0") + 1], app_module._raw_dedup(8, 1))
+        self.assertEqual(texts[texts.index("liq_missing") + 1], app_module._raw_dedup(68, 1))
+        self.assertEqual(texts[texts.index("would_open_S0") + 1], app_module._raw_dedup(546, 2))
+        self.assertEqual(texts[texts.index("would_open_S1") + 1], app_module._raw_dedup(538, 1))
+        self.assertEqual(texts[texts.index("leak") + 1], app_module._raw_dedup(3, 1))
+        self.assertEqual(texts[texts.index("Phase0") + 1], app_module._raw_dedup(2, 2))
+        self.assertIn(app_module._ENTRY_JEV_BANNER, texts)
         joined = "\n".join(texts)
         self.assertIn("live_candidate buy", joined)
         self.assertIn("exports/m7_s0_s1_shadow_register.csv", joined)
@@ -4142,6 +4235,324 @@ class DashboardSmokeTest(unittest.TestCase):
             "影簿≠已改闸 · S0 历史仅 8 笔对照极薄 · 勿用薄样本批改闸",
         )
         os.environ.pop("DASHBOARD_DB_ROOT", None)
+
+    def test_dedup_window_pause_split_and_closed_banner(self) -> None:
+        t0 = datetime(2026, 10, 20, 1, 0, tzinfo=timezone.utc)
+        events = [
+            (t0, "A"),
+            (t0 + timedelta(minutes=10), "A"),
+            (t0 + timedelta(minutes=59), "A"),
+            (t0 + timedelta(minutes=60), "A"),
+            (t0 + timedelta(minutes=10), "B"),
+            (t0, ""),
+            (t0 + timedelta(minutes=1), ""),
+            (None, "C"),
+        ]
+        self.assertEqual(dedup_token_count(events), 6)
+        self.assertEqual(
+            app_module.bonferroni_grid_label(),
+            "累计共测 268 格 · Bonferroni 按 268",
+        )
+        self.assertEqual(app_module.BONFERRONI_GRIDS, 268)
+        label_src = inspect.getsource(app_module.bonferroni_grid_label)
+        self.assertIn("BONFERRONI_GRIDS", label_src)
+        self.assertNotIn("268", label_src)
+        jev_texts = _rendered_card_texts(app_module._v2_jev_gate)
+        self.assertIn(app_module.bonferroni_grid_label(), jev_texts)
+        self.assertIn(app_module.RETIRED_GRID_LINE, jev_texts)
+        self.assertIn(app_module.REMAINING_ENTRY_LINE, jev_texts)
+        self.assertIn(app_module.C4_FLOW_BLIND_LINE, jev_texts)
+
+        now = datetime.now(timezone.utc)
+        execution = self.root / "dedup-exec.db"
+        with sqlite3.connect(execution) as conn:
+            conn.execute(
+                "CREATE TABLE execution_log ("
+                "id INTEGER PRIMARY KEY, ts TEXT, decision_log_id INTEGER, "
+                "validation_ok INTEGER, executed INTEGER)"
+            )
+        main = self.root / "dedup-main.db"
+        with sqlite3.connect(main) as conn:
+            conn.execute(
+                """
+                CREATE TABLE decision_log (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    token_address TEXT,
+                    mode TEXT NOT NULL,
+                    raw_json TEXT
+                )
+                """
+            )
+            conn.executemany(
+                "INSERT INTO decision_log (ts, strategy_id, action, token_address, mode, raw_json) "
+                "VALUES (?, 'alpha', 'buy', ?, 'dry_run', '{}')",
+                [
+                    (_iso(now - timedelta(minutes=50)), "SAME"),
+                    (_iso(now - timedelta(minutes=20)), "SAME"),
+                    (_iso(now - timedelta(minutes=5)), "SAME"),
+                    (_iso(now - timedelta(minutes=70)), "SAME"),
+                    (_iso(now - timedelta(minutes=10)), "OTHER"),
+                ],
+            )
+        store = DataStore(
+            DbPaths(
+                main=main,
+                execution=execution,
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        week = store.week_decision_stats()
+        self.assertTrue(week.available, week.reason)
+        self.assertEqual(week.data.n_decisions, 5)
+        self.assertEqual(week.data.n_decisions_dedup, 3)
+        buckets = store.strategy_buckets()
+        self.assertEqual(buckets.data.rows[0].n, 5)
+        self.assertEqual(buckets.data.rows[0].n_dedup, 3)
+        week_texts = _rendered_card_texts(lambda: app_module._v2_week(store))
+        self.assertIn(app_module._raw_dedup(5, 3), week_texts)
+
+        paper = self.root / "pause-paper.db"
+        before_open = "2026-10-20T08:00:00Z"
+        after_open = "2026-10-21T01:00:00Z"
+        with sqlite3.connect(paper) as conn:
+            conn.execute(
+                """
+                CREATE TABLE account (
+                    id INTEGER PRIMARY KEY,
+                    cash_usd REAL NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO account (id, cash_usd, updated_at) VALUES (1, 10000, ?)",
+                (before_open,),
+            )
+            conn.execute(
+                """
+                CREATE TABLE positions (
+                    id TEXT PRIMARY KEY,
+                    chain_id TEXT,
+                    pair_address TEXT,
+                    token_address TEXT,
+                    qty REAL,
+                    entry_price REAL,
+                    size_usd REAL,
+                    opened_at TEXT,
+                    status TEXT
+                )
+                """
+            )
+            conn.executemany(
+                "INSERT INTO positions (id, chain_id, pair_address, token_address, qty, entry_price, "
+                "size_usd, opened_at, status) VALUES (?, 'solana', ?, ?, 1, 1, 10, ?, 'open')",
+                [
+                    ("early", "P1", "T1", before_open),
+                    ("late", "P2", "T2", after_open),
+                ],
+            )
+        pause_store = DataStore(
+            DbPaths(
+                main=main,
+                execution=self.root / "missing-exec.db",
+                paper=paper,
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        split = pause_store.paper_pause_split()
+        self.assertTrue(split.available, split.reason)
+        self.assertEqual(split.data.before, 1)
+        self.assertEqual(split.data.after, 1)
+        self.assertIn("PAPER_OPEN_PAUSED", split.data.flag_note)
+        held = _rendered_card_texts(lambda: app_module._v2_positions(pause_store))
+        held_joined = "\n".join(held)
+        self.assertIn("暂停前 1 · 暂停后 1", held)
+        self.assertIn("暂停后出现新开仓 · 挂卡拦", held)
+        self.assertIn("v2-note-bad", inspect.getsource(app_module._v2_pause_line))
+        self.assertIn("PAPER_OPEN_PAUSED", held_joined)
+
+        quiet = self.root / "quiet-paper.db"
+        with sqlite3.connect(quiet) as conn:
+            conn.execute(
+                "CREATE TABLE positions (id TEXT PRIMARY KEY, pair_address TEXT, opened_at TEXT, status TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO positions (id, pair_address, opened_at, status) VALUES ('only', 'P', ?, 'open')",
+                (before_open,),
+            )
+        quiet_store = DataStore(
+            DbPaths(
+                main=main,
+                execution=self.root / "missing-exec.db",
+                paper=quiet,
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        calm = quiet_store.paper_pause_split()
+        self.assertEqual(calm.data.before, 1)
+        self.assertEqual(calm.data.after, 0)
+        calm_texts = _rendered_card_texts(lambda: app_module._v2_positions(quiet_store))
+        self.assertIn("暂停前 1 · 暂停后 0", calm_texts)
+        self.assertNotIn("暂停后出现新开仓 · 挂卡拦", calm_texts)
+
+        closed_paper = self.root / "closed-banner.db"
+        with sqlite3.connect(closed_paper) as conn:
+            conn.execute(
+                """
+                CREATE TABLE positions (
+                    id TEXT PRIMARY KEY,
+                    pair_address TEXT,
+                    token_address TEXT,
+                    status TEXT,
+                    opened_at TEXT,
+                    closed_at TEXT,
+                    exit_reason TEXT,
+                    pnl_usd REAL,
+                    meta_json TEXT
+                )
+                """
+            )
+            stamp = _iso(now)
+            conn.executemany(
+                "INSERT INTO positions (id, pair_address, token_address, status, opened_at, closed_at, "
+                "exit_reason, pnl_usd, meta_json) VALUES (?, ?, ?, 'closed', ?, ?, 'max_hold', ?, ?)",
+                [
+                    ("a", "pairA", "TOK", stamp, stamp, 1, json.dumps({"decision_log_id": 1})),
+                    (
+                        "b",
+                        "pairB",
+                        "TOK",
+                        _iso(now - timedelta(minutes=10)),
+                        _iso(now - timedelta(minutes=10)),
+                        -1,
+                        json.dumps({"decision_log_id": 2}),
+                    ),
+                ],
+            )
+        with sqlite3.connect(main) as conn:
+            conn.execute("ALTER TABLE decision_log ADD COLUMN purpose TEXT")
+            conn.execute("UPDATE decision_log SET purpose = 'live_candidate'")
+        closed_store = DataStore(
+            DbPaths(
+                main=main,
+                execution=self.root / "missing-exec.db",
+                paper=closed_paper,
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        closed = closed_store.paper_closed_buckets(days=14)
+        self.assertEqual(closed.data.first_hit_n, 2)
+        self.assertEqual(closed.data.first_hit_dedup, 1)
+        self.assertEqual(closed.data.first_hit_live_n, 2)
+        self.assertEqual(closed.data.first_hit_live_dedup, 1)
+        closed_texts = _rendered_card_texts(lambda: app_module._v2_closed(closed_store))
+        self.assertIn(app_module._ENTRY_JEV_BANNER, closed_texts)
+        self.assertIn(app_module._raw_dedup(2, 1), "\n".join(closed_texts))
+
+    def test_malformed_holder_and_bot_tables_show_gap_not_zero(self) -> None:
+        banner = SOURCE_TABLE_DAMAGE_BANNER
+        slip_banner = source_table_banner(SLIP_SUSPICIOUS_TABLES)
+        self.assertIn("索引可疑", banner)
+        self.assertIn("token_transfer_edges", banner)
+        self.assertIn("address_labels", banner)
+        self.assertIn("token_holder_snapshots", banner)
+        self.assertIn("bot_fill_observations", slip_banner)
+        self.assertNotIn("token_transfer_edges", slip_banner)
+        holder_src = inspect.getsource(DataStore._intel_holder_observe)
+        slip_src = inspect.getsource(DataStore._intel_slippage_observe)
+        self.assertIn("except sqlite3.DatabaseError", holder_src)
+        self.assertIn("except sqlite3.DatabaseError", slip_src)
+        self.assertIn("token_holder_snapshots", holder_src)
+        self.assertIn("bot_fill_observations", slip_src)
+
+        class _RaisingConnect:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def __enter__(self) -> object:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+        live = self.root / "mocked-dex.db"
+        with sqlite3.connect(live) as conn:
+            conn.execute(
+                "CREATE TABLE token_holder_snapshots (chain_id TEXT, token_address TEXT, recorded_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO token_holder_snapshots (chain_id, token_address, recorded_at) "
+                "VALUES ('solana', 'mint', '2026-10-21T00:00:00Z')"
+            )
+            conn.execute(
+                "CREATE TABLE bot_fill_observations (chain_id TEXT, token_address TEXT, recorded_at TEXT, bot_reason TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO bot_fill_observations (chain_id, token_address, recorded_at, bot_reason) "
+                "VALUES ('solana', 'mint', '2026-10-21T00:00:00Z', 'repeat')"
+            )
+        mocked = DataStore(
+            DbPaths(
+                main=live,
+                execution=self.root / "missing-exec.db",
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        with patch("dashboard.data.ro_connect", _RaisingConnect):
+            held = mocked.intel_holder_observe()
+            slipped = mocked.intel_slippage_observe()
+            holder_texts = _rendered_card_texts(lambda: app_module._v2_intel_holders(mocked))
+            slip_texts = _rendered_card_texts(lambda: app_module._v2_intel_slippage(mocked))
+        self.assertFalse(held.available, held.reason)
+        self.assertIsNone(held.data)
+        self.assertEqual(held.reason, banner)
+        self.assertFalse(slipped.available, slipped.reason)
+        self.assertIsNone(slipped.data)
+        self.assertEqual(slipped.reason, slip_banner)
+        self.assertIn(banner, holder_texts)
+        self.assertIn("data gap", holder_texts)
+        self.assertNotIn("快照样本", holder_texts)
+        self.assertIn(slip_banner, slip_texts)
+        self.assertIn("data gap", slip_texts)
+        self.assertNotIn("1h n", slip_texts)
+
+        corrupt = self.root / "corrupt-dex.db"
+        corrupt.write_bytes(b"not a database")
+        damaged = DataStore(
+            DbPaths(
+                main=corrupt,
+                execution=self.root / "missing-exec.db",
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        corrupt_holder = damaged.intel_holder_observe()
+        corrupt_slip = damaged.intel_slippage_observe()
+        self.assertFalse(corrupt_holder.available, corrupt_holder.reason)
+        self.assertIsNone(corrupt_holder.data)
+        self.assertEqual(corrupt_holder.reason, banner)
+        self.assertFalse(corrupt_slip.available, corrupt_slip.reason)
+        self.assertIsNone(corrupt_slip.data)
+        self.assertEqual(corrupt_slip.reason, slip_banner)
+        corrupt_holder_texts = _rendered_card_texts(lambda: app_module._v2_intel_holders(damaged))
+        corrupt_slip_texts = _rendered_card_texts(lambda: app_module._v2_intel_slippage(damaged))
+        self.assertIn(banner, corrupt_holder_texts)
+        self.assertIn("data gap", corrupt_holder_texts)
+        self.assertNotIn("快照样本", corrupt_holder_texts)
+        self.assertIn(slip_banner, corrupt_slip_texts)
+        self.assertIn("data gap", corrupt_slip_texts)
+        self.assertNotIn("1h n", corrupt_slip_texts)
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
@@ -4169,6 +4580,29 @@ class DashboardSmokeTest(unittest.TestCase):
         for name in ("risk.py", "positions.py", "signals.py", "execution.py"):
             self.assertIn("show_unavailable", (root / "panels" / name).read_text(encoding="utf-8"))
         self.assertEqual(offenders, [])
+
+    def test_c4_order_flow_stays_blind(self) -> None:
+        root = Path(__file__).resolve().parent
+        chunks: list[str] = []
+        for path in sorted(root.rglob("*.py")):
+            if path.name == "smoke_test.py":
+                continue
+            chunks.append(path.read_text(encoding="utf-8"))
+        prod = "\n".join(chunks)
+        for column in (
+            "txns_m5_buys",
+            "txns_m5_sells",
+            "txns_h1_buys",
+            "txns_h1_sells",
+            "volume_m5",
+        ):
+            self.assertNotIn(column, prod, column)
+        self.assertEqual(prod.count("C4 单流"), 2)
+        self.assertEqual(prod.count("C4"), 4)
+        self.assertNotRegex(prod, r"闪烁.{0,24}21")
+        self.assertNotRegex(prod, r"21.{0,24}闪烁")
+        self.assertNotIn("tp_not_held", prod)
+        self.assertNotIn("闪烁率", prod)
 
     def test_http_gate_hides_fixture_data(self) -> None:
         build_fixture(self.root)

@@ -148,6 +148,8 @@ class DecisionWindowStats:
     n_executed: int
     ok_rate: float | None
     executed_rate: float | None
+    # Same token inside 60 minutes counts once. First row in the window is kept.
+    n_decisions_dedup: int = 0
 
 
 @dataclass(frozen=True)
@@ -265,6 +267,7 @@ class StrategyBucketRow:
     strategy_id: str
     n: int
     ok_rate: str
+    n_dedup: int = 0
 
 
 @dataclass(frozen=True)
@@ -354,6 +357,8 @@ class PaperClosedReport:
     first_hit_live_n: int = 0
     first_hit_live_wins: int = 0
     first_hit_live_rate: float | None = None
+    first_hit_dedup: int = 0
+    first_hit_live_dedup: int = 0
     # Exit-reason dominance (10-14 lesson: stop_loss can eat almost all loss).
     stop_loss_pnl_usd: float | None = None
     stop_loss_share: float | None = None
@@ -485,6 +490,7 @@ class TokenAgeReport:
     buckets: tuple[TokenAgeBucket, ...]
     samples: tuple[TokenAgeSample, ...]
     limit: int
+    total_dedup: int = 0
 
 
 # Paper pace vs the stated $20k mark. Observe-only; not a forecast or a gate.
@@ -492,6 +498,11 @@ GOAL_TARGET_USD = 20_000.0
 GOAL_START_DAY = date(2026, 10, 20)
 GOAL_DEADLINE_DAY = date(2026, 10, 30)
 _HKT = ZoneInfo("Asia/Hong_Kong")
+
+# Main-book open pause. Counts use opened_at; the flag file is display-only.
+PAPER_OPEN_PAUSE_AT = datetime(2026, 10, 21, 0, 55, 16, tzinfo=_HKT)
+PAPER_OPEN_PAUSE_FLAG = "PAPER_OPEN_PAUSED"
+_TOKEN_DEDUP_WINDOW = timedelta(minutes=60)
 
 
 @dataclass(frozen=True)
@@ -517,6 +528,24 @@ class GoalPaceReport:
     daily_need_usd: float | None
     mark_to_market: bool
     note: str
+    # 原账 is cash + open size. 保守 subtracts upward bad ticks only.
+    equity_raw_usd: float = 0.0
+    equity_conservative_usd: float = 0.0
+    equity_down_only_usd: float = 0.0
+    equity_both_usd: float = 0.0
+    gap_raw_usd: float = 0.0
+    gap_conservative_usd: float = 0.0
+    true_tp_line: str = ""
+
+
+# 注解库缺席时的坏报价调整。向上从原账扣，向下加回。对不上的格数另见 BONFERRONI（取大）。
+BAD_TICK_UP_USD = -437.66
+BAD_TICK_DOWN_USD = 603.36
+TRUE_TP_FALLBACK = "真止盈 0/143（3 笔止盈均为向上假报价）"
+ANNOTATIONS_DB_NAME = "paper_trading_annotations.db"
+_BAD_TICK_UP = frozenset({"up", "upward", "向上", "up_tick", "uptick", "up-tick"})
+_BAD_TICK_DOWN = frozenset({"down", "downward", "向下", "down_tick", "downtick", "down-tick"})
+_TAKE_PROFIT_REASONS = frozenset({"take_profit", "tp", "takeprofit"})
 
 
 # Reverse the $20k pace into a per-close requirement. Observe-only.
@@ -578,6 +607,11 @@ class KpiReverseReport:
     negative_expectancy: bool | None
     daily_loss_line_usd: float
     gap_note: str
+    equity_raw_usd: float = 0.0
+    equity_conservative_usd: float = 0.0
+    gap_raw_usd: float = 0.0
+    gap_conservative_usd: float = 0.0
+    true_tp_line: str = ""
 
 
 # M7 shadow register. Observe-only buckets; the live floor stays where it is.
@@ -605,6 +639,8 @@ class _M7Obs:
     purpose: str | None
     action: str | None
     phase0: bool
+    token: str = ""
+    ts: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -629,11 +665,34 @@ class M7ShadowReport:
     counted: int
     dupes: int
     note: str
+    n_s1_dedup: int = 0
+    n_s0_dedup: int = 0
+    n_missing_dedup: int = 0
+    n_leak_dedup: int = 0
+    n_phase0_dedup: int = 0
+    would_open_s0_dedup: int = 0
+    would_open_s1_dedup: int = 0
 
 
 _INTEL_HOLDER_SAMPLE = 8
 _INTEL_HOLDER_SHOW = 5
 _INTEL_CROWD_STRATEGY = "jev_strength_v1"
+# dexscreener.db 源表损坏时计数留空，不当作 0。碰到的表写入索引可疑。
+SOURCE_DAMAGE_PREFIX = "源表损坏 · 待修（dexscreener.db malformed 2026-10-21）"
+HOLDER_SUSPICIOUS_TABLES = (
+    "token_holder_snapshots",
+    "token_transfer_edges",
+    "address_labels",
+)
+SLIP_SUSPICIOUS_TABLES = ("bot_fill_observations",)
+
+
+def source_table_banner(tables: tuple[str, ...]) -> str:
+    """Damage banner plus the tables this read touches."""
+    return f"{SOURCE_DAMAGE_PREFIX}· 索引可疑：{'、'.join(tables)}"
+
+
+SOURCE_TABLE_DAMAGE_BANNER = source_table_banner(HOLDER_SUSPICIOUS_TABLES)
 _TOKEN_AGE_LIMIT = 300
 _TOKEN_AGE_SAMPLES = 5
 _TOKEN_AGE_LABELS = ("<1d", "1-7d", ">7d", "unknown")
@@ -902,7 +961,84 @@ def _kpi_reverse_from_rows(
         negative_expectancy=negative,
         daily_loss_line_usd=KPI_DAILY_LOSS_LINE_USD,
         gap_note=_kpi_notes(pace.note, pnl_note, window_note, stop_note),
+        equity_raw_usd=pace.equity_raw_usd,
+        equity_conservative_usd=pace.equity_conservative_usd,
+        gap_raw_usd=pace.gap_raw_usd,
+        gap_conservative_usd=pace.gap_conservative_usd,
+        true_tp_line=pace.true_tp_line,
     )
+def dedup_token_count(events: list[tuple[datetime | None, str]]) -> int:
+    """Keep the first row of each token_address inside a 60-minute window.
+
+    A later row of the same token is dropped when it falls strictly inside
+    60 minutes of the last kept row. A row at exactly 60 minutes starts a new
+    window. A blank token is not merged with other blanks: a missing address
+    is not one shared token. An unparseable time is kept.
+    """
+    ordered = sorted(
+        enumerate(events),
+        key=lambda item: (
+            item[1][0] is None,
+            item[1][0] or datetime.min.replace(tzinfo=timezone.utc),
+            item[0],
+        ),
+    )
+    kept_at: dict[str, datetime] = {}
+    kept = 0
+    for _index, (stamp, token) in ordered:
+        key = token.strip().casefold()
+        if not key or stamp is None:
+            kept += 1
+            continue
+        previous = kept_at.get(key)
+        if previous is not None and stamp - previous < _TOKEN_DEDUP_WINDOW:
+            continue
+        kept_at[key] = stamp
+        kept += 1
+    return kept
+
+
+def _optional_ts(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return parse_ts(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def dashboard_repo_root() -> Path:
+    """Repo root for the pause flag. The crawler mirror sits one level down."""
+    root = Path(__file__).resolve().parents[1]
+    if root.name == "crawler":
+        return root.parent
+    return root
+
+
+def paper_pause_flag_state() -> tuple[bool | None, str]:
+    """Whether PAPER_OPEN_PAUSED exists. Unreadable stays None and does not raise."""
+    path = dashboard_repo_root() / PAPER_OPEN_PAUSE_FLAG
+    try:
+        present = path.is_file()
+    except OSError:
+        log.warning("paper pause flag unreadable")
+        return None, f"{PAPER_OPEN_PAUSE_FLAG}：不可读"
+    if present:
+        return True, f"{PAPER_OPEN_PAUSE_FLAG}：在"
+    return False, f"{PAPER_OPEN_PAUSE_FLAG}：不在"
+
+
+@dataclass(frozen=True)
+class PaperPauseSplit:
+    """Main-book opens before and after the pause instant."""
+
+    before: int
+    after: int
+    flag_present: bool | None
+    flag_note: str
 
 
 def _hkt_day(ts: str | None) -> str:
@@ -1251,6 +1387,14 @@ def _file_has_table(path: Path | None, table: str) -> bool:
         return _table_exists(conn, table)
 
 
+def _probe_table(path: Path, table: str) -> None:
+    """Read one row so a damaged table raises instead of looking like a zero count."""
+    with ro_connect(path) as conn:
+        if not _table_exists(conn, table):
+            return
+        _exec(conn, f"SELECT 1 FROM {_ident(table)} LIMIT 1").fetchone()
+
+
 def _crowding_line(
     strategy_id: str,
     live_n: int | None,
@@ -1366,6 +1510,8 @@ def _m7_obs_from_parts(
     purpose: str | None,
     action: str | None,
     phase0: bool,
+    token: str = "",
+    ts: datetime | None = None,
 ) -> _M7Obs:
     return _M7Obs(
         decision_id=decision_id,
@@ -1375,10 +1521,33 @@ def _m7_obs_from_parts(
         purpose=purpose,
         action=action,
         phase0=phase0,
+        token=token,
+        ts=ts,
     )
 
 
-def _m7_obs_from_raw(raw: dict[str, Any], action: str | None, decision_id: str | None) -> _M7Obs:
+def _m7_token_from_raw(raw: dict[str, Any]) -> str:
+    for key in ("token_address", "token"):
+        value = raw.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    extras = raw.get("extras")
+    if isinstance(extras, dict):
+        for key in ("token_address", "token"):
+            value = extras.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    return ""
+
+
+def _m7_obs_from_raw(
+    raw: dict[str, Any],
+    action: str | None,
+    decision_id: str | None,
+    *,
+    token: str = "",
+    ts: datetime | None = None,
+) -> _M7Obs:
     extras = raw.get("extras")
     extras_d = extras if isinstance(extras, dict) else {}
     has_liq = "liquidity_usd" in extras_d
@@ -1386,6 +1555,7 @@ def _m7_obs_from_raw(raw: dict[str, Any], action: str | None, decision_id: str |
     if purpose is None and "purpose" in raw and raw.get("purpose") is not None:
         purpose = str(raw.get("purpose")).strip()
     act = _m7_action(None if action is None else str(action), extras_d)
+    found = token.strip() or _m7_token_from_raw(raw)
     return _m7_obs_from_parts(
         decision_id=decision_id,
         liq_raw=extras_d.get("liquidity_usd") if has_liq else None,
@@ -1394,6 +1564,8 @@ def _m7_obs_from_raw(raw: dict[str, Any], action: str | None, decision_id: str |
         purpose=purpose,
         action=act,
         phase0=_m7_phase0_on(extras_d) or _m7_phase0_on(raw),
+        token=found,
+        ts=ts,
     )
 
 
@@ -1408,6 +1580,7 @@ def _m7_obs_from_csv(row: dict[str, Any], header: dict[str, str]) -> _M7Obs:
             if cell is not None and _m7_phase0_on({key: cell}):
                 phase0 = True
                 break
+    token = _m7_cell(row, header, "token") or _m7_cell(row, header, "token_address") or ""
     return _m7_obs_from_parts(
         decision_id=decision or None,
         liq_raw=_m7_cell(row, header, "liq_usd") if has_liq else None,
@@ -1416,6 +1589,8 @@ def _m7_obs_from_csv(row: dict[str, Any], header: dict[str, str]) -> _M7Obs:
         purpose=_m7_purpose(_m7_cell(row, header, "purpose"), extras),
         action=_m7_action(_m7_cell(row, header, "action"), extras),
         phase0=phase0,
+        token=token,
+        ts=_optional_ts(_m7_cell(row, header, "ts")),
     )
 
 
@@ -1471,6 +1646,39 @@ def _m7_cohort(rows: list[_M7Obs], *, origin: _M7Origin) -> tuple[list[_M7Obs], 
     return pool, "csv 全表", extra
 
 
+def _m7_dedup_counts(rows: list[_M7Obs]) -> dict[str, int]:
+    """Token-window dedup for each displayed M7 count, on the rows that make it."""
+    groups: dict[str, list[tuple[datetime | None, str]]] = {
+        "S1": [],
+        "S0": [],
+        "liq_missing": [],
+        "leak": [],
+        "phase0": [],
+        "would_open_s0": [],
+        "would_open_s1": [],
+    }
+    for row in rows:
+        event = (row.ts, row.token)
+        bucket = _m7_row_bucket(row)
+        match bucket:
+            case "S1":
+                groups["S1"].append(event)
+                groups["would_open_s0"].append(event)
+                groups["would_open_s1"].append(event)
+            case "S0":
+                groups["S0"].append(event)
+                groups["would_open_s0"].append(event)
+            case "liq_missing":
+                groups["liq_missing"].append(event)
+            case "leak":
+                groups["leak"].append(event)
+            case _ as unreachable:
+                assert_never(unreachable)
+        if row.phase0:
+            groups["phase0"].append(event)
+    return {key: dedup_token_count(value) for key, value in groups.items()}
+
+
 def _m7_tally(rows: list[_M7Obs]) -> tuple[int, int, int, int, int]:
     s1 = s0 = missing = leak = phase0 = 0
     for row in rows:
@@ -1501,6 +1709,7 @@ def _m7_report(
 ) -> M7ShadowReport:
     chosen, cohort, cohort_note = _m7_cohort(rows, origin=origin)
     n_s1, n_s0, n_missing, n_leak, n_phase0 = _m7_tally(chosen)
+    deduped = _m7_dedup_counts(chosen)
     bits: list[str] = []
     if dupes:
         bits.append(f"decision_log_id 重复 {dupes} 行，保留末行")
@@ -1522,6 +1731,13 @@ def _m7_report(
         counted=n_s1 + n_s0 + n_missing + n_leak,
         dupes=dupes,
         note=" · ".join(bits),
+        n_s1_dedup=deduped["S1"],
+        n_s0_dedup=deduped["S0"],
+        n_missing_dedup=deduped["liq_missing"],
+        n_leak_dedup=deduped["leak"],
+        n_phase0_dedup=deduped["phase0"],
+        would_open_s0_dedup=deduped["would_open_s0"],
+        would_open_s1_dedup=deduped["would_open_s1"],
     )
 
 
@@ -1531,6 +1747,106 @@ def _m7_source_label(path: Path) -> str:
         index = len(parts) - 1 - parts[::-1].index("exports")
         return str(Path(*parts[index:]))
     return path.name
+
+
+def _annotations_path(paper: Path) -> Path:
+    return paper.with_name(ANNOTATIONS_DB_NAME)
+
+
+def _load_bad_ticks(paper: Path) -> tuple[float, float, frozenset[str], bool]:
+    """Up/down adjustments and upward take-profit ids.
+
+    A missing annotations file, or a bad_tick table that cannot be read,
+    keeps the audit constants. A damaged file is not treated as a zero
+    adjustment.
+    """
+    fallback = (BAD_TICK_UP_USD, BAD_TICK_DOWN_USD, frozenset(), False)
+    path = _annotations_path(paper)
+    if not path.is_file():
+        return fallback
+    try:
+        with ro_connect(path) as conn:
+            table = "bad_tick" if _table_exists(conn, "bad_tick") else ""
+            if not table and _table_exists(conn, "bad_ticks"):
+                table = "bad_ticks"
+            if not table:
+                return fallback
+            cols = _columns(conn, table)
+            amount_col = next(
+                (
+                    name
+                    for name in ("adjustment_usd", "delta_usd", "pnl_delta", "pnl_usd")
+                    if name in cols
+                ),
+                "",
+            )
+            if not amount_col or "direction" not in cols:
+                return fallback
+            selected = ["direction", amount_col]
+            if "position_id" in cols:
+                selected.append("position_id")
+            if "exit_reason" in cols:
+                selected.append("exit_reason")
+            rows = _exec(
+                conn,
+                f"SELECT {', '.join(selected)} FROM {_ident(table)}",
+            ).fetchall()
+    except sqlite3.Error:
+        return fallback
+    up = 0.0
+    down = 0.0
+    up_tp: set[str] = set()
+    saw = False
+    for row in rows:
+        direction = str(_cell(row, "direction") or "").strip().casefold()
+        amount = safe_float(_cell(row, amount_col))
+        if amount is None:
+            continue
+        saw = True
+        if direction in _BAD_TICK_UP:
+            up += float(amount)
+            reason = str(_cell(row, "exit_reason") or "").strip().casefold()
+            if reason in _TAKE_PROFIT_REASONS:
+                pid = str(_cell(row, "position_id") or "").strip()
+                if pid:
+                    up_tp.add(pid)
+        elif direction in _BAD_TICK_DOWN:
+            down += float(amount)
+    if not saw:
+        return fallback
+    return (round(up, 2), round(down, 2), frozenset(up_tp), True)
+
+
+def _true_tp_line(
+    rows: list[sqlite3.Row],
+    cols: set[str],
+    up_tp_ids: frozenset[str],
+    from_annotations: bool,
+) -> str:
+    """Audit sentence. Without bad_tick rows, keep the known fallback."""
+    if not from_annotations or "exit_reason" not in cols:
+        return TRUE_TP_FALLBACK
+    closed_n = 0
+    tp_n = 0
+    fake = 0
+    for row in rows:
+        if _is_open(row, cols):
+            continue
+        status = str(_cell(row, "status") or "").strip().casefold()
+        if status in {"cancelled", "canceled"}:
+            continue
+        closed_n += 1
+        reason = str(_cell(row, "exit_reason") or "").strip().casefold()
+        if reason not in _TAKE_PROFIT_REASONS:
+            continue
+        tp_n += 1
+        pid = str(_cell(row, "id") or "").strip()
+        if pid and pid in up_tp_ids:
+            fake += 1
+    true_n = tp_n - fake
+    if true_n < 0:
+        true_n = 0
+    return f"真止盈 {true_n}/{closed_n}（{fake} 笔止盈均为向上假报价）"
 
 
 class DataStore:
@@ -1696,6 +2012,19 @@ class DataStore:
             log.warning("read failed token_age_observe: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "token_age_observe")
 
+    def paper_pause_split(self) -> DataResult:
+        """Opened counts on the main book split at the 2026-10-21 HKT pause.
+
+        Read-only. A position with opened_at after the pause is the after
+        count. The PAPER_OPEN_PAUSED flag is only whether the file exists.
+        """
+        started = time.perf_counter()
+        try:
+            return _finish(self._paper_pause_split(started), "paper_pause_split")
+        except Exception as exc:
+            log.warning("read failed paper_pause_split: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_pause_split")
+
     def paper_goal_pace(self, *, now: datetime | None = None) -> DataResult:
         """Observe-only paper equity versus $20k by 2026-10-30 HKT.
 
@@ -1817,14 +2146,16 @@ class DataStore:
             return _unavail(error, started)
         if not decisions:
             return _ok(
-                DecisionWindowStats(0, 0, 0, 0, None, None),
+                DecisionWindowStats(0, 0, 0, 0, None, None, n_decisions_dedup=0),
                 started,
             )
         latest, _dups, note = self._latest_execs([item[0] for item in decisions])
         if note:
             return _unavail(note, started)
         n_with = n_ok = n_executed = 0
-        for decision_id, _ts in decisions:
+        events: list[tuple[datetime | None, str]] = []
+        for decision_id, ts, token in decisions:
+            events.append((_optional_ts(ts), token))
             row = latest.get(decision_id)
             if row is None:
                 continue
@@ -1841,6 +2172,7 @@ class DataStore:
                 n_executed=n_executed,
                 ok_rate=(n_ok / n_with) if n_with else None,
                 executed_rate=(n_executed / n_with) if n_with else None,
+                n_decisions_dedup=dedup_token_count(events),
             ),
             started,
         )
@@ -2495,6 +2827,9 @@ class DataStore:
                 missing = _missing_table(conn, "token_holder_snapshots", path.name)
                 if missing:
                     return _unavail(missing, started)
+                for table in HOLDER_SUSPICIOUS_TABLES:
+                    if _table_exists(conn, table):
+                        _exec(conn, f"SELECT 1 FROM {_ident(table)} LIMIT 1").fetchone()
                 token_rows = _exec(
                     conn,
                     "SELECT chain_id, token_address, MAX(recorded_at) AS recorded_at "
@@ -2536,6 +2871,10 @@ class DataStore:
                                 delta,
                             )
                         )
+        except sqlite3.OperationalError as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        except sqlite3.DatabaseError:
+            return _unavail(SOURCE_TABLE_DAMAGE_BANNER, started)
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
         latest = tuple(sorted(points, key=_holder_point_key, reverse=True)[:_INTEL_HOLDER_SHOW])
@@ -2569,6 +2908,12 @@ class DataStore:
         try:
             slip_table = _file_has_table(ledger, "execution_log") or _file_has_table(paper, "fills")
             bot_table = _file_has_table(crawler, "bot_fill_observations")
+            if bot_table and crawler is not None:
+                _probe_table(crawler, "bot_fill_observations")
+        except sqlite3.OperationalError as exc:
+            return _unavail(f"查询失败：{_safe_exc(exc)}", started)
+        except sqlite3.DatabaseError:
+            return _unavail(source_table_banner(SLIP_SUSPICIOUS_TABLES), started)
         except sqlite3.Error as exc:
             return _unavail(f"查询失败：{_safe_exc(exc)}", started)
         if not slip_table and not bot_table:
@@ -2578,6 +2923,10 @@ class DataStore:
             )
         try:
             report = build_slippage_report(ledger=ledger, paper=paper, crawler_db=crawler)
+        except sqlite3.OperationalError as exc:
+            return _unavail(f"查询失败：{_safe_exc(exc)}", started)
+        except sqlite3.DatabaseError:
+            return _unavail(source_table_banner(SLIP_SUSPICIOUS_TABLES), started)
         except (OSError, sqlite3.Error) as exc:
             return _unavail(f"查询失败：{_safe_exc(exc)}", started)
         slip = report.get("slippage_1h") if isinstance(report, dict) else None
@@ -2677,9 +3026,12 @@ class DataStore:
                 absent = _require(cols, ("id", "ts", "raw_json"))
                 if absent:
                     return _unavail(f"{absent}（{path.name}）", started)
+                selected = ["id", "ts", "raw_json"]
+                if "token_address" in cols:
+                    selected.append("token_address")
                 rows = _exec(
                     conn,
-                    "SELECT id, ts, raw_json FROM decision_log ORDER BY id DESC LIMIT ?",
+                    f"SELECT {', '.join(selected)} FROM decision_log ORDER BY id DESC LIMIT ?",
                     (window,),
                 ).fetchall()
         except sqlite3.Error as exc:
@@ -2687,7 +3039,9 @@ class DataStore:
         counts = {label: 0 for label in _TOKEN_AGE_LABELS}
         with_field = 0
         samples: list[TokenAgeSample] = []
+        age_events: list[tuple[datetime | None, str]] = []
         for row in rows:
+            age_events.append((_optional_ts(_cell(row, "ts")), str(_cell(row, "token_address") or "")))
             raw_text = _cell(row, "raw_json")
             raw = parse_json(None if raw_text is None else str(raw_text))
             created = _extras_pair_created_ms(raw)
@@ -2713,6 +3067,7 @@ class DataStore:
                 buckets=buckets,
                 samples=tuple(samples),
                 limit=window,
+                total_dedup=dedup_token_count(age_events),
             ),
             started,
         )
@@ -2734,7 +3089,11 @@ class DataStore:
                 absent = _require(cols, ("size_usd",))
                 if absent:
                     return _unavail(f"{absent}（{path.name}）", started)
-                selected = [name for name in ("size_usd", "status", "closed_at") if name in cols]
+                selected = [
+                    name
+                    for name in ("id", "size_usd", "status", "closed_at", "exit_reason")
+                    if name in cols
+                ]
                 rows = _exec(
                     conn,
                     f"SELECT {', '.join(selected)} FROM positions",
@@ -2758,6 +3117,10 @@ class DataStore:
         gap = round(GOAL_TARGET_USD - equity, 4)
         days_left = _goal_days_left(as_of)
         note = f"{size_gaps} 笔未平缺 size_usd，未计入名义" if size_gaps else ""
+        up_usd, down_usd, up_tp_ids, from_annotations = _load_bad_ticks(path)
+        raw_equity = round(equity + 0.0, 2)
+        conservative = round(raw_equity + up_usd, 2)
+        both = round(raw_equity + up_usd + down_usd, 2)
         return _ok(
             GoalPaceReport(
                 cash_usd=float(cash),
@@ -2774,6 +3137,13 @@ class DataStore:
                 daily_need_usd=_goal_daily_need(gap, days_left),
                 mark_to_market=False,
                 note=note,
+                equity_raw_usd=raw_equity,
+                equity_conservative_usd=conservative,
+                equity_down_only_usd=round(raw_equity + down_usd, 2),
+                equity_both_usd=both,
+                gap_raw_usd=round(GOAL_TARGET_USD - raw_equity, 2),
+                gap_conservative_usd=round(GOAL_TARGET_USD - conservative, 2),
+                true_tp_line=_true_tp_line(rows, fetched, up_tp_ids, from_annotations),
             ),
             started,
         )
@@ -2806,6 +3176,38 @@ class DataStore:
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
         return _ok(_kpi_reverse_from_rows(pace.data, rows, set(selected)), started)
+
+    def _paper_pause_split(self, started: float) -> DataResult:
+        path = self.paths.paper
+        flag_present, flag_note = paper_pause_flag_state()
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "positions", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "positions")
+                if "opened_at" not in cols:
+                    return _ok(
+                        PaperPauseSplit(0, 0, flag_present, flag_note),
+                        started,
+                    )
+                rows = _exec(conn, "SELECT opened_at FROM positions").fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        pause = PAPER_OPEN_PAUSE_AT
+        before = 0
+        after = 0
+        for row in rows:
+            opened = _optional_ts(_cell(row, "opened_at"))
+            if opened is None:
+                continue
+            if opened > pause:
+                after += 1
+            else:
+                before += 1
+        return _ok(PaperPauseSplit(before, after, flag_present, flag_note), started)
 
     def _m7_csv_candidates(self) -> list[Path]:
         root = db_root()
@@ -2852,6 +3254,10 @@ class DataStore:
                 selected = ["action", "raw_json"]
                 if "id" in cols:
                     selected.insert(0, "id")
+                if "ts" in cols:
+                    selected.append("ts")
+                if "token_address" in cols:
+                    selected.append("token_address")
                 fetched = _exec(
                     conn,
                     f"SELECT {', '.join(selected)} FROM decision_log",
@@ -2868,7 +3274,14 @@ class DataStore:
             decision_id = None if raw_id is None else str(raw_id)
             action_cell = _cell(row, "action")
             action = None if action_cell is None else str(action_cell)
-            obs = _m7_obs_from_raw(raw, action, decision_id)
+            token = str(_cell(row, "token_address") or "")
+            obs = _m7_obs_from_raw(
+                raw,
+                action,
+                decision_id,
+                token=token,
+                ts=_optional_ts(_cell(row, "ts")),
+            )
             if obs.decision_id is None:
                 anon.append(obs)
                 continue
@@ -2925,6 +3338,13 @@ class DataStore:
                         counted=db_result.data.counted,
                         dupes=db_result.data.dupes,
                         note=joined,
+                        n_s1_dedup=db_result.data.n_s1_dedup,
+                        n_s0_dedup=db_result.data.n_s0_dedup,
+                        n_missing_dedup=db_result.data.n_missing_dedup,
+                        n_leak_dedup=db_result.data.n_leak_dedup,
+                        n_phase0_dedup=db_result.data.n_phase0_dedup,
+                        would_open_s0_dedup=db_result.data.would_open_s0_dedup,
+                        would_open_s1_dedup=db_result.data.would_open_s1_dedup,
                     ),
                     started,
                 )
@@ -3066,6 +3486,8 @@ class DataStore:
                     selected.append("pair_address")
                 if "opened_at" in cols:
                     selected.append("opened_at")
+                if "token_address" in cols:
+                    selected.append("token_address")
                 if "meta_json" in cols:
                     selected.append("meta_json")
                 rows = _exec(
@@ -3092,8 +3514,8 @@ class DataStore:
         closed = 0
         total_pnl = 0.0
         pnls: list[float] = []
-        # pair -> (opened_at sort key, closed_at, hit, purpose)
-        first_by_pair: dict[str, tuple[str, str, bool, str | None]] = {}
+        # pair -> (opened_at sort key, closed_at, hit, purpose, token, opened)
+        first_by_pair: dict[str, tuple[str, str, bool, str | None, str, datetime | None]] = {}
         for row in rows:
             if not _in_range(row["closed_at"], start, end, end_inclusive=True):
                 continue
@@ -3131,9 +3553,17 @@ class DataStore:
                 closed_at = str(_cell(row, "closed_at") or "")
                 sort_key = opened or closed_at
                 hit = pnl > 0
+                token = str(_cell(row, "token_address") or "")
                 prev = first_by_pair.get(pair)
                 if prev is None or (sort_key, closed_at) < (prev[0], prev[1]):
-                    first_by_pair[pair] = (sort_key, closed_at, hit, purpose)
+                    first_by_pair[pair] = (
+                        sort_key,
+                        closed_at,
+                        hit,
+                        purpose,
+                        token,
+                        _optional_ts(opened),
+                    )
         ordered = tuple(
             PaperClosedBucket(
                 exit_reason=key[0],
@@ -3162,6 +3592,10 @@ class DataStore:
         live_n = len(live_items)
         live_wins = sum(1 for item in live_items if item[2])
         live_rate = (live_wins / live_n) if live_n else None
+        first_events = [(item[5], item[4]) for item in first_by_pair.values()]
+        live_events = [(item[5], item[4]) for item in live_items]
+        first_dedup = dedup_token_count(first_events) if first_n else 0
+        live_dedup = dedup_token_count(live_events) if live_n else 0
         stop_loss_pnl = sum(sum(vals) for (er, _lb), vals in agg.items() if er == "stop_loss")
         stop_loss_pnl = float(stop_loss_pnl) if any(er == "stop_loss" for er, _ in agg) else None
         stop_loss_share = None
@@ -3185,6 +3619,8 @@ class DataStore:
                 first_hit_live_n=live_n,
                 first_hit_live_wins=live_wins,
                 first_hit_live_rate=round(live_rate, 4) if live_rate is not None else None,
+                first_hit_dedup=first_dedup,
+                first_hit_live_dedup=live_dedup,
                 stop_loss_pnl_usd=round(stop_loss_pnl, 4) if stop_loss_pnl is not None else None,
                 stop_loss_share=round(stop_loss_share, 4) if stop_loss_share is not None else None,
             ),
@@ -3231,7 +3667,7 @@ class DataStore:
         self,
         start: datetime,
         end: datetime,
-    ) -> tuple[list[tuple[int, str]], str]:
+    ) -> tuple[list[tuple[int, str, str]], str]:
         path = self.paths.main
         if not path.is_file():
             return [], f"数据库文件不存在：{path.name}"
@@ -3245,15 +3681,22 @@ class DataStore:
                 absent = _require(cols, ("id", "ts"))
                 if absent:
                     return [], f"{absent}（{path.name}）"
+                selected = ["id", "ts"]
+                if "token_address" in cols:
+                    selected.append("token_address")
                 rows = _exec(
                     conn,
-                    "SELECT id, ts FROM decision_log WHERE ts >= ?",
+                    f"SELECT {', '.join(selected)} FROM decision_log WHERE ts >= ?",
                     (lower,),
                 ).fetchall()
         except sqlite3.Error as exc:
             return [], f"查询失败（{path.name}）：{_safe_exc(exc)}"
         kept = [
-            (int(row["id"]), str(row["ts"] or ""))
+            (
+                int(row["id"]),
+                str(row["ts"] or ""),
+                str(_cell(row, "token_address") or ""),
+            )
             for row in rows
             if _in_range(row["ts"], start, end, end_inclusive=True)
         ]
@@ -3504,26 +3947,35 @@ class DataStore:
                 absent = _require(cols, ("id", "ts", "strategy_id"))
                 if absent:
                     return _unavail(f"{absent}（{path.name}）", started)
+                selected = ["id", "ts", "strategy_id"]
+                if "token_address" in cols:
+                    selected.append("token_address")
                 lower = (start - timedelta(days=1)).strftime("%Y-%m-%d")
                 rows = _exec(
                     conn,
-                    "SELECT id, ts, strategy_id FROM decision_log WHERE ts >= ?",
+                    f"SELECT {', '.join(selected)} FROM decision_log WHERE ts >= ?",
                     (lower,),
                 ).fetchall()
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
         kept = [
-            (int(row["id"]), str(row["strategy_id"] or "").strip() or "—")
+            (
+                int(row["id"]),
+                str(row["strategy_id"] or "").strip() or "—",
+                _optional_ts(row["ts"]),
+                str(_cell(row, "token_address") or ""),
+            )
             for row in rows
             if _in_range(row["ts"], start, end, end_inclusive=True)
         ]
         if not kept:
             return _ok(StrategyBuckets(rows=()), started)
         latest, _dups, note = self._latest_execs([item[0] for item in kept])
-        counts: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
-        for decision_id, strategy_id in kept:
+        counts: dict[str, list[Any]] = defaultdict(lambda: [0, 0, 0, []])
+        for decision_id, strategy_id, stamp, token in kept:
             cell = counts[strategy_id]
             cell[0] += 1
+            cell[3].append((stamp, token))
             if note:
                 continue
             exec_row = latest.get(decision_id)
@@ -3538,8 +3990,9 @@ class DataStore:
                 strategy_id=strategy_id,
                 n=n,
                 ok_rate=(f"{(n_ok / n_with) * 100:.1f}%" if n_with else "—"),
+                n_dedup=dedup_token_count(events),
             )
-            for strategy_id, (n, n_with, n_ok) in ordered
+            for strategy_id, (n, n_with, n_ok, events) in ordered
         )
         return _ok(StrategyBuckets(rows=payload), started)
 
