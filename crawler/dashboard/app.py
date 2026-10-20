@@ -2214,7 +2214,7 @@ _ENTRY_JEV_BANNER = (
     "入口为 stance 读反、jev 过期信号（接线 bug 期，指标 jev 新鲜度审计 2026-10-21）· 不可用于评价 jev"
 )
 # 对不上取大。只改 BONFERRONI_GRIDS。
-BONFERRONI_GRIDS = 267
+BONFERRONI_GRIDS = 268
 # 预注册格。静态文案，不读买卖单流、不算信号结果。
 RETIRED_GRID_LINE = "liq>1M·TP5·无止损 已淘汰（v2前60%扣0.6%后 −0.87%）"
 REMAINING_ENTRY_LINE = "剩余入口：C4 单流、迁移事件"

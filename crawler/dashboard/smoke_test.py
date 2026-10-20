@@ -4251,12 +4251,12 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(dedup_token_count(events), 6)
         self.assertEqual(
             app_module.bonferroni_grid_label(),
-            "累计共测 267 格 · Bonferroni 按 267",
+            "累计共测 268 格 · Bonferroni 按 268",
         )
-        self.assertEqual(app_module.BONFERRONI_GRIDS, 267)
+        self.assertEqual(app_module.BONFERRONI_GRIDS, 268)
         label_src = inspect.getsource(app_module.bonferroni_grid_label)
         self.assertIn("BONFERRONI_GRIDS", label_src)
-        self.assertNotIn("267", label_src)
+        self.assertNotIn("268", label_src)
         jev_texts = _rendered_card_texts(app_module._v2_jev_gate)
         self.assertIn(app_module.bonferroni_grid_label(), jev_texts)
         self.assertIn(app_module.RETIRED_GRID_LINE, jev_texts)
