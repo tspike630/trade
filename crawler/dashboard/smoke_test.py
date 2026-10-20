@@ -2429,7 +2429,7 @@ class DashboardSmokeTest(unittest.TestCase):
             "只读倒推 · 不改闸 · 不改 .env · 开杠杆由五层互批",
         )
         cases = [name for name in DashboardSmokeTest.__dict__ if name.startswith("test_")]
-        self.assertEqual(len(cases), 30)
+        self.assertEqual(len(cases), 31)
 
         missing = DataStore(
             DbPaths(
@@ -2771,6 +2771,9 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("比随机好多少 · TP10/SL5/h60 · 扣成本前 −1.46% · 扣1.2% −2.65% · 分档成本 −4.92%", phase_joined)
         self.assertIn("新币低liq(<5万)切片 已淘汰", phase_joined)
         self.assertIn("exports/random_entry_shared_seed20261021_v2_ulj.csv", phase_joined)
+        self.assertIn(app_module.RETIRED_GRID_LINE, gap_texts)
+        self.assertIn(app_module.REMAINING_ENTRY_LINE, gap_texts)
+        self.assertIn(app_module.C4_FLOW_BLIND_LINE, gap_texts)
 
         empty = self.root / "empty-shadow.csv"
         empty.write_text("", encoding="utf-8")
@@ -3167,6 +3170,9 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn(C_EXIT_DISCIPLINE, gap_texts)
         self.assertIn(app_module._ENTRY_JEV_BANNER, gap_texts)
         self.assertIn(app_module.bonferroni_grid_label(), gap_texts)
+        self.assertIn(app_module.RETIRED_GRID_LINE, gap_texts)
+        self.assertIn(app_module.REMAINING_ENTRY_LINE, gap_texts)
+        self.assertIn(app_module.C4_FLOW_BLIND_LINE, gap_texts)
         self.assertNotIn("样本不足", gap_joined)
         self.assertIn(C_EXIT_THRESHOLD, gap_texts)
         self.assertIn(C_EXIT_ROLLBACK, gap_texts)
@@ -4245,12 +4251,17 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(dedup_token_count(events), 6)
         self.assertEqual(
             app_module.bonferroni_grid_label(),
-            "累计共测 266 格 · Bonferroni 按 266",
+            "累计共测 267 格 · Bonferroni 按 267",
         )
-        self.assertEqual(app_module.BONFERRONI_GRIDS, 266)
+        self.assertEqual(app_module.BONFERRONI_GRIDS, 267)
         label_src = inspect.getsource(app_module.bonferroni_grid_label)
         self.assertIn("BONFERRONI_GRIDS", label_src)
-        self.assertNotIn("266", label_src)
+        self.assertNotIn("267", label_src)
+        jev_texts = _rendered_card_texts(app_module._v2_jev_gate)
+        self.assertIn(app_module.bonferroni_grid_label(), jev_texts)
+        self.assertIn(app_module.RETIRED_GRID_LINE, jev_texts)
+        self.assertIn(app_module.REMAINING_ENTRY_LINE, jev_texts)
+        self.assertIn(app_module.C4_FLOW_BLIND_LINE, jev_texts)
 
         now = datetime.now(timezone.utc)
         execution = self.root / "dedup-exec.db"
@@ -4569,6 +4580,29 @@ class DashboardSmokeTest(unittest.TestCase):
         for name in ("risk.py", "positions.py", "signals.py", "execution.py"):
             self.assertIn("show_unavailable", (root / "panels" / name).read_text(encoding="utf-8"))
         self.assertEqual(offenders, [])
+
+    def test_c4_order_flow_stays_blind(self) -> None:
+        root = Path(__file__).resolve().parent
+        chunks: list[str] = []
+        for path in sorted(root.rglob("*.py")):
+            if path.name == "smoke_test.py":
+                continue
+            chunks.append(path.read_text(encoding="utf-8"))
+        prod = "\n".join(chunks)
+        for column in (
+            "txns_m5_buys",
+            "txns_m5_sells",
+            "txns_h1_buys",
+            "txns_h1_sells",
+            "volume_m5",
+        ):
+            self.assertNotIn(column, prod, column)
+        self.assertEqual(prod.count("C4 单流"), 2)
+        self.assertEqual(prod.count("C4"), 4)
+        self.assertNotRegex(prod, r"闪烁.{0,24}21")
+        self.assertNotRegex(prod, r"21.{0,24}闪烁")
+        self.assertNotIn("tp_not_held", prod)
+        self.assertNotIn("闪烁率", prod)
 
     def test_http_gate_hides_fixture_data(self) -> None:
         build_fixture(self.root)

@@ -2037,6 +2037,7 @@ def _v2_jev_gate() -> None:
         "解读收紧，不改门槛、不算有效性。"
     ).classes("v2-note")
     ui.label(bonferroni_grid_label()).classes("v2-note")
+    _grid_registry_notes()
 
 
 def _v2_market_base(store: DataStore) -> None:
@@ -2213,7 +2214,13 @@ _ENTRY_JEV_BANNER = (
     "入口为 stance 读反、jev 过期信号（接线 bug 期，指标 jev 新鲜度审计 2026-10-21）· 不可用于评价 jev"
 )
 # 对不上取大。只改 BONFERRONI_GRIDS。
-BONFERRONI_GRIDS = 266
+BONFERRONI_GRIDS = 267
+# 预注册格。静态文案，不读买卖单流、不算信号结果。
+RETIRED_GRID_LINE = "liq>1M·TP5·无止损 已淘汰（v2前60%扣0.6%后 −0.87%）"
+REMAINING_ENTRY_LINE = "剩余入口：C4 单流、迁移事件"
+C4_FLOW_BLIND_LINE = (
+    "C4 单流：预登记 10-21 12:00 HKT 锁定·数据自 07:08 起·约 10-24 07:00 切 60/40·截止前不看数"
+)
 # 旁簿卖出按 mid 成交、未计滑点。绝对值和排名都不作候选证据。
 SIDE_BOOK_RETURN_TAG = "卖出未计滑点·绝对值与排名均待复核·不作候选证据"
 EQUITY_RULER_NOTE = "采集尺=只看当前及之前快照；执行尺=用下一快照·事后核账"
@@ -2229,9 +2236,16 @@ V_MARK_NOTE = "V 事后打标：可判 92 笔命中 3；51 笔无留痕判不了
 
 
 def bonferroni_grid_label() -> str:
-    """C 出口 / KPI 倒推共用的多重比较标注。"""
+    """C 出口 / JEV 门槛共用的多重比较标注。"""
     n = BONFERRONI_GRIDS
     return f"累计共测 {n} 格 · Bonferroni 按 {n}"
+
+
+def _grid_registry_notes() -> None:
+    """Static registry lines. No order-flow read and no signal outcome."""
+    ui.label(RETIRED_GRID_LINE).classes("v2-note")
+    ui.label(REMAINING_ENTRY_LINE).classes("v2-note")
+    ui.label(C4_FLOW_BLIND_LINE).classes("v2-note")
 
 
 def _raw_dedup(raw: int, dedup: int) -> str:
@@ -2246,6 +2260,7 @@ def _random_entry_note() -> None:
     """比随机好多少. Shown on entry cards, not on the C-exit return lines."""
     for line in random_entry_lines():
         ui.label(line).classes("v2-note")
+    _grid_registry_notes()
 
 
 def _v2_signal_streak(store: DataStore) -> None:
@@ -2867,11 +2882,13 @@ def _v2_c_exit_shadow() -> None:
         ui.label("旁簿不可读").classes("v2-note")
         ui.label(C_EXIT_DISCIPLINE).classes("v2-note")
         ui.label(C_EXIT_NAIL).classes("v2-note")
+        _grid_registry_notes()
         return
     ui.label(C_EXIT_NAIL).classes("v2-note")
     ui.label(C_EXIT_DISCIPLINE).classes("v2-note")
     ui.label(C_EXIT_GRID).classes("v2-note")
     ui.label(bonferroni_grid_label()).classes("v2-note")
+    _grid_registry_notes()
     ui.label(SIDE_BOOK_RETURN_TAG).classes("v2-note")
     for row in report.tags:
         ui.label(c_exit_tag_line(row)).classes("v2-note")
