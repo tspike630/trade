@@ -41,7 +41,11 @@ TP, SL = 0.10, 0.05
 COST_MULT_SENS = 2.0
 RANDOM_SEED = 20261021
 RANDOM_P = 0.05
-CUT_PCT = 60.0
+# Fixed calendar cut shared by C4 and random baseline (locked, not data-derived):
+# window start 2026-10-21 07:08 HKT + 60% of 71h52m (= 02:15:12), rounded by group to 02:15:00 HKT.
+CUT_ISO = "2026-10-22T18:15:00Z"       # 2026-10-23 02:15:00 HKT
+MAX_ENTRY_GAP_SEC = 600                # entry snapshot must be <= 10 min after trigger snapshot
+GAP_WARN_FRAC = 0.05                   # invalid_gap / triggers above this -> WARNING flag
 MIN_EVENTS = 30
 MIN_TOKENS = 30
 N_BOOT = 10_000
@@ -240,7 +244,8 @@ def build_events(pairs: list[Pair], kind: str, end_ts: int, seed: int = RANDOM_S
     """kind='c4' or 'random'. Applies: pool, trigger, next-snapshot entry, liq floor at entry,
     U/L/J entry skip, full hold window, then token 60-min dedup (earliest)."""
     rng = np.random.default_rng(seed)
-    cand = []; stats = {"ulj_skip": 0, "no_next": 0, "entry_liq_fail": 0, "no_full_hold": 0}
+    cand = []; stats = {"triggers": 0, "invalid_gap": 0, "ulj_skip": 0, "no_next": 0,
+                        "entry_liq_fail": 0, "no_full_hold": 0}
     for p in sorted(pairs, key=lambda q: q.pair):
         if len(p.t) < 2:
             continue
@@ -253,12 +258,15 @@ def build_events(pairs: list[Pair], kind: str, end_ts: int, seed: int = RANDOM_S
         idx = np.where(trig)[0]
         if not len(idx):
             continue
+        stats["triggers"] += int(len(idx))
         flags = ulj_flags(p)
         bad = flags[0] | flags[1] | flags[3]
         for i in idx:
             j = i + 1
             if j >= len(p.t):
                 stats["no_next"] += 1; continue
+            if p.t[j] - p.t[i] > MAX_ENTRY_GAP_SEC:
+                stats["invalid_gap"] += 1; continue
             if not (p.liq[j] >= LIQ_FLOOR):
                 stats["entry_liq_fail"] += 1; continue
             if bad[j]:
@@ -282,10 +290,16 @@ def build_events(pairs: list[Pair], kind: str, end_ts: int, seed: int = RANDOM_S
     return out, stats
 
 
-def cut_ts(events: list[dict]) -> float:
-    """60th percentile (numpy linear) of independent-event trigger timestamps."""
-    ts = np.array([e["trigger_ts"] for e in events], dtype=float)
-    return float(np.percentile(ts, CUT_PCT))
+def cut_ts() -> int:
+    """Fixed calendar cut (2026-10-23 02:15:00 HKT), identical for C4 and random."""
+    return _ts(CUT_ISO)
+
+
+def gap_report(stats: dict) -> dict:
+    trig = stats.get("triggers", 0); bad = stats.get("invalid_gap", 0)
+    frac = (bad / trig) if trig else 0.0
+    return {"triggers": trig, "invalid_gap": bad, "invalid_gap_frac": frac,
+            "warning": bool(frac > GAP_WARN_FRAC)}
 
 
 def segment(events: list[dict], cut: float, seg: str) -> list[dict]:
@@ -405,14 +419,18 @@ def run(db: str, seg: str, cells: int, out_dir: str, train_result: Optional[str]
         con.close()
     c4, s_c4 = build_events(pairs, "c4", end_ts)
     rnd, s_rnd = build_events(pairs, "random", end_ts)
+    cut = cut_ts()
     if not c4:
         res = {"segment": seg, "verdict": "INVALID (no C4 events)", "exits": {}}
     else:
-        cut = cut_ts(c4)
         res = evaluate(segment(c4, cut, seg), segment(rnd, cut, seg), seg, cells)
-        res["cut_ts"] = cut
-        res["cut_iso"] = datetime.fromtimestamp(int(cut), timezone.utc).isoformat()
+    res["cut_ts"] = cut
+    res["cut_iso"] = datetime.fromtimestamp(cut, timezone.utc).isoformat()
     res["filter_stats"] = {"c4": s_c4, "random": s_rnd}
+    gr = {"c4": gap_report(s_c4), "random": gap_report(s_rnd)}
+    res["entry_gap"] = gr
+    res["warnings"] = [f"WARNING: {k} invalid_gap {v['invalid_gap']}/{v['triggers']} = {v['invalid_gap_frac']:.2%} > {GAP_WARN_FRAC:.0%}"
+                       for k, v in gr.items() if v["warning"]]
     path = os.path.join(out_dir, f"c4_{seg}_result.json")
     with open(path, "w") as fh:
         json.dump(res, fh, indent=2, default=float)
@@ -431,6 +449,9 @@ def main(argv=None):
     print(json.dumps({k: res.get(k) for k in ("segment", "cut_iso", "alpha_one_sided", "n_c4", "n_random")}, default=float))
     for ex, r in res.get("exits", {}).items():
         print(ex, r.get("verdict"))
+    print("entry_gap", json.dumps(res.get("entry_gap"), default=float))
+    for w in res.get("warnings", []):
+        print(w)
 
 
 if __name__ == "__main__":

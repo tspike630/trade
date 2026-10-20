@@ -176,6 +176,39 @@ class TestTrades(unittest.TestCase):
         self.assertEqual(ev, []); self.assertEqual(st["no_full_hold"], 1)
 
 
+class TestEntryGap(unittest.TestCase):
+    def run_c4(self, extra_sec):
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db")
+        con = sqlite3.connect(path); con.execute(SCHEMA)
+        s = series(120); trigger_at(s, 80)
+        for k, r in enumerate(s):
+            ts = T0 + k * STEP + (extra_sec if k > 80 else 0)
+            con.execute("INSERT INTO pair_history(chain_id,pair_address,token_address,recorded_at,price_usd,liquidity_usd,tier,fdv,txns_m5_buys,txns_m5_sells,volume_m5) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        ("solana", "p1", "t1", iso(ts), r["px"], r["liq"], r["tier"], r["px"] * 1e9, r["buys"], r["sells"], r["vm5"]))
+        con.commit(); con.close()
+        return C.build_events(C.load_pairs(C.open_ro(path)), "c4", C._ts(C.WINDOW_END))
+
+    def test_gap_exactly_10min_ok(self):
+        ev, st = self.run_c4(300)          # entry 600s after trigger
+        self.assertEqual(len(ev), 1); self.assertEqual(st["invalid_gap"], 0); self.assertEqual(st["triggers"], 1)
+
+    def test_gap_over_10min_skipped_and_counted(self):
+        ev, st = self.run_c4(301)          # 601s
+        self.assertEqual(ev, []); self.assertEqual(st["invalid_gap"], 1); self.assertEqual(st["triggers"], 1)
+        self.assertTrue(C.gap_report(st)["warning"])
+
+    def test_random_gap_rule(self):
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db")
+        con = sqlite3.connect(path); con.execute(SCHEMA)
+        # every snapshot 12 min apart (still >=30 prior in 6h) -> any random trigger has an invalid gap
+        for k in range(300):
+            con.execute("INSERT INTO pair_history(chain_id,pair_address,token_address,recorded_at,price_usd,liquidity_usd,tier,fdv,txns_m5_buys,txns_m5_sells,volume_m5) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        ("solana", "p1", "t1", iso(T0 + k * 720), 1.0, 2e5, "hot", 1e9, 10, 10, 100.0))
+        con.commit(); con.close()
+        ev, st = C.build_events(C.load_pairs(C.open_ro(path)), "random", C._ts(C.WINDOW_END))
+        self.assertGreater(st["triggers"], 0); self.assertEqual(st["invalid_gap"], st["triggers"]); self.assertEqual(ev, [])
+
+
 class TestCostStats(unittest.TestCase):
     def test_tier_cost(self):
         self.assertEqual(C.tier_cost(2e6), 0.006); self.assertEqual(C.tier_cost(1e6), 0.02)
@@ -187,11 +220,28 @@ class TestCostStats(unittest.TestCase):
         self.assertAlmostEqual(C.bonferroni_alpha(268), 0.05 / 268)
         with self.assertRaises(ValueError): C.bonferroni_alpha(0)
 
-    def test_cut_60pct(self):
-        ev = [{"trigger_ts": t, "token": str(t)} for t in range(100)]
-        cut = C.cut_ts(ev)
-        self.assertAlmostEqual(cut, float(np.percentile(np.arange(100), 60)))
-        self.assertEqual(len(C.segment(ev, cut, "train")), 60); self.assertEqual(len(C.segment(ev, cut, "oos")), 40)
+    def test_fixed_cut(self):
+        cut = C.cut_ts()
+        self.assertEqual(cut, C._ts("2026-10-23T02:15:00+08:00"))
+        self.assertFalse(hasattr(C, "CUT_PCT"))
+        ev = [{"trigger_ts": cut - 1}, {"trigger_ts": cut}, {"trigger_ts": cut + 1}]
+        self.assertEqual(C.segment(ev, cut, "train"), ev[:2]); self.assertEqual(C.segment(ev, cut, "oos"), ev[2:])
+
+    def test_cut_independent_of_events(self):
+        # same cut regardless of data -> shared by C4 and random
+        self.assertEqual(C.cut_ts(), C._ts(C.CUT_ISO))
+
+    def test_gap_report(self):
+        self.assertFalse(C.gap_report({"triggers": 100, "invalid_gap": 5})["warning"])
+        g = C.gap_report({"triggers": 100, "invalid_gap": 6})
+        self.assertTrue(g["warning"]); self.assertAlmostEqual(g["invalid_gap_frac"], 0.06)
+        self.assertFalse(C.gap_report({"triggers": 0, "invalid_gap": 0})["warning"])
+
+    def test_no_hardcoded_pids(self):
+        import re
+        src = open(C.__file__).read()
+        self.assertIsNone(re.search(r"[1-9A-HJ-NP-Za-km-z]{32,44}", src))
+        self.assertIsNone(re.search(r"0x[0-9a-fA-F]{40}", src))
 
     def test_cluster_bootstrap_and_p(self):
         a = [{"token": f"a{i%40}"} for i in range(80)]; b = [{"token": f"b{i%40}"} for i in range(80)]
@@ -211,14 +261,14 @@ class TestCostStats(unittest.TestCase):
 
 
 class TestRandomAndRun(unittest.TestCase):
-    def make_many(self, n_pairs=80, trig=True):
+    def make_many(self, n_pairs=80, trig=True, t0=T0):
         d = tempfile.mkdtemp(); path = os.path.join(d, "f.db"); pairs = []
         for k in range(n_pairs):
             s = series(200)
             if trig:
                 trigger_at(s, 40 + (k * 7) % 140)
             pairs.append((f"p{k:03d}", f"t{k:03d}", s))
-        make_db(path, pairs); return d, path
+        make_db(path, pairs, t0=t0); return d, path
 
     def test_random_same_pool_and_seed(self):
         d, path = self.make_many(10)
@@ -265,6 +315,14 @@ class TestRandomAndRun(unittest.TestCase):
         with self.assertRaises(SystemExit):
             C.run(path, "oos", 268, d, train_result=trp, skip_time_check=True)
         self.assertFalse(os.path.exists(os.path.join(d, "c4_oos.lock")))
+
+    def test_split_straddles_fixed_cut_and_reports_gap(self):
+        d, path = self.make_many(80, t0=C.cut_ts() - 100 * STEP)
+        tr = C.run(path, "train", 268, d, skip_time_check=True)
+        self.assertEqual(tr["cut_iso"], "2026-10-22T18:15:00+00:00")
+        self.assertIn("entry_gap", tr); self.assertEqual(tr["warnings"], [])
+        self.assertEqual(tr["entry_gap"]["c4"]["invalid_gap"], 0)
+        self.assertGreater(tr["n_c4"], 0); self.assertLess(tr["n_c4"], 80)
 
     def test_invalid_small_sample(self):
         d, path = self.make_many(10)
