@@ -226,7 +226,7 @@ def process_once(
             skipped += 1
             continue
         if jev_guard_enabled():
-            jev_reason = jev_guard_reason(sig.get("extras"))
+            jev_reason = jev_guard_reason(sig.get("extras"), sig.get("strategy_id"))
             if jev_reason is not None:
                 skipped += 1
                 jev_rejected[jev_reason] = jev_rejected.get(jev_reason, 0) + 1

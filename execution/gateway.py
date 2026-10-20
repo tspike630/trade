@@ -173,13 +173,23 @@ def jev_guard_enabled() -> bool:
     return _env_bool("EXECUTION_JEV_GUARD", True)
 
 
-def jev_guard_reason(extras: dict[str, Any] | None) -> str | None:
+JEV_GUARD_STRATEGIES = frozenset({"jev_strength_v1"})
+
+
+def jev_guard_reason(
+    extras: dict[str, Any] | None, strategy_id: str | None = None
+) -> str | None:
     """Backstop on buy signals from decision extras (jev_age_min / jev_stance_raw).
+
+    Only strategy jev_strength_v1 is gated; any other strategy (no jev fields)
+    passes all three checks. strategy_id=None is treated as gated (strict).
 
     * jev_age_min missing / blank / unparsable -> jev_age_missing
     * jev_age_min > 1440                       -> jev_stale
     * jev_stance_raw present and != BULLISH    -> jev_stance_not_bullish
     """
+    if strategy_id is not None and str(strategy_id).strip() not in JEV_GUARD_STRATEGIES:
+        return None
     ex = extras if isinstance(extras, dict) else {}
     age = ex.get("jev_age_min")
     if age is None or (isinstance(age, str) and not age.strip()):
@@ -1031,7 +1041,7 @@ class ExecutionGateway:
                 str(sig.get("action") or "").strip().lower() == "buy"
                 and jev_guard_enabled()
             ):
-                jev_reason = jev_guard_reason(sig.get("extras"))
+                jev_reason = jev_guard_reason(sig.get("extras"), sig.get("strategy_id"))
                 if jev_reason is not None:
                     return self._reject_purpose(sig, jev_reason)
             return self._process_one_claimed(sig)

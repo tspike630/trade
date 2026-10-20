@@ -51,6 +51,10 @@ class ReasonTests(unittest.TestCase):
                          JEV_STANCE_NOT_BULLISH)
         self.assertEqual(jev_guard_reason({"jev_age_min": 30, "jev_stance_raw": ""}),
                          JEV_STANCE_NOT_BULLISH)
+        # other strategies: all three gates pass
+        self.assertIsNone(jev_guard_reason({}, "factor_x_v1"))
+        self.assertIsNone(jev_guard_reason({"jev_age_min": 9999, "jev_stance_raw": "BEARISH"}, "other"))
+        self.assertEqual(jev_guard_reason({}, "jev_strength_v1"), JEV_AGE_MISSING)
         # stale wins over stance
         self.assertEqual(jev_guard_reason({"jev_age_min": 5000, "jev_stance_raw": "BEARISH"}), JEV_STALE)
 
@@ -77,6 +81,7 @@ class GatewayTests(unittest.TestCase):
             bear = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE,
                           extras={"jev_age_min": 5, "jev_stance_raw": "BEARISH"})
             sell = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE, action="sell", extras={})
+            other = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE, strategy_id="combined_v1", extras={})
             db.close()
             paper = _RecordingExecutor()
             prev = gateway_mod.EXECUTION_RISK_ENABLED
@@ -96,7 +101,7 @@ class GatewayTests(unittest.TestCase):
                 self.assertEqual(_errors(rows[did]), [reason])
                 self.assertEqual(_receipt(rows[did])["reason"], reason)
                 self.assertIn("jev guard", _receipt(rows[did])["note"])
-            self.assertEqual(sorted(c["decision_log_id"] for c in paper.calls), [ok, sell])
+            self.assertEqual(sorted(c["decision_log_id"] for c in paper.calls), [ok, sell, other])
 
     def test_switch_off(self):
         with mock.patch.dict(os.environ, {"EXECUTION_JEV_GUARD": "0"}):
@@ -116,7 +121,7 @@ class RunnerTests(unittest.TestCase):
                 raw = {"action": "buy", "chain_id": "solana", "pair_address": f"p{i}", "size_pct": 0.05,
                        "purpose": "live_candidate", "extras": ex}
                 c.execute("INSERT INTO decision_log VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                          (i, "2026-10-21T01:00:00Z", "s", "buy", "solana", f"t{i}", 0.05, "", 1,
+                          (i, "2026-10-21T01:00:00Z", "jev_strength_v1", "buy", "solana", f"t{i}", 0.05, "", 1,
                            "dry_run", json.dumps(raw), "live_candidate"))
             c.commit(); c.close()
             with mock.patch.object(run, "_latest_mid", return_value=(1.0, 1e6)), \
