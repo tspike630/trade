@@ -29,6 +29,7 @@ from dashboard.data import (
     GOAL_DEADLINE_DAY,
     GOAL_START_DAY,
     KPI_WINDOW_DAYS,
+    SOURCE_DAMAGE_PREFIX,
     DataStore,
 )
 from dashboard.format_util import fmt_age, fmt_rate, liveness_label
@@ -78,6 +79,7 @@ from dashboard.entry_c_exit_joint import (
     table_rows as joint_table_rows,
     verdict_line as joint_verdict_line,
 )
+from dashboard.random_entry import random_entry_lines
 from dashboard.phase1_counterfactual import (
     PHASE1_CANDIDATE,
     PHASE1_CF_NAIL,
@@ -798,6 +800,8 @@ body { margin: 0; }
 
 .v2-note { color: var(--v2-mute); font-size: 10px; font-style: italic; }
 .v2-note-warn { color: var(--v2-warn); font-style: normal; font-weight: 650; }
+.v2-note-bad { color: var(--v2-down); font-style: normal; font-weight: 650; }
+.v2-note-grey { color: var(--v2-mute); font-style: normal; opacity: 0.72; }
 
 @media (max-width: 720px) {
   .v2-grid { grid-template-columns: repeat(2, 1fr); }
@@ -1923,10 +1927,12 @@ def _v2_week(store: DataStore) -> None:
     block = result.data
     # DecisionWindowStats rates use n_with_exec. There is no `n` field.
     denominator = _as_int(getattr(block, "n_with_exec", None))
+    raw_n = _as_int(getattr(block, "n_decisions", 0))
+    dedup_n = _as_int(getattr(block, "n_decisions_dedup", raw_n))
     _v2_table(
         [("决策数", "num"), ("有执行", "num"), ("通过率", "num"), ("执行率", "num")],
         [[
-            str(getattr(block, "n_decisions", "—")),
+            _raw_dedup(raw_n, dedup_n),
             str(getattr(block, "n_with_exec", "—")),
             fmt_rate(getattr(block, "ok_rate", None), _as_int(getattr(block, "n_ok", None)), denominator),
             fmt_rate(
@@ -2030,6 +2036,7 @@ def _v2_jev_gate() -> None:
         "证 edge≈0.02 约需 ~350 已结算样本（Foresight Arena）。"
         "解读收紧，不改门槛、不算有效性。"
     ).classes("v2-note")
+    ui.label(bonferroni_grid_label()).classes("v2-note")
 
 
 def _v2_market_base(store: DataStore) -> None:
@@ -2062,9 +2069,11 @@ def _v2_strategy(store: DataStore) -> None:
         return
     table_rows: list[list[str]] = []
     for bucket in rows:
+        raw_n = _as_int(getattr(bucket, "n", 0))
+        dedup_n = _as_int(getattr(bucket, "n_dedup", raw_n))
         table_rows.append([
             _v2_text(getattr(bucket, "strategy_id", None)),
-            _v2_text(getattr(bucket, "n", None)),
+            _raw_dedup(raw_n, dedup_n),
             _v2_text(getattr(bucket, "ok_rate", None)),
         ])
     _v2_table(
@@ -2074,10 +2083,31 @@ def _v2_strategy(store: DataStore) -> None:
     ui.label("B/C 策略出信号后自动分桶").classes("v2-note")
 
 
+def _v2_pause_line(store: DataStore) -> None:
+    """Main book opened_at split at the pause. After-pause opens are a red stop."""
+    try:
+        result = store.paper_pause_split()
+    except Exception:
+        log.warning("paper pause split failed")
+        return
+    if not result.available or result.data is None:
+        return
+    report = result.data
+    before = _as_int(getattr(report, "before", 0))
+    after = _as_int(getattr(report, "after", 0))
+    ui.label(f"暂停前 {before} · 暂停后 {after}").classes("v2-note")
+    if after > 0:
+        ui.label("暂停后出现新开仓 · 挂卡拦").classes("v2-note v2-note-bad")
+    note = getattr(report, "flag_note", "") or ""
+    if note:
+        ui.label(_v2_text(note)).classes("v2-note")
+
+
 def _v2_positions(store: DataStore) -> None:
     result = store.open_positions()
     if not result.available or result.data is None:
         ui.label("暂无数据").classes("v2-note")
+        _v2_pause_line(store)
         return
     payload = result.data
     cash_raw = getattr(payload, "cash_usd", None)
@@ -2128,6 +2158,8 @@ def _v2_positions(store: DataStore) -> None:
             tones,
         )
     ui.label("现价取 pair_history 最新；无价为「—」").classes("v2-note")
+    _v2_equity_books(store)
+    _v2_pause_line(store)
 
 
 def backtest_equity_tone(end: float, start: float | None) -> str:
@@ -2176,6 +2208,44 @@ _KPI_NAIL = "只读倒推 · 不改闸 · 不改 .env · 开杠杆由五层互�
 # M7 影簿短钉：S0 对照只有注册时的 8 笔，不能拿薄样本改闸。
 _M7_NAIL = "影簿≠已改闸 · S0 历史仅 8 笔对照极薄 · 勿用薄样本批改闸"
 _M7_PHASE0_NOTE = "与 Phase0 双列并存 · 不算有效性"
+# 接线 bug 期：入口 stance 读反且 jev 过期。这些卡不能用来评价 jev。
+_ENTRY_JEV_BANNER = (
+    "入口为 stance 读反、jev 过期信号（接线 bug 期，指标 jev 新鲜度审计 2026-10-21）· 不可用于评价 jev"
+)
+# 对不上取大。只改 BONFERRONI_GRIDS。
+BONFERRONI_GRIDS = 266
+# 旁簿卖出按 mid 成交、未计滑点。绝对值和排名都不作候选证据。
+SIDE_BOOK_RETURN_TAG = "卖出未计滑点·绝对值与排名均待复核·不作候选证据"
+EQUITY_RULER_NOTE = "采集尺=只看当前及之前快照；执行尺=用下一快照·事后核账"
+# 复盘定数，不随夹具权益改写。
+EQUITY_PRIMARY_USD = 8283.14
+EQUITY_BOTH_REVIEW_USD = 8886.49
+EQUITY_V_UP_USD = 8530.57
+EQUITY_V_PROXY_USD = 8356.48
+BOTH_TICK_LABEL = "剔除双向闪烁·根因已证·5笔·执行尺·下一快照"
+V_UP_LABEL = "采集V口径·只剔向上"
+KPI_GAP_PRIMARY_NOTE = "143笔V规则事后打标未完成"
+V_MARK_NOTE = "V 事后打标：可判 92 笔命中 3；51 笔无留痕判不了（pnl −597.09）·保守口径维持 $8,283"
+
+
+def bonferroni_grid_label() -> str:
+    """C 出口 / KPI 倒推共用的多重比较标注。"""
+    n = BONFERRONI_GRIDS
+    return f"累计共测 {n} 格 · Bonferroni 按 {n}"
+
+
+def _raw_dedup(raw: int, dedup: int) -> str:
+    return f"原始 {raw} / 去重 {dedup}（同 token 60 分钟）"
+
+
+def _entry_jev_banner() -> None:
+    ui.label(_ENTRY_JEV_BANNER).classes("v2-note")
+
+
+def _random_entry_note() -> None:
+    """比随机好多少. Shown on entry cards, not on the C-exit return lines."""
+    for line in random_entry_lines():
+        ui.label(line).classes("v2-note")
 
 
 def _v2_signal_streak(store: DataStore) -> None:
@@ -2289,6 +2359,8 @@ def _v2_trade_freq(store: DataStore) -> None:
     ).classes("v2-note")
 
 def _v2_closed(store: DataStore) -> None:
+    _entry_jev_banner()
+    _random_entry_note()
     result = store.paper_closed_buckets(days=14)
     if not result.available or result.data is None:
         ui.label("暂无数据").classes("v2-note")
@@ -2309,8 +2381,10 @@ def _v2_closed(store: DataStore) -> None:
     first_rate = getattr(report, "first_hit_rate", None)
     live_n = getattr(report, "first_hit_live_n", 0) or 0
     live_rate = getattr(report, "first_hit_live_rate", None)
-    first_text = f"{_pct(first_rate)} (n={first_n})" if first_n else "—"
-    live_text = f"{_pct(live_rate)} (n={live_n})" if live_n else "—"
+    first_dedup = _as_int(getattr(report, "first_hit_dedup", first_n))
+    live_dedup = _as_int(getattr(report, "first_hit_live_dedup", live_n))
+    first_text = f"{_pct(first_rate)} ({_raw_dedup(first_n, first_dedup)})" if first_n else "—"
+    live_text = f"{_pct(live_rate)} ({_raw_dedup(live_n, live_dedup)})" if live_n else "—"
     worst = getattr(report, "worst_pnl_usd", None)
     rest = getattr(report, "rest_pnl_usd", None)
     wipe = bool(getattr(report, "single_wipe", False))
@@ -2400,10 +2474,18 @@ def _short_addr(value: object) -> str:
     return text[:4] + "…" + text[-4:]
 
 
+def _source_damage(reason: str) -> bool:
+    return reason.startswith(SOURCE_DAMAGE_PREFIX)
+
+
 def _v2_intel_holders(store: DataStore) -> None:
     result = store.intel_holder_observe()
     if not result.available or result.data is None:
-        ui.label(result.reason or "data gap").classes("v2-note")
+        if _source_damage(result.reason):
+            ui.label(result.reason).classes("v2-note")
+            ui.label("data gap").classes("v2-note")
+        else:
+            ui.label(result.reason or "data gap").classes("v2-note")
         ui.label("权重0 / 不接决策").classes("v2-note")
         return
     report = result.data
@@ -2465,6 +2547,66 @@ def _mount_goal_20k(store: DataStore, *, now: datetime | None = None) -> None:
     )
 
 
+def _book_money(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    return f"${float(value):,.2f}"
+
+
+def _approx_gap(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    return f"≈${float(value) / 1000:.1f}k"
+
+
+def _v2_equity_book_row(report: object) -> None:
+    """原账 from the book. 保守 / 采集V / 双向 are the review figures."""
+    raw = getattr(report, "equity_raw_usd", None)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raw = getattr(report, "equity_usd", None)
+    _v2_kv([
+        ("原账", _book_money(raw), ""),
+        ("保守", f"{_book_money(EQUITY_PRIMARY_USD)} · 待定", ""),
+        (
+            V_UP_LABEL,
+            f"{_book_money(EQUITY_V_UP_USD)}（代理 {_book_money(EQUITY_V_PROXY_USD)} 参考）",
+            "",
+        ),
+        (BOTH_TICK_LABEL, _book_money(EQUITY_BOTH_REVIEW_USD), ""),
+    ])
+    ui.label("保守·仅剔向上坏报价").classes("v2-note")
+    ui.label(EQUITY_RULER_NOTE).classes("v2-note")
+    ui.label(V_MARK_NOTE).classes("v2-note")
+    line = str(getattr(report, "true_tp_line", "") or "")
+    if line:
+        ui.label(line).classes("v2-note")
+
+
+def _v2_equity_books(store: DataStore) -> None:
+    try:
+        result = store.paper_goal_pace()
+    except Exception:
+        log.warning("equity books failed")
+        return
+    if not result.available or result.data is None:
+        return
+    _v2_equity_book_row(result.data)
+
+
+def _v2_gap_primary(report: object) -> None:
+    """Headline gap is the review conservative book. Raw gap stays beside it."""
+    raw_eq = getattr(report, "equity_raw_usd", None)
+    if isinstance(raw_eq, bool) or not isinstance(raw_eq, (int, float)):
+        raw_eq = getattr(report, "equity_usd", None)
+    raw_gap = None
+    if isinstance(raw_eq, (int, float)) and not isinstance(raw_eq, bool):
+        raw_gap = 20_000.0 - float(raw_eq)
+    cons_gap = 20_000.0 - EQUITY_PRIMARY_USD
+    ui.label(f"保守 {_book_money(EQUITY_PRIMARY_USD)} · 缺口 {_approx_gap(cons_gap)}").classes("v2-note")
+    ui.label(KPI_GAP_PRIMARY_NOTE).classes("v2-note")
+    ui.label(f"原账 {_book_money(raw_eq)} · 缺口 {_approx_gap(raw_gap)}").classes("v2-note")
+
+
 def _v2_goal_20k(store: DataStore, *, now: datetime | None = None) -> None:
     result = store.paper_goal_pace(now=now)
     if not result.available or result.data is None:
@@ -2472,6 +2614,7 @@ def _v2_goal_20k(store: DataStore, *, now: datetime | None = None) -> None:
         ui.label(_GOAL_NAIL).classes("v2-note")
         return
     report = result.data
+    _v2_gap_primary(report)
     equity = getattr(report, "equity_usd", None)
     gap = getattr(report, "gap_usd", None)
     days = getattr(report, "days_left", None)
@@ -2591,6 +2734,7 @@ def _v2_kpi_reverse(store: DataStore, *, now: datetime | None = None) -> None:
         ui.label(_KPI_NAIL).classes("v2-note")
         return
     report = result.data
+    _v2_gap_primary(report)
     gap_text, gap_tone = _kpi_need_text(getattr(report, "gap_usd", None))
     days = getattr(report, "days_left", None)
     daily = getattr(report, "daily_need_usd", None)
@@ -2682,6 +2826,8 @@ def _mount_phase1_counterfactual() -> None:
 
 
 def _v2_phase1_counterfactual() -> None:
+    _entry_jev_banner()
+    _random_entry_note()
     try:
         report = load_phase1_counterfactual()
     except Exception:
@@ -2713,6 +2859,7 @@ def _mount_c_exit_shadow() -> None:
 
 
 def _v2_c_exit_shadow() -> None:
+    _entry_jev_banner()
     try:
         report = load_c_exit_shadow()
     except Exception:
@@ -2724,10 +2871,15 @@ def _v2_c_exit_shadow() -> None:
     ui.label(C_EXIT_NAIL).classes("v2-note")
     ui.label(C_EXIT_DISCIPLINE).classes("v2-note")
     ui.label(C_EXIT_GRID).classes("v2-note")
+    ui.label(bonferroni_grid_label()).classes("v2-note")
+    ui.label(SIDE_BOOK_RETURN_TAG).classes("v2-note")
     for row in report.tags:
         ui.label(c_exit_tag_line(row)).classes("v2-note")
+        live_n = getattr(row, "live_n", None)
+        if isinstance(live_n, int) and not isinstance(live_n, bool) and live_n < 30:
+            ui.label(f"{row.tag} · 样本不足").classes("v2-note")
     ui.label(c_exit_main_line(report)).classes("v2-note")
-    ui.label(c_exit_verdict_line(report)).classes("v2-note")
+    ui.label(c_exit_verdict_line(report)).classes("v2-note v2-note-grey")
     ui.label(C_EXIT_THRESHOLD).classes("v2-note")
     ui.label(C_EXIT_ROLLBACK).classes("v2-note")
     hit = rollback_hit_line(report)
@@ -2749,6 +2901,8 @@ def _mount_entry_c_exit_joint() -> None:
 
 
 def _v2_entry_c_exit_joint() -> None:
+    _entry_jev_banner()
+    _random_entry_note()
     try:
         report = load_entry_c_exit_joint()
     except Exception:
@@ -2759,6 +2913,8 @@ def _v2_entry_c_exit_joint() -> None:
         ui.label(JOINT_LIQ_LIVE).classes("v2-note")
         ui.label(JOINT_DISCIPLINE).classes("v2-note")
         return
+    if report.side_fills > 0:
+        ui.label(f"只读对照 · 旁簿成交={report.side_fills}").classes("v2-note")
     ui.label(joint_nail_line(report)).classes("v2-note")
     ui.label(JOINT_LIQ_NAIL).classes("v2-note")
     ui.label(JOINT_LIQ_LIVE).classes("v2-note")
@@ -2771,6 +2927,7 @@ def _v2_entry_c_exit_joint() -> None:
     rows, tones = joint_table_rows(report)
     _v2_table(list(TABLE_HEADERS), rows, tones)
     ui.label("★ = R3 × c_sl5_h60、c_sl5_h90 主旁证 · liq† = missing 风险").classes("v2-note")
+    ui.label(SIDE_BOOK_RETURN_TAG).classes("v2-note")
     ui.label(joint_peak_line(report)).classes("v2-note")
     ui.label(JOINT_PNL_NOTE).classes("v2-note")
     ui.label(joint_verdict_line(report)).classes("v2-note")
@@ -2789,6 +2946,8 @@ def _mount_m7_shadow(store: DataStore) -> None:
 
 
 def _v2_phase0_shadow() -> None:
+    _entry_jev_banner()
+    _random_entry_note()
     try:
         report = load_shadow_phase0()
     except Exception:
@@ -2817,6 +2976,8 @@ def _v2_phase0_shadow() -> None:
 
 
 def _v2_m7_shadow(store: DataStore) -> None:
+    _entry_jev_banner()
+    _random_entry_note()
     result = store.m7_shadow_register()
     if not result.available or result.data is None:
         ui.label(result.reason or "data gap").classes("v2-note")
@@ -2825,13 +2986,35 @@ def _v2_m7_shadow(store: DataStore) -> None:
         return
     report = result.data
     _v2_kv([
-        ("S1", str(_as_int(getattr(report, "n_s1", 0))), "mute"),
-        ("S0", str(_as_int(getattr(report, "n_s0", 0))), "mute"),
-        ("liq_missing", str(_as_int(getattr(report, "n_missing", 0))), "mute"),
-        ("would_open_S0", str(_as_int(getattr(report, "would_open_s0", 0))), "mute"),
-        ("would_open_S1", str(_as_int(getattr(report, "would_open_s1", 0))), "mute"),
-        ("leak", str(_as_int(getattr(report, "n_leak", 0))), "mute"),
-        ("Phase0", str(_as_int(getattr(report, "n_phase0", 0))), "mute"),
+        ("S1", _raw_dedup(_as_int(getattr(report, "n_s1", 0)), _as_int(getattr(report, "n_s1_dedup", 0))), "mute"),
+        ("S0", _raw_dedup(_as_int(getattr(report, "n_s0", 0)), _as_int(getattr(report, "n_s0_dedup", 0))), "mute"),
+        (
+            "liq_missing",
+            _raw_dedup(_as_int(getattr(report, "n_missing", 0)), _as_int(getattr(report, "n_missing_dedup", 0))),
+            "mute",
+        ),
+        (
+            "would_open_S0",
+            _raw_dedup(
+                _as_int(getattr(report, "would_open_s0", 0)),
+                _as_int(getattr(report, "would_open_s0_dedup", 0)),
+            ),
+            "mute",
+        ),
+        (
+            "would_open_S1",
+            _raw_dedup(
+                _as_int(getattr(report, "would_open_s1", 0)),
+                _as_int(getattr(report, "would_open_s1_dedup", 0)),
+            ),
+            "mute",
+        ),
+        ("leak", _raw_dedup(_as_int(getattr(report, "n_leak", 0)), _as_int(getattr(report, "n_leak_dedup", 0))), "mute"),
+        (
+            "Phase0",
+            _raw_dedup(_as_int(getattr(report, "n_phase0", 0)), _as_int(getattr(report, "n_phase0_dedup", 0))),
+            "mute",
+        ),
     ])
     cohort = _v2_text(getattr(report, "cohort", ""))
     source = _v2_text(getattr(report, "source", ""))
@@ -2859,8 +3042,9 @@ def _v2_token_age(store: DataStore) -> None:
     else:
         ratio_text = "—"
     unknown_text = f"{unknown}/{total}" if total else "—"
+    total_dedup = _as_int(getattr(report, "total_dedup", total))
     _v2_kv([
-        ("近端", str(total), "mute"),
+        ("近端", _raw_dedup(total, total_dedup), "mute"),
         ("有字段", str(_as_int(getattr(report, "with_field", 0))), "mute"),
         ("unknown", unknown_text, "mute"),
         ("unknown 占比", ratio_text, "mute"),
@@ -2893,7 +3077,11 @@ def _v2_token_age(store: DataStore) -> None:
 def _v2_intel_slippage(store: DataStore) -> None:
     result = store.intel_slippage_observe()
     if not result.available or result.data is None:
-        ui.label(result.reason or "data gap").classes("v2-note")
+        if _source_damage(result.reason):
+            ui.label(result.reason).classes("v2-note")
+            ui.label("data gap").classes("v2-note")
+        else:
+            ui.label(result.reason or "data gap").classes("v2-note")
         ui.label("高 bot 不跳单").classes("v2-note")
         return
     report = result.data

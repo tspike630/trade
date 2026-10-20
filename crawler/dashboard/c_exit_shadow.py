@@ -53,6 +53,7 @@ _NULL = frozenset({"", "null", "none", "nan", "na", "n/a"})
 _TAG_ORDER = ("c_sl4_h60", "c_sl5_h60", "c_sl4_h90", "c_sl5_h90")
 _TAG_SET = frozenset(_TAG_ORDER)
 _TAG_COLS = ("grid_tag", "tag", "account_tag", "shadow_tag")
+_TOKEN_COLS = ("token_address", "token", "mint", "base_address")
 _PNL_COLS = ("pnl_usd", "pnl")
 _REASON_COLS = ("exit_reason", "reason", "close_reason")
 _PREFERRED = ("positions", "shadow_positions", "c_exit_positions", "paper_positions")
@@ -299,6 +300,7 @@ def _select_sql(
     closed_at: str | None,
     tag: str | None,
     meta: str | None,
+    token: str | None,
     account: str | None = None,
     account_tag: str | None = None,
 ) -> str:
@@ -313,6 +315,7 @@ def _select_sql(
             _sql_expr("p", closed_at, "closed_at"),
             tag_sql,
             _sql_expr("p", meta, "meta"),
+            _sql_expr("p", token, "token"),
         )
     )
     if account is not None and account_tag is not None:
@@ -347,8 +350,9 @@ def _read_plan(conn: sqlite3.Connection) -> str | FallbackKind:
         reason = _pick(cols, _REASON_COLS)
         tag = _pick(cols, _TAG_COLS)
         meta = "meta_json" if "meta_json" in cols else None
+        token = _pick(cols, _TOKEN_COLS)
         if tag is not None:
-            return _select_sql(table, pnl, reason, status, closed_at, tag, None)
+            return _select_sql(table, pnl, reason, status, closed_at, tag, None, token)
         if "account_id" in cols and accounts:
             account = accounts[0]
             acols = set(_columns(conn, account))
@@ -362,11 +366,12 @@ def _read_plan(conn: sqlite3.Connection) -> str | FallbackKind:
                     closed_at,
                     None,
                     None,
+                    token,
                     account=account,
                     account_tag=account_tag,
                 )
         if meta is not None:
-            return _select_sql(table, pnl, reason, status, closed_at, None, meta)
+            return _select_sql(table, pnl, reason, status, closed_at, None, meta, token)
     return "schema"
 
 
@@ -396,6 +401,16 @@ def _parse_pnl(value: object) -> Decimal | None:
         return Decimal(text)
     except InvalidOperation:
         return None
+
+
+def _side_token_key(value: object, ordinal: int) -> str:
+    """Distinct-token key. A blank mint stays unique so row-only books keep n."""
+    if value is None:
+        return f"#{ordinal}"
+    text = str(value).strip()
+    if not text or text.casefold() in _NULL:
+        return f"#{ordinal}"
+    return text.casefold()
 
 
 def _canon_tag(value: object) -> str | None:
@@ -446,11 +461,13 @@ def _share(bucket: _Bucket) -> Decimal | None:
 
 def _fold_rows(rows: list[sqlite3.Row], uses_meta: bool) -> _Live | FallbackKind:
     buckets = {tag: _Bucket() for tag in _TAG_ORDER}
+    seen_tokens = {tag: set() for tag in _TAG_ORDER}
     saw_status = any(row["status"] is not None for row in rows)
     closed_rows = 0
     known_closed = 0
     cumulative = Decimal("0")
     single = False
+    ordinal = 0
     for row in rows:
         status = row["status"]
         closed_at = row["closed_at"]
@@ -470,8 +487,12 @@ def _fold_rows(rows: list[sqlite3.Row], uses_meta: bool) -> _Live | FallbackKind
         if tag not in _TAG_SET:
             continue
         known_closed += 1
+        ordinal += 1
         bucket = buckets[str(tag)]
-        bucket.n += 1
+        token_key = _side_token_key(row["token"], ordinal)
+        if token_key not in seen_tokens[str(tag)]:
+            seen_tokens[str(tag)].add(token_key)
+            bucket.n += 1
         bucket.total += cents
         if cents < 0:
             bucket.neg += cents
