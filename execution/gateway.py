@@ -173,7 +173,7 @@ def jev_guard_enabled() -> bool:
     return _env_bool("EXECUTION_JEV_GUARD", True)
 
 
-JEV_GUARD_STRATEGIES = frozenset({"jev_strength_v1"})
+JEV_GUARD_STRATEGIES = frozenset({"jev_strength_v1", "factor_jev_strength_v1"})
 
 
 def jev_guard_reason(
@@ -181,7 +181,7 @@ def jev_guard_reason(
 ) -> str | None:
     """Backstop on buy signals from decision extras (jev_age_min / jev_stance_raw).
 
-    Only strategy jev_strength_v1 is gated; any other strategy (no jev fields)
+    Only strategies jev_strength_v1 / factor_jev_strength_v1 are gated; any other strategy (no jev fields)
     passes all three checks. strategy_id=None is treated as gated (strict).
 
     * jev_age_min missing / blank / unparsable -> jev_age_missing

@@ -55,6 +55,16 @@ class ReasonTests(unittest.TestCase):
         self.assertIsNone(jev_guard_reason({}, "factor_x_v1"))
         self.assertIsNone(jev_guard_reason({"jev_age_min": 9999, "jev_stance_raw": "BEARISH"}, "other"))
         self.assertEqual(jev_guard_reason({}, "jev_strength_v1"), JEV_AGE_MISSING)
+        self.assertIsNone(jev_guard_reason({}, "factor_macd_cross_v1"))
+
+    def test_factor_jev_same_rules(self):
+        cases = [({}, JEV_AGE_MISSING), ({"jev_age_min": ""}, JEV_AGE_MISSING),
+                 ({"jev_age_min": 1441}, JEV_STALE), ({"jev_age_min": 1440}, None),
+                 ({"jev_age_min": 5, "jev_stance_raw": "NEUTRAL"}, JEV_STANCE_NOT_BULLISH),
+                 ({"jev_age_min": 5, "jev_stance_raw": "BULLISH"}, None)]
+        for ex, want in cases:
+            for strat in ("jev_strength_v1", "factor_jev_strength_v1"):
+                self.assertEqual(jev_guard_reason(ex, strat), want, (ex, strat))
         # stale wins over stance
         self.assertEqual(jev_guard_reason({"jev_age_min": 5000, "jev_stance_raw": "BEARISH"}), JEV_STALE)
 
@@ -82,6 +92,8 @@ class GatewayTests(unittest.TestCase):
                           extras={"jev_age_min": 5, "jev_stance_raw": "BEARISH"})
             sell = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE, action="sell", extras={})
             other = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE, strategy_id="combined_v1", extras={})
+            fjev = db.add(column_purpose=PURPOSE_LIVE_CANDIDATE, strategy_id="factor_jev_strength_v1",
+                          extras={"jev_age_min": 3000})
             db.close()
             paper = _RecordingExecutor()
             prev = gateway_mod.EXECUTION_RISK_ENABLED
@@ -94,7 +106,7 @@ class GatewayTests(unittest.TestCase):
                     rows = {int(r["decision_log_id"]): r for r in gw.ledger.recent(limit=20)}
             finally:
                 gateway_mod.EXECUTION_RISK_ENABLED = prev
-            for did, reason in ((stale, JEV_STALE), (missing, JEV_AGE_MISSING),
+            for did, reason in ((stale, JEV_STALE), (missing, JEV_AGE_MISSING), (fjev, JEV_STALE),
                                 (bear, JEV_STANCE_NOT_BULLISH)):
                 self.assertEqual(rows[did]["status"], "rejected")
                 self.assertEqual(rows[did]["executed"], 0)
