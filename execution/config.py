@@ -34,7 +34,8 @@ def _env_float_or_none(name: str) -> float | None:
 # 执行层风控骨架（方案5；默认关）。只认 _env_bool，默认仍为关。
 EXECUTION_RISK_ENABLED = _env_bool("EXECUTION_RISK_ENABLED", False)
 EXECUTION_MAX_OPEN = int(os.getenv("EXECUTION_MAX_OPEN", "5"))
-# 当日已实现亏损熔断（USD）。未设置 → 不启用。不改变 EXECUTION_RISK_ENABLED 默认关。
+# 当日已实现亏损熔断（USD）。未设置 → 不启用。日界是 Asia/Hong_Kong；
+# 阈值仍是 pnl < -limit。不改变 EXECUTION_RISK_ENABLED 默认关，也不改限额数值。
 EXECUTION_DAILY_LOSS_USD = _env_float_or_none("EXECUTION_DAILY_LOSS_USD")
 
 

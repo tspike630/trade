@@ -392,7 +392,9 @@ class ExecutionGateway:
         """After position_manager, before executor. Default off → no behavior change.
 
         SELL skips max_open inside the checker. Daily loss is passed through and
-        stays off unless EXECUTION_DAILY_LOSS_USD is set. Missing book fails closed
+        stays off unless EXECUTION_DAILY_LOSS_USD is set. Its day bucket is the
+        Asia/Hong_Kong date of closed_at; the limit comparison is unchanged.
+        Missing book fails closed
         only when the risk gate is on. F-1 loss streaks are not a checker: the
         order path does not read EXECUTION_F1_CIRCUIT and does not reject on streak.
         """
