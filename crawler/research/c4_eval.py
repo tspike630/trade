@@ -49,6 +49,9 @@ CUT_ISO = "2026-10-22T18:15:12Z"       # 2026-10-23 02:15:12 HKT
 CUT_TS = None  # set below after _ts is defined
 MAX_ENTRY_GAP_SEC = 600                # entry snapshot must be <= 10 min after trigger snapshot
 GAP_WARN_FRAC = 0.05                   # invalid_gap / triggers above this -> WARNING flag
+# no valid post-entry price: variant (a) settle at last valid price (=entry), variant (b) settle at -100%.
+# Verdict (train gate, OOS) uses variant (b). Both reported whenever count > 0.
+NVP_WARN_FRAC = 0.02                   # no_valid_post_price share above this -> WARNING flag
 MIN_EVENTS = 30
 MIN_TOKENS = 30
 N_BOOT = 10_000
@@ -293,7 +296,11 @@ def build_events(pairs: list[Pair], kind: str, end_ts: int, seed: int = RANDOM_S
             if r is None:
                 stats["no_full_hold"] += 1; continue
             nvp = r.pop("_no_valid_post")
-            cand.append(dict(no_valid_post=bool(nvp), token=p.token, pair=p.pair, trigger_ts=int(p.t[i]), entry_ts=int(p.t[j]),
+            va = {f"ret_{k}_a": v[0] for k, v in r.items()}
+            va.update({f"why_{k}_a": v[1] for k, v in r.items()})
+            if nvp:   # variant (b) = verdict: -100%
+                r = {k: (-1.0, "no_valid_post") for k in r}
+            cand.append(dict(no_valid_post=bool(nvp), **va, token=p.token, pair=p.pair, trigger_ts=int(p.t[i]), entry_ts=int(p.t[j]),
                              entry_price=float(p.px[j]), entry_liq=float(p.liq[j]),
                              cost=tier_cost(float(p.liq[j])),
                              **{f"ret_{k}": v[0] for k, v in r.items()},
@@ -391,6 +398,12 @@ def summarize(events, ex):
                 top5_share=float(sum(absv[:5]) / sum(absv)) if sum(absv) > 0 else float("nan"))
 
 
+def nvp_report(events) -> dict:
+    n = len(events); k = sum(1 for e in events if e.get("no_valid_post"))
+    sh = (k / n) if n else 0.0
+    return {"n": n, "no_valid_post_price": k, "share": sh, "warning": bool(sh > NVP_WARN_FRAC)}
+
+
 def evaluate(c4_seg, rnd_seg, seg: str, cells: int) -> dict:
     alpha = bonferroni_alpha(cells)
     res = {"segment": seg, "cells": cells, "primary_exit": PRIMARY_EXIT, "alpha_one_sided": alpha,
@@ -400,6 +413,15 @@ def evaluate(c4_seg, rnd_seg, seg: str, cells: int) -> dict:
         if c4_seg and rnd_seg:
             p, dci = diff_pvalue(c4_seg, [net(e, ex) for e in c4_seg], rnd_seg, [net(e, ex) for e in rnd_seg])
             r["diff_p_one_sided"] = p; r["diff_ci"] = dci
+        r["settlement"] = "variant_b_minus100 (verdict)"
+        if any(e.get("no_valid_post") for e in c4_seg + rnd_seg):
+            ea = ex + "_a"
+            va = {"settlement": "variant_a_last_valid (report only)",
+                  "c4": summarize(c4_seg, ea), "random": summarize(rnd_seg, ea)}
+            if c4_seg and rnd_seg:
+                pa, dca = diff_pvalue(c4_seg, [net(e, ea) for e in c4_seg], rnd_seg, [net(e, ea) for e in rnd_seg])
+                va["diff_p_one_sided"] = pa; va["diff_ci"] = dca
+            r["variant_a"] = va
         if ex != PRIMARY_EXIT:
             r["pass"] = False; r["verdict"] = "COMPARISON_ONLY (not a verdict exit)"
         elif not res["valid_c4"]:
@@ -457,6 +479,14 @@ def run(db: str, seg: str, cells: int, out_dir: str, train_result: Optional[str]
     res["entry_gap"] = gr
     res["warnings"] = [f"WARNING: {k} invalid_gap {v['invalid_gap']}/{v['triggers']} = {v['invalid_gap_frac']:.2%} > {GAP_WARN_FRAC:.0%}"
                        for k, v in gr.items() if v["warning"]]
+    if c4:
+        cs = segment(c4, cut, seg); rs = segment(rnd, cut, seg)
+    else:
+        cs, rs = [], []
+    nr = {"c4": nvp_report(cs), "random": nvp_report(rs)}
+    res["no_valid_post_price"] = nr
+    res["warnings"] += [f"WARNING: {k} no_valid_post_price {v['no_valid_post_price']}/{v['n']} = {v['share']:.2%} > {NVP_WARN_FRAC:.0%}"
+                        for k, v in nr.items() if v["warning"]]
     path = os.path.join(out_dir, f"c4_{seg}_result.json")
     with open(path, "w") as fh:
         json.dump(res, fh, indent=2, default=float)
@@ -476,6 +506,7 @@ def main(argv=None):
     for ex, r in res.get("exits", {}).items():
         print(ex, r.get("verdict"))
     print("entry_gap", json.dumps(res.get("entry_gap"), default=float))
+    print("no_valid_post_price", json.dumps(res.get("no_valid_post_price"), default=float))
     for w in res.get("warnings", []):
         print(w)
 

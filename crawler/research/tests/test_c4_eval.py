@@ -201,9 +201,44 @@ class TestTrades(unittest.TestCase):
         d = tempfile.mkdtemp(); path = os.path.join(d, "f.db"); make_db(path, [("p1", "t1", s)])
         ev, st = C.build_events(C.load_pairs(C.open_ro(path)), "c4", C._ts(C.WINDOW_END))
         self.assertEqual(len(ev), 1); self.assertTrue(ev[0]["no_valid_post"])
-        self.assertAlmostEqual(ev[0]["ret_tp10_sl5_h60"], 0.0)   # last valid price = entry
+        for ex in C.EXITS:
+            self.assertAlmostEqual(ev[0][f"ret_{ex}_a"], 0.0)    # variant (a): last valid price = entry
+            self.assertEqual(ev[0][f"ret_{ex}"], -1.0)           # variant (b): -100%, used for verdict
         self.assertEqual(st["no_valid_post_price"], 1)
         self.assertEqual(C.summarize(ev, "time60")["no_valid_post_price"], 1)
+        self.assertEqual(C.summarize(ev, "time60")["pre_mean"], -1.0)
+        self.assertEqual(C.summarize(ev, "time60_a")["pre_mean"], 0.0)
+
+    def test_nvp_both_variants_reported_and_verdict_uses_b(self):
+        mk = lambda tok, nvp: {"token": tok, "cost": 0.0, "no_valid_post": nvp,
+                               **{f"ret_{x}": (-1.0 if nvp else 0.05) for x in C.EXITS},
+                               **{f"ret_{x}_a": 0.05 if not nvp else 0.0 for x in C.EXITS},
+                               **{f"why_{x}": "x" for x in C.EXITS}, **{f"why_{x}_a": "x" for x in C.EXITS}}
+        c4 = [mk(f"c{i}", i < 3) for i in range(40)]
+        rnd = [mk(f"r{i}", False) for i in range(40)]
+        for e in rnd:
+            for x in C.EXITS: e[f"ret_{x}"] = e[f"ret_{x}_a"] = -0.05
+        r = C.evaluate(c4, rnd, "train", 268)["exits"]["tp10_sl5_h60"]
+        self.assertIn("variant_a", r)
+        self.assertLess(r["c4"]["net_mean"], 0)                     # (b) drags mean below 0
+        self.assertGreater(r["variant_a"]["c4"]["net_mean"], 0)     # (a) would be positive
+        self.assertFalse(r["pass"])                                 # verdict follows (b)
+        nr = C.nvp_report(c4); self.assertEqual(nr["no_valid_post_price"], 3); self.assertTrue(nr["warning"])
+        self.assertFalse(C.nvp_report([mk("a", True)] + [mk(str(i), False) for i in range(49)])["warning"])  # 2% not > 2%
+        # no nvp -> no variant_a block
+        self.assertNotIn("variant_a", C.evaluate(rnd, rnd, "train", 268)["exits"]["tp10_sl5_h60"])
+
+    def test_random_nvp_same_rule(self):
+        s = series(); s[82:100] = [dict(r, px=None) for r in s[82:100]]
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db"); make_db(path, [("p1", "t1", s)])
+        pairs = C.load_pairs(C.open_ro(path)); end = C._ts(C.WINDOW_END)
+        for seed in range(200):
+            ev, st = C.build_events(pairs, "random", end, seed=seed)
+            hit = [e for e in ev if e["no_valid_post"]]
+            if hit:
+                self.assertEqual(hit[0]["ret_tp10_sl5_h60"], -1.0); self.assertEqual(hit[0]["ret_tp10_sl5_h60_a"], 0.0)
+                self.assertEqual(st["no_valid_post_price"], len(hit)); return
+        self.fail("no random nvp event found")
 
     def test_collapse_counts_as_valid_minus_100(self):
         s = series(); trigger_at(s, 80)
@@ -240,16 +275,27 @@ class TestEntryGap(unittest.TestCase):
         self.assertEqual(ev, []); self.assertEqual(st["invalid_gap"], 1); self.assertEqual(st["triggers"], 1)
         self.assertTrue(C.gap_report(st)["warning"])
 
-    def test_random_gap_rule(self):
+    def random_with_spacing(self, step, n=300):
         d = tempfile.mkdtemp(); path = os.path.join(d, "f.db")
         con = sqlite3.connect(path); con.execute(SCHEMA)
-        # every snapshot 12 min apart (still >=30 prior in 6h) -> any random trigger has an invalid gap
-        for k in range(300):
+        for k in range(n):
             con.execute("INSERT INTO pair_history(chain_id,pair_address,token_address,recorded_at,price_usd,liquidity_usd,tier,fdv,txns_m5_buys,txns_m5_sells,volume_m5) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                        ("solana", "p1", "t1", iso(T0 + k * 720), 1.0, 2e5, "hot", 1e9, 10, 10, 100.0))
+                        ("solana", "p1", "t1", iso(T0 + k * step), 1.0, 2e5, "hot", 1e9, 10, 10, 100.0))
         con.commit(); con.close()
-        ev, st = C.build_events(C.load_pairs(C.open_ro(path)), "random", C._ts(C.WINDOW_END))
-        self.assertGreater(st["triggers"], 0); self.assertEqual(st["invalid_gap"], st["triggers"]); self.assertEqual(ev, [])
+        return C.build_events(C.load_pairs(C.open_ro(path)), "random", C._ts(C.WINDOW_END))
+
+    def test_random_gap_rule(self):
+        # random baseline: entry gap exactly 600s kept, 601s skipped + counted
+        ev, st = self.random_with_spacing(600)
+        self.assertGreater(st["triggers"], 0); self.assertEqual(st["invalid_gap"], 0)
+        self.assertGreater(len(ev), 0)
+        self.assertTrue(all(e["entry_ts"] - e["trigger_ts"] == 600 for e in ev))
+        self.assertFalse(C.gap_report(st)["warning"])
+        ev, st = self.random_with_spacing(601)
+        self.assertGreater(st["triggers"], 0)
+        self.assertEqual(st["invalid_gap"], st["triggers"])     # every random trigger skipped
+        self.assertEqual(ev, [])                                # excluded from returns
+        g = C.gap_report(st); self.assertTrue(g["warning"]); self.assertEqual(g["invalid_gap_frac"], 1.0)
 
 
 class TestCostStats(unittest.TestCase):
@@ -365,6 +411,7 @@ class TestRandomAndRun(unittest.TestCase):
         tr = C.run(path, "train", 268, d, skip_time_check=True)
         self.assertEqual(tr["cut_iso"], "2026-10-22T18:15:12+00:00")
         self.assertIn("entry_gap", tr); self.assertEqual(tr["warnings"], [])
+        self.assertIn("no_valid_post_price", tr); self.assertFalse(tr["no_valid_post_price"]["c4"]["warning"])
         self.assertEqual(tr["entry_gap"]["c4"]["invalid_gap"], 0)
         self.assertGreater(tr["n_c4"], 0); self.assertLess(tr["n_c4"], 80)
 
