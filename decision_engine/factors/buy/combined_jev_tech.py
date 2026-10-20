@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from decision_engine.factors.base import FactorBuyBase
+from decision_engine.strategies.jev_strategy import gate_defaults, jev_gate
 
 
 class CombinedJevTechBuyFactor(FactorBuyBase):
@@ -39,6 +40,9 @@ class CombinedJevTechBuyFactor(FactorBuyBase):
             and vs >= self.min_volume_strength
         ):
             return None
+        why, jx = jev_gate(row, *gate_defaults(None, None))
+        if why is not None:
+            return None
         return {
             "size_pct": self.position_pct,
             "reason": (
@@ -49,4 +53,5 @@ class CombinedJevTechBuyFactor(FactorBuyBase):
             "jev_strength": s,
             "change_5m": c5,
             "volume_strength": vs,
+            **jx,
         }

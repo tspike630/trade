@@ -420,19 +420,20 @@ class IndicatorDataAdapter:
         }
 
     def _attach_jev_stance(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Copy raw jev_signals.stance onto rows as ``jev_stance`` (read-only; None if absent)."""
+        """Copy jev_signals.stance/fetched_at onto rows as ``jev_stance``/``jev_fetched_at`` (read-only)."""
         if not rows or not self._table_exists("jev_signals"):
             return rows
         for r in rows:
             try:
                 got = self.conn.execute(
-                    "SELECT stance FROM jev_signals WHERE chain_id=? AND token_address=? "
+                    "SELECT stance, fetched_at FROM jev_signals WHERE chain_id=? AND token_address=? "
                     "ORDER BY fetched_at DESC LIMIT 1",
                     (r.get("chain_id"), r.get("token_address")),
                 ).fetchone()
             except sqlite3.Error:
                 got = None
             r["jev_stance"] = got[0] if got else None
+            r["jev_fetched_at"] = got[1] if got else None
         return rows
 
     def _attach_liquidity(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

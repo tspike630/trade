@@ -8,6 +8,8 @@ from logging_setup import get_logger
 
 from decision_engine.strategies.base_strategy import BaseStrategy
 
+from decision_engine.strategies.jev_strategy import gate_defaults, jev_gate  # noqa: E402
+
 log = get_logger("decision_engine.combined_strategy")
 
 
@@ -62,6 +64,10 @@ class CombinedJevTechStrategy(BaseStrategy):
                 and c5 >= self.min_change_5m
                 and vs >= self.min_volume_strength
             ):
+                why, jx = jev_gate(row, *gate_defaults(None, None))
+                if why is not None:
+                    log.info("combined jev reject reason=%s token=%s", why, str(row.get("token_address") or "")[:16])
+                    continue
                 hits += 1
                 self.buy(
                     chain_id=str(row.get("chain_id") or ""),
@@ -76,6 +82,7 @@ class CombinedJevTechStrategy(BaseStrategy):
                     jev_strength=s,
                     change_5m=c5,
                     volume_strength=vs,
+                    **jx,
                 )
         signals = self.drain()
         log.info(
