@@ -93,6 +93,13 @@ DECISION_MIN_LIQ_USD = _env_float(os.environ.get("DECISION_MIN_LIQ_USD", "50000"
 # JEV strength strategy defaults
 JEV_MIN_STRENGTH = float(os.environ.get("DECISION_JEV_MIN_STRENGTH", "0.3"))
 JEV_POSITION_PCT = float(os.environ.get("DECISION_JEV_POSITION_PCT", "0.05"))
+# Reject JEV buys whose jev_updated_at (or jev_age_min when the indicator layer
+# provides it) is older than this. 0 disables. Audit 2026-10-21: all 143 paper
+# trades used jev data 48-248h old.
+JEV_MAX_AGE_MIN = float(os.environ.get("DECISION_JEV_MAX_AGE_MIN", "1440"))
+# Require an explicit directional bullish stance in jev_signals; a NOT BULLISH /
+# NEUTRAL / INSUFFICIENT EVIDENCE stance promoted to "bullish" by score band is rejected.
+JEV_REQUIRE_BULLISH_STANCE = os.environ.get("DECISION_JEV_REQUIRE_BULLISH_STANCE", "1") != "0"
 
 # Optional API fallback (Step 1 prefers SQLite; unused unless enabled)
 API_BASE = os.environ.get("DECISION_API_BASE", "http://127.0.0.1:8080").rstrip("/")
