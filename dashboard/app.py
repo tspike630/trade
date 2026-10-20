@@ -43,6 +43,15 @@ from dashboard.panels.shell import (
     session_clock,
 )
 from dashboard.settings import allow_insecure, api_secret, bind_host, db_root, port, read_gates, refresh_seconds
+from dashboard.phase1_counterfactual import (
+    PHASE1_CANDIDATE,
+    PHASE1_CF_NAIL,
+    PHASE1_WINDOW,
+    baseline_line,
+    case_line,
+    honest_line,
+    load_phase1_counterfactual,
+)
 from dashboard.shadow_phase0 import (
     FLAG_LIQ,
     FLAG_R3,
@@ -1169,6 +1178,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                 )
                 _mount_goal_20k(store)
                 _mount_phase0_shadow()
+                _mount_phase1_counterfactual()
                 _mount_m7_shadow(store)
                 _v2_comp(
                     ("回测", "新闻"),
@@ -2473,6 +2483,37 @@ def _mount_phase0_shadow() -> None:
         foot=f"Phase0 双列 · exports/shadow_skip_stop_prone_live.csv · 不 soft-skip · {PHASE0_NAIL}",
         tools=("只读",),
     )
+
+
+def _mount_phase1_counterfactual() -> None:
+    """Read-only OVERVIEW card, directly between the Phase0 dual column and M7."""
+    _v2_comp(
+        ("Phase1", "soft-skip 反事实"),
+        "span-12",
+        _v2_phase1_counterfactual,
+        foot=f"只读旁证 · 不 soft-skip · 不改闸 · {PHASE1_CF_NAIL}",
+        tools=("只读",),
+    )
+
+
+def _v2_phase1_counterfactual() -> None:
+    try:
+        report = load_phase1_counterfactual()
+    except Exception:
+        log.warning("phase1 counterfactual card failed")
+        ui.label("反事实不可读").classes("v2-note")
+        ui.label(PHASE1_CF_NAIL).classes("v2-note")
+        return
+    ui.label(baseline_line(report)).classes("v2-note")
+    for case in report.cases:
+        ui.label(case_line(case)).classes("v2-note")
+    ui.label(honest_line(report)).classes("v2-note")
+    ui.label(PHASE1_WINDOW).classes("v2-note")
+    ui.label(PHASE1_CANDIDATE).classes("v2-note")
+    if report.note:
+        ui.label(report.note).classes("v2-note")
+    ui.label("只读旁证 · 不 soft-skip · 不改闸").classes("v2-note")
+    ui.label(PHASE1_CF_NAIL).classes("v2-note")
 
 
 def _mount_m7_shadow(store: DataStore) -> None:
