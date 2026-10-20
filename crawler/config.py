@@ -188,6 +188,12 @@ HISTORY_HOT_INTERVAL_SEC = int(os.environ.get("HISTORY_HOT_INTERVAL_SEC", "300")
 HISTORY_WARM_INTERVAL_SEC = int(os.environ.get("HISTORY_WARM_INTERVAL_SEC", "1800"))  # ~30 min
 HISTORY_COLD_INTERVAL_SEC = int(os.environ.get("HISTORY_COLD_INTERVAL_SEC", "7200"))
 HISTORY_RETENTION_DAYS = int(os.environ.get("HISTORY_RETENTION_DAYS", "14"))
+# Order-flow history on pair_history: txns m5/h1 buys/sells + volume m5.
+# Taken from the same DexScreener body as the snapshot (no extra API call).
+# 0 = columns still exist but new rows write NULL for them.
+HISTORY_TXN_FLOW = os.environ.get("HISTORY_TXN_FLOW", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 # P2: quality score — alerts below this are stored but Telegram/webhook not pushed
 ALERT_MIN_SCORE = float(os.environ.get("ALERT_MIN_SCORE", "25"))
@@ -311,6 +317,12 @@ JEV_ON_NEW_LISTING = os.environ.get("JEV_ON_NEW_LISTING", "0").strip().lower() i
 JEV_REQUEST_TIMEOUT_SEC = float(os.environ.get("JEV_REQUEST_TIMEOUT_SEC", "30"))
 JEV_RAW_MAX_CHARS = int(os.environ.get("JEV_RAW_MAX_CHARS", "8000"))  # truncate raw JSON
 JEV_PENDING_PATH = os.environ.get("JEV_PENDING_PATH", "exports/jev_pending.jsonl")
+# Refresh/new split for list_due_hot (pinned positions always first).
+JEV_REFRESH_SHARE = float(os.environ.get("JEV_REFRESH_SHARE", "0.5"))
+# Even pacing: minimum seconds between two JEV calls (hard floor 10s => <=6/min).
+JEV_MIN_GAP_SEC = float(os.environ.get("JEV_MIN_GAP_SEC", "10"))
+# Pinned (open position) tokens: max share of slots per pass.
+JEV_PIN_MAX_SHARE = float(os.environ.get("JEV_PIN_MAX_SHARE", "0.3"))
 
 
 # ---------------------------------------------------------------------------
