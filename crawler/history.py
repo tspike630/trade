@@ -105,8 +105,17 @@ def pair_history_column_sql(present: set[str]) -> str:
     return ", ".join(names)
 
 
-def history_tier_for_token(store: Any, chain_id: str, token_address: str | None) -> str:
-    """Map token recency → hot|warm|cold for snapshot cadence."""
+def history_tier_for_token(
+    store: Any, chain_id: str, token_address: str | None, pair_address: str | None = None
+) -> str:
+    """Map token recency → hot|warm|cold for snapshot cadence.
+
+    Open paper positions are pinned hot (PIN_OPEN_POSITIONS_HOT=0 disables).
+    """
+    from position_pin import is_pinned
+
+    if is_pinned(chain_id, token_address, pair_address):
+        return "hot"
     if not token_address:
         return "warm"
     row = store._conn.execute(
@@ -199,7 +208,7 @@ def maybe_snapshot_pair(
         from store import norm_address
 
         tok = norm_address(tok)
-    tier = history_tier_for_token(store, chain_id, tok)
+    tier = history_tier_for_token(store, chain_id, tok, pair_address)
     if not history_due(store, chain_id, pair_address, tier):
         return False
     m = extract_metrics(pair)
