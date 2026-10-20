@@ -28,6 +28,8 @@ import numpy as np
 # ---------------- locked parameters ----------------
 WINDOW_START = "2026-10-20T23:08:00Z"   # 2026-10-21 07:08 HKT
 WINDOW_END = "2026-10-23T23:00:00Z"     # 2026-10-24 07:00 HKT
+# history-only lookback start (6h median / >=30 snapshots); events only from WINDOW_START
+LOOKBACK_START = "2026-10-20T17:08:00Z" # 2026-10-21 01:08 HKT
 BUY_SHARE_MIN = 0.65
 TXNS_M5_MIN = 20
 VOL_MULT = 3.0
@@ -42,8 +44,9 @@ COST_MULT_SENS = 2.0
 RANDOM_SEED = 20261021
 RANDOM_P = 0.05
 # Fixed calendar cut shared by C4 and random baseline (locked, not data-derived):
-# window start 2026-10-21 07:08 HKT + 60% of 71h52m (= 02:15:12), rounded by group to 02:15:00 HKT.
-CUT_ISO = "2026-10-22T18:15:00Z"       # 2026-10-23 02:15:00 HKT
+# window start 2026-10-21 07:08 HKT + 60% of 71h52m = 2026-10-23 02:15:12 HKT (seconds included).
+CUT_ISO = "2026-10-22T18:15:12Z"       # 2026-10-23 02:15:12 HKT
+CUT_TS = None  # set below after _ts is defined
 MAX_ENTRY_GAP_SEC = 600                # entry snapshot must be <= 10 min after trigger snapshot
 GAP_WARN_FRAC = 0.05                   # invalid_gap / triggers above this -> WARNING flag
 MIN_EVENTS = 30
@@ -61,6 +64,7 @@ J_RATIO = 3.0
 J_LIQ_FRAC = 0.25
 
 EXITS = ("tp10_sl5_h60", "time60")
+PRIMARY_EXIT = "tp10_sl5_h60"   # sole verdict exit (gates OOS; Bonferroni 268 cells). time60 = comparison only
 
 
 def _ts(s: str) -> int:
@@ -69,6 +73,9 @@ def _ts(s: str) -> int:
     if d.tzinfo is None:
         d = d.replace(tzinfo=timezone.utc)
     return int(d.timestamp())
+
+
+CUT_TS = _ts(CUT_ISO)
 
 
 def _nan(x) -> float:
@@ -94,8 +101,9 @@ def open_ro(path: str) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
 
 
-def load_pairs(con: sqlite3.Connection, start: str = WINDOW_START, end: str = WINDOW_END) -> list[Pair]:
-    """Load snapshots in [start, end]. Data before start is never used."""
+def load_pairs(con: sqlite3.Connection, start: str = LOOKBACK_START, end: str = WINDOW_END) -> list[Pair]:
+    """Load snapshots in [start, end]. start defaults to LOOKBACK_START (history only);
+    events are restricted to >= WINDOW_START in build_events. Data before start is never used."""
     rows = con.execute(
         """SELECT pair_address, token_address, recorded_at, price_usd, liquidity_usd, fdv, tier,
                   txns_m5_buys, txns_m5_sells, volume_m5
@@ -207,7 +215,14 @@ def simulate(p: Pair, j: int, flags, end_ts: int) -> Optional[dict]:
     if t0 + HOLD_SEC > end_ts:
         return None
     res = {}
-    # tp10/sl5/h60
+    seen = False  # any valid (non-bad) post-entry price within hold
+    for k in range(j + 1, len(p.t)):
+        if p.t[k] > t0 + HOLD_SEC:
+            break
+        if Lrel[k] or not bad[k]:
+            seen = True; break
+    res["_no_valid_post"] = not seen
+    # tp10/sl5/h60 (gap through TP is capped at +10%; SL fills at actual price)
     x = None; why = "hold"; last = e
     for k in range(j + 1, len(p.t)):
         if p.t[k] > t0 + HOLD_SEC:
@@ -240,12 +255,14 @@ def simulate(p: Pair, j: int, flags, end_ts: int) -> Optional[dict]:
     return res
 
 
-def build_events(pairs: list[Pair], kind: str, end_ts: int, seed: int = RANDOM_SEED) -> tuple[list[dict], dict]:
+def build_events(pairs: list[Pair], kind: str, end_ts: int, seed: int = RANDOM_SEED,
+                 event_start_ts: Optional[int] = None) -> tuple[list[dict], dict]:
     """kind='c4' or 'random'. Applies: pool, trigger, next-snapshot entry, liq floor at entry,
     U/L/J entry skip, full hold window, then token 60-min dedup (earliest)."""
     rng = np.random.default_rng(seed)
+    ev0 = _ts(WINDOW_START) if event_start_ts is None else event_start_ts
     cand = []; stats = {"triggers": 0, "invalid_gap": 0, "ulj_skip": 0, "no_next": 0,
-                        "entry_liq_fail": 0, "no_full_hold": 0}
+                        "entry_liq_fail": 0, "no_full_hold": 0, "no_valid_post_price": 0}
     for p in sorted(pairs, key=lambda q: q.pair):
         if len(p.t) < 2:
             continue
@@ -255,6 +272,7 @@ def build_events(pairs: list[Pair], kind: str, end_ts: int, seed: int = RANDOM_S
         else:
             draw = rng.random(len(p.t)) < RANDOM_P
             trig = pm & draw
+        trig = trig & (p.t >= ev0)   # lookback history never produces events
         idx = np.where(trig)[0]
         if not len(idx):
             continue
@@ -274,7 +292,8 @@ def build_events(pairs: list[Pair], kind: str, end_ts: int, seed: int = RANDOM_S
             r = simulate(p, j, flags, end_ts)
             if r is None:
                 stats["no_full_hold"] += 1; continue
-            cand.append(dict(token=p.token, pair=p.pair, trigger_ts=int(p.t[i]), entry_ts=int(p.t[j]),
+            nvp = r.pop("_no_valid_post")
+            cand.append(dict(no_valid_post=bool(nvp), token=p.token, pair=p.pair, trigger_ts=int(p.t[i]), entry_ts=int(p.t[j]),
                              entry_price=float(p.px[j]), entry_liq=float(p.liq[j]),
                              cost=tier_cost(float(p.liq[j])),
                              **{f"ret_{k}": v[0] for k, v in r.items()},
@@ -287,12 +306,13 @@ def build_events(pairs: list[Pair], kind: str, end_ts: int, seed: int = RANDOM_S
             continue
         last[d["token"]] = d["trigger_ts"]; out.append(d)
     out.sort(key=lambda d: d["trigger_ts"])
+    stats["no_valid_post_price"] = sum(1 for d in out if d["no_valid_post"])
     return out, stats
 
 
 def cut_ts() -> int:
-    """Fixed calendar cut (2026-10-23 02:15:00 HKT), identical for C4 and random."""
-    return _ts(CUT_ISO)
+    """Fixed calendar cut (2026-10-23 02:15:12 HKT), identical for C4 and random."""
+    return CUT_TS
 
 
 def gap_report(stats: dict) -> dict:
@@ -366,19 +386,23 @@ def summarize(events, ex):
                 net2x_mean=float(np.mean(n2)), net2x_ci=cluster_ci(events, n2),
                 worst5_mean=float(w.mean()), max_loss=float(srt[0]),
                 collapse=int(sum(e[f"why_{ex}"] == "collapse" for e in events)),
+                no_valid_post_price=int(sum(bool(e.get("no_valid_post")) for e in events)),
+                no_valid_post_share=float(np.mean([bool(e.get("no_valid_post")) for e in events])),
                 top5_share=float(sum(absv[:5]) / sum(absv)) if sum(absv) > 0 else float("nan"))
 
 
 def evaluate(c4_seg, rnd_seg, seg: str, cells: int) -> dict:
     alpha = bonferroni_alpha(cells)
-    res = {"segment": seg, "cells": cells, "alpha_one_sided": alpha,
+    res = {"segment": seg, "cells": cells, "primary_exit": PRIMARY_EXIT, "alpha_one_sided": alpha,
            "valid_c4": valid(c4_seg), "n_c4": len(c4_seg), "n_random": len(rnd_seg), "exits": {}}
     for ex in EXITS:
         r = {"c4": summarize(c4_seg, ex), "random": summarize(rnd_seg, ex)}
         if c4_seg and rnd_seg:
             p, dci = diff_pvalue(c4_seg, [net(e, ex) for e in c4_seg], rnd_seg, [net(e, ex) for e in rnd_seg])
             r["diff_p_one_sided"] = p; r["diff_ci"] = dci
-        if not res["valid_c4"]:
+        if ex != PRIMARY_EXIT:
+            r["pass"] = False; r["verdict"] = "COMPARISON_ONLY (not a verdict exit)"
+        elif not res["valid_c4"]:
             r["pass"] = False; r["verdict"] = "INVALID (<30 events or tokens)"
         elif seg == "train":
             ok = r.get("diff_p_one_sided", 1.0) < alpha and r["c4"]["net_mean"] > 0
@@ -393,7 +417,7 @@ def evaluate(c4_seg, rnd_seg, seg: str, cells: int) -> dict:
 
 # ---------------- CLI ----------------
 def run(db: str, seg: str, cells: int, out_dir: str, train_result: Optional[str] = None,
-        start: str = WINDOW_START, end: str = WINDOW_END, skip_time_check: bool = False,
+        start: str = LOOKBACK_START, end: str = WINDOW_END, skip_time_check: bool = False,
         now_ts: Optional[int] = None) -> dict:
     end_ts = _ts(end)
     now = now_ts if now_ts is not None else int(datetime.now(timezone.utc).timestamp())
@@ -408,8 +432,8 @@ def run(db: str, seg: str, cells: int, out_dir: str, train_result: Optional[str]
             raise SystemExit("refuse: --train-result required for OOS")
         with open(train_result) as fh:
             tr = json.load(fh)
-        if not any(v.get("pass") for v in tr["exits"].values()):
-            raise SystemExit("refuse: no exit passed train; OOS must not be looked at")
+        if not tr.get("exits", {}).get(PRIMARY_EXIT, {}).get("pass"):
+            raise SystemExit(f"refuse: primary exit {PRIMARY_EXIT} did not pass train; OOS must not be looked at")
         with open(marker, "x") as fh:
             fh.write(datetime.now(timezone.utc).isoformat())
     con = open_ro(db)
@@ -419,6 +443,8 @@ def run(db: str, seg: str, cells: int, out_dir: str, train_result: Optional[str]
         con.close()
     c4, s_c4 = build_events(pairs, "c4", end_ts)
     rnd, s_rnd = build_events(pairs, "random", end_ts)
+    for st, evs in ((s_c4, c4), (s_rnd, rnd)):
+        st["no_valid_post_share"] = (st["no_valid_post_price"] / len(evs)) if evs else 0.0
     cut = cut_ts()
     if not c4:
         res = {"segment": seg, "verdict": "INVALID (no C4 events)", "exits": {}}

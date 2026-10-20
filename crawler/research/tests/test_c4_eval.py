@@ -85,13 +85,40 @@ class TestTrigger(unittest.TestCase):
         p, _ = load(s)
         self.assertEqual(list(np.where(C.c4_trigger(p))[0]), [30])
 
-    def test_pre_window_data_ignored(self):
+    def test_lookback_history_used_but_no_events_before_0708(self):
         d = tempfile.mkdtemp(); path = os.path.join(d, "f.db")
-        s = series(60); trigger_at(s, 50)
-        make_db(path, [("p1", "t1", s)], t0=T0 - 40 * STEP)  # first 40 snapshots before window
+        # 01:08 HKT lookback start .. 07:08 HKT = 72 snapshots of history
+        s = series(120); trigger_at(s, 50); trigger_at(s, 85)   # 50 = pre-07:08, 85 = after
+        make_db(path, [("p1", "t1", s)], t0=C._ts(C.LOOKBACK_START))
         p = C.load_pairs(C.open_ro(path))[0]
-        self.assertEqual(len(p.t), 20)
-        self.assertFalse(C.c4_trigger(p).any())
+        self.assertEqual(len(p.t), 120)
+        self.assertEqual(list(np.where(C.c4_trigger(p))[0]), [50, 85])   # history-based trigger computable
+        end = C._ts(C.WINDOW_END)
+        for kind in ("c4", "random"):
+            ev, _ = C.build_events([p], kind, end)
+            self.assertTrue(all(e["trigger_ts"] >= T0 for e in ev), kind)
+        ev, _ = C.build_events([p], "c4", end)
+        self.assertEqual([e["trigger_ts"] for e in ev], [C._ts(C.LOOKBACK_START) + 85 * STEP])
+        # first post-07:08 snapshot already has >=30 prior snapshots thanks to lookback
+        self.assertTrue(C.pool_mask(p)[72])
+
+    def test_data_before_lookback_start_ignored(self):
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db")
+        make_db(path, [("p1", "t1", series(60))], t0=C._ts(C.LOOKBACK_START) - 40 * STEP)
+        self.assertEqual(len(C.load_pairs(C.open_ro(path))[0].t), 20)
+
+    def test_6h_boundary(self):
+        # t-6h included, t excluded: snapshot at exactly t-6h counts toward the 30
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db")
+        con = sqlite3.connect(path); con.execute(SCHEMA)
+        t = T0 + 7 * 3600
+        times = [t - 6 * 3600] + [t - 6 * 3600 + 600 * (k + 1) for k in range(29)] + [t]
+        for ts in times:
+            con.execute("INSERT INTO pair_history(chain_id,pair_address,token_address,recorded_at,price_usd,liquidity_usd,tier,fdv,txns_m5_buys,txns_m5_sells,volume_m5) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        ("solana", "p1", "t1", iso(ts), 1.0, 2e5, "hot", 1e9, 20, 5, 100.0 if ts < t else 1000.0))
+        con.commit(); con.close()
+        p = C.load_pairs(C.open_ro(path))[0]
+        self.assertTrue(C.c4_trigger(p)[30]); self.assertTrue(C.pool_mask(p)[30])
 
 
 class TestPool(unittest.TestCase):
@@ -168,6 +195,22 @@ class TestTrades(unittest.TestCase):
         s = series(140); trigger_at(s, 80); trigger_at(s, 90); trigger_at(s, 92)
         self.assertEqual([e["trigger_ts"] for e in self.ev(s)], [T0 + 80 * STEP, T0 + 92 * STEP])
 
+    def test_no_valid_post_price_settles_at_last_valid_and_counted(self):
+        s = series(); trigger_at(s, 80)
+        for k in range(82, 100): s[k]["px"] = None   # every post-entry tick invalid (U)
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db"); make_db(path, [("p1", "t1", s)])
+        ev, st = C.build_events(C.load_pairs(C.open_ro(path)), "c4", C._ts(C.WINDOW_END))
+        self.assertEqual(len(ev), 1); self.assertTrue(ev[0]["no_valid_post"])
+        self.assertAlmostEqual(ev[0]["ret_tp10_sl5_h60"], 0.0)   # last valid price = entry
+        self.assertEqual(st["no_valid_post_price"], 1)
+        self.assertEqual(C.summarize(ev, "time60")["no_valid_post_price"], 1)
+
+    def test_collapse_counts_as_valid_minus_100(self):
+        s = series(); trigger_at(s, 80)
+        for k in range(82, 100): s[k]["liq"] = 5_000.0
+        e = self.ev(s)[0]
+        self.assertFalse(e["no_valid_post"]); self.assertEqual(e["ret_tp10_sl5_h60"], -1.0)
+
     def test_no_full_hold_excluded(self):
         d = tempfile.mkdtemp(); path = os.path.join(d, "f.db")
         s = series(); trigger_at(s, 95); make_db(path, [("p1", "t1", s)])
@@ -222,7 +265,8 @@ class TestCostStats(unittest.TestCase):
 
     def test_fixed_cut(self):
         cut = C.cut_ts()
-        self.assertEqual(cut, C._ts("2026-10-23T02:15:00+08:00"))
+        self.assertEqual(cut, C._ts("2026-10-23T02:15:12+08:00"))
+        self.assertEqual(C.CUT_TS, C._ts("2026-10-22T18:15:12Z"))
         self.assertFalse(hasattr(C, "CUT_PCT"))
         ev = [{"trigger_ts": cut - 1}, {"trigger_ts": cut}, {"trigger_ts": cut + 1}]
         self.assertEqual(C.segment(ev, cut, "train"), ev[:2]); self.assertEqual(C.segment(ev, cut, "oos"), ev[2:])
@@ -298,7 +342,7 @@ class TestRandomAndRun(unittest.TestCase):
         self.assertIn("cut_iso", tr); self.assertTrue(tr["valid_c4"])
         trp = os.path.join(d, "c4_train_result.json")
         # force pass so the OOS path can be exercised on the fixture
-        j = json.load(open(trp)); j["exits"]["time60"]["pass"] = True; json.dump(j, open(trp, "w"))
+        j = json.load(open(trp)); j["exits"]["tp10_sl5_h60"]["pass"] = True; json.dump(j, open(trp, "w"))
         oos = C.run(path, "oos", 268, d, train_result=trp, skip_time_check=True)
         self.assertEqual(oos["segment"], "oos")
         self.assertTrue(os.path.exists(os.path.join(d, "c4_oos.lock")))
@@ -319,10 +363,23 @@ class TestRandomAndRun(unittest.TestCase):
     def test_split_straddles_fixed_cut_and_reports_gap(self):
         d, path = self.make_many(80, t0=C.cut_ts() - 100 * STEP)
         tr = C.run(path, "train", 268, d, skip_time_check=True)
-        self.assertEqual(tr["cut_iso"], "2026-10-22T18:15:00+00:00")
+        self.assertEqual(tr["cut_iso"], "2026-10-22T18:15:12+00:00")
         self.assertIn("entry_gap", tr); self.assertEqual(tr["warnings"], [])
         self.assertEqual(tr["entry_gap"]["c4"]["invalid_gap"], 0)
         self.assertGreater(tr["n_c4"], 0); self.assertLess(tr["n_c4"], 80)
+
+    def test_time60_cannot_open_oos(self):
+        d, path = self.make_many(80)
+        tr = C.run(path, "train", 268, d, skip_time_check=True)
+        self.assertEqual(tr["primary_exit"], "tp10_sl5_h60")
+        self.assertFalse(tr["exits"]["time60"]["pass"])
+        self.assertTrue(tr["exits"]["time60"]["verdict"].startswith("COMPARISON_ONLY"))
+        trp = os.path.join(d, "c4_train_result.json")
+        j = json.load(open(trp)); j["exits"]["time60"]["pass"] = True; j["exits"]["tp10_sl5_h60"]["pass"] = False
+        json.dump(j, open(trp, "w"))
+        with self.assertRaises(SystemExit):
+            C.run(path, "oos", 268, d, train_result=trp, skip_time_check=True)
+        self.assertFalse(os.path.exists(os.path.join(d, "c4_oos.lock")))
 
     def test_invalid_small_sample(self):
         d, path = self.make_many(10)
