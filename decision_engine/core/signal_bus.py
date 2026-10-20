@@ -43,7 +43,8 @@ _PUBLISH_RETRY_SLEEP_SEC = 0.2
 # purpose enum. Do not reuse mode for this; dry_run covers both producers.
 PURPOSE_SAMPLE = "sample"
 PURPOSE_LIVE_CANDIDATE = "live_candidate"
-PURPOSES = frozenset({PURPOSE_SAMPLE, PURPOSE_LIVE_CANDIDATE})
+PURPOSE_SHADOW_010 = "shadow_010"  # shadow entry book; never paper-eligible (gateway rejects)
+PURPOSES = frozenset({PURPOSE_SAMPLE, PURPOSE_LIVE_CANDIDATE, PURPOSE_SHADOW_010})
 DEFAULT_PURPOSE = PURPOSE_LIVE_CANDIDATE
 
 DECISION_LOG_DDL = """
