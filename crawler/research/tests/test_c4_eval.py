@@ -1,0 +1,277 @@
+"""Unit tests for the locked C4 eval script — SYNTHETIC fixture only (no real DB)."""
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+from datetime import datetime, timezone
+
+import numpy as np
+
+from research import c4_eval as C
+
+T0 = C._ts(C.WINDOW_START)
+STEP = 300  # 5 min
+
+
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+SCHEMA = """CREATE TABLE pair_history (id INTEGER PRIMARY KEY, chain_id TEXT, pair_address TEXT, token_address TEXT,
+ recorded_at TEXT, price_usd REAL, volume_h24 REAL, volume_h1 REAL, liquidity_usd REAL, txns_h24 INTEGER, tier TEXT,
+ market_cap REAL, fdv REAL, txns_m5_buys INTEGER, txns_m5_sells INTEGER, txns_h1_buys INTEGER, txns_h1_sells INTEGER,
+ volume_m5 REAL)"""
+
+
+def series(n=100, px=1.0, liq=200_000.0, buys=10, sells=10, vm5=100.0, tier="hot"):
+    return [dict(px=px, liq=liq, buys=buys, sells=sells, vm5=vm5, tier=tier) for _ in range(n)]
+
+
+def trigger_at(s, i, buys=20, sells=5, vm5=1000.0):
+    s[i].update(buys=buys, sells=sells, vm5=vm5)
+
+
+def make_db(path, pairs, t0=T0):
+    con = sqlite3.connect(path); con.execute(SCHEMA)
+    for name, tok, rows in pairs:
+        for k, r in enumerate(rows):
+            ts = t0 + k * STEP
+            con.execute("INSERT INTO pair_history(chain_id,pair_address,token_address,recorded_at,price_usd,liquidity_usd,tier,fdv,txns_m5_buys,txns_m5_sells,volume_m5) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        ("solana", name, tok, iso(ts), r["px"], r["liq"], r["tier"],
+                         None if r["px"] is None else r["px"] * 1e9, r["buys"], r["sells"], r["vm5"]))
+    con.commit(); con.close()
+
+
+def load(rows, name="p1", tok="t1"):
+    d = tempfile.mkdtemp(); path = os.path.join(d, "f.db")
+    make_db(path, [(name, tok, rows)])
+    return C.load_pairs(C.open_ro(path))[0], path
+
+
+class TestTrigger(unittest.TestCase):
+    def test_basic_trigger(self):
+        s = series(); trigger_at(s, 80)
+        p, _ = load(s)
+        self.assertEqual(list(np.where(C.c4_trigger(p))[0]), [80])
+
+    def test_buy_share_and_txns_thresholds(self):
+        s = series(); trigger_at(s, 80, buys=12, sells=8)   # 0.60 < 0.65
+        trigger_at(s, 85, buys=13, sells=6)                 # 19 txns < 20
+        trigger_at(s, 90, buys=13, sells=7)                 # 0.65, 20 -> trigger
+        p, _ = load(s)
+        self.assertEqual(list(np.where(C.c4_trigger(p))[0]), [90])
+
+    def test_volume_multiple(self):
+        s = series(); trigger_at(s, 80, vm5=299.0); trigger_at(s, 90, vm5=300.0)
+        p, _ = load(s)
+        self.assertEqual(list(np.where(C.c4_trigger(p))[0]), [90])
+
+    def test_null_and_zero_no_trigger(self):
+        s = series(); trigger_at(s, 80); s[80]["buys"] = None
+        trigger_at(s, 85); s[85]["vm5"] = None
+        s[90].update(buys=0, sells=0, vm5=1000.0)
+        p, _ = load(s)
+        self.assertFalse(C.c4_trigger(p).any())
+
+    def test_zero_median_no_trigger(self):
+        s = series(vm5=0.0); trigger_at(s, 80)
+        p, _ = load(s)
+        self.assertFalse(C.c4_trigger(p).any())
+
+    def test_min_nonnull_history(self):
+        s = series(); trigger_at(s, 29)   # only 29 prior snapshots
+        trigger_at(s, 30)
+        p, _ = load(s)
+        self.assertEqual(list(np.where(C.c4_trigger(p))[0]), [30])
+
+    def test_pre_window_data_ignored(self):
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db")
+        s = series(60); trigger_at(s, 50)
+        make_db(path, [("p1", "t1", s)], t0=T0 - 40 * STEP)  # first 40 snapshots before window
+        p = C.load_pairs(C.open_ro(path))[0]
+        self.assertEqual(len(p.t), 20)
+        self.assertFalse(C.c4_trigger(p).any())
+
+
+class TestPool(unittest.TestCase):
+    def test_hot_only(self):
+        s = series(); s[80]["tier"] = "warm"
+        p, _ = load(s)
+        self.assertFalse(C.pool_mask(p)[80]); self.assertTrue(C.pool_mask(p)[81])
+
+    def test_prior_snapshots(self):
+        p, _ = load(series())
+        m = C.pool_mask(p)
+        self.assertFalse(m[29]); self.assertTrue(m[30])
+
+    def test_liq_floor(self):
+        s = series(); s[80]["liq"] = 49_999.0; s[81]["liq"] = None
+        p, _ = load(s)
+        m = C.pool_mask(p)
+        self.assertFalse(m[80]); self.assertFalse(m[81]); self.assertTrue(m[82])
+
+
+class TestULJ(unittest.TestCase):
+    def test_flags(self):
+        s = series()
+        s[50]["liq"] = 500.0            # L abs
+        s[60]["px"] = 10.0; s[60]["liq"] = 200_000.0   # J: x10 price, flat liq
+        s[70]["liq"] = 10_000.0         # L rel (<0.1*median 200k)
+        p, _ = load(s)
+        U, L, Lrel, J = C.ulj_flags(p)
+        self.assertTrue(L[50]); self.assertTrue(J[60]); self.assertTrue(Lrel[70]); self.assertFalse((U | L | J)[40])
+
+    def test_unit_flag(self):
+        s = series(); s[50]["px"] = 1e-20
+        p, _ = load(s)
+        self.assertTrue(C.ulj_flags(p)[0][50])
+
+    def test_entry_skip(self):
+        s = series(); trigger_at(s, 80); s[81]["px"] = 10.0  # entry snapshot J-bad
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db"); make_db(path, [("p1", "t1", s)])
+        ev, st = C.build_events(C.load_pairs(C.open_ro(path)), "c4", C._ts(C.WINDOW_END))
+        self.assertEqual(ev, []); self.assertEqual(st["ulj_skip"], 1)
+
+
+class TestTrades(unittest.TestCase):
+    def ev(self, s):
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db"); make_db(path, [("p1", "t1", s)])
+        return C.build_events(C.load_pairs(C.open_ro(path)), "c4", C._ts(C.WINDOW_END))[0]
+
+    def test_next_snapshot_entry_and_tp(self):
+        s = series(); trigger_at(s, 80); s[80]["px"] = 0.5   # trigger price must NOT be used
+        s[81]["px"] = 1.0; s[83]["px"] = 1.2
+        e = self.ev(s)[0]
+        self.assertEqual(e["entry_price"], 1.0); self.assertEqual(e["entry_ts"], T0 + 81 * STEP)
+        self.assertAlmostEqual(e["ret_tp10_sl5_h60"], 0.10); self.assertEqual(e["why_tp10_sl5_h60"], "tp")
+
+    def test_sl_and_time60(self):
+        s = series(); trigger_at(s, 80); s[83]["px"] = 0.9
+        for k in range(84, 100): s[k]["px"] = 1.02
+        e = self.ev(s)[0]
+        self.assertAlmostEqual(e["ret_tp10_sl5_h60"], -0.10); self.assertEqual(e["why_tp10_sl5_h60"], "sl")
+        self.assertAlmostEqual(e["ret_time60"], 0.02)   # last snapshot within 60 min (k=93)
+
+    def test_collapse(self):
+        s = series(); trigger_at(s, 80); s[85]["liq"] = 5_000.0
+        e = self.ev(s)[0]
+        self.assertEqual(e["ret_tp10_sl5_h60"], -1.0); self.assertEqual(e["ret_time60"], -1.0)
+        self.assertEqual(e["why_time60"], "collapse")
+
+    def test_in_hold_bad_tick_ignored(self):
+        s = series(); trigger_at(s, 80); s[84]["px"] = 10.0  # J spike, ignored
+        e = self.ev(s)[0]
+        self.assertEqual(e["why_tp10_sl5_h60"], "hold"); self.assertAlmostEqual(e["ret_tp10_sl5_h60"], 0.0)
+
+    def test_dedup_60min(self):
+        s = series(140); trigger_at(s, 80); trigger_at(s, 90); trigger_at(s, 92)
+        self.assertEqual([e["trigger_ts"] for e in self.ev(s)], [T0 + 80 * STEP, T0 + 92 * STEP])
+
+    def test_no_full_hold_excluded(self):
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db")
+        s = series(); trigger_at(s, 95); make_db(path, [("p1", "t1", s)])
+        end = T0 + 99 * STEP
+        ev, st = C.build_events(C.load_pairs(C.open_ro(path), C.WINDOW_START, iso(end)), "c4", end)
+        self.assertEqual(ev, []); self.assertEqual(st["no_full_hold"], 1)
+
+
+class TestCostStats(unittest.TestCase):
+    def test_tier_cost(self):
+        self.assertEqual(C.tier_cost(2e6), 0.006); self.assertEqual(C.tier_cost(1e6), 0.02)
+        self.assertEqual(C.tier_cost(5e4), 0.02)
+        e = {"ret_x": 0.1, "cost": 0.02}
+        self.assertAlmostEqual(C.net(e, "x"), 1.1 * 0.98 - 1); self.assertAlmostEqual(C.net(e, "x", 2.0), 1.1 * 0.96 - 1)
+
+    def test_bonferroni(self):
+        self.assertAlmostEqual(C.bonferroni_alpha(268), 0.05 / 268)
+        with self.assertRaises(ValueError): C.bonferroni_alpha(0)
+
+    def test_cut_60pct(self):
+        ev = [{"trigger_ts": t, "token": str(t)} for t in range(100)]
+        cut = C.cut_ts(ev)
+        self.assertAlmostEqual(cut, float(np.percentile(np.arange(100), 60)))
+        self.assertEqual(len(C.segment(ev, cut, "train")), 60); self.assertEqual(len(C.segment(ev, cut, "oos")), 40)
+
+    def test_cluster_bootstrap_and_p(self):
+        a = [{"token": f"a{i%40}"} for i in range(80)]; b = [{"token": f"b{i%40}"} for i in range(80)]
+        p, _ = C.diff_pvalue(a, [0.05] * 80, b, [-0.05] * 80, n_boot=500)
+        self.assertEqual(p, 0.0)
+        p2, _ = C.diff_pvalue(a, [-0.05] * 80, b, [0.05] * 80, n_boot=500)
+        self.assertEqual(p2, 1.0)
+        # clustering: one token dominating -> wide CI
+        ev = [{"token": "x"}] * 50 + [{"token": f"y{i}"} for i in range(30)]
+        lo, hi = C.cluster_ci(ev, [1.0] * 50 + [0.0] * 30, n_boot=500)
+        self.assertLess(lo, 0.3); self.assertGreater(hi, 0.8)
+
+    def test_validity(self):
+        self.assertFalse(C.valid([{"token": "a"}] * 40))
+        self.assertTrue(C.valid([{"token": str(i)} for i in range(30)]))
+        self.assertFalse(C.valid([{"token": str(i)} for i in range(29)]))
+
+
+class TestRandomAndRun(unittest.TestCase):
+    def make_many(self, n_pairs=80, trig=True):
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db"); pairs = []
+        for k in range(n_pairs):
+            s = series(200)
+            if trig:
+                trigger_at(s, 40 + (k * 7) % 140)
+            pairs.append((f"p{k:03d}", f"t{k:03d}", s))
+        make_db(path, pairs); return d, path
+
+    def test_random_same_pool_and_seed(self):
+        d, path = self.make_many(10)
+        pairs = C.load_pairs(C.open_ro(path)); end = C._ts(C.WINDOW_END)
+        a, _ = C.build_events(pairs, "random", end); b, _ = C.build_events(pairs, "random", end)
+        self.assertEqual(a, b)
+        self.assertTrue(len(a) > 0)
+        for e in a:  # pool: entry after >=30 prior snapshots (trigger idx>=30)
+            self.assertGreaterEqual((e["trigger_ts"] - T0) // STEP, 30)
+        c, _ = C.build_events(pairs, "random", end, seed=1)
+        self.assertNotEqual(a, c)
+
+    def test_readonly(self):
+        d, path = self.make_many(2)
+        con = C.open_ro(path)
+        with self.assertRaises(sqlite3.OperationalError):
+            con.execute("INSERT INTO pair_history(pair_address) VALUES ('x')")
+
+    def test_time_check_blinding(self):
+        d, path = self.make_many(2)
+        with self.assertRaises(SystemExit):
+            C.run(path, "train", 268, d, now_ts=C._ts(C.WINDOW_END) - 1)
+
+    def test_train_then_oos_once(self):
+        d, path = self.make_many(80)
+        tr = C.run(path, "train", 268, d, skip_time_check=True)
+        self.assertIn("cut_iso", tr); self.assertTrue(tr["valid_c4"])
+        trp = os.path.join(d, "c4_train_result.json")
+        # force pass so the OOS path can be exercised on the fixture
+        j = json.load(open(trp)); j["exits"]["time60"]["pass"] = True; json.dump(j, open(trp, "w"))
+        oos = C.run(path, "oos", 268, d, train_result=trp, skip_time_check=True)
+        self.assertEqual(oos["segment"], "oos")
+        self.assertTrue(os.path.exists(os.path.join(d, "c4_oos.lock")))
+        with self.assertRaises(SystemExit):
+            C.run(path, "oos", 268, d, train_result=trp, skip_time_check=True)
+
+    def test_oos_refuses_without_train_pass(self):
+        d, path = self.make_many(40)
+        C.run(path, "train", 268, d, skip_time_check=True)
+        trp = os.path.join(d, "c4_train_result.json")
+        j = json.load(open(trp))
+        for v in j["exits"].values(): v["pass"] = False
+        json.dump(j, open(trp, "w"))
+        with self.assertRaises(SystemExit):
+            C.run(path, "oos", 268, d, train_result=trp, skip_time_check=True)
+        self.assertFalse(os.path.exists(os.path.join(d, "c4_oos.lock")))
+
+    def test_invalid_small_sample(self):
+        d, path = self.make_many(10)
+        r = C.run(path, "train", 268, d, skip_time_check=True)
+        self.assertFalse(r["valid_c4"])
+        for v in r["exits"].values(): self.assertFalse(v["pass"])
+
+
+if __name__ == "__main__":
+    unittest.main()
