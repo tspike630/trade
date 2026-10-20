@@ -7,6 +7,7 @@ tables return :class:`DataResult` instead of raising.
 
 from __future__ import annotations
 
+import csv
 import importlib.util
 import logging
 import re
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal, assert_never
 from urllib.parse import quote
 
 from execution.slippage_report import build_report as build_slippage_report
@@ -518,6 +519,57 @@ class GoalPaceReport:
     note: str
 
 
+# M7 shadow register. Observe-only buckets; the live floor stays where it is.
+_M7_S0_MIN = 50_000.0
+_M7_S1_MIN = 100_000.0
+_M7_CSV_NAME = "m7_s0_s1_shadow_register.csv"
+_M7_DB_SOURCE = "decision_log.raw_json.extras.liquidity_usd"
+_M7_PHASE0_KEYS = ("shadow_liq_lt_150k", "shadow_R3", "shadow_skip_stop_prone")
+_M7_LEAK_HINTS = frozenset(
+    {"leak", "leak_below_s0", "liq_<50k", "liq_below_min", "below_s0"}
+)
+_M7_BLANK_WORDS = frozenset({"null", "none", "nan", "na", "n/a"})
+_M7Bucket = Literal["S1", "S0", "liq_missing", "leak"]
+_M7Origin = Literal["csv", "decision_log"]
+
+
+@dataclass(frozen=True)
+class _M7Obs:
+    """One signal before the live_candidate buy filter."""
+
+    decision_id: str | None
+    liq_raw: Any
+    has_liq: bool
+    bucket_hint: str | None
+    purpose: str | None
+    action: str | None
+    phase0: bool
+
+
+@dataclass(frozen=True)
+class M7ShadowReport:
+    """S0 / S1 / liq_missing counts. Not a gate and not a Phase0 score.
+
+    ``would_open_s0`` is S0+S1. ``would_open_s1`` is S1. ``n_leak`` is liquidity
+    below 50k and stays outside the three buckets. ``n_phase0`` only counts
+    rows that also carry a Phase0 flag; the flag does not pick the bucket.
+    """
+
+    n_s1: int
+    n_s0: int
+    n_missing: int
+    n_leak: int
+    n_phase0: int
+    would_open_s0: int
+    would_open_s1: int
+    cohort: str
+    source: str
+    source_kind: _M7Origin
+    counted: int
+    dupes: int
+    note: str
+
+
 _INTEL_HOLDER_SAMPLE = 8
 _INTEL_HOLDER_SHOW = 5
 _INTEL_CROWD_STRATEGY = "jev_strength_v1"
@@ -964,6 +1016,273 @@ def _crowding_line(
     )
 
 
+def _m7_classify(value: Any) -> _M7Bucket:
+    """S1 ≥ 100k, S0 in [50k, 100k), leak below 50k, else liq_missing."""
+    if value is None or isinstance(value, bool):
+        return "liq_missing"
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text or text.lower() in _M7_BLANK_WORDS:
+            return "liq_missing"
+        value = text
+    number = safe_float(value)
+    if number is None:
+        return "liq_missing"
+    if number >= _M7_S1_MIN:
+        return "S1"
+    if number >= _M7_S0_MIN:
+        return "S0"
+    return "leak"
+
+
+def _m7_hint_bucket(hint: str | None) -> _M7Bucket:
+    """Use a CSV bucket only when liq_usd itself is absent. Unknown stays missing."""
+    text = (hint or "").strip()
+    if text == "S1":
+        return "S1"
+    if text == "S0":
+        return "S0"
+    if text == "liq_missing":
+        return "liq_missing"
+    if text.lower() in _M7_LEAK_HINTS:
+        return "leak"
+    return "liq_missing"
+
+
+def _m7_row_bucket(row: _M7Obs) -> _M7Bucket:
+    if row.has_liq:
+        return _m7_classify(row.liq_raw)
+    return _m7_hint_bucket(row.bucket_hint)
+
+
+def _m7_phase0_on(payload: dict[str, Any]) -> bool:
+    for key in _M7_PHASE0_KEYS:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if value is None or value is False or value == 0:
+            continue
+        if isinstance(value, str) and value.strip().lower() in {"", "0", "false", "no", "off"}:
+            continue
+        return True
+    return False
+
+
+def _m7_header_map(fieldnames: list[str] | None) -> dict[str, str]:
+    mapped: dict[str, str] = {}
+    for name in fieldnames or []:
+        if name is None:
+            continue
+        key = str(name).strip().lstrip("\ufeff").lower()
+        if key and key not in mapped:
+            mapped[key] = name
+    return mapped
+
+
+def _m7_cell(row: dict[str, Any], header: dict[str, str], key: str) -> str | None:
+    original = header.get(key)
+    if original is None or original not in row:
+        return None
+    value = row.get(original)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _m7_purpose(cell: str | None, extras: dict[str, Any]) -> str | None:
+    if cell:
+        return cell.strip()
+    if "purpose" in extras and extras.get("purpose") is not None:
+        return str(extras.get("purpose")).strip()
+    if cell is not None:
+        return ""
+    return None
+
+
+def _m7_action(cell: str | None, extras: dict[str, Any]) -> str | None:
+    if cell:
+        return cell.strip().lower() or None
+    if "action" in extras and extras.get("action") is not None:
+        return str(extras.get("action")).strip().lower() or None
+    return None
+
+
+def _m7_obs_from_parts(
+    *,
+    decision_id: str | None,
+    liq_raw: Any,
+    has_liq: bool,
+    bucket_hint: str | None,
+    purpose: str | None,
+    action: str | None,
+    phase0: bool,
+) -> _M7Obs:
+    return _M7Obs(
+        decision_id=decision_id,
+        liq_raw=liq_raw,
+        has_liq=has_liq,
+        bucket_hint=bucket_hint,
+        purpose=purpose,
+        action=action,
+        phase0=phase0,
+    )
+
+
+def _m7_obs_from_raw(raw: dict[str, Any], action: str | None, decision_id: str | None) -> _M7Obs:
+    extras = raw.get("extras")
+    extras_d = extras if isinstance(extras, dict) else {}
+    has_liq = "liquidity_usd" in extras_d
+    purpose = _m7_purpose(None, extras_d)
+    if purpose is None and "purpose" in raw and raw.get("purpose") is not None:
+        purpose = str(raw.get("purpose")).strip()
+    act = _m7_action(None if action is None else str(action), extras_d)
+    return _m7_obs_from_parts(
+        decision_id=decision_id,
+        liq_raw=extras_d.get("liquidity_usd") if has_liq else None,
+        has_liq=has_liq,
+        bucket_hint=None,
+        purpose=purpose,
+        action=act,
+        phase0=_m7_phase0_on(extras_d) or _m7_phase0_on(raw),
+    )
+
+
+def _m7_obs_from_csv(row: dict[str, Any], header: dict[str, str]) -> _M7Obs:
+    extras = parse_json(_m7_cell(row, header, "extras"))
+    has_liq = "liq_usd" in header
+    decision = _m7_cell(row, header, "decision_log_id")
+    phase0 = _m7_phase0_on(extras)
+    if not phase0:
+        for key in _M7_PHASE0_KEYS:
+            cell = _m7_cell(row, header, key.lower())
+            if cell is not None and _m7_phase0_on({key: cell}):
+                phase0 = True
+                break
+    return _m7_obs_from_parts(
+        decision_id=decision or None,
+        liq_raw=_m7_cell(row, header, "liq_usd") if has_liq else None,
+        has_liq=has_liq,
+        bucket_hint=_m7_cell(row, header, "bucket"),
+        purpose=_m7_purpose(_m7_cell(row, header, "purpose"), extras),
+        action=_m7_action(_m7_cell(row, header, "action"), extras),
+        phase0=phase0,
+    )
+
+
+def _m7_read_csv(path: Path) -> tuple[list[_M7Obs], int]:
+    by_id: dict[str, _M7Obs] = {}
+    anon: list[_M7Obs] = []
+    dupes = 0
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        header = _m7_header_map(reader.fieldnames)
+        for raw_row in reader:
+            if raw_row is None:
+                continue
+            if all(not str(value or "").strip() for value in raw_row.values()):
+                continue
+            obs = _m7_obs_from_csv(raw_row, header)
+            if obs.decision_id is None:
+                anon.append(obs)
+                continue
+            if obs.decision_id in by_id:
+                dupes += 1
+            by_id[obs.decision_id] = obs
+    return list(by_id.values()) + anon, dupes
+
+
+def _m7_cohort(rows: list[_M7Obs], *, origin: _M7Origin) -> tuple[list[_M7Obs], str, str]:
+    """Prefer live_candidate buys. A file with no purpose column keeps every row.
+
+    An explicit non-buy is dropped. Rows that never recorded an action stay,
+    because the shadow CSV is the buy register and often has no action column.
+    """
+    if origin == "decision_log":
+        pool = [row for row in rows if row.action == "buy"]
+        action_known = True
+        extra = ""
+    elif any(row.action is not None for row in rows):
+        pool = [row for row in rows if row.action in (None, "buy")]
+        action_known = True
+        extra = ""
+    else:
+        pool = list(rows)
+        action_known = False
+        extra = "CSV 无 action 列，按影簿 buy 计"
+    if any(row.purpose is not None for row in pool):
+        live = [row for row in pool if row.purpose == "live_candidate"]
+        if live:
+            return live, "live_candidate buy", extra
+        if action_known:
+            return pool, "buy（无 live_candidate）", ""
+        return pool, "全表（无 live_candidate）", extra
+    if action_known:
+        return pool, "buy", ""
+    return pool, "csv 全表", extra
+
+
+def _m7_tally(rows: list[_M7Obs]) -> tuple[int, int, int, int, int]:
+    s1 = s0 = missing = leak = phase0 = 0
+    for row in rows:
+        bucket = _m7_row_bucket(row)
+        match bucket:
+            case "S1":
+                s1 += 1
+            case "S0":
+                s0 += 1
+            case "liq_missing":
+                missing += 1
+            case "leak":
+                leak += 1
+            case _ as unreachable:
+                assert_never(unreachable)
+        if row.phase0:
+            phase0 += 1
+    return s1, s0, missing, leak, phase0
+
+
+def _m7_report(
+    rows: list[_M7Obs],
+    dupes: int,
+    *,
+    origin: _M7Origin,
+    source: str,
+    note: str,
+) -> M7ShadowReport:
+    chosen, cohort, cohort_note = _m7_cohort(rows, origin=origin)
+    n_s1, n_s0, n_missing, n_leak, n_phase0 = _m7_tally(chosen)
+    bits: list[str] = []
+    if dupes:
+        bits.append(f"decision_log_id 重复 {dupes} 行，保留末行")
+    if cohort_note:
+        bits.append(cohort_note)
+    if note:
+        bits.append(note)
+    return M7ShadowReport(
+        n_s1=n_s1,
+        n_s0=n_s0,
+        n_missing=n_missing,
+        n_leak=n_leak,
+        n_phase0=n_phase0,
+        would_open_s0=n_s1 + n_s0,
+        would_open_s1=n_s1,
+        cohort=cohort,
+        source=source,
+        source_kind=origin,
+        counted=n_s1 + n_s0 + n_missing + n_leak,
+        dupes=dupes,
+        note=" · ".join(bits),
+    )
+
+
+def _m7_source_label(path: Path) -> str:
+    parts = path.parts
+    if "exports" in parts:
+        index = len(parts) - 1 - parts[::-1].index("exports")
+        return str(Path(*parts[index:]))
+    return path.name
+
+
 class DataStore:
     def __init__(self, paths: DbPaths | None = None) -> None:
         self.paths = paths if paths is not None else DbPaths.from_env()
@@ -1139,6 +1458,21 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed paper_goal_pace: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_goal_pace")
+
+    def m7_shadow_register(self, *, csv_path: Path | None = None) -> DataResult:
+        """Observe-only M7 S0 / S1 / liq_missing counts.
+
+        Prefer ``exports/m7_s0_s1_shadow_register.csv`` when that file exists.
+        Otherwise tally ``decision_log.raw_json.extras.liquidity_usd`` for
+        live_candidate buys. A missing or unreadable CSV does not raise.
+        Does not write the register, the databases, or any gate.
+        """
+        started = time.perf_counter()
+        try:
+            return _finish(self._m7_shadow_register(started, csv_path), "m7_shadow_register")
+        except Exception as exc:
+            log.warning("read failed m7_shadow_register: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "m7_shadow_register")
 
     def risk_daily_loss_today(self) -> DataResult:
 
@@ -2178,6 +2512,132 @@ class DataStore:
             ),
             started,
         )
+
+    def _m7_csv_candidates(self) -> list[Path]:
+        root = db_root()
+        ordered = (
+            root / "exports" / _M7_CSV_NAME,
+            root.parent / "exports" / _M7_CSV_NAME,
+            root / "crawler" / "exports" / _M7_CSV_NAME,
+            self.paths.main.parent / "exports" / _M7_CSV_NAME,
+        )
+        found: list[Path] = []
+        seen: set[str] = set()
+        for path in ordered:
+            try:
+                key = str(path.resolve())
+            except OSError:
+                key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(path)
+        return found
+
+    def _m7_locate_csv(self, csv_path: Path | None) -> Path | None:
+        if csv_path is not None:
+            return csv_path if csv_path.is_file() else None
+        for candidate in self._m7_csv_candidates():
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _m7_from_decision_log(self, started: float, *, source_suffix: str) -> DataResult:
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "decision_log", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "decision_log")
+                absent = _require(cols, ("action", "raw_json"))
+                if absent:
+                    return _unavail(f"{absent}（{path.name}）", started)
+                selected = ["action", "raw_json"]
+                if "id" in cols:
+                    selected.insert(0, "id")
+                fetched = _exec(
+                    conn,
+                    f"SELECT {', '.join(selected)} FROM decision_log",
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        by_id: dict[str, _M7Obs] = {}
+        anon: list[_M7Obs] = []
+        dupes = 0
+        for row in fetched:
+            raw_text = _cell(row, "raw_json")
+            raw = parse_json(None if raw_text is None else str(raw_text))
+            raw_id = _cell(row, "id")
+            decision_id = None if raw_id is None else str(raw_id)
+            action_cell = _cell(row, "action")
+            action = None if action_cell is None else str(action_cell)
+            obs = _m7_obs_from_raw(raw, action, decision_id)
+            if obs.decision_id is None:
+                anon.append(obs)
+                continue
+            if obs.decision_id in by_id:
+                dupes += 1
+            by_id[obs.decision_id] = obs
+        report = _m7_report(
+            list(by_id.values()) + anon,
+            dupes,
+            origin="decision_log",
+            source=_M7_DB_SOURCE + source_suffix,
+            note="",
+        )
+        return _ok(report, started)
+
+    def _m7_shadow_register(self, started: float, csv_path: Path | None) -> DataResult:
+        path = self._m7_locate_csv(csv_path)
+        csv_failed = ""
+        if path is not None:
+            try:
+                rows, dupes = _m7_read_csv(path)
+            except (OSError, UnicodeError, csv.Error) as exc:
+                csv_failed = _safe_exc(exc)
+            else:
+                return _ok(
+                    _m7_report(
+                        rows,
+                        dupes,
+                        origin="csv",
+                        source=_m7_source_label(path),
+                        note="",
+                    ),
+                    started,
+                )
+        suffix = "（CSV 无法读取）" if csv_failed else "（CSV 缺）"
+        db_result = self._m7_from_decision_log(started, source_suffix=suffix)
+        if db_result.available and db_result.data is not None:
+            if csv_failed and isinstance(db_result.data, M7ShadowReport):
+                note = db_result.data.note
+                extra = csv_failed
+                joined = f"{note} · {extra}" if note else extra
+                return _ok(
+                    M7ShadowReport(
+                        n_s1=db_result.data.n_s1,
+                        n_s0=db_result.data.n_s0,
+                        n_missing=db_result.data.n_missing,
+                        n_leak=db_result.data.n_leak,
+                        n_phase0=db_result.data.n_phase0,
+                        would_open_s0=db_result.data.would_open_s0,
+                        would_open_s1=db_result.data.would_open_s1,
+                        cohort=db_result.data.cohort,
+                        source=db_result.data.source,
+                        source_kind=db_result.data.source_kind,
+                        counted=db_result.data.counted,
+                        dupes=db_result.data.dupes,
+                        note=joined,
+                    ),
+                    started,
+                )
+            return db_result
+        if csv_failed:
+            return _unavail(f"CSV 无法读取；{db_result.reason}", started)
+        return _unavail(f"CSV 缺 · {db_result.reason}", started)
 
     def _risk_daily_loss_today(self, started: float) -> DataResult:
         path = self.paths.execution

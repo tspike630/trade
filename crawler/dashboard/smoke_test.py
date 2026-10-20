@@ -8,6 +8,7 @@ missing databases degrade instead of raising. Run from the project root::
 
 from __future__ import annotations
 
+import csv
 import inspect
 from collections.abc import Callable
 import io
@@ -2480,6 +2481,7 @@ class DashboardSmokeTest(unittest.TestCase):
 
         overview = inspect.getsource(app_module._render_dashboard)
         self.assertIn("_mount_phase0_shadow", overview)
+        self.assertIn("_mount_m7_shadow", overview)
         self.assertIn("_mount_goal_20k", overview)
         self.assertIn('("平仓", "旁证")', overview)
         phase_src = inspect.getsource(app_module._mount_phase0_shadow)
@@ -2493,6 +2495,401 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertNotIn("soft_skip", card_src)
         self.assertNotIn('"shadow_R3"', card_src)
         self.assertNotIn("'shadow_R3'", card_src)
+
+    def test_m7_s0_s1_shadow_card(self) -> None:
+        missing_csv = self.root / "no-such-m7.csv"
+        missing = DataStore(
+            DbPaths(
+                main=self.root / "missing-main.db",
+                execution=self.root / "missing-exec.db",
+                paper=self.root / "missing-paper.db",
+                backtest=self.root / "missing-bt.db",
+                news=self.root / "missing-news.db",
+            )
+        )
+        absent = missing.m7_shadow_register(csv_path=missing_csv)
+        self.assertFalse(absent.available)
+        self.assertIn("CSV 缺", absent.reason)
+        self.assertIn("数据库文件不存在", absent.reason)
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root / "empty-root")
+        gap_texts = _rendered_card_texts(lambda: app_module._v2_m7_shadow(missing))
+        os.environ.pop("DASHBOARD_DB_ROOT", None)
+        gap_joined = "\n".join(gap_texts)
+        self.assertIn("CSV 缺", gap_joined)
+        self.assertIn(app_module._M7_NAIL, gap_texts)
+        self.assertIn("S0 历史仅 8 笔对照极薄", gap_joined)
+        self.assertIn("勿用薄样本批改闸", gap_joined)
+        self.assertIn(app_module._M7_PHASE0_NOTE, gap_texts)
+
+        bare = self.root / "bare-m7.db"
+        sqlite3.connect(bare).close()
+        bare_store = DataStore(DbPaths(main=bare, execution=bare, paper=bare, backtest=bare, news=bare))
+        bare_report = bare_store.m7_shadow_register(csv_path=missing_csv)
+        self.assertFalse(bare_report.available, bare_report.reason)
+        self.assertIn("缺少数据表", bare_report.reason)
+
+        thin = self.root / "thin-m7.db"
+        with sqlite3.connect(thin) as conn:
+            conn.execute("CREATE TABLE decision_log (id INTEGER PRIMARY KEY, action TEXT)")
+        thin_store = DataStore(DbPaths(main=thin, execution=thin, paper=thin, backtest=thin, news=thin))
+        thin_report = thin_store.m7_shadow_register(csv_path=missing_csv)
+        self.assertFalse(thin_report.available, thin_report.reason)
+        self.assertIn("raw_json", thin_report.reason)
+
+        def pack(liq: object = "OMIT", purpose: str = "live_candidate", phase0: bool = False) -> str:
+            extras: dict[str, object] = {"purpose": purpose}
+            if liq != "OMIT":
+                extras["liquidity_usd"] = liq
+            if phase0:
+                extras["shadow_liq_lt_150k"] = 1
+                extras["shadow_R3"] = True
+            return json.dumps({"extras": extras})
+
+        main = self.root / "m7-decision.db"
+        with sqlite3.connect(main) as conn:
+            conn.execute(
+                """
+                CREATE TABLE decision_log (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT,
+                    action TEXT,
+                    raw_json TEXT
+                )
+                """
+            )
+            conn.executemany(
+                "INSERT INTO decision_log (id, ts, action, raw_json) VALUES (?, ?, ?, ?)",
+                [
+                    (1, "2026-10-20T00:00:01Z", "buy", pack(100_000)),
+                    (2, "2026-10-20T00:00:02Z", "buy", pack(100_000.5)),
+                    (3, "2026-10-20T00:00:03Z", "buy", pack(" 150000 ")),
+                    (4, "2026-10-20T00:00:04Z", "buy", pack(50_000)),
+                    (5, "2026-10-20T00:00:05Z", "buy", pack(99_999.99)),
+                    (6, "2026-10-20T00:00:06Z", "buy", pack(49_999.99)),
+                    (7, "2026-10-20T00:00:07Z", "buy", pack(None)),
+                    (8, "2026-10-20T00:00:08Z", "buy", pack()),
+                    (9, "2026-10-20T00:00:09Z", "buy", pack("abc")),
+                    (10, "2026-10-20T00:00:10Z", "buy", pack("")),
+                    (11, "2026-10-20T00:00:11Z", "buy", pack(True)),
+                    (12, "2026-10-20T00:00:12Z", "buy", pack("n/a")),
+                    (13, "2026-10-20T00:00:13Z", "buy", pack(120_000, phase0=True)),
+                    (14, "2026-10-20T00:00:14Z", "buy", pack(200_000, purpose="sample")),
+                    (15, "2026-10-20T00:00:15Z", "sell", pack(200_000)),
+                    (16, "2026-10-20T00:00:16Z", "buy", pack(1)),
+                    (17, "2026-10-20T00:00:17Z", "buy", pack(phase0=True)),
+                    (
+                        18,
+                        "2026-10-20T00:00:18Z",
+                        "buy",
+                        json.dumps(
+                            {
+                                "purpose": "live_candidate",
+                                "liquidity": {"usd": 500_000},
+                                "extras": {},
+                            }
+                        ),
+                    ),
+                    (19, "2026-10-20T00:00:19Z", "BUY", pack(180_000)),
+                ],
+            )
+        store = DataStore(DbPaths(main=main, execution=main, paper=main, backtest=main, news=main))
+        before = main.stat().st_mtime_ns
+        fallback = store.m7_shadow_register(csv_path=missing_csv)
+        self.assertTrue(fallback.available, fallback.reason)
+        data = fallback.data
+        self.assertEqual(data.n_s1, 5)
+        self.assertEqual(data.n_s0, 2)
+        self.assertEqual(data.n_missing, 8)
+        self.assertEqual(data.n_leak, 2)
+        self.assertEqual(data.n_phase0, 2)
+        self.assertEqual(data.would_open_s0, 7)
+        self.assertEqual(data.would_open_s1, 5)
+        self.assertEqual(data.cohort, "live_candidate buy")
+        self.assertEqual(data.source_kind, "decision_log")
+        self.assertIn("decision_log.raw_json.extras.liquidity_usd", data.source)
+        self.assertIn("CSV 缺", data.source)
+        self.assertEqual(data.n_s1 + data.n_s0 + data.n_missing, data.counted - data.n_leak)
+        self.assertEqual(main.stat().st_mtime_ns, before)
+
+        def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fields = [
+                "ts",
+                "decision_log_id",
+                "chain",
+                "token",
+                "liq_usd",
+                "bucket",
+                "would_open_S0",
+                "would_open_S1",
+                "extras",
+            ]
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+
+        def extras_for(purpose: str, **flags: object) -> str:
+            payload: dict[str, object] = {"purpose": purpose}
+            payload.update(flags)
+            return json.dumps(payload, separators=(",", ":"))
+
+        register = self.root / "exports" / "m7_s0_s1_shadow_register.csv"
+        csv_rows: list[dict[str, object]] = []
+        for index in range(538):
+            flags = {"shadow_liq_lt_150k": 1} if index == 0 else {}
+            csv_rows.append(
+                {
+                    "ts": "2026-10-20T00:44:22Z",
+                    "decision_log_id": str(index + 1),
+                    "chain": "solana",
+                    "token": "tok",
+                    "liq_usd": "150000" if index else "100,000",
+                    "bucket": "S1",
+                    "would_open_S0": "1",
+                    "would_open_S1": "1",
+                    "extras": extras_for("live_candidate", **flags),
+                }
+            )
+        for index in range(8):
+            csv_rows.append(
+                {
+                    "ts": "2026-10-20T00:50:00Z",
+                    "decision_log_id": str(1000 + index),
+                    "chain": "solana",
+                    "token": "s0",
+                    "liq_usd": "50000" if index == 0 else "99999.99",
+                    "bucket": "S0",
+                    "would_open_S0": "1",
+                    "would_open_S1": "0",
+                    "extras": extras_for("live_candidate", S1_skip=1),
+                }
+            )
+        for index in range(68):
+            flags = {"shadow_R3": 1} if index == 0 else {}
+            csv_rows.append(
+                {
+                    "ts": "2026-10-20T00:55:00Z",
+                    "decision_log_id": str(2000 + index),
+                    "chain": "solana",
+                    "token": "gap",
+                    "liq_usd": "",
+                    "bucket": "S1" if index == 0 else "",
+                    "would_open_S0": "1",
+                    "would_open_S1": "1",
+                    "extras": extras_for("live_candidate", **flags),
+                }
+            )
+        for index, liq in enumerate(("1000", "49999.99", "0")):
+            csv_rows.append(
+                {
+                    "ts": "2026-10-20T01:00:00Z",
+                    "decision_log_id": str(3000 + index),
+                    "chain": "solana",
+                    "token": "leak",
+                    "liq_usd": liq,
+                    "bucket": "liq_below_min",
+                    "would_open_S0": "0",
+                    "would_open_S1": "0",
+                    "extras": extras_for("live_candidate", leak_below_S0=1),
+                }
+            )
+        csv_rows.append(
+            {
+                "ts": "2026-10-20T01:01:00Z",
+                "decision_log_id": "4001",
+                "chain": "solana",
+                "token": "sample",
+                "liq_usd": "250000",
+                "bucket": "S1",
+                "would_open_S0": "1",
+                "would_open_S1": "1",
+                "extras": extras_for("sample"),
+            }
+        )
+        csv_rows.append(
+            {
+                "ts": "2026-10-20T01:02:00Z",
+                "decision_log_id": "4002",
+                "chain": "solana",
+                "token": "sell",
+                "liq_usd": "250000",
+                "bucket": "S1",
+                "would_open_S0": "1",
+                "would_open_S1": "1",
+                "extras": extras_for("live_candidate", action="sell"),
+            }
+        )
+        write_csv(register, csv_rows)
+        before_csv = main.stat().st_mtime_ns
+        cross = store.m7_shadow_register(csv_path=register)
+        self.assertTrue(cross.available, cross.reason)
+        book = cross.data
+        self.assertEqual(book.n_s1, 538)
+        self.assertEqual(book.n_s0, 8)
+        self.assertEqual(book.n_missing, 68)
+        self.assertEqual(book.n_leak, 3)
+        self.assertEqual(book.would_open_s0, 546)
+        self.assertEqual(book.would_open_s1, 538)
+        self.assertEqual(book.n_phase0, 2)
+        self.assertEqual(book.cohort, "live_candidate buy")
+        self.assertEqual(book.source_kind, "csv")
+        self.assertEqual(book.source, "exports/m7_s0_s1_shadow_register.csv")
+        self.assertEqual(main.stat().st_mtime_ns, before_csv)
+
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+        discovered = store.m7_shadow_register()
+        self.assertTrue(discovered.available, discovered.reason)
+        self.assertEqual(discovered.data.n_s1, 538)
+        self.assertEqual(discovered.data.n_s0, 8)
+        self.assertEqual(discovered.data.n_missing, 68)
+        self.assertEqual(discovered.data.source_kind, "csv")
+
+        nested = self.root / "pkg"
+        os.environ["DASHBOARD_DB_ROOT"] = str(nested)
+        from_parent = store.m7_shadow_register()
+        self.assertEqual(from_parent.data.source_kind, "csv")
+        self.assertEqual(from_parent.data.n_s1, 538)
+        nearer = nested / "exports" / "m7_s0_s1_shadow_register.csv"
+        write_csv(
+            nearer,
+            [
+                {
+                    "ts": "2026-10-20T02:00:00Z",
+                    "decision_log_id": "1",
+                    "chain": "solana",
+                    "token": "only",
+                    "liq_usd": "60000",
+                    "bucket": "S1",
+                    "would_open_S0": "1",
+                    "would_open_S1": "1",
+                    "extras": extras_for("live_candidate"),
+                }
+            ],
+        )
+        preferred = store.m7_shadow_register()
+        self.assertEqual(preferred.data.n_s0, 1)
+        self.assertEqual(preferred.data.n_s1, 0)
+        self.assertEqual(preferred.data.would_open_s1, 0)
+        self.assertEqual(preferred.data.source, "exports/m7_s0_s1_shadow_register.csv")
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+
+        header_only = self.root / "empty-m7.csv"
+        header_only.write_text(
+            "ts,decision_log_id,liq_usd,bucket,extras\n",
+            encoding="utf-8",
+        )
+        empty = store.m7_shadow_register(csv_path=header_only)
+        self.assertTrue(empty.available, empty.reason)
+        self.assertEqual(empty.data.n_s1, 0)
+        self.assertEqual(empty.data.n_s0, 0)
+        self.assertEqual(empty.data.n_missing, 0)
+        self.assertEqual(empty.data.n_leak, 0)
+        self.assertEqual(empty.data.source_kind, "csv")
+        self.assertEqual(main.stat().st_mtime_ns, before_csv)
+
+        broken = self.root / "broken-m7.csv"
+        broken.write_bytes(b"\xff\xfe not a csv")
+        rescued = store.m7_shadow_register(csv_path=broken)
+        self.assertTrue(rescued.available, rescued.reason)
+        self.assertEqual(rescued.data.source_kind, "decision_log")
+        self.assertIn("CSV 无法读取", rescued.data.source)
+        self.assertEqual(rescued.data.n_s1, 5)
+
+        hinted = self.root / "hint-m7.csv"
+        hinted.write_text(
+            "decision_log_id,bucket,extras\n"
+            '1,S0,"{""purpose"":""live_candidate""}"\n'
+            '2,leak,"{""purpose"":""live_candidate""}"\n'
+            '3,liq_missing,"{""purpose"":""live_candidate""}"\n'
+            '4,S1,"{""purpose"":""live_candidate""}"\n'
+            '5,liq_<50k,"{""purpose"":""live_candidate""}"\n',
+            encoding="utf-8",
+        )
+        hints = store.m7_shadow_register(csv_path=hinted)
+        self.assertEqual(hints.data.n_s0, 1)
+        self.assertEqual(hints.data.n_s1, 1)
+        self.assertEqual(hints.data.n_missing, 1)
+        self.assertEqual(hints.data.n_leak, 2)
+        self.assertIn("CSV 无 action 列", hints.data.note)
+
+        duped = self.root / "dupe-m7.csv"
+        write_csv(
+            duped,
+            [
+                {
+                    "ts": "2026-10-20T03:00:00Z",
+                    "decision_log_id": "9",
+                    "chain": "solana",
+                    "token": "a",
+                    "liq_usd": "60000",
+                    "bucket": "S0",
+                    "would_open_S0": "1",
+                    "would_open_S1": "0",
+                    "extras": extras_for("live_candidate"),
+                },
+                {
+                    "ts": "2026-10-20T03:01:00Z",
+                    "decision_log_id": "9",
+                    "chain": "solana",
+                    "token": "a",
+                    "liq_usd": "150000",
+                    "bucket": "S0",
+                    "would_open_S0": "1",
+                    "would_open_S1": "0",
+                    "extras": extras_for("live_candidate"),
+                },
+            ],
+        )
+        deduped = store.m7_shadow_register(csv_path=duped)
+        self.assertEqual(deduped.data.n_s1, 1)
+        self.assertEqual(deduped.data.n_s0, 0)
+        self.assertEqual(deduped.data.dupes, 1)
+        self.assertIn("保留末行", deduped.data.note)
+
+        corrupt = self.root / "corrupt-m7.db"
+        corrupt.write_text("{not json and not sqlite", encoding="utf-8")
+        corrupt_store = DataStore(
+            DbPaths(main=corrupt, execution=corrupt, paper=corrupt, backtest=corrupt, news=corrupt)
+        )
+        corrupt_report = corrupt_store.m7_shadow_register(csv_path=missing_csv)
+        self.assertFalse(corrupt_report.available, corrupt_report.reason)
+        self.assertIn("查询失败", corrupt_report.reason)
+        self.assertIn("CSV 缺", corrupt_report.reason)
+
+        texts = _rendered_card_texts(lambda: app_module._mount_m7_shadow(store))
+        self.assertIn("M7", texts)
+        self.assertIn("S0|S1|liq_missing", texts)
+        self.assertEqual(texts[texts.index("S1") + 1], "538")
+        self.assertEqual(texts[texts.index("S0") + 1], "8")
+        self.assertEqual(texts[texts.index("liq_missing") + 1], "68")
+        self.assertEqual(texts[texts.index("would_open_S0") + 1], "546")
+        self.assertEqual(texts[texts.index("would_open_S1") + 1], "538")
+        self.assertEqual(texts[texts.index("leak") + 1], "3")
+        self.assertEqual(texts[texts.index("Phase0") + 1], "2")
+        joined = "\n".join(texts)
+        self.assertIn("live_candidate buy", joined)
+        self.assertIn("exports/m7_s0_s1_shadow_register.csv", joined)
+        self.assertIn("leak 不并进 S0 / S1 / liq_missing", joined)
+        self.assertIn(app_module._M7_NAIL, joined)
+        self.assertIn("影簿≠已改闸", joined)
+        self.assertIn("不算有效性", joined)
+        self.assertNotIn("低于门槛", joined)
+
+        overview = inspect.getsource(app_module._render_dashboard)
+        self.assertIn("_mount_m7_shadow", overview)
+        self.assertIn("_mount_phase0_shadow", overview)
+        card_src = inspect.getsource(app_module._v2_m7_shadow)
+        self.assertIn("_M7_NAIL", card_src)
+        self.assertIn("liq_missing", card_src)
+        self.assertIn("would_open_S0", card_src)
+        self.assertNotIn("place_order", card_src)
+        self.assertNotIn("低于门槛", card_src)
+        self.assertEqual(
+            app_module._M7_NAIL,
+            "影簿≠已改闸 · S0 历史仅 8 笔对照极薄 · 勿用薄样本批改闸",
+        )
+        os.environ.pop("DASHBOARD_DB_ROOT", None)
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
