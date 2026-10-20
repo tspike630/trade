@@ -38,6 +38,8 @@ from execution.c_exit_shadow_ledger import (  # noqa: E402
 )
 from execution.gateway import (  # noqa: E402
     PURPOSE_LIVE_CANDIDATE,
+    jev_guard_enabled,
+    jev_guard_reason,
     parse_decision_row,
     purpose_reject_reason,
     read_decision_purpose,
@@ -204,6 +206,7 @@ def process_once(
     skipped = 0
     raw_buys = 0
     dedup_skipped = 0
+    jev_rejected: dict[str, int] = {}
     last_id = since
 
     for row in rows:
@@ -222,6 +225,13 @@ def process_once(
         if action != "buy":
             skipped += 1
             continue
+        if jev_guard_enabled():
+            jev_reason = jev_guard_reason(sig.get("extras"))
+            if jev_reason is not None:
+                skipped += 1
+                jev_rejected[jev_reason] = jev_rejected.get(jev_reason, 0) + 1
+                log.info("shadow jev guard reject decision_id=%s reason=%s", last_id, jev_reason)
+                continue
         chain_id = norm_chain(sig.get("chain_id") or "")
         pair = norm_address(sig.get("pair_address") or "")
         token = sig.get("token_address")
@@ -358,6 +368,7 @@ def process_once(
         "opened": opened,
         "raw_buys": raw_buys,
         "dedup_skipped": dedup_skipped,
+        "jev_rejected": jev_rejected,
         "cursor": ledger.get_last_processed_id(),
         "tick_closed": tick_closed,
     }

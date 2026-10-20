@@ -161,6 +161,43 @@ def paper_open_paused(flag: str | Path | None = None) -> bool:
     return path.exists()
 
 
+JEV_STALE = "jev_stale"
+JEV_AGE_MISSING = "jev_age_missing"
+JEV_STANCE_NOT_BULLISH = "jev_stance_not_bullish"
+JEV_MAX_AGE_MIN = 1440.0
+_JEV_REASONS = (JEV_STALE, JEV_AGE_MISSING, JEV_STANCE_NOT_BULLISH)
+
+
+def jev_guard_enabled() -> bool:
+    """EXECUTION_JEV_GUARD, default on."""
+    return _env_bool("EXECUTION_JEV_GUARD", True)
+
+
+def jev_guard_reason(extras: dict[str, Any] | None) -> str | None:
+    """Backstop on buy signals from decision extras (jev_age_min / jev_stance_raw).
+
+    * jev_age_min missing / blank / unparsable -> jev_age_missing
+    * jev_age_min > 1440                       -> jev_stale
+    * jev_stance_raw present and != BULLISH    -> jev_stance_not_bullish
+    """
+    ex = extras if isinstance(extras, dict) else {}
+    age = ex.get("jev_age_min")
+    if age is None or (isinstance(age, str) and not age.strip()):
+        return JEV_AGE_MISSING
+    try:
+        age_f = float(age)
+    except (TypeError, ValueError):
+        return JEV_AGE_MISSING
+    if age_f != age_f:  # NaN
+        return JEV_AGE_MISSING
+    if age_f > JEV_MAX_AGE_MIN:
+        return JEV_STALE
+    if "jev_stance_raw" in ex and ex.get("jev_stance_raw") is not None:
+        if str(ex.get("jev_stance_raw")).strip().upper() != "BULLISH":
+            return JEV_STANCE_NOT_BULLISH
+    return None
+
+
 def purpose_reject_reason(purpose: str | None) -> str | None:
     """None only for executable ``live_candidate``. Otherwise a reject code.
 
@@ -910,6 +947,8 @@ class ExecutionGateway:
             "note": (
                 "paper open paused (flag); not executed"
                 if reason == PAPER_OPEN_PAUSED_REASON
+                else "jev guard; not executed"
+                if reason in _JEV_REASONS
                 else "purpose gate; not executed"
             ),
             "paper_enabled": self.paper_enabled,
@@ -988,6 +1027,13 @@ class ExecutionGateway:
                 and paper_open_paused()
             ):
                 return self._reject_purpose(sig, PAPER_OPEN_PAUSED_REASON)
+            if (
+                str(sig.get("action") or "").strip().lower() == "buy"
+                and jev_guard_enabled()
+            ):
+                jev_reason = jev_guard_reason(sig.get("extras"))
+                if jev_reason is not None:
+                    return self._reject_purpose(sig, jev_reason)
             return self._process_one_claimed(sig)
         except Exception as exc:  # noqa: BLE001 — bad message must not wedge the cursor
             log.exception(
