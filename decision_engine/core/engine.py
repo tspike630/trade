@@ -24,12 +24,14 @@ class DecisionEngine:
         *,
         risk: RiskManager | None = None,
         hot_limit: int = 50,
+        token_cooldown: Any = None,
     ):
         self.adapter = adapter
         self.bus = bus
         self.strategies = strategies
         self.risk = risk or RiskManager()
         self.hot_limit = hot_limit
+        self.token_cooldown = token_cooldown
         self.tick_count = 0
         resolved = getattr(adapter, "db_path", None)
         if resolved is not None:
@@ -76,6 +78,8 @@ class DecisionEngine:
         # Also stamp pairCreatedAt (ms) for decision_log extras / token_age.
         self._stamp_buy_liquidity(candidates, hot)
         passed = self.risk.filter(candidates)
+        if self.token_cooldown is not None:
+            passed = self.token_cooldown.filter(passed)
         emitted = self.bus.publish_many(passed)
         log.info(
             "tick#%s candidates=%s emitted=%s",

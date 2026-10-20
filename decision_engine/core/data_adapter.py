@@ -33,6 +33,8 @@ _INDICATOR_COLS = (
     "jev_signal",
     "jev_confidence",
     "jev_strength",
+    "jev_updated_at",
+    "jev_age_min",
     "tier",
     "primary_pair_address",
     "updated_at",
@@ -291,7 +293,7 @@ class IndicatorDataAdapter:
                 "on" if join_seen else "missing",
                 "on" if has_tech else "missing",
             )
-            return self._attach_liquidity([dict(r) for r in rows])
+            return self._attach_jev_stance(self._attach_liquidity([dict(r) for r in rows]))
 
         if n_hot > 0:
             log.info(
@@ -316,7 +318,7 @@ class IndicatorDataAdapter:
             limit,
             len(rows),
         )
-        return self._attach_liquidity([dict(r) for r in rows])
+        return self._attach_jev_stance(self._attach_liquidity([dict(r) for r in rows]))
 
     def get_indicators(self, chain_id: str, token_address: str) -> dict[str, Any] | None:
         if not self._table_exists("token_indicators"):
@@ -416,6 +418,23 @@ class IndicatorDataAdapter:
             key: meta.get("liquidity_usd")
             for key, meta in self._pair_meta_by_pair(keys).items()
         }
+
+    def _attach_jev_stance(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Copy jev_signals.stance/fetched_at onto rows as ``jev_stance``/``jev_fetched_at`` (read-only)."""
+        if not rows or not self._table_exists("jev_signals"):
+            return rows
+        for r in rows:
+            try:
+                got = self.conn.execute(
+                    "SELECT stance, fetched_at FROM jev_signals WHERE chain_id=? AND token_address=? "
+                    "ORDER BY fetched_at DESC LIMIT 1",
+                    (r.get("chain_id"), r.get("token_address")),
+                ).fetchone()
+            except sqlite3.Error:
+                got = None
+            r["jev_stance"] = got[0] if got else None
+            r["jev_fetched_at"] = got[1] if got else None
+        return rows
 
     def _attach_liquidity(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Set liquidity_usd (+ pair_created_at when known) on scanned indicator rows.
