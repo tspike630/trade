@@ -34,6 +34,8 @@ from dashboard.data import (
     GOAL_DEADLINE_DAY,
     GOAL_START_DAY,
     GOAL_TARGET_USD,
+    KPI_DAILY_LOSS_LINE_USD,
+    KPI_WINDOW_DAYS,
     DataStore,
     DbPaths,
     _WRITE_RE,
@@ -2352,7 +2354,7 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertAlmostEqual(partial.data.equity_usd, 1000)
         self.assertIn("未计入名义", partial.data.note)
 
-        texts = _rendered_card_texts(lambda: app_module._mount_goal_20k(store))
+        texts = _rendered_card_texts(lambda: app_module._mount_goal_20k(store, now=start))
         self.assertIn("距", texts)
         self.assertIn("$20k", texts)
         self.assertEqual(texts[texts.index("权益粗算") + 1], "$8,704")
@@ -2391,6 +2393,338 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("权益粗算", ended_texts)
         self.assertEqual(ended_texts[ended_texts.index("缺口") + 1], "-$1,000")
         self.assertIn(app_module._GOAL_NAIL, ended_texts)
+
+    def test_kpi_reverse_card_renders(self) -> None:
+        self.assertEqual(KPI_DAILY_LOSS_LINE_USD, 200.0)
+        self.assertEqual(KPI_WINDOW_DAYS, 7)
+        self.assertEqual(
+            app_module._KPI_NAIL,
+            "只读倒推 · 不改闸 · 不改 .env · 开杠杆由五层互批",
+        )
+        cases = [name for name in DashboardSmokeTest.__dict__ if name.startswith("test_")]
+        self.assertEqual(len(cases), 28)
+
+        missing = DataStore(
+            DbPaths(
+                main=self.root / "missing-kpi-main.db",
+                execution=self.root / "missing-kpi-exec.db",
+                paper=self.root / "missing-kpi-paper.db",
+                backtest=self.root / "missing-kpi-bt.db",
+                news=self.root / "missing-kpi-news.db",
+            )
+        )
+        absent = missing.paper_kpi_reverse()
+        self.assertFalse(absent.available)
+        self.assertIn("数据库文件不存在", absent.reason)
+        gap_texts = _rendered_card_texts(lambda: app_module._mount_kpi_reverse(missing))
+        self.assertIn("数据库文件不存在", "\n".join(gap_texts))
+        self.assertIn(app_module._KPI_NAIL, gap_texts)
+        self.assertNotIn("负期望 × 杠杆 = 放大亏损", gap_texts)
+
+        bare = self.root / "bare-kpi.db"
+        sqlite3.connect(bare).close()
+        bare_store = DataStore(
+            DbPaths(main=bare, execution=bare, paper=bare, backtest=bare, news=bare)
+        )
+        bare_kpi = bare_store.paper_kpi_reverse()
+        self.assertFalse(bare_kpi.available, bare_kpi.reason)
+        self.assertIn("缺少数据表", bare_kpi.reason)
+
+        corrupt = self.root / "corrupt-kpi.db"
+        corrupt.write_text("{not json and not sqlite", encoding="utf-8")
+        corrupt_store = DataStore(
+            DbPaths(main=corrupt, execution=corrupt, paper=corrupt, backtest=corrupt, news=corrupt)
+        )
+        corrupt_kpi = corrupt_store.paper_kpi_reverse()
+        self.assertFalse(corrupt_kpi.available, corrupt_kpi.reason)
+        self.assertIn("查询失败", corrupt_kpi.reason)
+
+        def _store(name: str, rows: list[tuple[object, ...]], *, cash: float = 8000.0) -> DataStore:
+            path = self.root / name
+            with sqlite3.connect(path) as conn:
+                conn.execute("CREATE TABLE account (id INTEGER PRIMARY KEY, cash_usd REAL)")
+                conn.execute("INSERT INTO account (id, cash_usd) VALUES (1, ?)", (cash,))
+                conn.execute(
+                    """
+                    CREATE TABLE positions (
+                        id TEXT PRIMARY KEY,
+                        size_usd REAL,
+                        status TEXT,
+                        closed_at TEXT,
+                        pnl_usd REAL,
+                        sl_pct REAL
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO positions (id, size_usd, status, closed_at, pnl_usd, sl_pct)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+            return DataStore(DbPaths(main=path, execution=path, paper=path, backtest=path, news=path))
+
+        hkt = ZoneInfo("Asia/Hong_Kong")
+        start = datetime(2026, 10, 20, 4, 0, tzinfo=hkt)
+        happy_rows = [
+            ("open-a", 450, "open", None, None, 5),
+            ("open-b", 254, "OPEN", "", None, 4),
+            ("c1", 4000, "closed", "2026-10-19T16:30:00Z", -30, 5),
+            ("c2", 100, "closed", "2026-10-13T16:00:00Z", -10, 5),
+            ("c3", 80, "closed", "2026-10-13T15:59:00Z", 5, 5),
+            ("c4", 80, "closed", "2026-10-20T15:00:00Z", -5, 5),
+            ("cancel", 9999, "cancelled", None, -999, 50),
+        ]
+        store = _store("kpi-happy.db", happy_rows)
+        paper = self.root / "kpi-happy.db"
+        before = paper.stat().st_mtime_ns
+        report = store.paper_kpi_reverse(now=start)
+        self.assertTrue(report.available, report.reason)
+        self.assertEqual(paper.stat().st_mtime_ns, before)
+        data = report.data
+        self.assertAlmostEqual(data.gap_usd, 11_296)
+        self.assertEqual(data.days_left, 10)
+        self.assertAlmostEqual(data.daily_need_usd or 0, 1129.6)
+        self.assertEqual(data.as_of_day, "2026-10-20")
+        self.assertEqual(data.closed_n, 4)
+        self.assertAlmostEqual(data.pnl_sum_usd or 0, -40)
+        self.assertAlmostEqual(data.avg_pnl_usd or 0, -10)
+        self.assertAlmostEqual(data.avg_closes_per_day or 0, round(3 / 7, 4))
+        self.assertEqual(data.window_days, 7)
+        self.assertTrue(data.negative_expectancy)
+        self.assertEqual(data.daily_loss_line_usd, 200.0)
+        self.assertAlmostEqual(data.max_stop_usd or 0, 200.0)
+        self.assertEqual(data.gap_note, "")
+        labels = [row.label for row in data.pace_rows]
+        self.assertEqual(labels, ["近7日", "5", "10", "20"])
+        by_label = {row.label: row for row in data.pace_rows}
+        self.assertAlmostEqual(by_label["近7日"].closes_per_day or 0, 0.4286)
+        self.assertAlmostEqual(by_label["近7日"].need_per_trade_usd or 0, round(1129.6 / 0.4286, 4))
+        self.assertEqual(by_label["近7日"].contrast, "符号相反")
+        self.assertAlmostEqual(by_label["5"].need_per_trade_usd or 0, 225.92)
+        self.assertEqual(by_label["5"].contrast, "符号相反")
+        self.assertAlmostEqual(by_label["10"].need_per_trade_usd or 0, 112.96)
+        self.assertAlmostEqual(by_label["20"].need_per_trade_usd or 0, 56.48)
+        self.assertEqual(by_label["20"].live_avg_pnl_usd, -10)
+        steps = {row.multiple: row for row in data.leverage_rows}
+        self.assertEqual(sorted(steps), [1, 2, 3])
+        self.assertAlmostEqual(steps[1].stop_usd or 0, 200.0)
+        self.assertEqual(steps[1].vs_line, "触线")
+        self.assertAlmostEqual(steps[2].stop_usd or 0, 400.0)
+        self.assertEqual(steps[2].vs_line, "超线")
+        self.assertAlmostEqual(steps[3].stop_usd or 0, 600.0)
+        self.assertEqual(steps[3].vs_line, "超线")
+
+        eve = store.paper_kpi_reverse(now=datetime(2026, 10, 13, 15, 59, tzinfo=timezone.utc))
+        self.assertEqual(eve.data.as_of_day, "2026-10-13")
+        self.assertAlmostEqual(eve.data.avg_closes_per_day or 0, round(1 / 7, 4))
+        opened = store.paper_kpi_reverse(now=datetime(2026, 10, 13, 16, 0, tzinfo=timezone.utc))
+        self.assertEqual(opened.data.as_of_day, "2026-10-14")
+        self.assertAlmostEqual(opened.data.avg_closes_per_day or 0, round(2 / 7, 4))
+
+        texts = _rendered_card_texts(lambda: app_module._mount_kpi_reverse(store, now=start))
+        self.assertIn("KPI", texts)
+        self.assertIn("倒推", texts)
+        self.assertEqual(texts[texts.index("缺口") + 1], "+$11,296.00")
+        self.assertEqual(texts[texts.index("剩余天") + 1], "10")
+        self.assertEqual(texts[texts.index("日需") + 1], "+$1,129.60")
+        self.assertEqual(texts[texts.index("已平") + 1], "4")
+        self.assertEqual(texts[texts.index("每笔均") + 1], "-$10.00")
+        self.assertEqual(texts[texts.index("近7日均笔") + 1], "0.4286")
+        near = texts.index("近7日 0.4286")
+        self.assertEqual(texts[near + 1], "+$2,635.56")
+        self.assertEqual(texts[near + 2], "-$10.00")
+        self.assertEqual(texts[near + 3], "符号相反")
+        five = texts.index("5 笔")
+        self.assertEqual(texts[five + 1], "+$225.92")
+        self.assertEqual(texts[five + 3], "符号相反")
+        joined = "\n".join(texts)
+        self.assertIn("负期望 × 杠杆 = 放大亏损", joined)
+        self.assertIn("单笔最大止损 $200.00", joined)
+        self.assertIn("1× $200.00 · 日亏线 $200 · 触线", joined)
+        self.assertIn("2× $400.00 · 日亏线 $200 · 超线", joined)
+        self.assertIn("3× $600.00 · 日亏线 $200 · 超线", joined)
+        self.assertIn("止损 = size_usd×sl_pct/100 · 不含撤单", joined)
+        self.assertIn("近7个 HKT 日含零成交日", joined)
+        self.assertIn("口径日 2026-10-20 HKT", joined)
+        self.assertIn("硬 KPI 倒推", joined)
+        self.assertIn("截止 2026-10-30 HKT", joined)
+        self.assertIn(app_module._KPI_NAIL, joined)
+        self.assertNotIn("$999", joined)
+
+        deadline = datetime(2026, 10, 30, 0, 0, tzinfo=hkt)
+        ended = store.paper_kpi_reverse(now=deadline)
+        self.assertEqual(ended.data.days_left, 0)
+        self.assertIsNone(ended.data.daily_need_usd)
+        self.assertTrue(all(row.need_per_trade_usd is None for row in ended.data.pace_rows))
+        self.assertTrue(all(row.contrast == "" for row in ended.data.pace_rows))
+        self.assertTrue(ended.data.negative_expectancy)
+        ended_texts = _rendered_card_texts(lambda: app_module._v2_kpi_reverse(store, now=deadline))
+        self.assertEqual(ended_texts[ended_texts.index("剩余天") + 1], "0")
+        self.assertEqual(ended_texts[ended_texts.index("日需") + 1], "—")
+        self.assertIn("负期望 × 杠杆 = 放大亏损", ended_texts)
+        self.assertIn(app_module._KPI_NAIL, ended_texts)
+
+        positive_rows = [
+            ("open-a", 450, "open", None, None, 5),
+            ("open-b", 254, "OPEN", "", None, 4),
+            ("p1", 50, "closed", "2026-10-20T01:00:00Z", 30, 5),
+            ("p2", 50, "closed", "2026-10-14T00:00:00Z", 10, 5),
+        ]
+        positive = _store("kpi-positive.db", positive_rows)
+        pos = positive.paper_kpi_reverse(now=start)
+        self.assertTrue(pos.available, pos.reason)
+        self.assertAlmostEqual(pos.data.avg_pnl_usd or 0, 20)
+        self.assertFalse(pos.data.negative_expectancy)
+        self.assertAlmostEqual(pos.data.avg_closes_per_day or 0, round(2 / 7, 4))
+        self.assertEqual(pos.data.pace_rows[1].contrast, "差 11.30 倍")
+        self.assertAlmostEqual(pos.data.max_stop_usd or 0, 22.5)
+        self.assertEqual(pos.data.leverage_rows[0].vs_line, "低于线")
+        self.assertEqual(pos.data.leverage_rows[2].vs_line, "低于线")
+        pos_texts = _rendered_card_texts(lambda: app_module._v2_kpi_reverse(positive, now=start))
+        self.assertNotIn("负期望 × 杠杆 = 放大亏损", pos_texts)
+        self.assertIn("差 11.30 倍", pos_texts)
+        self.assertIn("1× $22.50 · 日亏线 $200 · 低于线", pos_texts)
+        self.assertIn("3× $67.50 · 日亏线 $200 · 低于线", pos_texts)
+
+        quiet = _store(
+            "kpi-quiet.db",
+            [
+                ("open-a", 450, "open", None, None, 5),
+                ("open-b", 254, "OPEN", "", None, 4),
+            ],
+        )
+        quiet_report = quiet.paper_kpi_reverse(now=start)
+        self.assertEqual(quiet_report.data.closed_n, 0)
+        self.assertIsNone(quiet_report.data.avg_pnl_usd)
+        self.assertIsNone(quiet_report.data.pnl_sum_usd)
+        self.assertEqual(quiet_report.data.avg_closes_per_day, 0.0)
+        self.assertIsNone(quiet_report.data.negative_expectancy)
+        self.assertIsNone(quiet_report.data.pace_rows[0].need_per_trade_usd)
+        self.assertAlmostEqual(quiet_report.data.pace_rows[1].need_per_trade_usd or 0, 225.92)
+        self.assertEqual(quiet_report.data.pace_rows[1].contrast, "")
+        self.assertAlmostEqual(quiet_report.data.max_stop_usd or 0, 22.5)
+        quiet_texts = _rendered_card_texts(lambda: app_module._v2_kpi_reverse(quiet, now=start))
+        self.assertEqual(quiet_texts[quiet_texts.index("已平") + 1], "0")
+        self.assertEqual(quiet_texts[quiet_texts.index("每笔均") + 1], "—")
+        self.assertEqual(quiet_texts[quiet_texts.index("近7日均笔") + 1], "0")
+        self.assertEqual(quiet_texts[quiet_texts.index("近7日 0") + 1], "—")
+        self.assertNotIn("负期望 × 杠杆 = 放大亏损", quiet_texts)
+
+        thin_pnl = _store(
+            "kpi-thin-pnl.db",
+            [
+                ("open-a", 450, "open", None, None, 5),
+                ("c1", 80, "closed", "2026-10-20T01:00:00Z", None, 5),
+                ("c2", 80, "closed", "2026-10-19T01:00:00Z", -8, 5),
+            ],
+        )
+        thin = thin_pnl.paper_kpi_reverse(now=start)
+        self.assertEqual(thin.data.closed_n, 2)
+        self.assertIsNone(thin.data.avg_pnl_usd)
+        self.assertIsNone(thin.data.pnl_sum_usd)
+        self.assertIsNone(thin.data.negative_expectancy)
+        self.assertIn("1 笔已平缺 pnl_usd", thin.data.gap_note)
+        self.assertTrue(all(row.contrast == "" for row in thin.data.pace_rows))
+        self.assertIsNotNone(thin.data.pace_rows[1].need_per_trade_usd)
+        thin_texts = _rendered_card_texts(lambda: app_module._v2_kpi_reverse(thin_pnl, now=start))
+        self.assertEqual(thin_texts[thin_texts.index("每笔均") + 1], "—")
+        self.assertIn("1 笔已平缺 pnl_usd", thin_texts)
+        self.assertNotIn("负期望 × 杠杆 = 放大亏损", thin_texts)
+        self.assertNotIn("$0.00", "\n".join(thin_texts))
+
+        undated = _store(
+            "kpi-undated.db",
+            [
+                ("open-a", 450, "open", None, None, 5),
+                ("c1", 80, "closed", "not-a-day", -10, 5),
+                ("c2", 80, "closed", "2026-10-20T01:00:00Z", -10, 5),
+            ],
+        )
+        undated_report = undated.paper_kpi_reverse(now=start)
+        self.assertEqual(undated_report.data.closed_n, 2)
+        self.assertAlmostEqual(undated_report.data.avg_pnl_usd or 0, -10)
+        self.assertIsNone(undated_report.data.avg_closes_per_day)
+        self.assertIn("1 笔已平无法按 HKT 切日", undated_report.data.gap_note)
+        self.assertIsNone(undated_report.data.pace_rows[0].closes_per_day)
+        self.assertIsNone(undated_report.data.pace_rows[0].need_per_trade_usd)
+        self.assertEqual(undated_report.data.pace_rows[1].contrast, "符号相反")
+        undated_texts = _rendered_card_texts(lambda: app_module._v2_kpi_reverse(undated, now=start))
+        self.assertEqual(undated_texts[undated_texts.index("近7日均笔") + 1], "—")
+        self.assertIn("近7日 —", undated_texts)
+        self.assertIn("1 笔已平无法按 HKT 切日", undated_texts)
+
+        partial = _store(
+            "kpi-partial-sl.db",
+            happy_rows + [("open-gap", 100, "open", None, None, None)],
+        )
+        partial_report = partial.paper_kpi_reverse(now=start)
+        self.assertAlmostEqual(partial_report.data.max_stop_usd or 0, 200.0)
+        self.assertIn("未计入最大", partial_report.data.gap_note)
+        self.assertIn("1 笔缺 size_usd 或 sl_pct", partial_report.data.gap_note)
+
+        no_sl = self.root / "kpi-no-sl.db"
+        with sqlite3.connect(no_sl) as conn:
+            conn.execute("CREATE TABLE account (id INTEGER PRIMARY KEY, cash_usd REAL)")
+            conn.execute("INSERT INTO account (id, cash_usd) VALUES (1, 8000)")
+            conn.execute(
+                """
+                CREATE TABLE positions (
+                    id TEXT PRIMARY KEY,
+                    size_usd REAL,
+                    status TEXT,
+                    closed_at TEXT,
+                    pnl_usd REAL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO positions (id, size_usd, status, closed_at, pnl_usd)"
+                " VALUES ('c1', 100, 'closed', '2026-10-20T01:00:00Z', -4)"
+            )
+        no_sl_store = DataStore(
+            DbPaths(main=no_sl, execution=no_sl, paper=no_sl, backtest=no_sl, news=no_sl)
+        )
+        no_sl_report = no_sl_store.paper_kpi_reverse(now=start)
+        self.assertTrue(no_sl_report.available, no_sl_report.reason)
+        self.assertIsNone(no_sl_report.data.max_stop_usd)
+        self.assertIn("缺少字段：sl_pct", no_sl_report.data.gap_note)
+        self.assertTrue(all(row.stop_usd is None for row in no_sl_report.data.leverage_rows))
+        no_sl_texts = _rendered_card_texts(lambda: app_module._v2_kpi_reverse(no_sl_store, now=start))
+        self.assertIn("单笔最大止损 —", no_sl_texts)
+        self.assertIn("1× — · 日亏线 $200 · —", no_sl_texts)
+        self.assertIn("缺少字段：sl_pct", no_sl_texts)
+        self.assertNotIn("低于线", no_sl_texts)
+
+        signed = _store("kpi-signed-sl.db", [("open-neg", 100, "open", None, None, -5)], cash=1000)
+        signed_report = signed.paper_kpi_reverse(now=start)
+        self.assertAlmostEqual(signed_report.data.max_stop_usd or 0, 5.0)
+        self.assertEqual(signed_report.data.leverage_rows[0].vs_line, "低于线")
+
+        overview = inspect.getsource(app_module._render_dashboard)
+        goal_at = overview.index("_mount_goal_20k")
+        kpi_at = overview.index("_mount_kpi_reverse")
+        phase_at = overview.index("_mount_phase0_shadow")
+        self.assertLess(goal_at, kpi_at)
+        self.assertLess(kpi_at, phase_at)
+        mount_src = inspect.getsource(app_module._mount_kpi_reverse)
+        self.assertIn("span-6", mount_src)
+        self.assertIn("_KPI_NAIL", mount_src)
+        card_src = inspect.getsource(app_module._v2_kpi_reverse)
+        self.assertIn("负期望 × 杠杆 = 放大亏损", card_src)
+        self.assertIn("日亏线", card_src)
+        self.assertNotIn("place_order", card_src)
+        self.assertNotIn("os.environ", card_src)
+        read_src = inspect.getsource(DataStore._paper_kpi_reverse)
+        self.assertIn("ro_connect", read_src)
+        self.assertNotIn("os.environ", read_src)
+        mirror = Path(__file__).resolve().parent.parent / "crawler" / "dashboard"
+        if mirror.is_dir():
+            for name in ("data.py", "app.py", "smoke_test.py"):
+                self.assertEqual(
+                    (Path(__file__).resolve().parent / name).read_bytes(),
+                    (mirror / name).read_bytes(),
+                    name,
+                )
 
     def test_phase0_shadow_card_reads_csv_and_gaps(self) -> None:
         missing = self.root / "no-such-shadow.csv"
