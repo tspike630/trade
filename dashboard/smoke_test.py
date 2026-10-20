@@ -9,6 +9,7 @@ missing databases degrade instead of raising. Run from the project root::
 from __future__ import annotations
 
 import csv
+from decimal import Decimal
 import inspect
 from collections.abc import Callable
 import io
@@ -58,7 +59,17 @@ from dashboard.panels.shell import (
     select_top_tab,
 )
 import dashboard.app as app_module
+import dashboard.c_exit_shadow as c_exit_module
 import dashboard.phase1_counterfactual as phase1_module
+from dashboard.c_exit_shadow import (
+    C_EXIT_DISCIPLINE,
+    C_EXIT_NAIL,
+    C_EXIT_ROLLBACK,
+    C_EXIT_THRESHOLD,
+    C_EXIT_VERDICT,
+    load_c_exit_shadow,
+    tag_line as c_exit_tag_line,
+)
 from dashboard.phase1_counterfactual import (
     PHASE1_CANDIDATE,
     PHASE1_CF_NAIL,
@@ -94,6 +105,7 @@ _TOUCHED = (
     "JEV_TREND_CSV",
     "SHADOW_PHASE0_CSV",
     "PHASE1_CF_CSV",
+    "C_EXIT_SHADOW_DB",
     "DB_PATH",
     "PAPER_DB_PATH",
     "HEARTBEAT_STALE_SEC",
@@ -2716,6 +2728,283 @@ class DashboardSmokeTest(unittest.TestCase):
         )
         self.assertIn("候选", PHASE1_CANDIDATE)
         self.assertNotIn("已接", PHASE1_CANDIDATE)
+
+    def test_c_exit_shadow_card_loads_and_nails(self) -> None:
+        names = [name for name in dir(DashboardSmokeTest) if name.startswith("test_")]
+        self.assertGreaterEqual(len(names), 26)
+        self.assertEqual(C_EXIT_NAIL, "假设旁簿≠已改主闸")
+        self.assertIn("不改 .env", C_EXIT_DISCIPLINE)
+        self.assertIn("不升主", C_EXIT_DISCIPLINE)
+        module_src = inspect.getsource(c_exit_module)
+        self.assertIn(C_EXIT_NAIL, module_src)
+        self.assertNotIn("sqlite3.connect", module_src)
+        self.assertNotIn("place_order", module_src)
+        self.assertNotIn("LIVE_TRADING_ENABLED", module_src)
+        self.assertNotIn("paper_trading.db", module_src)
+
+        line_60 = "c_sl4_h60 · n=141 · Σpnl −$1144.01 · 止损占负 81.6% · 单笔SL峰 −$491.67"
+        line_90 = "c_sl5_h90 · n=142 · Σpnl −$546.98 · 止损占负 86.1% · 单笔SL峰 −$491.67"
+        missing = self.root / "no-such-c-exit.db"
+        self.assertFalse(missing.exists())
+        absent = load_c_exit_shadow(missing)
+        self.assertFalse(missing.exists())
+        self.assertEqual(absent.source, "packaged")
+        self.assertIn("旁簿库缺失", absent.note)
+        self.assertIn("路径重放非旁簿实盘", absent.note)
+        self.assertFalse(absent.rollback_single)
+        self.assertFalse(absent.rollback_cum)
+        self.assertEqual(c_exit_module.verdict_line(absent), C_EXIT_VERDICT)
+        self.assertEqual(
+            [row.tag for row in absent.tags],
+            ["c_sl4_h60", "c_sl5_h60", "c_sl4_h90", "c_sl5_h90"],
+        )
+        self.assertEqual(c_exit_tag_line(absent.tags[0]), line_60)
+        self.assertEqual(c_exit_tag_line(absent.tags[3]), line_90)
+
+        fixture = Path(__file__).resolve().parent / "fixtures" / "c_exit_grid_offline_2026-10-20.csv"
+        with fixture.open(newline="", encoding="utf-8") as handle:
+            sheet = list(csv.DictReader(handle))
+        self.assertEqual(len(sheet), 4)
+        for row, item in zip(absent.tags, sheet, strict=True):
+            self.assertEqual(item["tag"], row.tag)
+            self.assertEqual(int(item["n"]), row.n)
+            self.assertEqual(Decimal(item["sum_pnl"]), row.sum_pnl)
+            self.assertEqual(Decimal(item["sl_share_pct"]), row.sl_share)
+            self.assertEqual(Decimal(item["sl_peak"]), row.sl_peak)
+
+        os.environ["C_EXIT_SHADOW_DB"] = str(missing)
+        gap_texts = _rendered_card_texts(lambda: app_module._mount_c_exit_shadow())
+        gap_joined = "\n".join(gap_texts)
+        self.assertIn("C 出口", gap_texts)
+        self.assertIn("旁簿", gap_texts)
+        self.assertIn(C_EXIT_NAIL, gap_texts)
+        self.assertIn(C_EXIT_DISCIPLINE, gap_texts)
+        self.assertIn(C_EXIT_THRESHOLD, gap_texts)
+        self.assertIn(C_EXIT_ROLLBACK, gap_texts)
+        self.assertIn(line_60, gap_texts)
+        self.assertIn(line_90, gap_texts)
+        self.assertIn("≈ −$1296", gap_joined)
+        self.assertIn("−$1295.71", gap_joined)
+        self.assertIn(C_EXIT_VERDICT, gap_texts)
+        self.assertIn("不升主", gap_joined)
+        self.assertIn("−$500", gap_joined)
+        self.assertIn("−$400", gap_joined)
+        self.assertIn("污染主簿", gap_joined)
+        self.assertNotIn("停旁簿", gap_joined)
+        self.assertNotIn("place_order", gap_joined)
+
+        corrupt = self.root / "corrupt-c-exit.db"
+        corrupt.write_bytes(b"not a database")
+        broken = load_c_exit_shadow(corrupt)
+        self.assertEqual(broken.source, "packaged")
+        self.assertIn("旁簿库不可读", broken.note)
+        self.assertIn(line_60, c_exit_tag_line(broken.tags[0]))
+
+        empty = self.root / "empty-c-exit.db"
+        sqlite3.connect(empty).close()
+        blank = load_c_exit_shadow(empty)
+        self.assertIn("旁簿库空", blank.note)
+        self.assertEqual(blank.tags[0].n, 141)
+
+        shapeless = self.root / "shapeless-c-exit.db"
+        conn = sqlite3.connect(shapeless)
+        conn.execute("CREATE TABLE positions (id INTEGER PRIMARY KEY, status TEXT, pnl_usd REAL)")
+        conn.execute("INSERT INTO positions (status, pnl_usd) VALUES ('closed', -1)")
+        conn.commit()
+        conn.close()
+        self.assertIn("旁簿库缺列", load_c_exit_shadow(shapeless).note)
+
+        opens = self.root / "open-c-exit.db"
+        conn = sqlite3.connect(opens)
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, grid_tag TEXT, status TEXT, exit_reason TEXT, pnl_usd REAL)"
+        )
+        conn.execute(
+            "INSERT INTO positions (grid_tag, status, exit_reason, pnl_usd) "
+            "VALUES ('c_sl4_h60', 'open', 'stop_loss', -999)"
+        )
+        conn.commit()
+        conn.close()
+        self.assertIn("旁簿无 closed", load_c_exit_shadow(opens).note)
+
+        bad = self.root / "bad-c-exit.db"
+        conn = sqlite3.connect(bad)
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, grid_tag TEXT, status TEXT, exit_reason TEXT, pnl_usd REAL)"
+        )
+        conn.execute(
+            "INSERT INTO positions (grid_tag, status, exit_reason, pnl_usd) "
+            "VALUES ('c_sl4_h60', 'closed', 'stop_loss', NULL)"
+        )
+        conn.commit()
+        conn.close()
+        self.assertIn("旁簿坏数据", load_c_exit_shadow(bad).note)
+
+        joined = self.root / "account-c-exit.db"
+        conn = sqlite3.connect(joined)
+        conn.execute(
+            "CREATE TABLE account (id INTEGER PRIMARY KEY, grid_tag TEXT NOT NULL, cash_usd REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, status TEXT NOT NULL, "
+            "exit_reason TEXT, pnl_usd REAL)"
+        )
+        conn.executemany(
+            "INSERT INTO account (id, grid_tag, cash_usd) VALUES (?, ?, 10000)",
+            [(1, "c_sl4_h60"), (2, "c_sl5_h60"), (3, "c_sl4_h90"), (4, "c_sl5_h90")],
+        )
+        conn.executemany(
+            "INSERT INTO positions (account_id, status, exit_reason, pnl_usd) VALUES (?, ?, ?, ?)",
+            [
+                (1, "Closed", "stop_loss", -1),
+                (2, "closed", "max_hold", -2),
+                (3, "closed", "take_profit", 3),
+                (4, "open", "stop_loss", -800),
+            ],
+        )
+        conn.commit()
+        conn.close()
+        thin = load_c_exit_shadow(joined)
+        self.assertEqual(thin.source, "packaged")
+        self.assertEqual(thin.tags[0].n, 141)
+        self.assertEqual(thin.tags[0].live_n, 1)
+        self.assertEqual(thin.tags[3].live_n, 0)
+        self.assertIn("c_sl4_h60=1", thin.note)
+        self.assertIn("未满 30", thin.note)
+        self.assertFalse(thin.rollback_single)
+        self.assertIn(line_60, c_exit_tag_line(thin.tags[0]))
+
+        meta = self.root / "meta-c-exit.db"
+        conn = sqlite3.connect(meta)
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, status TEXT, exit_reason TEXT, pnl_usd REAL, meta_json TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO positions (status, exit_reason, pnl_usd, meta_json) "
+            "VALUES ('closed', 'stop_loss', -3, ?)",
+            ('{"grid_tag":"c_sl5_h90"}',),
+        )
+        conn.commit()
+        conn.close()
+        meta_report = load_c_exit_shadow(meta)
+        self.assertEqual(meta_report.tags[3].live_n, 1)
+        self.assertEqual(meta_report.tags[0].live_n, 0)
+        self.assertEqual(meta_report.tags[3].n, 142)
+
+        mixed = self.root / "mixed-c-exit.db"
+        conn = sqlite3.connect(mixed)
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, grid_tag TEXT, status TEXT, exit_reason TEXT, pnl_usd REAL)"
+        )
+        mixed_rows: list[tuple[str, str, str, float]] = []
+        mixed_rows.append(("c_sl4_h60", "closed", "stop_loss", -40))
+        mixed_rows.extend(("c_sl4_h60", "closed", "max_hold", 0) for _ in range(29))
+        mixed_rows.append(("c_sl5_h60", "closed", "stop_loss", -1))
+        mixed_rows.append(("c_sl4_h90", "closed", "max_hold", -1))
+        mixed_rows.append(("c_sl5_h90", "closed", "max_hold", -1))
+        conn.executemany(
+            "INSERT INTO positions (grid_tag, status, exit_reason, pnl_usd) VALUES (?, ?, ?, ?)",
+            mixed_rows,
+        )
+        conn.commit()
+        conn.close()
+        mixed_report = load_c_exit_shadow(mixed)
+        self.assertEqual(mixed_report.source, "mixed")
+        self.assertEqual(mixed_report.tags[0].origin, "live")
+        self.assertEqual(mixed_report.tags[0].n, 30)
+        self.assertEqual(mixed_report.tags[0].sum_pnl, Decimal("-40.00"))
+        self.assertEqual(mixed_report.tags[1].origin, "packaged")
+        self.assertEqual(mixed_report.tags[1].n, 141)
+        self.assertIn("未满 30", mixed_report.note)
+
+        full = self.root / "full-c-exit.db"
+        conn = sqlite3.connect(full)
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, grid_tag TEXT, status TEXT, exit_reason TEXT, pnl_usd REAL)"
+        )
+        full_rows: list[tuple[str, str, str, float]] = []
+        for tag, sl in (
+            ("c_sl4_h60", -40),
+            ("c_sl5_h60", -50),
+            ("c_sl4_h90", -60),
+            ("c_sl5_h90", -70),
+        ):
+            full_rows.append((tag, "closed", "stop_loss", sl))
+            full_rows.extend((tag, "closed", "max_hold", 0) for _ in range(29))
+            full_rows.append((tag, "open", "stop_loss", -999))
+        conn.executemany(
+            "INSERT INTO positions (grid_tag, status, exit_reason, pnl_usd) VALUES (?, ?, ?, ?)",
+            full_rows,
+        )
+        conn.commit()
+        conn.close()
+        before = full.stat().st_mtime_ns
+        os.environ["C_EXIT_SHADOW_DB"] = str(full)
+        live = load_c_exit_shadow()
+        self.assertEqual(full.stat().st_mtime_ns, before)
+        self.assertEqual(live.source, "live")
+        self.assertIn("旁簿实盘", live.note)
+        self.assertNotIn("回退离线", live.note)
+        self.assertFalse(live.rollback_single)
+        self.assertFalse(live.rollback_cum)
+        self.assertEqual(
+            c_exit_tag_line(live.tags[0]),
+            "c_sl4_h60 · n=30 · Σpnl −$40.00 · 止损占负 100.0% · 单笔SL峰 −$40.00",
+        )
+        self.assertEqual(live.tags[3].sum_pnl, Decimal("-70.00"))
+        self.assertNotEqual(c_exit_module.verdict_line(live), C_EXIT_VERDICT)
+        self.assertIn("不升主", c_exit_module.verdict_line(live))
+        live_texts = _rendered_card_texts(lambda: app_module._v2_c_exit_shadow())
+        live_joined = "\n".join(live_texts)
+        self.assertIn(C_EXIT_NAIL, live_texts)
+        self.assertIn("n=30", live_joined)
+        self.assertNotIn("−$1144.01", live_joined)
+        self.assertNotIn("路径重放", live_joined)
+
+        breach = self.root / "breach-c-exit.db"
+        conn = sqlite3.connect(breach)
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, grid_tag TEXT, status TEXT, exit_reason TEXT, pnl_usd REAL)"
+        )
+        conn.execute(
+            "INSERT INTO positions (grid_tag, status, exit_reason, pnl_usd) "
+            "VALUES ('c_sl4_h60', 'closed', 'stop_loss', -501)"
+        )
+        conn.commit()
+        conn.close()
+        os.environ["C_EXIT_SHADOW_DB"] = str(breach)
+        tripped = load_c_exit_shadow()
+        self.assertTrue(tripped.rollback_single)
+        self.assertTrue(tripped.rollback_cum)
+        self.assertEqual(tripped.tags[0].n, 141)
+        self.assertEqual(tripped.tags[0].sl_peak, Decimal("-491.67"))
+        breach_texts = _rendered_card_texts(lambda: app_module._mount_c_exit_shadow())
+        breach_joined = "\n".join(breach_texts)
+        self.assertIn("实盘单笔≤−$500", breach_joined)
+        self.assertIn("实盘累计≤−$400", breach_joined)
+        self.assertIn("停旁簿", breach_joined)
+        self.assertIn(line_60, breach_texts)
+        self.assertIn(C_EXIT_NAIL, breach_texts)
+
+        overview = inspect.getsource(app_module._render_dashboard)
+        phase1_at = overview.index("_mount_phase1_counterfactual")
+        card_at = overview.index("_mount_c_exit_shadow")
+        m7_at = overview.index("_mount_m7_shadow")
+        self.assertLess(phase1_at, card_at)
+        self.assertLess(card_at, m7_at)
+        mount_src = inspect.getsource(app_module._mount_c_exit_shadow)
+        card_src = inspect.getsource(app_module._v2_c_exit_shadow)
+        self.assertIn("C_EXIT_NAIL", mount_src)
+        self.assertIn("C_EXIT_NAIL", card_src)
+        self.assertNotIn("place_order", mount_src)
+        self.assertNotIn("place_order", card_src)
 
     def test_m7_s0_s1_shadow_card(self) -> None:
         missing_csv = self.root / "no-such-m7.csv"
