@@ -153,6 +153,7 @@ def classify_token_tier(
     cycle_number: int,
     now: datetime | None = None,
     seen_this_cycle: bool = False,
+    pinned: bool = False,
 ) -> str | None:
     """
     Return 'new' | 'hot' | 'warm' | 'cold' if enrich is due this cycle, else None.
@@ -181,7 +182,8 @@ def classify_token_tier(
         return None
 
     # has_pairs == 1
-    is_hot = seen_this_cycle or (seen_age is not None and seen_age <= HOT_SEEN_WINDOW_SEC)
+    # pinned: open paper position → always hot cadence (PIN_OPEN_POSITIONS_HOT)
+    is_hot = pinned or seen_this_cycle or (seen_age is not None and seen_age <= HOT_SEEN_WINDOW_SEC)
     if is_hot:
         if enriched_age is None or enriched_age >= HOT_ENRICH_MIN_INTERVAL_SEC:
             return "hot"
@@ -442,6 +444,18 @@ def _queue_tiered(
     """Select due tokens by tier and add to pending_enrich."""
     now = _utc_now()
     by_chain: dict[str, list[str]] = defaultdict(list)
+    from position_pin import is_pinned, last_failed_count, pin_enabled, pinned_count, status_summary
+
+    if pin_enabled():
+        summary["pinned_open_positions"] = pinned_count()
+        summary["pin_load_failed_dbs"] = last_failed_count()
+        log.info(
+            "position_pin hot pinned_open_positions=%s dbs=[%s] failed_dbs=%s cycle_id=%s",
+            summary["pinned_open_positions"],
+            status_summary(),
+            summary["pin_load_failed_dbs"],
+            summary.get("cycle_id"),
+        )
     for row in store.list_tokens_for_tiering():
         if not chain_enabled(row["chain_id"]):
             continue
@@ -452,6 +466,7 @@ def _queue_tiered(
             cycle_number=cycle_number,
             now=now,
             seen_this_cycle=seen_this,
+            pinned=is_pinned(row["chain_id"], row["token_address"]),
         )
         if tier is None:
             hp = row.get("has_pairs")
