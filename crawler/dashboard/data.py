@@ -362,15 +362,22 @@ class PaperClosedReport:
     # Exit-reason dominance (10-14 lesson: stop_loss can eat almost all loss).
     stop_loss_pnl_usd: float | None = None
     stop_loss_share: float | None = None
+    # Indicator method: stop-loss losses ÷ all negative PnL (main figure).
+    stop_loss_loss_share: float | None = None
 
 
 @dataclass(frozen=True)
 class PaperTradeDay:
-    """G-1 observe: daily open count vs realized pnl (Gann trade-frequency cost)."""
+    """G-1 observe: daily open count vs realized pnl (Gann trade-frequency cost).
+
+    opens/closed/pnl_usd None = 缺失 (no table / no row that day), never 0.
+    """
     day: str
-    opens: int
-    closed: int
-    pnl_usd: float
+    opens: int | None
+    closed: int | None
+    pnl_usd: float | None
+    pnl_gap: int = 0
+    missing_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -2781,24 +2788,55 @@ class DataStore:
                         day = _hkt_day(row[0] if row else "")
                         if not day:
                             continue
-                        slot = closed_by.setdefault(day, [0, 0.0])
+                        slot = closed_by.setdefault(day, [0, 0.0, 0])
                         slot[0] += 1
-                        slot[1] += float(row[1] or 0.0)
+                        value = safe_float(row[1])
+                        if value is None:
+                            slot[2] += 1
+                        else:
+                            slot[1] += value
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
-        days_sorted = sorted(set(opens_by) | set(closed_by), reverse=True)[:window]
-        rows = tuple(
-            PaperTradeDay(
-                day=day,
-                opens=int(opens_by.get(day, 0)),
-                closed=int((closed_by.get(day) or [0, 0.0])[0]),
-                pnl_usd=round(float((closed_by.get(day) or [0, 0.0])[1]), 4),
+        has_fills = "fills" in tabs
+        has_positions = "positions" in tabs
+        today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date()
+        days_sorted = [(today - timedelta(days=i)).isoformat() for i in range(window)]
+        built: list[PaperTradeDay] = []
+        for day in sorted(days_sorted):
+            reasons: list[str] = []
+            if not has_fills:
+                opens: int | None = None
+                reasons.append("无 fills 表")
+            elif day in opens_by:
+                opens = int(opens_by[day])
+            else:
+                opens = None
+                reasons.append("当日无开仓记录")
+            slot = closed_by.get(day)
+            if not has_positions:
+                closed: int | None = None
+                pnl: float | None = None
+                reasons.append("无 positions 表")
+            elif slot is None:
+                closed, pnl = None, None
+                reasons.append("当日无平仓记录")
+            else:
+                closed = int(slot[0])
+                pnl = round(float(slot[1]), 4)
+            built.append(
+                PaperTradeDay(
+                    day=day,
+                    opens=opens,
+                    closed=closed,
+                    pnl_usd=pnl,
+                    pnl_gap=int(slot[2]) if slot is not None else 0,
+                    missing_reason="；".join(reasons),
+                )
             )
-            for day in sorted(days_sorted)
-        )
-        total_opens = sum(r.opens for r in rows)
-        total_closed = sum(r.closed for r in rows)
-        total_pnl = round(sum(r.pnl_usd for r in rows), 4)
+        rows = tuple(built)
+        total_opens = sum(r.opens or 0 for r in rows)
+        total_closed = sum(r.closed or 0 for r in rows)
+        total_pnl = round(sum(r.pnl_usd or 0.0 for r in rows), 4)
         active = [r for r in rows if r.opens or r.closed]
         avg = (total_opens / len(active)) if active else None
         return _ok(
@@ -3601,6 +3639,9 @@ class DataStore:
         stop_loss_share = None
         if stop_loss_pnl is not None and total_pnl < 0 and abs(total_pnl) > 1e-9:
             stop_loss_share = min(1.0, abs(stop_loss_pnl) / abs(total_pnl))
+        neg_all = sum(v for vals in agg.values() for v in vals if v < 0)
+        neg_sl = sum(v for (er, _lb), vals in agg.items() if er == "stop_loss" for v in vals if v < 0)
+        stop_loss_loss_share = (neg_sl / neg_all) if neg_all < 0 and stop_loss_pnl is not None else None
         return _ok(
             PaperClosedReport(
                 window_days,
@@ -3623,6 +3664,9 @@ class DataStore:
                 first_hit_live_dedup=live_dedup,
                 stop_loss_pnl_usd=round(stop_loss_pnl, 4) if stop_loss_pnl is not None else None,
                 stop_loss_share=round(stop_loss_share, 4) if stop_loss_share is not None else None,
+                stop_loss_loss_share=(
+                    round(stop_loss_loss_share, 4) if stop_loss_loss_share is not None else None
+                ),
             ),
             started,
         )

@@ -4249,14 +4249,27 @@ class DashboardSmokeTest(unittest.TestCase):
             (None, "C"),
         ]
         self.assertEqual(dedup_token_count(events), 6)
+        ledger = self.root / "CELL_LEDGER.csv"
+        ledger.write_text(
+            "cell_id,date,layer,hypothesis,status,ref\n"
+            "1,2026-10-01,entry,a,rejected,x\n"
+            "271,2026-10-21,entry,jev b,暂定拒绝,y\n"
+            "12,2026-10-02,exit,c,rejected,z\n",
+            encoding="utf-8",
+        )
+        os.environ["CELL_LEDGER_CSV"] = str(ledger)
         self.assertEqual(
             app_module.bonferroni_grid_label(),
-            "累计共测 268 格 · Bonferroni 按 268",
+            "累计共测 271 格 · Bonferroni 按 271（CELL_LEDGER 最大 cell_id）",
         )
-        self.assertEqual(app_module.BONFERRONI_GRIDS, 268)
+        self.assertFalse(hasattr(app_module, "BONFERRONI_GRIDS"))
         label_src = inspect.getsource(app_module.bonferroni_grid_label)
-        self.assertIn("BONFERRONI_GRIDS", label_src)
         self.assertNotIn("268", label_src)
+        self.assertNotIn("271", label_src)
+        jev_texts = _rendered_card_texts(app_module._v2_jev_gate)
+        self.assertTrue(any("暂定拒绝" in t for t in jev_texts))
+        os.environ["CELL_LEDGER_CSV"] = str(self.root / "no-ledger.csv")
+        self.assertEqual(app_module.bonferroni_grid_label(), "格数：总账缺失")
         jev_texts = _rendered_card_texts(app_module._v2_jev_gate)
         self.assertIn(app_module.bonferroni_grid_label(), jev_texts)
         self.assertIn(app_module.RETIRED_GRID_LINE, jev_texts)
@@ -4660,6 +4673,64 @@ class DashboardSmokeTest(unittest.TestCase):
                 output, _ = proc.communicate(timeout=5)
         self.assertNotIn(secret, output or "")
 
+
+
+class BoardTruthSmokeTest(unittest.TestCase):
+    """Display-only truth cards: missing never reads as 0."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._env = dict(os.environ)
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._env)
+        self._tmp.cleanup()
+
+    def test_supply_gaps_partial_and_missing(self) -> None:
+        from dashboard import board_truth as bt
+        self.assertIsNone(bt.load_supply_gaps(self.root / "none.csv"))
+        self.assertEqual(bt.day_coverage("2026-10-21", None), "断供记录缺失")
+        csv_path = self.root / "supply_gaps.csv"
+        csv_path.write_text(
+            "component,start_at,end_at,start_hkt,end_hkt,reason,source\n"
+            "execution_main_loop,2026-10-20T18:03:17Z,2026-10-21T00:05:00Z,,,stop,execution\n"
+            "shadow010_book,2026-10-20T17:50:11Z,,,,halt,execution\n",
+            encoding="utf-8",
+        )
+        gaps = bt.load_supply_gaps(csv_path)
+        now = datetime(2026, 10, 21, 4, 0, tzinfo=timezone.utc)
+        cov = bt.day_coverage("2026-10-21", gaps, now=now)
+        self.assertIn("execution_main_loop 部分 02:03–08:05", cov)
+        self.assertIn("shadow010_book 部分 01:50–进行中", cov)
+        self.assertEqual(bt.day_coverage("2026-10-19", gaps, now=now), "")
+
+    def test_side_book_missing_is_not_zero(self) -> None:
+        from dashboard import entry_c_exit_joint as ej
+        os.environ["C_EXIT_SHADOW_DB"] = str(self.root / "absent.db")
+        os.environ["ENTRY_C_EXIT_JOINT_CSV"] = str(self.root / "absent.csv")
+        count, reason = ej.side_book_count_or_missing()
+        self.assertIsNone(count)
+        self.assertTrue(reason)
+        report = ej.load_entry_c_exit_joint()
+        self.assertIn("缺失", ej.nail_line(report))
+
+    def test_watchdog_heartbeat(self) -> None:
+        from dashboard import board_truth as bt
+        hb = self.root / "hb"
+        self.assertEqual(bt.watchdog_status(hb)[1], "看门未上线/缺失")
+        hb.write_text("x")
+        self.assertEqual(bt.watchdog_status(hb)[0], "ok")
+        self.assertEqual(bt.watchdog_status(hb, now=time.time() + 600)[0], "warn")
+
+    def test_deploy_unreported(self) -> None:
+        from dashboard import board_truth as bt
+        (self.root / "execution").mkdir()
+        (self.root / "execution" / "a.py").write_text("x=1\n")
+        row = bt.compare_component(self.root, None, "execution", "no-such-proc-xyz")
+        self.assertEqual(row.status, "unreported")
+        self.assertIn("未报", row.detail)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -121,6 +121,8 @@ class JointReport:
     liq_missing_n: int
     liq_excluded_n: int
     liq_column: bool
+    # None = side book read fine; otherwise why the count is missing (not 0).
+    side_missing: str | None = None
 
 
 @dataclass
@@ -561,11 +563,13 @@ def _count_sql(table: SideTable) -> str:
             return _never(unreachable)
 
 
-def side_book_position_count() -> int:
-    """Rows in the C-exit side book. Missing or unreadable counts as zero fills."""
+def side_book_count_or_missing() -> tuple[int | None, str | None]:
+    """Rows in the C-exit side book, or (None, reason). Missing is never 0."""
     path = c_exit_db_path()
-    if path is None or not path.is_file():
-        return 0
+    if path is None:
+        return None, "库路径未解析"
+    if not path.is_file():
+        return None, "库不存在"
     try:
         with ro_connect(path) as conn:
             listed = conn.execute(
@@ -577,12 +581,17 @@ def side_book_position_count() -> int:
                     continue
                 counted = conn.execute(_count_sql(table)).fetchone()
                 if counted is None:
-                    return 0
-                return int(counted[0])
+                    return None, "计数无返回"
+                return int(counted[0]), None
     except (OSError, sqlite3.Error, UnicodeError, ValueError):
         log.warning("entry joint side book unreadable")
-        return 0
-    return 0
+        return None, "库不可读"
+    return None, "无旁簿表"
+
+
+def side_book_position_count() -> int | None:
+    """Rows in the C-exit side book. None when missing/unreadable (shown as 缺失)."""
+    return side_book_count_or_missing()[0]
 
 
 def _source_note(source: SourceKind, sample_in: bool) -> str:
@@ -612,8 +621,14 @@ def _from_fixture(note: str) -> JointReport:
     return replace(summarized, source="packaged", note=note, side_fills=0)
 
 
-def _with_side(report: JointReport, side_fills: int) -> JointReport:
+def _with_side(
+    report: JointReport, side_fills: int | None, missing: str | None = None
+) -> JointReport:
     note = report.note
+    if side_fills is None:
+        reason = missing or "不可读"
+        note = f"{note} · 旁簿成交：缺失（{reason}）"
+        return replace(report, side_fills=0, side_missing=reason, note=note)
     if side_fills > 0:
         note = f"{note} · 旁簿库 {side_fills} 笔 · 联合表无旁簿实盘 pnl"
     return replace(report, side_fills=side_fills, note=note)
@@ -625,25 +640,25 @@ def load_entry_c_exit_joint(path: Path | None = None) -> JointReport:
     An empty side book does not blank the card. The fixture stays on screen
     and the nail says the join is sample-in with zero side-book fills.
     """
-    side_fills = side_book_position_count()
+    side_fills, side_missing = side_book_count_or_missing()
     target = path if path is not None else joint_export_path()
     if target is None or not target.is_file():
-        return _with_side(packaged_report(fallback_note("missing")), side_fills)
+        return _with_side(packaged_report(fallback_note("missing")), side_fills, side_missing)
     try:
         rows, fieldnames = _read_csv(target)
     except (OSError, UnicodeError, csv.Error):
         log.warning("entry joint csv unreadable")
-        return _with_side(packaged_report(fallback_note("unreadable")), side_fills)
+        return _with_side(packaged_report(fallback_note("unreadable")), side_fills, side_missing)
     summarized = summarize_joint(rows, fieldnames)
     if isinstance(summarized, str):
-        return _with_side(packaged_report(fallback_note(summarized)), side_fills)
+        return _with_side(packaged_report(fallback_note(summarized)), side_fills, side_missing)
     source: SourceKind = "packaged" if _is_fixture(target) else "export"
     report = replace(
         summarized,
         source=source,
         note=_source_note(source, summarized.sample_in),
     )
-    return _with_side(report, side_fills)
+    return _with_side(report, side_fills, side_missing)
 
 
 def packaged_report(note: str) -> JointReport:
@@ -652,6 +667,9 @@ def packaged_report(note: str) -> JointReport:
 
 
 def nail_line(report: JointReport) -> str:
+    if report.side_missing:
+        kind = "样本内假设" if report.sample_in else "含打标后新开"
+        return f"{kind} · 旁簿成交：缺失（{report.side_missing}） · ≠升主/≠抬权/≠Phase1"
     if report.sample_in and report.side_fills == 0:
         return JOINT_NAIL
     kind = "样本内假设" if report.sample_in else "含打标后新开"
