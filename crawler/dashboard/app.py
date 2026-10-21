@@ -80,6 +80,7 @@ from dashboard.entry_c_exit_joint import (
     verdict_line as joint_verdict_line,
 )
 from dashboard.random_entry import random_entry_lines
+from dashboard import board_truth
 from dashboard.phase1_counterfactual import (
     PHASE1_CANDIDATE,
     PHASE1_CF_NAIL,
@@ -756,6 +757,7 @@ body { margin: 0; }
 .v2-table td.up, .v2-table .v.up { color: var(--v2-up); }
 .v2-table td.down, .v2-table .v.down { color: var(--v2-down); }
 .v2-table td.mute, .v2-table .v.mute { color: var(--v2-mute); }
+.v2-table td.warn { color: var(--v2-warn); }
 .v2-table tr:hover td { background: rgba(47,129,247,.06); }
 
 /* ---- 脉冲块 ---- */
@@ -1216,6 +1218,7 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     tools=("只读",),
                 )
                 _mount_goal_20k(store)
+                _mount_deploy_sha()
                 _mount_kpi_reverse(store)
                 _mount_phase0_shadow()
                 _mount_phase1_counterfactual()
@@ -2115,6 +2118,9 @@ def _v2_positions(store: DataStore) -> None:
     equity_raw = getattr(payload, "equity_usd", None)
     cash = _v2_money(cash_raw)
     equity = _v2_money(equity_raw) if equity_raw is not None else cash
+    missing_px = getattr(payload, "missing_price", 0)
+    if isinstance(missing_px, int) and not isinstance(missing_px, bool) and missing_px > 0:
+        equity = f"{equity} · 不完整（{missing_px} 笔缺报价，未计市值）"
     held_rows = getattr(payload, "rows", None)
     if held_rows is None:
         count = getattr(payload, "open_count", None)
@@ -2137,6 +2143,8 @@ def _v2_positions(store: DataStore) -> None:
         dd_pct = (float(equity_raw) - start_cash) / start_cash
         dd_text = f"{dd_pct * 100:+.2f}%"
         dd_tone = "up" if dd_pct > 0 else ("down" if dd_pct < 0 else "mute")
+        if isinstance(missing_px, int) and not isinstance(missing_px, bool) and missing_px > 0:
+            dd_text = f"{dd_text}（不完整·缺报价按未计）"
     _v2_kv([
         ("总权益", equity, dd_tone if dd_tone != "mute" else ""),
         ("相对起盘", dd_text, dd_tone),
@@ -2213,8 +2221,7 @@ _M7_PHASE0_NOTE = "与 Phase0 双列并存 · 不算有效性"
 _ENTRY_JEV_BANNER = (
     "入口为 stance 读反、jev 过期信号（接线 bug 期，指标 jev 新鲜度审计 2026-10-21）· 不可用于评价 jev"
 )
-# 对不上取大。只改 BONFERRONI_GRIDS。
-BONFERRONI_GRIDS = 268
+# 格数只读 docs/CELL_LEDGER.csv 最大 cell_id；缺文件显示「格数：总账缺失」，不回退常量。
 # 预注册格。静态文案，不读买卖单流、不算信号结果。
 RETIRED_GRID_LINE = "liq>1M·TP5·无止损 已淘汰（v2前60%扣0.6%后 −0.87%）"
 REMAINING_ENTRY_LINE = "剩余入口：C4 单流、迁移事件"
@@ -2236,14 +2243,21 @@ V_MARK_NOTE = "V 事后打标：可判 92 笔命中 3；51 笔无留痕判不了
 
 
 def bonferroni_grid_label() -> str:
-    """C 出口 / JEV 门槛共用的多重比较标注。"""
-    n = BONFERRONI_GRIDS
-    return f"累计共测 {n} 格 · Bonferroni 按 {n}"
+    """C 出口 / JEV 门槛共用的多重比较标注。读 CELL_LEDGER，缺失不回退。"""
+    try:
+        return board_truth.grid_count_label()
+    except Exception:
+        log.warning("cell ledger read failed")
+        return board_truth.LEDGER_MISSING
 
 
 def _grid_registry_notes() -> None:
     """Static registry lines. No order-flow read and no signal outcome."""
     ui.label(RETIRED_GRID_LINE).classes("v2-note")
+    try:
+        ui.label(board_truth.tentative_reject_line()).classes("v2-note")
+    except Exception:
+        ui.label(board_truth.TENTATIVE_REJECT_LINE).classes("v2-note")
     ui.label(REMAINING_ENTRY_LINE).classes("v2-note")
     ui.label(C4_FLOW_BLIND_LINE).classes("v2-note")
 
@@ -2350,23 +2364,45 @@ def _v2_trade_freq(store: DataStore) -> None:
             "down" if isinstance(getattr(report, "total_pnl_usd", None), (int, float)) and report.total_pnl_usd < 0 else "mute",
         ),
     ])
+    try:
+        gaps = board_truth.load_supply_gaps()
+    except Exception:
+        log.warning("supply gaps read failed")
+        gaps = None
     table = []
     tones = []
     for item in list(rows_data)[-10:]:
         pnl = getattr(item, "pnl_usd", None)
-        pnl_text, pnl_tone = _signed_usd(pnl)
+        if pnl is None:
+            pnl_text, pnl_tone = "缺失", "mute"
+        else:
+            pnl_text, pnl_tone = _signed_usd(pnl)
+            gap_n = getattr(item, "pnl_gap", 0) or 0
+            if gap_n:
+                pnl_text = f"{pnl_text}（{gap_n} 笔缺 pnl 未计）"
+        opens = getattr(item, "opens", None)
+        closed = getattr(item, "closed", None)
+        day = _v2_text(getattr(item, "day", None))
+        try:
+            cover = board_truth.day_coverage(str(getattr(item, "day", "") or ""), gaps)
+        except Exception:
+            cover = board_truth.GAPS_MISSING
+        reason = str(getattr(item, "missing_reason", "") or "")
         table.append([
-            _v2_text(getattr(item, "day", None)),
-            str(getattr(item, "opens", "—")),
-            str(getattr(item, "closed", "—")),
+            day,
+            str(opens) if opens is not None else "缺失",
+            str(closed) if closed is not None else "缺失",
             pnl_text,
+            "；".join(x for x in (cover, reason) if x) or "—",
         ])
-        tones.append(["", "", "", pnl_tone])
+        tones.append(["", "", "", pnl_tone, "down" if cover else "mute"])
     _v2_table(
-        [("日", ""), ("开仓", "num"), ("平仓", "num"), ("PnL", "num")],
+        [("日", ""), ("开仓", "num"), ("平仓", "num"), ("PnL", "num"), ("覆盖/缺失原因", "")],
         table,
         tones,
     )
+    if gaps is None:
+        ui.label(board_truth.GAPS_MISSING).classes("v2-note")
     ui.label(
         "G-1：日切 HKT；多样本可取，但日开↑常伴随损耗↑——观察峰，不解读为应加仓频。"
         "对照冷却/max_open，不盘中改参。"
@@ -2421,18 +2457,28 @@ def _v2_closed(store: DataStore) -> None:
         (
             "止损占亏",
             (
+                f"{float(getattr(report, 'stop_loss_loss_share', 0) or 0) * 100:.1f}%"
+                if isinstance(getattr(report, "stop_loss_loss_share", None), (int, float))
+                else "缺失（无负 PnL 或无止损笔）"
+            ),
+            (
+                "down"
+                if isinstance(getattr(report, "stop_loss_loss_share", None), (int, float))
+                and float(report.stop_loss_loss_share) >= 0.5
+                else "mute"
+            ),
+        ),
+        (
+            "占净亏",
+            (
                 f"{float(getattr(report, 'stop_loss_share', 0) or 0) * 100:.0f}%"
                 if isinstance(getattr(report, "stop_loss_share", None), (int, float))
                 else "—"
             ),
-            (
-                "down"
-                if isinstance(getattr(report, "stop_loss_share", None), (int, float))
-                and float(report.stop_loss_share) >= 0.5
-                else "mute"
-            ),
+            "mute",
         ),
     ])
+    ui.label("止损占亏 = 止损亏损 ÷ 全部负 PnL（指标口径）；占净亏 = 止损 PnL ÷ 净实现亏损").classes("v2-note")
     ui.label(
         "半胜仍亏：止损可抹盈，常由少数 stop_loss 打穿主导；"
         "日亏闸触发是保护不是失效——对齐 min_liq/冷却，不盘中改 TP·SL。"
@@ -2549,6 +2595,57 @@ def _goal_short_text(value: object) -> tuple[str, str]:
     return text, "mute"
 
 
+_DEPLOY_TONE = {"ok": "up", "red": "down", "yellow": "warn", "unreported": "mute", "unknown": "mute"}
+_DEPLOY_WORD = {"ok": "一致", "red": "不符", "yellow": "磁盘已换、进程未重启", "unreported": "未报", "unknown": "无法比对"}
+
+
+def _v2_deploy_sha() -> None:
+    try:
+        rows = board_truth.deploy_rows()
+    except Exception:
+        log.warning("deploy sha card failed")
+        ui.label("现网 sha：读取失败").classes("v2-note")
+        return
+    table: list[list[str]] = []
+    tones: list[list[str]] = []
+    for row in rows:
+        word = _DEPLOY_WORD.get(row.status, row.status)
+        if "无可比文件" in row.detail and row.status in {"unknown", "unreported"}:
+            word = "无可比文件"
+        if row.status == "yellow" and row.declared is None:
+            word = "未报 · 磁盘已换、进程未重启"
+        table.append([
+            row.component,
+            (row.declared or "未报")[:12],
+            word,
+            row.detail,
+        ])
+        tones.append(["", "", _DEPLOY_TONE.get(row.status, "mute"), ""])
+    _v2_table(
+        [("组件", ""), ("DEPLOY_SHA", ""), ("状态", ""), ("明细", "")],
+        table,
+        tones,
+    )
+    try:
+        wd_tone, wd_text = board_truth.watchdog_status()
+    except Exception:
+        wd_tone, wd_text = "mute", board_truth.WATCHDOG_MISSING
+    ui.label(f"采集看门心跳：{wd_text}").classes(
+        "v2-note v2-note-warn" if wd_tone == "warn" else "v2-note"
+    )
+    ui.label("红=声明 sha 与文件不符 · 黄=磁盘比进程新（未重启）· 未报=目录无 DEPLOY_SHA · 只读 git ls-tree，不 fetch").classes("v2-note")
+
+
+def _mount_deploy_sha() -> None:
+    _v2_comp(
+        ("现网 sha", "对 main"),
+        "span-6",
+        _v2_deploy_sha,
+        foot="只读对照 · 不部署 · 不重启",
+        tools=("只读",),
+    )
+
+
 def _mount_goal_20k(store: DataStore, *, now: datetime | None = None) -> None:
     _v2_comp(
         ("距", "$20k"),
@@ -2617,9 +2714,18 @@ def _v2_gap_primary(report: object) -> None:
     if isinstance(raw_eq, (int, float)) and not isinstance(raw_eq, bool):
         raw_gap = 20_000.0 - float(raw_eq)
     cons_gap = 20_000.0 - EQUITY_PRIMARY_USD
+    v_gap = 20_000.0 - EQUITY_V_UP_USD
+    both_gap = 20_000.0 - EQUITY_BOTH_REVIEW_USD
+    _v2_kv([
+        ("保守（主）", f"{_book_money(EQUITY_PRIMARY_USD)} · 缺口 {_approx_gap(cons_gap)}", "down"),
+        ("原账", f"{_book_money(raw_eq)} · 缺口 {_approx_gap(raw_gap)}", "mute"),
+        ("V 规则", f"{_book_money(EQUITY_V_UP_USD)} · 缺口 {_approx_gap(v_gap)}", "mute"),
+        ("剔双向", f"{_book_money(EQUITY_BOTH_REVIEW_USD)} · 缺口 {_approx_gap(both_gap)}", "mute"),
+    ])
     ui.label(f"保守 {_book_money(EQUITY_PRIMARY_USD)} · 缺口 {_approx_gap(cons_gap)}").classes("v2-note")
     ui.label(KPI_GAP_PRIMARY_NOTE).classes("v2-note")
     ui.label(f"原账 {_book_money(raw_eq)} · 缺口 {_approx_gap(raw_gap)}").classes("v2-note")
+    ui.label("原账读账本；保守/V 规则/剔双向为复盘定数（无可计算数据源）").classes("v2-note")
 
 
 def _v2_goal_20k(store: DataStore, *, now: datetime | None = None) -> None:
@@ -2930,7 +3036,9 @@ def _v2_entry_c_exit_joint() -> None:
         ui.label(JOINT_LIQ_LIVE).classes("v2-note")
         ui.label(JOINT_DISCIPLINE).classes("v2-note")
         return
-    if report.side_fills > 0:
+    if getattr(report, "side_missing", None):
+        ui.label(f"只读对照 · 旁簿成交：缺失（{report.side_missing}）").classes("v2-note")
+    elif report.side_fills > 0:
         ui.label(f"只读对照 · 旁簿成交={report.side_fills}").classes("v2-note")
     ui.label(joint_nail_line(report)).classes("v2-note")
     ui.label(JOINT_LIQ_NAIL).classes("v2-note")

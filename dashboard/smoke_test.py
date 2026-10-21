@@ -4249,14 +4249,29 @@ class DashboardSmokeTest(unittest.TestCase):
             (None, "C"),
         ]
         self.assertEqual(dedup_token_count(events), 6)
+        ledger = self.root / "CELL_LEDGER.csv"
+        ledger.write_text(
+            "cell_id,cell_id_end,date,layer,hypothesis,status,ref\n"
+            "1,267,2026-10-20,all,历史累计、明细待补,历史累计、明细待补,r\n"
+            "268,,2026-10-21,entry,a,rejected,x\n"
+            "269,,2026-10-21,entry,b,rejected,x\n"
+            "270,,2026-10-21,exit,c,rejected,x\n"
+            "271,,2026-10-21,entry,jev d,暂定拒绝,y\n",
+            encoding="utf-8",
+        )
+        os.environ["CELL_LEDGER_CSV"] = str(ledger)
         self.assertEqual(
             app_module.bonferroni_grid_label(),
-            "累计共测 268 格 · Bonferroni 按 268",
+            "累计共测 271 格 · Bonferroni 按 271（CELL_LEDGER 最大 cell_id）",
         )
-        self.assertEqual(app_module.BONFERRONI_GRIDS, 268)
+        self.assertFalse(hasattr(app_module, "BONFERRONI_GRIDS"))
         label_src = inspect.getsource(app_module.bonferroni_grid_label)
-        self.assertIn("BONFERRONI_GRIDS", label_src)
         self.assertNotIn("268", label_src)
+        self.assertNotIn("271", label_src)
+        jev_texts = _rendered_card_texts(app_module._v2_jev_gate)
+        self.assertTrue(any("暂定拒绝" in t for t in jev_texts))
+        os.environ["CELL_LEDGER_CSV"] = str(self.root / "no-ledger.csv")
+        self.assertEqual(app_module.bonferroni_grid_label(), "格数：总账缺失")
         jev_texts = _rendered_card_texts(app_module._v2_jev_gate)
         self.assertIn(app_module.bonferroni_grid_label(), jev_texts)
         self.assertIn(app_module.RETIRED_GRID_LINE, jev_texts)
@@ -4660,6 +4675,152 @@ class DashboardSmokeTest(unittest.TestCase):
                 output, _ = proc.communicate(timeout=5)
         self.assertNotIn(secret, output or "")
 
+
+
+class BoardTruthSmokeTest(unittest.TestCase):
+    """Display-only truth cards: missing never reads as 0."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._env = dict(os.environ)
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._env)
+        self._tmp.cleanup()
+
+    def test_supply_gaps_partial_and_missing(self) -> None:
+        from dashboard import board_truth as bt
+        self.assertIsNone(bt.load_supply_gaps(self.root / "none.csv"))
+        self.assertEqual(bt.day_coverage("2026-10-21", None), "断供记录缺失")
+        csv_path = self.root / "supply_gaps.csv"
+        csv_path.write_text(
+            "component,start_at,end_at,start_hkt,end_hkt,reason,source\n"
+            "execution_main_loop,2026-10-20T18:03:17Z,2026-10-21T00:05:00Z,,,stop,execution\n"
+            "shadow010_book,2026-10-20T17:50:11Z,,,,halt,execution\n",
+            encoding="utf-8",
+        )
+        gaps = bt.load_supply_gaps(csv_path)
+        now = datetime(2026, 10, 21, 4, 0, tzinfo=timezone.utc)
+        cov = bt.day_coverage("2026-10-21", gaps, now=now)
+        self.assertIn("execution_main_loop 部分 02:03–08:05", cov)
+        self.assertIn("shadow010_book 部分 01:50–进行中", cov)
+        self.assertEqual(bt.day_coverage("2026-10-19", gaps, now=now), "")
+
+    def test_side_book_missing_is_not_zero(self) -> None:
+        from dashboard import entry_c_exit_joint as ej
+        os.environ["C_EXIT_SHADOW_DB"] = str(self.root / "absent.db")
+        os.environ["ENTRY_C_EXIT_JOINT_CSV"] = str(self.root / "absent.csv")
+        count, reason = ej.side_book_count_or_missing()
+        self.assertIsNone(count)
+        self.assertTrue(reason)
+        report = ej.load_entry_c_exit_joint()
+        self.assertIn("缺失", ej.nail_line(report))
+
+    def test_watchdog_heartbeat(self) -> None:
+        from dashboard import board_truth as bt
+        self.assertEqual(bt.WATCHDOG_HEARTBEAT_REL, Path("logs") / "heartbeat_gap_watch.alive")
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+        os.environ.pop("WATCHDOG_HEARTBEAT_FILE", None)
+        self.assertEqual(bt.watchdog_status()[1], "看门未上线/缺失")
+        (self.root / "logs").mkdir()
+        (self.root / "logs" / "heartbeat_gap_watch.alive").write_text("x")
+        self.assertEqual(bt.watchdog_status()[0], "ok")
+        hb = self.root / "hb"
+        os.environ["WATCHDOG_HEARTBEAT_FILE"] = str(hb)
+        self.assertEqual(bt.watchdog_status()[1], "看门未上线/缺失")
+        self.assertEqual(bt.watchdog_status(hb)[1], "看门未上线/缺失")
+        hb.write_text("x")
+        self.assertEqual(bt.watchdog_status(hb)[0], "ok")
+        self.assertEqual(bt.watchdog_status(hb, now=time.time() + 600)[0], "warn")
+
+    def test_cell_ledger_range_rows(self) -> None:
+        from dashboard import board_truth as bt
+        head = "cell_id,date,layer,hypothesis,status,ref\n"
+        singles = "".join(f"{i},2026-10-21,entry,h,rejected,r\n" for i in range(268, 272))
+        for dash in ("-", "–"):
+            path = self.root / f"ledger{ord(dash)}.csv"
+            path.write_text(
+                head + f"1{dash}267,2026-10-20,all,历史累计、明细待补,历史累计、明细待补,r\n"
+                + singles + "bad,x,x,x,x,x\n,x,x,x,x,x\n9-3,x,x,x,x,x\n",
+                encoding="utf-8",
+            )
+            led = bt.load_cell_ledger(path)
+            self.assertEqual(led.max_cell_id, 271)
+            self.assertEqual(led.skipped, 3)
+            self.assertIn("3 行无法解析已跳过", bt.grid_count_label(led))
+        only = self.root / "only_range.csv"
+        only.write_text(head + "1–267,x,x,x,x,x\n", encoding="utf-8")
+        self.assertEqual(bt.load_cell_ledger(only).max_cell_id, 267)
+
+    def test_deploy_components_include_indicators(self) -> None:
+        from dashboard import board_truth as bt
+        self.assertIn(("indicators", "indicators.run"), bt.DEPLOY_COMPONENTS)
+        self.assertEqual(bt.DEPLOY_REPO_PATHS["indicators"], "crawler/indicators")
+        (self.root / "indicators").mkdir()
+        (self.root / "indicators" / "a.py").write_text("x=1\n")
+        seen: list[str] = []
+
+        def fake_tree(_repo, _rev, sub):
+            seen.append(sub)
+            return {"a.py": bt._blob_sha(b"x=1\n")}
+
+        with patch.object(bt, "_tree", side_effect=fake_tree):
+            row = bt.compare_component(self.root, self.root, "indicators", "no-such-proc-xyz")
+        self.assertEqual(seen, ["crawler/indicators"])
+        self.assertIn("0 文件不同", row.detail)
+
+    def test_cell_ledger_reserved_rows(self) -> None:
+        from dashboard import board_truth as bt
+        head = "cell_id,cell_id_end,date,layer,hypothesis,status,ref\n"
+        rng = "1,267,,multi,历史累计,mixed,r\n"
+        only = self.root / "only.csv"
+        only.write_text(head + rng, encoding="utf-8")
+        self.assertEqual(bt.load_cell_ledger(only).max_cell_id, 267)
+        full = self.root / "full.csv"
+        full.write_text(
+            head + rng
+            + "".join(f"{i},,2026-10-21,x,h,registered,r\n" for i in range(268, 272))
+            + "272,,2026-10-21,decision,迁移,reserved,r\n",
+            encoding="utf-8",
+        )
+        led = bt.load_cell_ledger(full)
+        self.assertEqual(led.max_cell_id, 271)
+        self.assertEqual(led.reserved, (272,))
+        label = bt.grid_count_label(led)
+        self.assertIn("累计共测 271 格", label)
+        self.assertIn("另有 1 行 reserved（272）", label)
+
+    def test_cell_ledger_end_column_bad_row(self) -> None:
+        from dashboard import board_truth as bt
+        path = self.root / "l.csv"
+        path.write_text(
+            "cell_id,cell_id_end,date,layer,hypothesis,status,ref\n"
+            "1,267,x,x,x,x,x\n270,,x,x,x,x,x\n5,zz,x,x,x,x,x\n",
+            encoding="utf-8",
+        )
+        led = bt.load_cell_ledger(path)
+        self.assertEqual((led.max_cell_id, led.skipped), (270, 1))
+
+    def test_deploy_no_comparable_files(self) -> None:
+        from dashboard import board_truth as bt
+        (self.root / "indicators").mkdir()
+        (self.root / "indicators" / "run.py").write_text("x=1\n")
+        with patch.object(bt, "_tree", return_value={}):
+            row = bt.compare_component(self.root, self.root, "indicators", "no-such-proc-xyz")
+        self.assertIn("无可比文件", row.detail)
+        self.assertNotIn("0 文件不同", row.detail)
+        self.assertIn(row.status, {"unknown", "unreported"})
+        self.assertEqual(app_module._DEPLOY_TONE[row.status], "mute")
+
+    def test_deploy_unreported(self) -> None:
+        from dashboard import board_truth as bt
+        (self.root / "execution").mkdir()
+        (self.root / "execution" / "a.py").write_text("x=1\n")
+        row = bt.compare_component(self.root, None, "execution", "no-such-proc-xyz")
+        self.assertEqual(row.status, "unreported")
+        self.assertIn("未报", row.detail)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
