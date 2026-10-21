@@ -4814,6 +4814,130 @@ class BoardTruthSmokeTest(unittest.TestCase):
         self.assertIn(row.status, {"unknown", "unreported"})
         self.assertEqual(app_module._DEPLOY_TONE[row.status], "mute")
 
+    def _git_repo_with_ledger(self, content: str | None) -> Path:
+        origin = self.root / "origin"
+        work = self.root / "work"
+        run = lambda *a, cwd=None: subprocess.run(a, cwd=cwd, check=True, capture_output=True)
+        run("git", "init", "-q", "-b", "main", str(origin))
+        run("git", "-C", str(origin), "config", "user.email", "t@t")
+        run("git", "-C", str(origin), "config", "user.name", "t")
+        (origin / "docs").mkdir()
+        if content is not None:
+            (origin / "docs" / "CELL_LEDGER.csv").write_text(content, encoding="utf-8")
+        else:
+            (origin / "docs" / "x.md").write_text("x")
+        run("git", "-C", str(origin), "add", "-A")
+        run("git", "-C", str(origin), "commit", "-qm", "c")
+        run("git", "clone", "-q", str(origin), str(work))
+        run("git", "-C", str(work), "fetch", "-q", "origin")
+        return work
+
+    def test_ledger_from_git(self) -> None:
+        from dashboard import board_truth as bt
+        head = "cell_id,cell_id_end,date,layer,hypothesis,status,ref\n"
+        body = head + "1,267,,m,h,mixed,r\n" + "".join(
+            f"{i},,d,l,h,registered,r\n" for i in range(268, 272)
+        ) + "272,,d,l,h,reserved,r\n"
+        work = self._git_repo_with_ledger(body)
+        os.environ.pop("CELL_LEDGER_CSV", None)
+        os.environ["DEPLOY_COMPARE_REPO"] = str(work)
+        bt._LEDGER_CACHE = None
+        led, src = bt.load_ledger_with_source()
+        self.assertEqual(led.max_cell_id, 271)
+        self.assertEqual(src.kind, "git")
+        sha = subprocess.run(["git", "-C", str(work), "rev-parse", "origin/main"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(src.sha, sha)
+        self.assertFalse(src.stale)
+        text, warn = bt.ledger_source_line(src)
+        self.assertIn(sha[:8], text)
+        self.assertIn("HKT", text)
+        self.assertFalse(warn)
+        _led, old = bt.load_ledger_with_source(now=time.time() + 7200)
+        self.assertTrue(old.stale)
+        self.assertTrue(bt.ledger_source_line(old)[1])
+        self.assertTrue(bt.fetch_compare_repo_once())
+        # explicit override wins and is labelled 本地覆盖 <path>
+        over = self.root / "over.csv"
+        over.write_text(head + "5,,d,l,h,x,r\n", encoding="utf-8")
+        os.environ["CELL_LEDGER_CSV"] = str(over)
+        led, src = bt.cached_ledger()
+        self.assertEqual(led.max_cell_id, 5)
+        self.assertIn(f"来源：本地覆盖 {over}", bt.ledger_source_line(src)[0])
+
+    def test_ledger_git_missing_file_and_repo(self) -> None:
+        from dashboard import board_truth as bt
+        os.environ.pop("CELL_LEDGER_CSV", None)
+        work = self._git_repo_with_ledger(None)
+        os.environ["DEPLOY_COMPARE_REPO"] = str(work)
+        led, _src = bt.load_ledger_with_source()
+        self.assertIsNone(led.max_cell_id)
+        self.assertTrue(bt.grid_count_label(led).startswith("格数：总账缺失（"))
+        os.environ["DEPLOY_COMPARE_REPO"] = str(self.root / "nope")
+        led, _src = bt.load_ledger_with_source()
+        self.assertTrue(bt.grid_count_label(led).startswith("格数：总账缺失（"))
+        bt._FETCH_STATE["last_error"] = None
+        self.assertFalse(bt.fetch_compare_repo_once())
+        bt._FETCH_STATE["last_error"] = None
+
+    def test_deploy_diff_is_yellow_even_if_declared_matches(self) -> None:
+        from dashboard import board_truth as bt
+        folder = self.root / "execution"
+        folder.mkdir()
+        (folder / "a.py").write_text("x=1\n")
+        (folder / "DEPLOY_SHA").write_text("abc123\n")
+        good = {"a.py": bt._blob_sha(b"x=1\n")}
+
+        def fake_tree(_repo, rev, _sub):
+            return dict(good) if rev == "abc123" else {"a.py": good["a.py"], "b.py": "f" * 40}
+
+        with patch.object(bt, "_tree", side_effect=fake_tree):
+            row = bt.compare_component(self.root, self.root, "execution", "no-such-proc-xyz")
+        self.assertIn("与文件一致", row.detail)
+        self.assertEqual(row.status, "yellow")
+
+    def test_main_diff_nonzero_exact(self) -> None:
+        from dashboard import board_truth as bt
+        self.assertFalse(bt.main_diff_nonzero("未报 · 对 main：0 文件不同 · 0 缺"))
+        self.assertTrue(bt.main_diff_nonzero("对 main：1 文件不同 · 0 缺"))
+        self.assertTrue(bt.main_diff_nonzero("对 main：10 文件不同 · 0 缺"))
+        self.assertTrue(bt.main_diff_nonzero("对 main：0 文件不同 · 1 缺"))
+        self.assertFalse(bt.main_diff_nonzero("无可比文件"))
+
+    def test_ledger_missing_always_warns(self) -> None:
+        from dashboard import board_truth as bt
+        src = bt.LedgerSource(
+            "missing", "origin/main@deadbeef", "deadbeef" * 5,
+            datetime.now(timezone.utc), False, reason="origin/main 无 docs/CELL_LEDGER.csv",
+        )
+        text, warn = bt.ledger_source_line(src)
+        self.assertTrue(warn)
+        self.assertIn("缺失", text)
+
+    def test_ledger_show_uses_resolved_sha(self) -> None:
+        from dashboard import board_truth as bt
+        head = "cell_id,cell_id_end,date,layer,hypothesis,status,ref\n1,,d,l,h,x,r\n"
+        work = self._git_repo_with_ledger(head)
+        os.environ.pop("CELL_LEDGER_CSV", None)
+        os.environ["DEPLOY_COMPARE_REPO"] = str(work)
+        sha = subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "origin/main"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        seen: list[str] = []
+        real = bt._git
+
+        def spy(repo, *args):
+            seen.append(args)
+            return real(repo, *args)
+
+        with patch.object(bt, "_git", side_effect=spy):
+            bt.load_ledger_with_source()
+        shows = [a for a in seen if a and a[0] == "show"]
+        self.assertEqual(len(shows), 1)
+        self.assertEqual(shows[0], ("show", f"{sha}:docs/CELL_LEDGER.csv"))
+        self.assertNotIn("origin/main:", shows[0][1])
+
     def test_deploy_unreported(self) -> None:
         from dashboard import board_truth as bt
         (self.root / "execution").mkdir()

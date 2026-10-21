@@ -2039,7 +2039,7 @@ def _v2_jev_gate() -> None:
         "证 edge≈0.02 约需 ~350 已结算样本（Foresight Arena）。"
         "解读收紧，不改门槛、不算有效性。"
     ).classes("v2-note")
-    ui.label(bonferroni_grid_label()).classes("v2-note")
+    _grid_count_lines()
     _grid_registry_notes()
 
 
@@ -2249,6 +2249,18 @@ def bonferroni_grid_label() -> str:
     except Exception:
         log.warning("cell ledger read failed")
         return board_truth.LEDGER_MISSING
+
+
+def _grid_count_lines() -> None:
+    """Grid count + where the ledger came from (git origin/main or 本地覆盖)."""
+    ui.label(bonferroni_grid_label()).classes("v2-note")
+    try:
+        _led, src = board_truth.cached_ledger()
+        text, warn = board_truth.ledger_source_line(src)
+    except Exception:
+        log.warning("ledger source read failed")
+        text, warn = "来源：缺失（读取失败）", True
+    ui.label(text).classes("v2-note v2-note-warn" if warn else "v2-note")
 
 
 def _grid_registry_notes() -> None:
@@ -2596,7 +2608,7 @@ def _goal_short_text(value: object) -> tuple[str, str]:
 
 
 _DEPLOY_TONE = {"ok": "up", "red": "down", "yellow": "warn", "unreported": "mute", "unknown": "mute"}
-_DEPLOY_WORD = {"ok": "一致", "red": "不符", "yellow": "磁盘已换、进程未重启", "unreported": "未报", "unknown": "无法比对"}
+_DEPLOY_WORD = {"ok": "一致", "red": "不符", "yellow": "需留意", "unreported": "未报", "unknown": "无法比对"}
 
 
 def _v2_deploy_sha() -> None:
@@ -2612,8 +2624,15 @@ def _v2_deploy_sha() -> None:
         word = _DEPLOY_WORD.get(row.status, row.status)
         if "无可比文件" in row.detail and row.status in {"unknown", "unreported"}:
             word = "无可比文件"
-        if row.status == "yellow" and row.declared is None:
-            word = "未报 · 磁盘已换、进程未重启"
+        if row.status == "yellow":
+            parts = []
+            if row.declared is None:
+                parts.append("未报")
+            if "磁盘已换" in row.detail:
+                parts.append("磁盘已换、进程未重启")
+            if board_truth.main_diff_nonzero(row.detail):
+                parts.append("与 main 有差异")
+            word = " · ".join(parts) or word
         table.append([
             row.component,
             (row.declared or "未报")[:12],
@@ -2993,7 +3012,7 @@ def _v2_c_exit_shadow() -> None:
     ui.label(C_EXIT_NAIL).classes("v2-note")
     ui.label(C_EXIT_DISCIPLINE).classes("v2-note")
     ui.label(C_EXIT_GRID).classes("v2-note")
-    ui.label(bonferroni_grid_label()).classes("v2-note")
+    _grid_count_lines()
     _grid_registry_notes()
     ui.label(SIDE_BOOK_RETURN_TAG).classes("v2-note")
     for row in report.tags:
@@ -3267,6 +3286,7 @@ def main() -> None:
     setup_logging()
     register_health()
     register_pages()
+    board_truth.start_background_fetch()
     listen_port = port()
     if api_secret():
         auth_mode = "required"

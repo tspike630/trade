@@ -7,12 +7,15 @@ an explicit "missing" reason, never as a zero or a hardcoded fallback.
 from __future__ import annotations
 
 import csv
+import re
 import hashlib
+import io
 import logging
 import os
 import subprocess
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -80,6 +83,10 @@ def load_cell_ledger(path: Path | None = None) -> LedgerCount:
     except (OSError, UnicodeError, csv.Error):
         log.warning("cell ledger unreadable")
         return LedgerCount(None, None, "总账不可读")
+    return _parse_ledger_rows(rows)
+
+
+def _parse_ledger_rows(rows: list[dict[str, str]]) -> LedgerCount:
     ids: list[int] = []
     tentative = 0
     skipped = 0
@@ -107,10 +114,148 @@ def load_cell_ledger(path: Path | None = None) -> LedgerCount:
     return LedgerCount(max(ids), tentative, None, skipped, tuple(reserved))
 
 
+@dataclass(frozen=True)
+class LedgerSource:
+    kind: str  # "override" / "git" / "missing"
+    detail: str  # path for override; "origin/main@<sha>" for git
+    sha: str | None = None
+    fetched_at: datetime | None = None
+    stale: bool = False
+    reason: str | None = None
+
+
+LEDGER_GIT_PATH = "docs/CELL_LEDGER.csv"
+FETCH_STALE_SECONDS = 3600
+FETCH_INTERVAL_SECONDS = 900
+_FETCH_STATE: dict[str, object] = {"last_error": None}
+_LEDGER_CACHE: tuple[float, LedgerCount, LedgerSource] | None = None
+
+
+def _fetch_head_mtime(repo: Path) -> float | None:
+    best: float | None = None
+    for args in (("rev-parse", "--git-path", "FETCH_HEAD"), ("rev-parse", "--git-common-dir")):
+        out = _git(repo, *args)
+        if not out:
+            continue
+        path = Path(out.strip())
+        if args[-1] == "--git-common-dir":
+            path = path / "FETCH_HEAD"
+        if not path.is_absolute():
+            path = repo / path
+        try:
+            m = path.stat().st_mtime
+        except OSError:
+            continue
+        best = m if best is None else max(best, m)
+    return best
+
+
+def load_ledger_with_source(*, now: float | None = None) -> tuple[LedgerCount, LedgerSource]:
+    """CELL_LEDGER_CSV override first (本地覆盖), else git show origin/main."""
+    raw = os.environ.get("CELL_LEDGER_CSV", "").strip()
+    if raw:
+        path = Path(raw).expanduser()
+        return load_cell_ledger(path), LedgerSource("override", str(path))
+    repo = deploy_repo_path()
+    if repo is None:
+        return LedgerCount(None, None, "总账缺失（无比对仓库）"), LedgerSource("missing", "", reason="无比对仓库")
+    sha_out = _git(repo, "rev-parse", "origin/main")
+    if sha_out is None:
+        return LedgerCount(None, None, "总账缺失（git 不可用或无 origin/main）"), LedgerSource(
+            "missing", "", reason="git 不可用或无 origin/main"
+        )
+    sha = sha_out.strip()
+    mtime = _fetch_head_mtime(repo)
+    clock = now if now is not None else time.time()
+    fetched = datetime.fromtimestamp(mtime, HKT) if mtime is not None else None
+    stale = mtime is None or clock - mtime > FETCH_STALE_SECONDS or bool(_FETCH_STATE.get("last_error"))
+    src = LedgerSource("git", f"origin/main@{sha[:8]}", sha, fetched, stale)
+    text = _git(repo, "show", f"{sha}:{LEDGER_GIT_PATH}")
+    if text is None:
+        return LedgerCount(None, None, f"总账缺失（origin/main 无 {LEDGER_GIT_PATH}）"), replace(
+            src, kind="missing", reason=f"origin/main 无 {LEDGER_GIT_PATH}"
+        )
+    try:
+        rows = list(csv.DictReader(io.StringIO(text)))
+    except csv.Error:
+        return LedgerCount(None, None, "总账缺失（git 内容不可解析）"), replace(src, kind="missing")
+    return _parse_ledger_rows(rows), src
+
+
+def cached_ledger(*, ttl: float = 60.0) -> tuple[LedgerCount, LedgerSource]:
+    global _LEDGER_CACHE
+    if os.environ.get("CELL_LEDGER_CSV", "").strip():
+        return load_ledger_with_source()
+    mono = time.monotonic()
+    if _LEDGER_CACHE is not None and mono - _LEDGER_CACHE[0] < ttl:
+        return _LEDGER_CACHE[1], _LEDGER_CACHE[2]
+    led, src = load_ledger_with_source()
+    _LEDGER_CACHE = (mono, led, src)
+    return led, src
+
+
+def ledger_source_line(src: LedgerSource) -> tuple[str, bool]:
+    """(text, warn). warn = yellow."""
+    if src.kind == "override":
+        return f"来源：本地覆盖 {src.detail}（临时副本）", True
+    if src.kind == "missing":
+        return f"来源：缺失（{src.reason or '未知'}）", True
+    fetched = src.fetched_at.strftime("%m-%d %H:%M HKT") if src.fetched_at else "从未 fetch"
+    err = _FETCH_STATE.get("last_error")
+    tail = f" · 最近 fetch 失败：{err}" if err else ""
+    stale = " · 超过 1 小时未 fetch" if src.stale and not err else ""
+    return f"来源：git origin/main {src.sha[:8] if src.sha else '?'} · 本地副本 fetch 于 {fetched}{stale}{tail}", src.stale
+
+
+def fetch_compare_repo_once() -> bool:
+    """Read-only `git fetch origin` (never touches the work tree)."""
+    repo = deploy_repo_path()
+    if repo is None:
+        _FETCH_STATE["last_error"] = "无比对仓库"
+        log.warning("ledger fetch skipped: no compare repo")
+        return False
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(repo), "fetch", "-q", "origin"],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _FETCH_STATE["last_error"] = type(exc).__name__
+        log.warning("compare repo fetch failed: %s", type(exc).__name__)
+        return False
+    if done.returncode != 0:
+        _FETCH_STATE["last_error"] = f"exit {done.returncode}"
+        log.warning("compare repo fetch failed: exit %s", done.returncode)
+        return False
+    _FETCH_STATE["last_error"] = None
+    global _LEDGER_CACHE, _CACHE
+    _LEDGER_CACHE = None
+    _CACHE = None
+    return True
+
+
+def start_background_fetch(interval: float = FETCH_INTERVAL_SECONDS) -> threading.Thread:
+    def loop() -> None:
+        while True:
+            try:
+                fetch_compare_repo_once()
+            except Exception:
+                log.exception("compare repo fetch loop error")
+            time.sleep(interval)
+
+    thread = threading.Thread(target=loop, name="compare-repo-fetch", daemon=True)
+    thread.start()
+    return thread
+
+
 def grid_count_label(ledger: LedgerCount | None = None) -> str:
-    led = ledger if ledger is not None else load_cell_ledger()
+    led = ledger if ledger is not None else cached_ledger()[0]
     if led.max_cell_id is None:
-        return LEDGER_MISSING if led.reason == "总账缺失" else f"格数：{led.reason}"
+        if led.reason == "总账缺失":
+            return LEDGER_MISSING
+        if (led.reason or "").startswith("总账缺失"):
+            return f"格数：{led.reason}"
+        return f"格数：{led.reason}"
     n = led.max_cell_id
     label = f"累计共测 {n} 格 · Bonferroni 按 {n}（CELL_LEDGER 最大 cell_id）"
     if led.reserved:
@@ -122,7 +267,7 @@ def grid_count_label(ledger: LedgerCount | None = None) -> str:
 
 
 def tentative_reject_line(ledger: LedgerCount | None = None) -> str:
-    led = ledger if ledger is not None else load_cell_ledger()
+    led = ledger if ledger is not None else cached_ledger()[0]
     if led.tentative_reject:
         return f"{TENTATIVE_REJECT_LINE} · 总账标记 {led.tentative_reject} 格"
     return TENTATIVE_REJECT_LINE
@@ -332,6 +477,21 @@ def deploy_repo_path() -> Path | None:
     return None
 
 
+_MAIN_DIFF_RE = re.compile(r"(?:^| · )对 main：(\d+) 文件不同 · (\d+) 缺(?:$| · )")
+
+
+def main_diff_nonzero(detail: str) -> bool:
+    """True when detail reports a non-zero diff or missing count against main.
+
+    Matches the exact phrase produced by compare_component (not a substring of
+    "10 文件不同"). Numbers are parsed; a zero/zero report is not a diff.
+    """
+    matched = _MAIN_DIFF_RE.search(f" · {detail} · ")
+    if matched is None:
+        return False
+    return int(matched.group(1)) != 0 or int(matched.group(2)) != 0
+
+
 # live dir -> repo path on origin/main when they differ; default = same name.
 DEPLOY_REPO_PATHS: dict[str, str] = {"indicators": "crawler/indicators"}
 
@@ -368,6 +528,8 @@ def compare_component(root: Path, repo: Path | None, name: str, proc: str) -> De
             )
             gone = sum(1 for rel in tracked if rel not in disk)
             notes.append(f"对 main：{diff} 文件不同 · {gone} 缺")
+            if (diff or gone) and status == "ok":
+                status = "yellow"
         if declared is not None:
             want = _tree(repo, declared, repo_sub)
             if want is None:
