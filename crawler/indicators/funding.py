@@ -124,7 +124,7 @@ def compute_funding_fields(
         strength = round((raw_f / 100.0) * conf * coef, 6)
 
     jev_ts = sig.get("fetched_at") or sig.get("analyzed_at")
-    updated = jev_ts or utc_now_iso()
+    updated = jev_ts or None  # no JEV clock -> None; never stamp now (stale bypass)
     age_min = jev_age_minutes(jev_ts, now)
 
     return {
