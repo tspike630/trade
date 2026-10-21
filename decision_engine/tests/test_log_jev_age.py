@@ -53,8 +53,8 @@ class LogJevAgeTests(unittest.TestCase):
         self.assertEqual(ex["jev_age_min"], 7.2)  # gate's rounded value
         self.assertEqual(ex["jev_stance_raw"], "BULLISH")
 
-    def test_missing_or_nonfinite_age_logged_as_null(self):
-        self.bus.publish(_buy())
+    def test_gated_unknown_or_nonfinite_age_logged_as_null(self):
+        self.bus.publish(_buy(jev_age_min=None))
         self.bus.publish(_buy(token_address="Tok222", jev_age_min=float("nan"), jev_stance_raw="BULLISH"))
         a, b = self._extras()
         self.assertIn("jev_age_min", a)
@@ -62,6 +62,12 @@ class LogJevAgeTests(unittest.TestCase):
         self.assertNotIn("jev_stance_raw", a)
         self.assertIsNone(b["jev_age_min"])
         self.assertEqual(b["jev_stance_raw"], "BULLISH")
+
+    def test_non_gated_signal_has_no_jev_fields(self):
+        self.bus.publish(_buy(strategy_id="rsi_only_v1", rsi_14=25.0))
+        ex = self._extras()[0]
+        self.assertNotIn("jev_age_min", ex)
+        self.assertNotIn("jev_stance_raw", ex)
 
 
 if __name__ == "__main__":
