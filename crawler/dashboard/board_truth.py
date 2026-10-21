@@ -47,6 +47,7 @@ class LedgerCount:
     tentative_reject: int | None
     reason: str | None
     skipped: int = 0
+    reserved: tuple[int, ...] = ()
 
 
 def _cell_upper(raw: str) -> int | None:
@@ -82,6 +83,7 @@ def load_cell_ledger(path: Path | None = None) -> LedgerCount:
     ids: list[int] = []
     tentative = 0
     skipped = 0
+    reserved: list[int] = []
     for row in rows:
         upper = _cell_upper(str(row.get("cell_id") or ""))
         end_raw = str(row.get("cell_id_end") or "").strip()
@@ -94,12 +96,15 @@ def load_cell_ledger(path: Path | None = None) -> LedgerCount:
         if upper is None:
             skipped += 1
             continue
+        if str(row.get("status") or "").strip().lower() == "reserved":
+            reserved.append(upper)
+            continue
         ids.append(upper)
         if TENTATIVE_REJECT in str(row.get("status") or ""):
             tentative += 1
     if not ids:
-        return LedgerCount(None, None, "总账无 cell_id", skipped)
-    return LedgerCount(max(ids), tentative, None, skipped)
+        return LedgerCount(None, None, "总账无 cell_id", skipped, tuple(reserved))
+    return LedgerCount(max(ids), tentative, None, skipped, tuple(reserved))
 
 
 def grid_count_label(ledger: LedgerCount | None = None) -> str:
@@ -108,6 +113,9 @@ def grid_count_label(ledger: LedgerCount | None = None) -> str:
         return LEDGER_MISSING if led.reason == "总账缺失" else f"格数：{led.reason}"
     n = led.max_cell_id
     label = f"累计共测 {n} 格 · Bonferroni 按 {n}（CELL_LEDGER 最大 cell_id）"
+    if led.reserved:
+        ids = "、".join(str(i) for i in led.reserved)
+        label += f" · 另有 {len(led.reserved)} 行 reserved（{ids}）"
     if led.skipped:
         label += f" · {led.skipped} 行无法解析已跳过"
     return label

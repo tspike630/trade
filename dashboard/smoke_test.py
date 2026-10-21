@@ -4771,6 +4771,27 @@ class BoardTruthSmokeTest(unittest.TestCase):
         self.assertEqual(seen, ["crawler/indicators"])
         self.assertIn("0 文件不同", row.detail)
 
+    def test_cell_ledger_reserved_rows(self) -> None:
+        from dashboard import board_truth as bt
+        head = "cell_id,cell_id_end,date,layer,hypothesis,status,ref\n"
+        rng = "1,267,,multi,历史累计,mixed,r\n"
+        only = self.root / "only.csv"
+        only.write_text(head + rng, encoding="utf-8")
+        self.assertEqual(bt.load_cell_ledger(only).max_cell_id, 267)
+        full = self.root / "full.csv"
+        full.write_text(
+            head + rng
+            + "".join(f"{i},,2026-10-21,x,h,registered,r\n" for i in range(268, 272))
+            + "272,,2026-10-21,decision,迁移,reserved,r\n",
+            encoding="utf-8",
+        )
+        led = bt.load_cell_ledger(full)
+        self.assertEqual(led.max_cell_id, 271)
+        self.assertEqual(led.reserved, (272,))
+        label = bt.grid_count_label(led)
+        self.assertIn("累计共测 271 格", label)
+        self.assertIn("另有 1 行 reserved（272）", label)
+
     def test_cell_ledger_end_column_bad_row(self) -> None:
         from dashboard import board_truth as bt
         path = self.root / "l.csv"
