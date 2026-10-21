@@ -26,6 +26,7 @@ as a fallback outside this writer). No gate / weight / run-param change.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -138,6 +139,17 @@ def coerce_pair_created_at_ms(value: Any) -> int | None:
     return None
 
 
+def _json_safe_age(v: Any) -> float | None:
+    """Finite float or None (NaN/inf/garbage -> None so raw_json stays valid JSON)."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def normalize_signal(
     sig: dict[str, Any],
     *,
@@ -172,6 +184,12 @@ def normalize_signal(
     }
     # preserve extras in raw
     extras = {k: v for k, v in sig.items() if k not in out}
+    if out["action"] == "buy":
+        # Logging only (no gate change): record the jev age the gate used, or
+        # null when unknown, so stale-gate bypasses can be audited later.
+        extras["jev_age_min"] = _json_safe_age(extras.get("jev_age_min"))
+        if extras.get("jev_stance_raw") is None:
+            extras.pop("jev_stance_raw", None)
     if extras:
         out["_extras"] = extras
     return out
