@@ -444,13 +444,16 @@ def _queue_tiered(
     """Select due tokens by tier and add to pending_enrich."""
     now = _utc_now()
     by_chain: dict[str, list[str]] = defaultdict(list)
-    from position_pin import is_pinned, pin_enabled, pinned_count
+    from position_pin import is_pinned, last_failed_count, pin_enabled, pinned_count, status_summary
 
     if pin_enabled():
         summary["pinned_open_positions"] = pinned_count()
+        summary["pin_load_failed_dbs"] = last_failed_count()
         log.info(
-            "position_pin hot pinned_open_positions=%s cycle_id=%s",
+            "position_pin hot pinned_open_positions=%s dbs=[%s] failed_dbs=%s cycle_id=%s",
             summary["pinned_open_positions"],
+            status_summary(),
+            summary["pin_load_failed_dbs"],
             summary.get("cycle_id"),
         )
     for row in store.list_tokens_for_tiering():

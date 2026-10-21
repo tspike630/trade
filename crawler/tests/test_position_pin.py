@@ -24,6 +24,61 @@ def _mk(path: Path, rows, with_token=True):
     c.close()
 
 
+class DbStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.env = mock.patch.dict(os.environ, {"PIN_OPEN_POSITIONS_HOT": "1"})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def _load(self, dbs):
+        with self.assertLogs(position_pin.log, level="INFO") as cm:
+            position_pin.load_pins(base_dir=self.d, dbs=dbs)
+        return [m for m in cm.output if m.startswith("WARNING")]
+
+    def test_missing_file_warns(self):
+        w = self._load(("nope.db",))
+        self.assertTrue(any("nope.db" in m and "not found" in m for m in w))
+        self.assertEqual(position_pin.last_status, {"nope.db": "missing"})
+        self.assertEqual(position_pin.last_failed_count(), 1)
+        self.assertFalse((self.d / "nope.db").exists())
+
+    def test_no_positions_table_warns(self):
+        c = sqlite3.connect(self.d / "x.db"); c.execute("CREATE TABLE other (a)"); c.commit(); c.close()
+        w = self._load(("x.db",))
+        self.assertTrue(any("x.db" in m and "no positions table" in m for m in w))
+        self.assertEqual(position_pin.last_status["x.db"], "no_table")
+
+    def test_missing_columns_warns(self):
+        c = sqlite3.connect(self.d / "y.db"); c.execute("CREATE TABLE positions (id TEXT, token_address TEXT)"); c.commit(); c.close()
+        w = self._load(("y.db",))
+        self.assertTrue(any("y.db" in m and "status" in m and "chain_id" in m for m in w))
+        self.assertEqual(position_pin.last_status["y.db"], "missing_cols")
+
+    def test_normal_db_counts(self):
+        _mk(self.d / "a.db", [("1", "solana", "P1", "T1", "open"), ("2", "solana", "P2", "T2", "open"), ("3", "solana", "P3", "T3", "closed")])
+        _mk(self.d / "b.db", [("4", "bsc", "P4", "open")], with_token=False)
+        w = self._load(("a.db", "b.db"))
+        self.assertEqual(w, [])
+        self.assertEqual(position_pin.last_status, {"a.db": 2, "b.db": 1})
+        self.assertEqual(position_pin.last_failed_count(), 0)
+
+    def test_startup_info_once(self):
+        _mk(self.d / "a.db", [])
+        with mock.patch.object(position_pin, "_startup_logged", False):
+            with self.assertLogs(position_pin.log, level="INFO") as cm:
+                position_pin.load_pins(base_dir=self.d, dbs=("a.db", "gone.db"))
+                position_pin.load_pins(base_dir=self.d, dbs=("a.db", "gone.db"))
+        starts = [m for m in cm.output if "startup" in m]
+        self.assertEqual(len(starts), 2)
+        self.assertTrue(any("a.db found" in m for m in starts))
+        self.assertTrue(any("gone.db missing" in m for m in starts))
+
+
 class LoadPinsTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
