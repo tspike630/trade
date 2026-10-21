@@ -450,15 +450,22 @@ class JevStore:
         return out + pick_r + pick_n
 
 
-def _load_pinned_tokens() -> set[tuple[str, str]]:
-    """Open-position tokens via position_pin (optional module; failures -> empty)."""
+def _load_pinned_tokens(status: dict[str, Any] | None = None) -> set[tuple[str, str]]:
+    """Open-position tokens via position_pin (optional module; failures -> empty).
+
+    On import/load failure logs a WARNING and, if ``status`` is given, sets
+    ``status["failed"] = True`` so callers can count pin_load_failed.
+    """
     try:
         import position_pin  # type: ignore
 
         _pairs, tokens = position_pin.load_pins()
         return {(norm_chain(c), norm_address(a)) for c, a in tokens}
     except Exception as exc:  # noqa: BLE001
-        log.debug("position_pin unavailable: %s", exc)
+        log.warning("position_pin load failed; pins skipped this round: %r", exc)
+        if status is not None:
+            status["failed"] = True
+            status["error"] = repr(exc)
         return set()
 
 
@@ -845,7 +852,8 @@ def run_pass(
     force=True ignores freshness interval (still rate-limited).
     """
     stats = {"seen": 0, "ok": 0, "err": 0, "skip": 0, "preserved": 0,
-             "ok_pin": 0, "ok_refresh": 0, "ok_new": 0, "s429": 0}
+             "ok_pin": 0, "ok_refresh": 0, "ok_new": 0, "s429": 0,
+             "pin_load_failed": 0}
     lim = limit if limit is not None else JEV_HOT_LIMIT
     queue: list[tuple[str, str]] = []
     tiers: dict[str, str] = {}
@@ -859,7 +867,13 @@ def run_pass(
             for t in store.list_hot_tokens(limit=lim):
                 queue.append((t["chain_id"], t["token_address"]))
         else:
-            for t in store.list_due_hot(limit=lim, interval_sec=JEV_HOT_INTERVAL_SEC):
+            pin_status: dict[str, Any] = {}
+            pins = _load_pinned_tokens(status=pin_status)
+            if pin_status.get("failed"):
+                stats["pin_load_failed"] += 1
+            for t in store.list_due_hot(
+                limit=lim, interval_sec=JEV_HOT_INTERVAL_SEC, pins=pins
+            ):
                 queue.append((t["chain_id"], t["token_address"]))
                 tiers[f"{norm_chain(t['chain_id'])}|{norm_address(t['token_address'])}"] = t["tier"]
 
@@ -912,6 +926,19 @@ def run_pass(
     return stats
 
 
+# Floor on the inter-round tail sleep so --interval 0 with no due tokens
+# cannot busy-loop (each pass would otherwise return immediately).
+JEV_MIN_ROUND_SLEEP_SEC = 30
+
+
+def _tail_sleep_sec(interval: int | float | None) -> int:
+    try:
+        val = int(interval or 0)
+    except (TypeError, ValueError):
+        val = 0
+    return max(JEV_MIN_ROUND_SLEEP_SEC, val)
+
+
 def run_loop(
     *,
     db_path: str = DB_PATH,
@@ -933,20 +960,20 @@ def run_loop(
                 stats = run_pass(store, client, force=False, limit=limit)
                 log.info(
                     "jev pass ok=%s err=%s seen=%s rows=%s remaining_budget=%s "
-                    "pin=%s refresh=%s new=%s preserved=%s s429=%s history=%s dur=%.0fs",
+                    "pin=%s refresh=%s new=%s pin_load_failed=%s preserved=%s s429=%s history=%s dur=%.0fs",
                     stats["ok"],
                     stats["err"],
                     stats["seen"],
                     store.count_signals(),
                     client.budget.remaining(),
                     stats["ok_pin"], stats["ok_refresh"], stats["ok_new"],
-                    stats["preserved"], stats["s429"], store.count_history(),
+                    stats["pin_load_failed"], stats["preserved"], stats["s429"], store.count_history(),
                     time.monotonic() - t0,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.exception("jev pass crashed: %s", exc)
             # Even pacing lives in MinuteBudget; this is only a tail wait.
-            time.sleep(max(0, int(interval)))
+            time.sleep(_tail_sleep_sec(interval))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -964,7 +991,7 @@ def main(argv: list[str] | None = None) -> int:
         "--interval",
         type=int,
         default=None,
-        help=f"Tail sleep seconds between passes (default {JEV_HOT_INTERVAL_SEC}; 0 = none)",
+        help=f"Tail sleep seconds between passes (default {JEV_HOT_INTERVAL_SEC}; floored at {JEV_MIN_ROUND_SLEEP_SEC}s)",
     )
     parser.add_argument(
         "--limit",

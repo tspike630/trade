@@ -151,6 +151,56 @@ class TestErrorsAndHistory(_Base):
         self.assertEqual(stats["s429"], 3)
         self.assertEqual(sleeps, [60.0, 120.0, 240.0])
 
+    def test_pin_load_failure_warns_counts_and_proceeds(self):
+        self.add_token("a")
+        client = self._client({"jev_score": 50.0, "fetched_at": _iso(0)})
+        fake = mock.MagicMock()
+        fake.load_pins.side_effect = RuntimeError("positions db locked")
+        with mock.patch.dict("sys.modules", {"position_pin": fake}), \
+             self.assertLogs(jev.log, level="WARNING") as cm:
+            stats = jev.run_pass(self.store, client, limit=3, sleep_fn=lambda s: None)
+        self.assertEqual(stats["pin_load_failed"], 1)
+        self.assertEqual(stats["seen"], 1)
+        self.assertEqual(stats["ok_pin"], 0)
+        self.assertTrue(any("position_pin load failed" in m and "positions db locked" in m
+                            for m in cm.output))
+        self.assertTrue(all(r.levelname == "WARNING" for r in cm.records
+                            if "position_pin" in r.getMessage()))
+
+    def test_pin_load_ok_no_failure_count(self):
+        with mock.patch.object(jev, "_load_pinned_tokens", return_value=set()):
+            stats = jev.run_pass(self.store, self._client({}), limit=3, sleep_fn=lambda s: None)
+        self.assertEqual(stats["pin_load_failed"], 0)
+
+
+class TestSleepFloor(unittest.TestCase):
+    def test_floor(self):
+        self.assertGreaterEqual(jev.JEV_MIN_ROUND_SLEEP_SEC, 30)
+        self.assertEqual(jev._tail_sleep_sec(0), 30)
+        self.assertEqual(jev._tail_sleep_sec(None), 30)
+        self.assertEqual(jev._tail_sleep_sec(-5), 30)
+        self.assertEqual(jev._tail_sleep_sec(900), 900)
+
+    def test_run_loop_interval_zero_sleeps_floor(self):
+        slept = []
+
+        class _Stop(Exception):
+            pass
+
+        def fake_sleep(s):
+            slept.append(s)
+            raise _Stop
+
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = mock.MagicMock()
+        with mock.patch.object(jev, "JevStore", return_value=cm), \
+             mock.patch.object(jev, "JevClient", return_value=cm), \
+             mock.patch.object(jev, "run_pass", return_value={}), \
+             mock.patch.object(jev.time, "sleep", side_effect=fake_sleep):
+            with self.assertRaises(_Stop):
+                jev.run_loop(db_path=":memory:", interval_sec=0)
+        self.assertEqual(slept, [30])
+
 
 class TestPacing(unittest.TestCase):
     def test_hard_caps(self):
