@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -38,9 +39,12 @@ def jev_age_min(row: dict[str, Any], now: datetime | None = None) -> float | Non
         if v is None:
             return None
         try:
-            return float(v)
+            f = float(v)
         except (TypeError, ValueError):
             return None
+        if math.isnan(f) or math.isinf(f) or f < 0:
+            return None
+        return f
     ts = row.get("jev_fetched_at") or row.get("jev_updated_at")
     if not ts:
         return None

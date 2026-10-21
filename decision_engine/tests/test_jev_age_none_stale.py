@@ -45,6 +45,12 @@ class JevAgeNoneStaleTests(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["jev_age_min"], 5.0)
 
+    def test_nan_inf_negative_are_stale(self):
+        for bad in (float("nan"), float("inf"), float("-inf"), "nan", "NaN", "inf", -1.0):
+            row = _row(jev_age_min=bad)
+            self.assertIsNone(jev_age_min(row), repr(bad))
+            self.assertEqual(jev_gate(row, 1440, True)[0], "jev_stale", repr(bad))
+
 
 if __name__ == "__main__":
     unittest.main()
