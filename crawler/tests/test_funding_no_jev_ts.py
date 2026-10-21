@@ -21,8 +21,6 @@ def _load_jev_gate():
     try:
         from decision_engine.strategies.jev_strategy import jev_gate as g
         return g
-    except Exception:  # noqa: BLE001
-        return None
     finally:
         sys.path[:] = saved_path
         for k in [k for k in sys.modules if k == "decision_engine" or k.startswith("decision_engine.")]:
@@ -43,7 +41,6 @@ class FundingNoJevTimestamp(unittest.TestCase):
         self.assertIsNone(f["jev_age_min"])
         self.assertEqual(f["jev_signal"], "bullish")
 
-    @unittest.skipIf(jev_gate is None, "decision jev_gate not importable; decision-side fix pending")
     def test_decision_gate_rejects(self):
         f = compute_funding_fields(dict(SIG))
         row = {**f, "jev_stance": SIG["stance"]}
