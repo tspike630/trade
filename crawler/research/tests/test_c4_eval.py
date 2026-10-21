@@ -180,6 +180,22 @@ class TestTrades(unittest.TestCase):
         self.assertAlmostEqual(e["ret_tp10_sl5_h60"], -0.10); self.assertEqual(e["why_tp10_sl5_h60"], "sl")
         self.assertAlmostEqual(e["ret_time60"], 0.02)   # last snapshot within 60 min (k=93)
 
+    def test_sl_gap_recorded_report_only(self):
+        s = series(); trigger_at(s, 80); s[83]["px"] = 0.9; s[83]["liq"] = 123_456.0
+        e = self.ev(s)[0]
+        self.assertEqual(e["sl_gap_sec"], 300); self.assertEqual(e["sl_liq"], 123_456.0)
+        s2 = series(); trigger_at(s2, 80)
+        self.assertIsNone(self.ev(s2)[0]["sl_gap_sec"])   # no SL -> not recorded
+
+    def test_sl_gap_report_thresholds(self):
+        ev = [{"token": f"t{i}", "pair": f"p{i}", "trigger_ts": i, "sl_gap_sec": g, "sl_liq": 1e5}
+              for i, g in enumerate([300, 600, 601, 900, 901, 1200])] + [{"token": "x", "sl_gap_sec": None}]
+        r = C.sl_gap_report(ev)
+        self.assertEqual(r["n_sl"], 6); self.assertEqual(r["gap_sec_dist"]["max"], 1200.0)
+        self.assertEqual(r["n_gt_600s"], 4); self.assertEqual(r["n_gt_900s"], 2)
+        self.assertEqual([x["gap_sec"] for x in r["gt_900s"]], [901, 1200])
+        self.assertEqual(C.sl_gap_report([])["n_sl"], 0)
+
     def test_collapse(self):
         s = series(); trigger_at(s, 80); s[85]["liq"] = 5_000.0
         e = self.ev(s)[0]
@@ -411,6 +427,7 @@ class TestRandomAndRun(unittest.TestCase):
         tr = C.run(path, "train", 268, d, skip_time_check=True)
         self.assertEqual(tr["cut_iso"], "2026-10-22T18:15:12+00:00")
         self.assertIn("entry_gap", tr); self.assertEqual(tr["warnings"], [])
+        self.assertIn("sl_exit_gap", tr); self.assertIn("random", tr["sl_exit_gap"])
         self.assertIn("no_valid_post_price", tr); self.assertFalse(tr["no_valid_post_price"]["c4"]["warning"])
         self.assertEqual(tr["entry_gap"]["c4"]["invalid_gap"], 0)
         self.assertGreater(tr["n_c4"], 0); self.assertLess(tr["n_c4"], 80)

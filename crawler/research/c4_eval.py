@@ -236,7 +236,11 @@ def simulate(p: Pair, j: int, flags, end_ts: int) -> Optional[dict]:
             continue
         last = p.px[k]
         if last <= e * (1 - SL):
-            x, why = last, "sl"; break
+            x, why = last, "sl"
+            # report-only diagnostics: gap from the previous snapshot to the SL exit snapshot, pool liq then
+            res["_sl_gap_sec"] = int(p.t[k] - p.t[k - 1])
+            res["_sl_liq"] = float(p.liq[k])
+            break
         if last >= e * (1 + TP):
             x, why = e * (1 + TP), "tp"; break
     if x is None:
@@ -296,11 +300,12 @@ def build_events(pairs: list[Pair], kind: str, end_ts: int, seed: int = RANDOM_S
             if r is None:
                 stats["no_full_hold"] += 1; continue
             nvp = r.pop("_no_valid_post")
+            slg = r.pop("_sl_gap_sec", None); sll = r.pop("_sl_liq", None)
             va = {f"ret_{k}_a": v[0] for k, v in r.items()}
             va.update({f"why_{k}_a": v[1] for k, v in r.items()})
             if nvp:   # variant (b) = verdict: -100%
                 r = {k: (-1.0, "no_valid_post") for k in r}
-            cand.append(dict(no_valid_post=bool(nvp), **va, token=p.token, pair=p.pair, trigger_ts=int(p.t[i]), entry_ts=int(p.t[j]),
+            cand.append(dict(no_valid_post=bool(nvp), sl_gap_sec=slg, sl_liq=sll, **va, token=p.token, pair=p.pair, trigger_ts=int(p.t[i]), entry_ts=int(p.t[j]),
                              entry_price=float(p.px[j]), entry_liq=float(p.liq[j]),
                              cost=tier_cost(float(p.liq[j])),
                              **{f"ret_{k}": v[0] for k, v in r.items()},
@@ -398,6 +403,28 @@ def summarize(events, ex):
                 top5_share=float(sum(absv[:5]) / sum(absv)) if sum(absv) > 0 else float("nan"))
 
 
+SL_GAP_LIST_THRESHOLDS = (600, 900)   # report-only listing thresholds (seconds)
+
+
+def sl_gap_report(events) -> dict:
+    """Report-only: for SL exits (primary exit), seconds between the last snapshot before the stop
+    and the exit snapshot, plus pool liquidity_usd at exit. No effect on verdict or warnings."""
+    sl = [e for e in events if e.get("sl_gap_sec") is not None]
+    g = np.array([e["sl_gap_sec"] for e in sl], dtype=float)
+    out = {"n_sl": len(sl)}
+    if len(sl):
+        out["gap_sec_dist"] = {"min": float(g.min()), "p25": float(np.percentile(g, 25)),
+                               "median": float(np.median(g)), "p75": float(np.percentile(g, 75)),
+                               "p90": float(np.percentile(g, 90)), "max": float(g.max()), "mean": float(g.mean())}
+        out["liq_at_exit_median"] = float(np.median([e["sl_liq"] for e in sl]))
+    for th in SL_GAP_LIST_THRESHOLDS:
+        out[f"gt_{th}s"] = [{"token": e["token"], "pair": e["pair"], "trigger_ts": e["trigger_ts"],
+                             "gap_sec": e["sl_gap_sec"], "liq_usd": e["sl_liq"]}
+                            for e in sl if e["sl_gap_sec"] > th]
+        out[f"n_gt_{th}s"] = len(out[f"gt_{th}s"])
+    return out
+
+
 def nvp_report(events) -> dict:
     n = len(events); k = sum(1 for e in events if e.get("no_valid_post"))
     sh = (k / n) if n else 0.0
@@ -485,6 +512,7 @@ def run(db: str, seg: str, cells: int, out_dir: str, train_result: Optional[str]
         cs, rs = [], []
     nr = {"c4": nvp_report(cs), "random": nvp_report(rs)}
     res["no_valid_post_price"] = nr
+    res["sl_exit_gap"] = {"c4": sl_gap_report(cs), "random": sl_gap_report(rs)}   # report-only
     res["warnings"] += [f"WARNING: {k} no_valid_post_price {v['no_valid_post_price']}/{v['n']} = {v['share']:.2%} > {NVP_WARN_FRAC:.0%}"
                         for k, v in nr.items() if v["warning"]]
     path = os.path.join(out_dir, f"c4_{seg}_result.json")
@@ -507,6 +535,7 @@ def main(argv=None):
         print(ex, r.get("verdict"))
     print("entry_gap", json.dumps(res.get("entry_gap"), default=float))
     print("no_valid_post_price", json.dumps(res.get("no_valid_post_price"), default=float))
+    print("sl_exit_gap", json.dumps(res.get("sl_exit_gap"), default=float))
     for w in res.get("warnings", []):
         print(w)
 
