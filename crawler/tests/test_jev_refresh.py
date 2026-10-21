@@ -93,6 +93,28 @@ class TestTiers(_Base):
         self.assertEqual(len(rows), 4)
 
 
+    def test_default_config_all_pins_first(self):
+        """Defaults (limit 40, pin share 1.0): every open position is picked before hot tokens."""
+        from config import JEV_HOT_LIMIT, JEV_PIN_MAX_SHARE
+        for i in range(60):
+            self.add_token(f"new{i}")
+        pins = {("solana", f"HELD{i}") for i in range(15)}
+        rows = self.store.list_due_hot(
+            limit=JEV_HOT_LIMIT, interval_sec=900, pins=pins, pin_max_share=JEV_PIN_MAX_SHARE
+        )
+        self.assertEqual(len(rows), 40)
+        self.assertEqual([r["tier"] for r in rows[:15]], ["pin"] * 15)
+        self.assertEqual({r["token_address"] for r in rows[:15]}, {f"held{i}" for i in range(15)})
+
+    def test_pins_can_fill_whole_pass(self):
+        for i in range(10):
+            self.add_token(f"new{i}")
+        pins = {("solana", f"HELD{i}") for i in range(50)}
+        rows = self.store.list_due_hot(limit=40, interval_sec=900, pins=pins, pin_max_share=1.0)
+        self.assertEqual(len(rows), 40)
+        self.assertTrue(all(r["tier"] == "pin" for r in rows))
+
+
 class TestErrorsAndHistory(_Base):
     def _client(self, result):
         c = mock.Mock()

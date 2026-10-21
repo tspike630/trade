@@ -74,7 +74,7 @@ INDICATORS_STEP2.md         # 本文
 | 新上市（默认关） | `JEV_ON_NEW_LISTING=1` → `exports/jev_pending.jsonl`，由 loop 消费 |
 
 热档：`has_pairs=1` 且 `last_seen_at` 在 `HOT_SEEN_WINDOW_SEC`（1h）内。  
-暖/冷档：**不主动拉取**。每轮最多 `JEV_HOT_LIMIT`（默认 20）个，优先从未拉过 / `fetched_at` 最旧。
+暖/冷档：**不主动拉取**。每轮最多 `JEV_HOT_LIMIT`（默认 40）个；第一档为持仓币（position_pin，默认可占满全部名额），其余优先从未拉过 / `fetched_at` 最旧。
 
 ## 配置（`config.py` / 环境变量）
 
@@ -86,7 +86,8 @@ INDICATORS_STEP2.md         # 本文
 | `JEV_AUTH_MODE` | `header` | `header` / `bearer` / `query` |
 | `JEV_HOT_INTERVAL_SEC` | `900` | 热档刷新间隔 |
 | `JEV_MAX_PER_MIN` | `7` | 客户端每分钟上限（公开 <8；鉴权可调高） |
-| `JEV_HOT_LIMIT` | `20` | 每轮最多拉取数 |
+| `JEV_HOT_LIMIT` | `40` | 每轮最多拉取数（持仓币优先） |
+| `JEV_PIN_MAX_SHARE` | `1.0` | 持仓币最多可占的名额比例 |
 | `JEV_ON_NEW_LISTING` | `0` | 新上市入队（默认关） |
 | `JEV_REQUEST_TIMEOUT_SEC` | `30` | HTTP 超时 |
 | `JEV_RAW_MAX_CHARS` | `8000` | raw/metrics 截断 |
