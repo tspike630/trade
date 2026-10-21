@@ -196,6 +196,31 @@ class TestTrades(unittest.TestCase):
         self.assertEqual([x["gap_sec"] for x in r["gt_900s"]], [901, 1200])
         self.assertEqual(C.sl_gap_report([])["n_sl"], 0)
 
+    def test_sl_gap_through_counted_exact_minus5_not(self):
+        s = series(); trigger_at(s, 80); s[83]["px"] = 0.9          # -10%: gapped through
+        a = self.ev(s)[0]
+        s = series(); trigger_at(s, 80); s[83]["px"] = 0.95         # exactly -5%: not counted
+        b = self.ev(s)[0]
+        self.assertEqual(a["why_tp10_sl5_h60"], "sl"); self.assertEqual(b["why_tp10_sl5_h60"], "sl")
+        r = C.sl_gap_through_report([a, b])
+        self.assertEqual(r["n_sl"], 2); self.assertEqual(r["n_gap_through"], 1); self.assertAlmostEqual(r["share_gap_through"], 0.5)
+        self.assertAlmostEqual(r["diff_dist"]["min"], -0.05); self.assertAlmostEqual(r["diff_dist"]["median"], -0.025)
+        self.assertEqual(C.sl_gap_through_report([b])["n_gap_through"], 0)
+        self.assertEqual(C.sl_gap_through_report([])["n_sl"], 0)
+
+    def test_sl_gap_through_random_baseline(self):
+        s = series(); s[82:100] = [dict(r, px=0.8) for r in s[82:100]]
+        d = tempfile.mkdtemp(); path = os.path.join(d, "f.db"); make_db(path, [("p1", "t1", s)])
+        pairs = C.load_pairs(C.open_ro(path)); end = C._ts(C.WINDOW_END)
+        for seed in range(300):
+            ev, _ = C.build_events(pairs, "random", end, seed=seed)
+            hit = [e for e in ev if e["why_tp10_sl5_h60"] == "sl" and e["trigger_ts"] < T0 + 82 * STEP]
+            if hit:
+                r = C.sl_gap_through_report(hit)
+                self.assertEqual(r["n_gap_through"], len(hit)); self.assertAlmostEqual(r["diff_dist"]["min"], -0.15)
+                return
+        self.fail("no random SL event found")
+
     def test_collapse(self):
         s = series(); trigger_at(s, 80); s[85]["liq"] = 5_000.0
         e = self.ev(s)[0]
@@ -427,6 +452,7 @@ class TestRandomAndRun(unittest.TestCase):
         tr = C.run(path, "train", 268, d, skip_time_check=True)
         self.assertEqual(tr["cut_iso"], "2026-10-22T18:15:12+00:00")
         self.assertIn("entry_gap", tr); self.assertEqual(tr["warnings"], [])
+        self.assertIn("sl_gap_through", tr); self.assertIn("random", tr["sl_gap_through"])
         self.assertIn("sl_exit_gap", tr); self.assertIn("random", tr["sl_exit_gap"])
         self.assertIn("no_valid_post_price", tr); self.assertFalse(tr["no_valid_post_price"]["c4"]["warning"])
         self.assertEqual(tr["entry_gap"]["c4"]["invalid_gap"], 0)

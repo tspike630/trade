@@ -425,6 +425,22 @@ def sl_gap_report(events) -> dict:
     return out
 
 
+GAP_THROUGH_TOL = 1e-9   # float tolerance: exactly -5% is NOT counted as gapped through
+
+
+def sl_gap_through_report(events, ex: str = PRIMARY_EXIT) -> dict:
+    """Report-only: SL exits whose realized (pre-cost) exit return < -SL (gapped through the stop).
+    diff = realized - (-SL); exactly -SL not counted. No effect on verdict or warnings."""
+    sl = [e for e in events if e.get(f"why_{ex}") == "sl"]
+    d = np.array([e[f"ret_{ex}"] + SL for e in sl], dtype=float)
+    k = int((d < -GAP_THROUGH_TOL).sum()) if len(sl) else 0
+    out = {"exit": ex, "n_sl": len(sl), "n_gap_through": k, "share_gap_through": (k / len(sl)) if sl else 0.0}
+    if len(sl):
+        out["diff_dist"] = {"median": float(np.median(d)), "p10_worst": float(np.percentile(d, 10)),
+                            "min": float(d.min())}
+    return out
+
+
 def nvp_report(events) -> dict:
     n = len(events); k = sum(1 for e in events if e.get("no_valid_post"))
     sh = (k / n) if n else 0.0
@@ -513,6 +529,7 @@ def run(db: str, seg: str, cells: int, out_dir: str, train_result: Optional[str]
     nr = {"c4": nvp_report(cs), "random": nvp_report(rs)}
     res["no_valid_post_price"] = nr
     res["sl_exit_gap"] = {"c4": sl_gap_report(cs), "random": sl_gap_report(rs)}   # report-only
+    res["sl_gap_through"] = {"c4": sl_gap_through_report(cs), "random": sl_gap_through_report(rs)}   # report-only
     res["warnings"] += [f"WARNING: {k} no_valid_post_price {v['no_valid_post_price']}/{v['n']} = {v['share']:.2%} > {NVP_WARN_FRAC:.0%}"
                         for k, v in nr.items() if v["warning"]]
     path = os.path.join(out_dir, f"c4_{seg}_result.json")
@@ -536,6 +553,7 @@ def main(argv=None):
     print("entry_gap", json.dumps(res.get("entry_gap"), default=float))
     print("no_valid_post_price", json.dumps(res.get("no_valid_post_price"), default=float))
     print("sl_exit_gap", json.dumps(res.get("sl_exit_gap"), default=float))
+    print("sl_gap_through", json.dumps(res.get("sl_gap_through"), default=float))
     for w in res.get("warnings", []):
         print(w)
 
