@@ -12,7 +12,7 @@
 |----|------|
 | 只读下层：指标加工表 / 蜘蛛·消息采集表；策略**插件化**；**风控前置** | 侵入采集或指标层写库、改权重、改评分 |
 | 只出**标准化指令**给执行层（`decision_log` 等）；**独立进程** | 下单、开实盘闸、改执行日亏闸 / PM |
-| 代码在仓库根 `decision_engine/`（镜像 `crawler/decision_engine/`） | 提交 `.env`、API Key、`*.db` |
+| 代码在仓库根 `decision_engine/`（旧副本 `crawler/decision_engine/` 已删除） | 提交 `.env`、API Key、`*.db` |
 | 周检硬旁证 / 拥挤度观察 / Step2 回测闸门 | 替看板编造读数；替复盘改归因口径 |
 | 每次改码后 **同步推** `tspike630/trade`；合后同步本机 `dexscreener-crawler` | 权重 0 前接 INTEL 因子进盘中参 |
 
