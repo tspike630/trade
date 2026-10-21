@@ -4251,10 +4251,12 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertEqual(dedup_token_count(events), 6)
         ledger = self.root / "CELL_LEDGER.csv"
         ledger.write_text(
-            "cell_id,date,layer,hypothesis,status,ref\n"
-            "1,2026-10-01,entry,a,rejected,x\n"
-            "271,2026-10-21,entry,jev b,暂定拒绝,y\n"
-            "12,2026-10-02,exit,c,rejected,z\n",
+            "cell_id,cell_id_end,date,layer,hypothesis,status,ref\n"
+            "1,267,2026-10-20,all,历史累计、明细待补,历史累计、明细待补,r\n"
+            "268,,2026-10-21,entry,a,rejected,x\n"
+            "269,,2026-10-21,entry,b,rejected,x\n"
+            "270,,2026-10-21,exit,c,rejected,x\n"
+            "271,,2026-10-21,entry,jev d,暂定拒绝,y\n",
             encoding="utf-8",
         )
         os.environ["CELL_LEDGER_CSV"] = str(ledger)
@@ -4755,6 +4757,30 @@ class BoardTruthSmokeTest(unittest.TestCase):
     def test_deploy_components_include_indicators(self) -> None:
         from dashboard import board_truth as bt
         self.assertIn(("indicators", "indicators.run"), bt.DEPLOY_COMPONENTS)
+        self.assertEqual(bt.DEPLOY_REPO_PATHS["indicators"], "crawler/indicators")
+        (self.root / "indicators").mkdir()
+        (self.root / "indicators" / "a.py").write_text("x=1\n")
+        seen: list[str] = []
+
+        def fake_tree(_repo, _rev, sub):
+            seen.append(sub)
+            return {"a.py": bt._blob_sha(b"x=1\n")}
+
+        with patch.object(bt, "_tree", side_effect=fake_tree):
+            row = bt.compare_component(self.root, self.root, "indicators", "no-such-proc-xyz")
+        self.assertEqual(seen, ["crawler/indicators"])
+        self.assertIn("0 文件不同", row.detail)
+
+    def test_cell_ledger_end_column_bad_row(self) -> None:
+        from dashboard import board_truth as bt
+        path = self.root / "l.csv"
+        path.write_text(
+            "cell_id,cell_id_end,date,layer,hypothesis,status,ref\n"
+            "1,267,x,x,x,x,x\n270,,x,x,x,x,x\n5,zz,x,x,x,x,x\n",
+            encoding="utf-8",
+        )
+        led = bt.load_cell_ledger(path)
+        self.assertEqual((led.max_cell_id, led.skipped), (270, 1))
 
     def test_deploy_no_comparable_files(self) -> None:
         from dashboard import board_truth as bt

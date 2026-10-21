@@ -84,6 +84,13 @@ def load_cell_ledger(path: Path | None = None) -> LedgerCount:
     skipped = 0
     for row in rows:
         upper = _cell_upper(str(row.get("cell_id") or ""))
+        end_raw = str(row.get("cell_id_end") or "").strip()
+        if end_raw:
+            end = _cell_upper(end_raw)
+            if end is None or upper is None:
+                skipped += 1
+                continue
+            upper = max(upper, end)
         if upper is None:
             skipped += 1
             continue
@@ -317,11 +324,16 @@ def deploy_repo_path() -> Path | None:
     return None
 
 
+# live dir -> repo path on origin/main when they differ; default = same name.
+DEPLOY_REPO_PATHS: dict[str, str] = {"indicators": "crawler/indicators"}
+
+
 def compare_component(root: Path, repo: Path | None, name: str, proc: str) -> DeployRow:
     folder = root / name
     if not folder.is_dir():
         return DeployRow(name, None, None, "unknown", "目录不存在")
     declared, tree_sha = _read_declared(folder)
+    repo_sub = DEPLOY_REPO_PATHS.get(name, name)
     disk = _disk_files(folder)
     notes: list[str] = []
     status = "ok"
@@ -333,7 +345,7 @@ def compare_component(root: Path, repo: Path | None, name: str, proc: str) -> De
         if status == "ok":
             status = "unknown"
     else:
-        main = _tree(repo, "origin/main", name)
+        main = _tree(repo, "origin/main", repo_sub)
         if main is None:
             notes.append("origin/main 不可读")
         elif not main:
@@ -349,7 +361,7 @@ def compare_component(root: Path, repo: Path | None, name: str, proc: str) -> De
             gone = sum(1 for rel in tracked if rel not in disk)
             notes.append(f"对 main：{diff} 文件不同 · {gone} 缺")
         if declared is not None:
-            want = _tree(repo, declared, name)
+            want = _tree(repo, declared, repo_sub)
             if want is None:
                 status = "red"
                 notes.append(f"声明 sha {declared[:8]} 仓库里找不到")
