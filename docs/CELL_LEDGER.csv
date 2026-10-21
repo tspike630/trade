@@ -1,0 +1,7 @@
+cell_id,cell_id_end,date,layer,hypothesis,status,ref
+1,267,,multi,历史累计（逐格明细未落盘，待补；不凭记忆补编）,mixed,群内逐条累加
+268,,2026-10-21,decision,C4 预登记单流（TP10/SL5/h60；tag c4-lock-20261021 @4020fa4；Bonferroni N=271）,running_blinded,tag c4-lock-20261021 (4020fa4) / main 副本 292a122
+269,,2026-10-21,decision,C4 报告字段 sl_gap_through / sl_exit_gap（决策 diff 零行）,registered,c4 protocol
+270,,2026-10-21,review,H-WC1 每笔平均金额×退出质量（单一判据，待 #122/#123 后新事件 n>=30 OOS）,hypothesis_pending_oos,docs/REVIEW_FRONTIER_LOG.md f139e93
+271,,2026-10-21,indicator,池龄×流动性 止损占负描述性统计（污染期，仅观察，不进 H-WC1）,descriptive_only,/workspace/out/poolage_liq_stopshare_2026-10-21.md
+272,,2026-10-21,decision,迁移事件预登记（含 wash 分层；单一判据，待写死）,reserved,群议 2026-10-21
