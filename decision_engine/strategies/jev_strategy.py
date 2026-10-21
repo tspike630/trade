@@ -22,6 +22,8 @@ def stance_is_bullish(stance: Any) -> bool:
     s = str(stance or "").strip()
     return bool(s) and bool(_BULLISH_RE.search(s)) and not _NOT_BULLISH_RE.search(s)
 
+_CLOCK_SKEW_MIN = 2.0  # tolerated future skew (minutes) on legacy timestamps
+
 
 def jev_age_min(row: dict[str, Any], now: datetime | None = None) -> float | None:
     """Minutes since jev_signals.fetched_at (indicator layer's definition).
@@ -55,7 +57,11 @@ def jev_age_min(row: dict[str, Any], now: datetime | None = None) -> float | Non
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     now = now or datetime.now(timezone.utc)
-    return (now - dt).total_seconds() / 60.0
+    age = (now - dt).total_seconds() / 60.0
+    # Future-dated beyond small clock skew, or NaN -> unknown (stale).
+    if math.isnan(age) or age < -_CLOCK_SKEW_MIN:
+        return None
+    return max(age, 0.0)
 
 
 def jev_gate(row: dict[str, Any], max_age_min: float, require_bullish_stance: bool) -> tuple[str | None, dict[str, Any]]:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from decision_engine.strategies.jev_strategy import JevStrengthStrategy, jev_age_min, jev_gate
 
@@ -50,6 +50,18 @@ class JevAgeNoneStaleTests(unittest.TestCase):
             row = _row(jev_age_min=bad)
             self.assertIsNone(jev_age_min(row), repr(bad))
             self.assertEqual(jev_gate(row, 1440, True)[0], "jev_stale", repr(bad))
+
+    def test_legacy_future_timestamp_beyond_skew_is_stale(self):
+        fut = (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        row = _row(jev_updated_at=fut)
+        self.assertIsNone(jev_age_min(row))
+        self.assertEqual(jev_gate(row, 1440, True)[0], "jev_stale")
+
+    def test_legacy_future_timestamp_within_skew_passes(self):
+        fut = (datetime.now(timezone.utc) + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        row = _row(jev_updated_at=fut)
+        self.assertEqual(jev_age_min(row), 0.0)
+        self.assertIsNone(jev_gate(row, 1440, True)[0])
 
 
 if __name__ == "__main__":
