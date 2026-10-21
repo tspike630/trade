@@ -27,13 +27,20 @@ def jev_age_min(row: dict[str, Any], now: datetime | None = None) -> float | Non
 
     Order: indicator column ``jev_age_min`` > ``jev_fetched_at`` (attached by the
     adapter from jev_signals) > ``jev_updated_at`` (= fetched_at or analyzed_at).
+    If the ``jev_age_min`` key is present but None/invalid, returns None (stale);
+    timestamp fallback applies only to legacy rows lacking the key entirely.
     """
-    v = row.get("jev_age_min")
-    if v is not None:
+    if "jev_age_min" in row:
+        # Indicator layer emits jev_age_min=None for jev rows without a real
+        # timestamp (while writing jev_updated_at=now as a placeholder). Treat
+        # that as unknown age -> stale; never fall back to jev_updated_at here.
+        v = row.get("jev_age_min")
+        if v is None:
+            return None
         try:
             return float(v)
         except (TypeError, ValueError):
-            pass
+            return None
     ts = row.get("jev_fetched_at") or row.get("jev_updated_at")
     if not ts:
         return None
