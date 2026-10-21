@@ -42,16 +42,72 @@ from decision_engine.strategies import get_strategy, list_strategies  # noqa: E4
 
 log = get_logger("decision_engine.run")
 
-_DEPLOY_SHA_FILE = Path(__file__).resolve().parent / "DEPLOY_SHA"
+_PKG_DIR = Path(__file__).resolve().parent
+_DEPLOY_SHA_FILE = _PKG_DIR / "DEPLOY_SHA"
+
+
+def tree_sha256(pkg_dir: Path | None = None) -> str:
+    """Content fingerprint of the loaded package.
+
+    sha256 over sorted relative POSIX paths + bytes of every ``*.py`` under
+    ``pkg_dir`` (excluding ``__pycache__`` and ``tests``). Per file:
+    ``rel_path + b"\\0" + content + b"\\0"``. Must stay identical to
+    ``scripts/tree_fingerprint.py`` (used by scripts/sync_deploy.sh).
+    """
+    import hashlib
+
+    root = Path(pkg_dir or _PKG_DIR)
+    files = []
+    for f in root.rglob("*.py"):
+        rel = f.relative_to(root)
+        if any(part in ("__pycache__", "tests") for part in rel.parts[:-1]):
+            continue
+        files.append((rel.as_posix(), f))
+    h = hashlib.sha256()
+    for rel, f in sorted(files):
+        h.update(rel.encode("utf-8") + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def read_deploy_info(path: Path | None = None) -> tuple[str, str | None]:
+    """DEPLOY_SHA format: line 1 git sha, optional line 2 expected tree_sha256.
+
+    Returns (git_sha or "unknown", expected_tree or None).
+    """
+    try:
+        lines = [ln.strip() for ln in (path or _DEPLOY_SHA_FILE).read_text(encoding="utf-8").splitlines()]
+    except OSError:
+        return "unknown", None
+    lines = [ln for ln in lines if ln]
+    sha = lines[0].split()[0] if lines else "unknown"
+    expected = lines[1].split()[0].lower() if len(lines) > 1 else None
+    return sha, expected
 
 
 def read_deploy_sha(path: Path | None = None) -> str:
-    """Git sha of main written into decision_engine/DEPLOY_SHA at sync time ("unknown" if absent)."""
+    """Git sha written into decision_engine/DEPLOY_SHA at sync time ("unknown" if absent)."""
+    return read_deploy_info(path)[0]
+
+
+def log_deploy_identity(path: Path | None = None, pkg_dir: Path | None = None) -> bool:
+    """Log deploy_sha + tree fingerprint; WARNING deploy_sha_mismatch if expected tree differs.
+
+    Returns True when there is a mismatch. Never raises (startup must not fail on this).
+    """
+    sha, expected = read_deploy_info(path)
     try:
-        sha = (path or _DEPLOY_SHA_FILE).read_text(encoding="utf-8").strip().split()[0]
-    except (OSError, IndexError):
-        return "unknown"
-    return sha or "unknown"
+        actual = tree_sha256(pkg_dir)
+    except OSError as exc:  # pragma: no cover - defensive
+        log.warning("tree_sha256 failed: %s", exc)
+        actual = "unknown"
+    log.info("deploy_sha=%s tree_sha256=%s", sha, actual[:12])
+    if expected and actual != "unknown" and not actual.startswith(expected) and expected != actual:
+        log.warning(
+            "deploy_sha_mismatch deploy_sha=%s expected_tree_sha256=%s runtime_tree_sha256=%s",
+            sha, expected[:12], actual[:12],
+        )
+        return True
+    return False
 
 
 # --- Opt-in shadow cohort path (default behavior unchanged) -----------------
@@ -346,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
         log.error("%s", exc)
         return 2
 
-    log.info("deploy_sha=%s", read_deploy_sha())
+    log_deploy_identity()
     log.info(
         "decision_engine start db=%s dry_run=%s purpose=%s strategies=%s "
         "interval=%s once=%s ticks=%s min_jev_strength=%s min_liq_usd=%s",
