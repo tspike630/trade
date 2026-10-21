@@ -173,6 +173,17 @@ class MinuteBudget:
         self._last = now
 
 
+def _blank(v: Any) -> bool:
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
+def _missing_ts_with_stance(row: dict[str, Any]) -> bool:
+    """Defense-in-depth: a stance row must carry fetched_at or analyzed_at."""
+    return not _blank(row.get("stance")) and _blank(row.get("fetched_at")) and _blank(
+        row.get("analyzed_at")
+    )
+
+
 class JevStore:
     """Own sqlite connection; WRITE only jev_signals; READ tokens for hot list."""
 
@@ -251,9 +262,17 @@ class JevStore:
             self._conn.execute("SELECT COUNT(*) FROM jev_signals_history").fetchone()[0]
         )
 
-    def upsert_signal(self, row: dict[str, Any]) -> None:
+    def upsert_signal(self, row: dict[str, Any]) -> bool:
         chain_id = norm_chain(row["chain_id"])
         token_address = norm_address(row["token_address"])
+        if _missing_ts_with_stance(row):
+            log.warning(
+                "jev refuse write: stance set but fetched_at/analyzed_at both empty "
+                "chain_id=%s token_address=%s",
+                chain_id,
+                token_address,
+            )
+            return False
         fetched_at = row.get("fetched_at") or utc_now_iso()
         cols = [
             "jev_score",
@@ -296,6 +315,7 @@ class JevStore:
             (chain_id, token_address, *values),
         )
         self._conn.commit()
+        return True
 
     def get_signal(self, chain_id: str, token_address: str) -> dict[str, Any] | None:
         row = self._conn.execute(
