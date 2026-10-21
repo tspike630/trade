@@ -4718,11 +4718,43 @@ class BoardTruthSmokeTest(unittest.TestCase):
 
     def test_watchdog_heartbeat(self) -> None:
         from dashboard import board_truth as bt
+        self.assertEqual(bt.WATCHDOG_HEARTBEAT_REL, Path("logs") / "heartbeat_gap_watch.alive")
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+        os.environ.pop("WATCHDOG_HEARTBEAT_FILE", None)
+        self.assertEqual(bt.watchdog_status()[1], "看门未上线/缺失")
+        (self.root / "logs").mkdir()
+        (self.root / "logs" / "heartbeat_gap_watch.alive").write_text("x")
+        self.assertEqual(bt.watchdog_status()[0], "ok")
         hb = self.root / "hb"
+        os.environ["WATCHDOG_HEARTBEAT_FILE"] = str(hb)
+        self.assertEqual(bt.watchdog_status()[1], "看门未上线/缺失")
         self.assertEqual(bt.watchdog_status(hb)[1], "看门未上线/缺失")
         hb.write_text("x")
         self.assertEqual(bt.watchdog_status(hb)[0], "ok")
         self.assertEqual(bt.watchdog_status(hb, now=time.time() + 600)[0], "warn")
+
+    def test_cell_ledger_range_rows(self) -> None:
+        from dashboard import board_truth as bt
+        head = "cell_id,date,layer,hypothesis,status,ref\n"
+        singles = "".join(f"{i},2026-10-21,entry,h,rejected,r\n" for i in range(268, 272))
+        for dash in ("-", "–"):
+            path = self.root / f"ledger{ord(dash)}.csv"
+            path.write_text(
+                head + f"1{dash}267,2026-10-20,all,历史累计、明细待补,历史累计、明细待补,r\n"
+                + singles + "bad,x,x,x,x,x\n,x,x,x,x,x\n9-3,x,x,x,x,x\n",
+                encoding="utf-8",
+            )
+            led = bt.load_cell_ledger(path)
+            self.assertEqual(led.max_cell_id, 271)
+            self.assertEqual(led.skipped, 3)
+            self.assertIn("3 行无法解析已跳过", bt.grid_count_label(led))
+        only = self.root / "only_range.csv"
+        only.write_text(head + "1–267,x,x,x,x,x\n", encoding="utf-8")
+        self.assertEqual(bt.load_cell_ledger(only).max_cell_id, 267)
+
+    def test_deploy_components_include_indicators(self) -> None:
+        from dashboard import board_truth as bt
+        self.assertIn(("indicators", "indicators.run"), bt.DEPLOY_COMPONENTS)
 
     def test_deploy_unreported(self) -> None:
         from dashboard import board_truth as bt

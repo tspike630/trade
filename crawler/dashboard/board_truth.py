@@ -46,6 +46,20 @@ class LedgerCount:
     max_cell_id: int | None
     tentative_reject: int | None
     reason: str | None
+    skipped: int = 0
+
+
+def _cell_upper(raw: str) -> int | None:
+    """'271' -> 271; range '1-267' / '1–267' / '1—267' -> 267; else None."""
+    text = str(raw or "").strip()
+    for dash in ("–", "—", "-"):
+        if dash in text:
+            lo, _, hi = text.partition(dash)
+            lo, hi = lo.strip(), hi.strip()
+            if lo.isdigit() and hi.isdigit() and int(lo) <= int(hi):
+                return int(hi)
+            return None
+    return int(text) if text.isdigit() else None
 
 
 def cell_ledger_path() -> Path:
@@ -67,16 +81,18 @@ def load_cell_ledger(path: Path | None = None) -> LedgerCount:
         return LedgerCount(None, None, "总账不可读")
     ids: list[int] = []
     tentative = 0
+    skipped = 0
     for row in rows:
-        try:
-            ids.append(int(str(row.get("cell_id") or "").strip()))
-        except ValueError:
+        upper = _cell_upper(str(row.get("cell_id") or ""))
+        if upper is None:
+            skipped += 1
             continue
+        ids.append(upper)
         if TENTATIVE_REJECT in str(row.get("status") or ""):
             tentative += 1
     if not ids:
-        return LedgerCount(None, None, "总账无 cell_id")
-    return LedgerCount(max(ids), tentative, None)
+        return LedgerCount(None, None, "总账无 cell_id", skipped)
+    return LedgerCount(max(ids), tentative, None, skipped)
 
 
 def grid_count_label(ledger: LedgerCount | None = None) -> str:
@@ -84,7 +100,10 @@ def grid_count_label(ledger: LedgerCount | None = None) -> str:
     if led.max_cell_id is None:
         return LEDGER_MISSING if led.reason == "总账缺失" else f"格数：{led.reason}"
     n = led.max_cell_id
-    return f"累计共测 {n} 格 · Bonferroni 按 {n}（CELL_LEDGER 最大 cell_id）"
+    label = f"累计共测 {n} 格 · Bonferroni 按 {n}（CELL_LEDGER 最大 cell_id）"
+    if led.skipped:
+        label += f" · {led.skipped} 行无法解析已跳过"
+    return label
 
 
 def tentative_reject_line(ledger: LedgerCount | None = None) -> str:
@@ -195,6 +214,7 @@ DEPLOY_COMPONENTS: tuple[tuple[str, str], ...] = (
     ("sources", "sources.jev"),
     ("review", "review"),
     ("dashboard", "dashboard.app"),
+    ("indicators", "indicators.run"),
 )
 
 
@@ -374,9 +394,9 @@ def deploy_rows(*, ttl: float = 60.0) -> tuple[DeployRow, ...]:
 
 # ---------------------------------------------------------------- watchdog heartbeat
 
-# TODO(#133): PR #133 (heartbeat_gap_watch.py) reads logs/heartbeat.json but does
-# not define a heartbeat file of its own yet. Update this once it lands.
-WATCHDOG_HEARTBEAT_REL = Path("logs") / "heartbeat_gap_watch.heartbeat"
+# Collection watchdog (#133) touches this file under the live root.
+# Override with WATCHDOG_HEARTBEAT_FILE.
+WATCHDOG_HEARTBEAT_REL = Path("logs") / "heartbeat_gap_watch.alive"
 WATCHDOG_STALE_SECONDS = 300
 WATCHDOG_MISSING = "看门未上线/缺失"
 
