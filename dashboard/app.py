@@ -2610,6 +2610,8 @@ def _v2_deploy_sha() -> None:
     tones: list[list[str]] = []
     for row in rows:
         word = _DEPLOY_WORD.get(row.status, row.status)
+        if "无可比文件" in row.detail and row.status in {"unknown", "unreported"}:
+            word = "无可比文件"
         if row.status == "yellow" and row.declared is None:
             word = "未报 · 磁盘已换、进程未重启"
         table.append([

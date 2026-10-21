@@ -336,6 +336,10 @@ def compare_component(root: Path, repo: Path | None, name: str, proc: str) -> De
         main = _tree(repo, "origin/main", name)
         if main is None:
             notes.append("origin/main 不可读")
+        elif not main:
+            notes.append("无可比文件")
+            if status == "ok":
+                status = "unknown"
         else:
             tracked = main
             diff = sum(
@@ -349,6 +353,8 @@ def compare_component(root: Path, repo: Path | None, name: str, proc: str) -> De
             if want is None:
                 status = "red"
                 notes.append(f"声明 sha {declared[:8]} 仓库里找不到")
+            elif not want:
+                notes.append(f"声明 sha {declared[:8]} 下无可比文件")
             else:
                 bad = sum(
                     1 for rel, blob in want.items()

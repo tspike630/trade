@@ -4756,6 +4756,17 @@ class BoardTruthSmokeTest(unittest.TestCase):
         from dashboard import board_truth as bt
         self.assertIn(("indicators", "indicators.run"), bt.DEPLOY_COMPONENTS)
 
+    def test_deploy_no_comparable_files(self) -> None:
+        from dashboard import board_truth as bt
+        (self.root / "indicators").mkdir()
+        (self.root / "indicators" / "run.py").write_text("x=1\n")
+        with patch.object(bt, "_tree", return_value={}):
+            row = bt.compare_component(self.root, self.root, "indicators", "no-such-proc-xyz")
+        self.assertIn("无可比文件", row.detail)
+        self.assertNotIn("0 文件不同", row.detail)
+        self.assertIn(row.status, {"unknown", "unreported"})
+        self.assertEqual(app_module._DEPLOY_TONE[row.status], "mute")
+
     def test_deploy_unreported(self) -> None:
         from dashboard import board_truth as bt
         (self.root / "execution").mkdir()
