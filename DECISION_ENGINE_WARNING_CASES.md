@@ -90,3 +90,10 @@
 - **M-6**：高信心≠高收益，信号强度≠胜率（PolyBench / Prediction Arena）。只作解读，不加新过滤。临时 `purpose=live_candidate` 且 `--min-jev-strength 0.15` 的行保持未标记，**不算有效性**。第二批文献（Prophet Arena / LiveTradeBench / When Agents Trade / FinPos / PredictionMarketBench）同样只作解读：**校准好 ≠ 赚钱**，**回测好看 ≠ 有效**；已被本条与 M-1 功效脚注覆盖（`DECISION_ENGINE_WEEKLY_CHECK.md`「统计功效标注」，[#54](https://github.com/tspike630/trade/pull/54)）。**不加新过滤。**
 - 文献映射（第一批不上 LLM 决策主路径、不上 agent 栈；第二批只读；**AlphaAgent 准入三门槛**）见 `DECISION_ENGINE_RESEARCH_MAPPING.md`（`crawler/` 同文）。
 - **假因子 / 拥挤加速衰减**（#78 健康度旁证强制入周检笔记；INTEL 权重0裸跑风险）：只旁证，不改运行参，不否决 Step2。
+
+
+## W-2026-10-21 前沿周研警示（只读）
+
+- **最优格≠edge**：多格搜索后挑最好的一格必带选择偏差（Bailey & López de Prado DSR/PBO）；报最优格须附累计试验数，C4 单流预登记为准。
+- **止损不必然止损**：随机游走下止损溢价恒负（Kaminski & Lo）；止损占负高先查亏损段是动量还是回复，不据此删止损（meme 有归零尾部）。
+- **假热度**：高涨幅 meme 多数带刷量/LPI 证据（arXiv:2507.01963）；量与热度特征可读性打折，不据此直接加过滤。
