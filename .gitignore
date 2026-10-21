@@ -13,3 +13,6 @@ proxies.txt
 LIVE_TRADING_DISABLED
 *.log
 .DS_Store
+
+# written at deploy sync time, never committed
+decision_engine/DEPLOY_SHA

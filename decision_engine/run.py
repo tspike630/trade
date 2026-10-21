@@ -42,6 +42,17 @@ from decision_engine.strategies import get_strategy, list_strategies  # noqa: E4
 
 log = get_logger("decision_engine.run")
 
+_DEPLOY_SHA_FILE = Path(__file__).resolve().parent / "DEPLOY_SHA"
+
+
+def read_deploy_sha(path: Path | None = None) -> str:
+    """Git sha of main written into decision_engine/DEPLOY_SHA at sync time ("unknown" if absent)."""
+    try:
+        sha = (path or _DEPLOY_SHA_FILE).read_text(encoding="utf-8").strip().split()[0]
+    except (OSError, IndexError):
+        return "unknown"
+    return sha or "unknown"
+
 
 # --- Opt-in shadow cohort path (default behavior unchanged) -----------------
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
@@ -335,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         log.error("%s", exc)
         return 2
 
+    log.info("deploy_sha=%s", read_deploy_sha())
     log.info(
         "decision_engine start db=%s dry_run=%s purpose=%s strategies=%s "
         "interval=%s once=%s ticks=%s min_jev_strength=%s min_liq_usd=%s",
