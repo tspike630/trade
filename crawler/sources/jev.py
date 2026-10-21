@@ -460,6 +460,12 @@ def _load_pinned_tokens(status: dict[str, Any] | None = None) -> set[tuple[str, 
         import position_pin  # type: ignore
 
         _pairs, tokens = position_pin.load_pins()
+        failed_dbs = getattr(position_pin, "last_failed_count", lambda: 0)()
+        if failed_dbs and status is not None:
+            # per-DB failures from position_pin (missing/no_table/missing_cols/error)
+            status["failed"] = True
+            status["error"] = f"failed_dbs={failed_dbs}"
+            status["dbs"] = dict(getattr(position_pin, "last_status", {}) or {})
         return {(norm_chain(c), norm_address(a)) for c, a in tokens}
     except Exception as exc:  # noqa: BLE001
         log.warning("position_pin load failed; pins skipped this round: %r", exc)

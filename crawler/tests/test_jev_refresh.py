@@ -232,3 +232,26 @@ class TestPacing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PinPerDbFailureCountsTest(unittest.TestCase):
+    def test_per_db_failure_sets_status(self):
+        import sys, types
+        from sources import jev as jevmod
+        fake = types.ModuleType("position_pin")
+        fake.load_pins = lambda: (set(), {("solana", "abc")})
+        fake.last_failed_count = lambda: 1
+        fake.last_status = {"paper_trading.db": "missing"}
+        old = sys.modules.get("position_pin")
+        sys.modules["position_pin"] = fake
+        try:
+            st = {}
+            toks = jevmod._load_pinned_tokens(st)
+        finally:
+            if old is None:
+                sys.modules.pop("position_pin", None)
+            else:
+                sys.modules["position_pin"] = old
+        self.assertTrue(st.get("failed"))
+        self.assertEqual(st["dbs"], {"paper_trading.db": "missing"})
+        self.assertEqual(len(toks), 1)
