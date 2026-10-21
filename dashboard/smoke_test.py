@@ -4896,6 +4896,48 @@ class BoardTruthSmokeTest(unittest.TestCase):
         self.assertIn("与文件一致", row.detail)
         self.assertEqual(row.status, "yellow")
 
+    def test_main_diff_nonzero_exact(self) -> None:
+        from dashboard import board_truth as bt
+        self.assertFalse(bt.main_diff_nonzero("未报 · 对 main：0 文件不同 · 0 缺"))
+        self.assertTrue(bt.main_diff_nonzero("对 main：1 文件不同 · 0 缺"))
+        self.assertTrue(bt.main_diff_nonzero("对 main：10 文件不同 · 0 缺"))
+        self.assertTrue(bt.main_diff_nonzero("对 main：0 文件不同 · 1 缺"))
+        self.assertFalse(bt.main_diff_nonzero("无可比文件"))
+
+    def test_ledger_missing_always_warns(self) -> None:
+        from dashboard import board_truth as bt
+        src = bt.LedgerSource(
+            "missing", "origin/main@deadbeef", "deadbeef" * 5,
+            datetime.now(timezone.utc), False, reason="origin/main 无 docs/CELL_LEDGER.csv",
+        )
+        text, warn = bt.ledger_source_line(src)
+        self.assertTrue(warn)
+        self.assertIn("缺失", text)
+
+    def test_ledger_show_uses_resolved_sha(self) -> None:
+        from dashboard import board_truth as bt
+        head = "cell_id,cell_id_end,date,layer,hypothesis,status,ref\n1,,d,l,h,x,r\n"
+        work = self._git_repo_with_ledger(head)
+        os.environ.pop("CELL_LEDGER_CSV", None)
+        os.environ["DEPLOY_COMPARE_REPO"] = str(work)
+        sha = subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "origin/main"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        seen: list[str] = []
+        real = bt._git
+
+        def spy(repo, *args):
+            seen.append(args)
+            return real(repo, *args)
+
+        with patch.object(bt, "_git", side_effect=spy):
+            bt.load_ledger_with_source()
+        shows = [a for a in seen if a and a[0] == "show"]
+        self.assertEqual(len(shows), 1)
+        self.assertEqual(shows[0], ("show", f"{sha}:docs/CELL_LEDGER.csv"))
+        self.assertNotIn("origin/main:", shows[0][1])
+
     def test_deploy_unreported(self) -> None:
         from dashboard import board_truth as bt
         (self.root / "execution").mkdir()

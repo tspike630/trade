@@ -2630,7 +2630,7 @@ def _v2_deploy_sha() -> None:
                 parts.append("未报")
             if "磁盘已换" in row.detail:
                 parts.append("磁盘已换、进程未重启")
-            if "文件不同" in row.detail and not ("0 文件不同 · 0 缺" in row.detail):
+            if board_truth.main_diff_nonzero(row.detail):
                 parts.append("与 main 有差异")
             word = " · ".join(parts) or word
         table.append([

@@ -7,6 +7,7 @@ an explicit "missing" reason, never as a zero or a hardcoded fallback.
 from __future__ import annotations
 
 import csv
+import re
 import hashlib
 import io
 import logging
@@ -169,7 +170,7 @@ def load_ledger_with_source(*, now: float | None = None) -> tuple[LedgerCount, L
     fetched = datetime.fromtimestamp(mtime, HKT) if mtime is not None else None
     stale = mtime is None or clock - mtime > FETCH_STALE_SECONDS or bool(_FETCH_STATE.get("last_error"))
     src = LedgerSource("git", f"origin/main@{sha[:8]}", sha, fetched, stale)
-    text = _git(repo, "show", f"origin/main:{LEDGER_GIT_PATH}")
+    text = _git(repo, "show", f"{sha}:{LEDGER_GIT_PATH}")
     if text is None:
         return LedgerCount(None, None, f"总账缺失（origin/main 无 {LEDGER_GIT_PATH}）"), replace(
             src, kind="missing", reason=f"origin/main 无 {LEDGER_GIT_PATH}"
@@ -197,7 +198,7 @@ def ledger_source_line(src: LedgerSource) -> tuple[str, bool]:
     """(text, warn). warn = yellow."""
     if src.kind == "override":
         return f"来源：本地覆盖 {src.detail}（临时副本）", True
-    if src.kind == "missing" and src.sha is None:
+    if src.kind == "missing":
         return f"来源：缺失（{src.reason or '未知'}）", True
     fetched = src.fetched_at.strftime("%m-%d %H:%M HKT") if src.fetched_at else "从未 fetch"
     err = _FETCH_STATE.get("last_error")
@@ -474,6 +475,21 @@ def deploy_repo_path() -> Path | None:
         if (cand / ".git").exists():
             return cand
     return None
+
+
+_MAIN_DIFF_RE = re.compile(r"(?:^| · )对 main：(\d+) 文件不同 · (\d+) 缺(?:$| · )")
+
+
+def main_diff_nonzero(detail: str) -> bool:
+    """True when detail reports a non-zero diff or missing count against main.
+
+    Matches the exact phrase produced by compare_component (not a substring of
+    "10 文件不同"). Numbers are parsed; a zero/zero report is not a diff.
+    """
+    matched = _MAIN_DIFF_RE.search(f" · {detail} · ")
+    if matched is None:
+        return False
+    return int(matched.group(1)) != 0 or int(matched.group(2)) != 0
 
 
 # live dir -> repo path on origin/main when they differ; default = same name.
