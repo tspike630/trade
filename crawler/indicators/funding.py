@@ -62,7 +62,11 @@ def jev_age_minutes(fetched_at: str | None, now: datetime | None = None) -> floa
     if t.tzinfo is None:
         t = t.replace(tzinfo=timezone.utc)
     now = now or datetime.now(timezone.utc)
-    return round(max(0.0, (now - t).total_seconds() / 60.0), 2)
+    age = (now - t).total_seconds() / 60.0
+    # Future-dated beyond 2-min clock skew -> unknown (None), never "fresh".
+    if age < -2.0:
+        return None
+    return round(max(0.0, age), 2)
 
 
 def direction_coef(signal: str) -> float:
@@ -124,7 +128,7 @@ def compute_funding_fields(
         strength = round((raw_f / 100.0) * conf * coef, 6)
 
     jev_ts = sig.get("fetched_at") or sig.get("analyzed_at")
-    updated = jev_ts or utc_now_iso()
+    updated = jev_ts or None  # no JEV clock -> None; never stamp now (stale bypass)
     age_min = jev_age_minutes(jev_ts, now)
 
     return {
