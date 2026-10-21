@@ -310,7 +310,7 @@ _JEV_AUTH_RAW = os.environ.get("JEV_AUTH_MODE", "header").strip().lower()
 JEV_AUTH_MODE = _JEV_AUTH_RAW if _JEV_AUTH_RAW in ("header", "bearer", "query") else "header"
 JEV_HOT_INTERVAL_SEC = int(os.environ.get("JEV_HOT_INTERVAL_SEC", "900"))  # 15 min
 JEV_MAX_PER_MIN = int(os.environ.get("JEV_MAX_PER_MIN", "7"))  # stay under 8/min IP
-JEV_HOT_LIMIT = int(os.environ.get("JEV_HOT_LIMIT", "20"))  # max hot tokens per cycle
+JEV_HOT_LIMIT = int(os.environ.get("JEV_HOT_LIMIT", "40"))  # max tokens per cycle (pins first)
 JEV_ON_NEW_LISTING = os.environ.get("JEV_ON_NEW_LISTING", "0").strip().lower() in (
     "1", "true", "yes", "on",
 )
@@ -322,7 +322,8 @@ JEV_REFRESH_SHARE = float(os.environ.get("JEV_REFRESH_SHARE", "0.5"))
 # Even pacing: minimum seconds between two JEV calls (hard floor 10s => <=6/min).
 JEV_MIN_GAP_SEC = float(os.environ.get("JEV_MIN_GAP_SEC", "10"))
 # Pinned (open position) tokens: max share of slots per pass.
-JEV_PIN_MAX_SHARE = float(os.environ.get("JEV_PIN_MAX_SHARE", "0.3"))
+# Default 1.0: jev is no longer an entry source; open positions may use every slot.
+JEV_PIN_MAX_SHARE = float(os.environ.get("JEV_PIN_MAX_SHARE", "1.0"))
 
 
 # ---------------------------------------------------------------------------
