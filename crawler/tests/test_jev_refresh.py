@@ -1,0 +1,257 @@
+"""JEV refresh tiers, pacing, error preservation, history. Temp DB; no network."""
+
+from __future__ import annotations
+
+import sqlite3
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+
+from sources import jev
+
+
+def _iso(delta_sec: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=delta_sec)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+class _Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self.tmp.name) / "t.db"
+        c = sqlite3.connect(self.db)
+        c.execute(
+            "CREATE TABLE tokens (chain_id TEXT, token_address TEXT, has_pairs INT,"
+            " last_seen_at TEXT, raw_json TEXT)"
+        )
+        c.execute("CREATE TABLE pairs (chain_id TEXT, token_address TEXT, raw_json TEXT, updated_at TEXT)")
+        c.commit()
+        c.close()
+        self.store = jev.JevStore(self.db)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def add_token(self, addr, seen=-60, chain="solana"):
+        self.store._conn.execute(
+            "INSERT INTO tokens VALUES (?,?,1,?,NULL)", (chain, addr, _iso(seen))
+        )
+        self.store._conn.commit()
+
+    def add_signal(self, addr, fetched_delta, error=None, chain="solana"):
+        self.store.upsert_signal(
+            {"chain_id": chain, "token_address": addr, "fetched_at": _iso(fetched_delta),
+             "jev_score": 50.0, "stance": "NEUTRAL", "error": error}
+        )
+
+
+class TestTiers(_Base):
+    def test_half_refresh_half_new(self):
+        for i in range(10):
+            self.add_token(f"new{i}")
+        for i in range(10):
+            self.add_token(f"old{i}")
+            self.add_signal(f"old{i}", -86400 + i * 60)
+        rows = self.store.list_due_hot(limit=8, interval_sec=900, pins=set())
+        tiers = [r["tier"] for r in rows]
+        self.assertEqual(tiers.count("refresh"), 4)
+        self.assertEqual(tiers.count("new"), 4)
+        refresh = [r["token_address"] for r in rows if r["tier"] == "refresh"]
+        self.assertEqual(refresh, ["old0", "old1", "old2", "old3"])  # oldest first
+
+    def test_share_configurable_and_spill(self):
+        for i in range(10):
+            self.add_token(f"new{i}")
+        self.add_token("old0")
+        self.add_signal("old0", -86400)
+        rows = self.store.list_due_hot(limit=6, interval_sec=900, refresh_share=0.5, pins=set())
+        self.assertEqual(len(rows), 6)  # only 1 refresh available -> spill to new
+        self.assertEqual(sum(r["tier"] == "refresh" for r in rows), 1)
+        rows = self.store.list_due_hot(limit=6, interval_sec=900, refresh_share=0.0, pins=set())
+        self.assertEqual(sum(r["tier"] == "refresh" for r in rows), 0)
+
+    def test_fresh_not_refreshed(self):
+        self.add_token("old0")
+        self.add_signal("old0", -60)
+        self.assertEqual(self.store.list_due_hot(limit=5, interval_sec=900, pins=set()), [])
+
+    def test_pins_first_and_deduped(self):
+        for i in range(4):
+            self.add_token(f"new{i}")
+        self.add_token("held")
+        self.add_signal("held", -7200)
+        rows = self.store.list_due_hot(
+            limit=4, interval_sec=900, pins={("solana", "HELD")}, pin_max_share=0.5
+        )
+        self.assertEqual(rows[0]["tier"], "pin")
+        self.assertEqual(rows[0]["token_address"], "held")
+        self.assertEqual(sum(r["token_address"] == "held" for r in rows), 1)
+        self.assertEqual(len(rows), 4)
+
+
+class TestErrorsAndHistory(_Base):
+    def _client(self, result):
+        c = mock.Mock()
+        c.fetch_score.return_value = result
+        return c
+
+    def test_error_preserves_success(self):
+        self.add_token("tok")
+        self.add_signal("tok", -3600)
+        before = self.store.get_signal("solana", "tok")
+        for code in ("status:403", "status:429", "status:503", "http_error:ConnectError"):
+            row = jev.fetch_and_store(self.store, self._client({"error": code, "fetched_at": _iso(0)}), "solana", "tok")
+            self.assertTrue(row.get("preserved"))
+            after = self.store.get_signal("solana", "tok")
+            self.assertEqual(after["jev_score"], before["jev_score"])
+            self.assertEqual(after["fetched_at"], before["fetched_at"])
+            self.assertIsNone(after["error"])
+            self.assertEqual(after["last_error"], code)
+            self.assertIsNotNone(after["last_error_at"])
+        self.assertEqual(self.store.count_history(), 0)
+
+    def test_error_on_new_token_still_written(self):
+        jev.fetch_and_store(self.store, self._client({"error": "status:403", "fetched_at": _iso(0)}), "solana", "x")
+        r = self.store.get_signal("solana", "x")
+        self.assertEqual(r["error"], "status:403")
+
+    def test_success_appends_history(self):
+        ok = jev.parse_score_response({"jev_score": 77, "investment_verdict": {"stance": "NEUTRAL"}})
+        ok["fetched_at"] = _iso(0)
+        for _ in range(3):
+            jev.fetch_and_store(self.store, self._client(dict(ok)), "solana", "tok", tier="refresh")
+        self.assertEqual(self.store.count_signals(), 1)
+        h = self.store._conn.execute("SELECT * FROM jev_signals_history").fetchall()
+        self.assertEqual(len(h), 3)
+        self.assertEqual(h[0]["stance"], "NEUTRAL")
+        self.assertEqual(h[0]["jev_score"], 77.0)
+        self.assertEqual(h[0]["tier"], "refresh")
+        self.assertTrue(h[0]["fetched_at"])
+
+    def test_existing_history_table_reused(self):
+        self.store.close()
+        c = sqlite3.connect(self.db)
+        c.execute("DROP TABLE jev_signals_history")
+        c.execute("CREATE TABLE jev_signals_history (id INTEGER PRIMARY KEY, chain_id TEXT, token_address TEXT, fetched_at TEXT)")
+        c.commit(); c.close()
+        self.store = jev.JevStore(self.db)
+        cols = {r[1] for r in self.store._conn.execute("PRAGMA table_info(jev_signals_history)")}
+        self.assertTrue({"stance", "jev_score", "tier"} <= cols)
+
+    def test_consecutive_429_backoff(self):
+        self.add_token("a"); self.add_token("b"); self.add_token("c")
+        client = self._client({"error": "status:429", "fetched_at": _iso(0)})
+        sleeps = []
+        with mock.patch.object(jev, "_load_pinned_tokens", return_value=set()):
+            stats = jev.run_pass(self.store, client, limit=3, sleep_fn=sleeps.append)
+        self.assertEqual(stats["s429"], 3)
+        self.assertEqual(sleeps, [60.0, 120.0, 240.0])
+
+    def test_pin_load_failure_warns_counts_and_proceeds(self):
+        self.add_token("a")
+        client = self._client({"jev_score": 50.0, "fetched_at": _iso(0)})
+        fake = mock.MagicMock()
+        fake.load_pins.side_effect = RuntimeError("positions db locked")
+        with mock.patch.dict("sys.modules", {"position_pin": fake}), \
+             self.assertLogs(jev.log, level="WARNING") as cm:
+            stats = jev.run_pass(self.store, client, limit=3, sleep_fn=lambda s: None)
+        self.assertEqual(stats["pin_load_failed"], 1)
+        self.assertEqual(stats["seen"], 1)
+        self.assertEqual(stats["ok_pin"], 0)
+        self.assertTrue(any("position_pin load failed" in m and "positions db locked" in m
+                            for m in cm.output))
+        self.assertTrue(all(r.levelname == "WARNING" for r in cm.records
+                            if "position_pin" in r.getMessage()))
+
+    def test_pin_load_ok_no_failure_count(self):
+        with mock.patch.object(jev, "_load_pinned_tokens", return_value=set()):
+            stats = jev.run_pass(self.store, self._client({}), limit=3, sleep_fn=lambda s: None)
+        self.assertEqual(stats["pin_load_failed"], 0)
+
+
+class TestSleepFloor(unittest.TestCase):
+    def test_floor(self):
+        self.assertGreaterEqual(jev.JEV_MIN_ROUND_SLEEP_SEC, 30)
+        self.assertEqual(jev._tail_sleep_sec(0), 30)
+        self.assertEqual(jev._tail_sleep_sec(None), 30)
+        self.assertEqual(jev._tail_sleep_sec(-5), 30)
+        self.assertEqual(jev._tail_sleep_sec(900), 900)
+
+    def test_run_loop_interval_zero_sleeps_floor(self):
+        slept = []
+
+        class _Stop(Exception):
+            pass
+
+        def fake_sleep(s):
+            slept.append(s)
+            raise _Stop
+
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = mock.MagicMock()
+        with mock.patch.object(jev, "JevStore", return_value=cm), \
+             mock.patch.object(jev, "JevClient", return_value=cm), \
+             mock.patch.object(jev, "run_pass", return_value={}), \
+             mock.patch.object(jev.time, "sleep", side_effect=fake_sleep):
+            with self.assertRaises(_Stop):
+                jev.run_loop(db_path=":memory:", interval_sec=0)
+        self.assertEqual(slept, [30])
+
+
+class TestPacing(unittest.TestCase):
+    def test_hard_caps(self):
+        b = jev.MinuteBudget(7, min_gap_sec=1)
+        self.assertEqual(b.max_per_min, 6)
+        self.assertEqual(b.min_gap_sec, 10.0)
+
+    def test_min_gap_enforced(self):
+        clock = [1000.0]
+        slept = []
+
+        def sleep(s):
+            slept.append(s)
+            clock[0] += s
+
+        with mock.patch.object(jev.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(jev.time, "sleep", side_effect=sleep):
+            b = jev.MinuteBudget(6)
+            stamps = []
+            for _ in range(13):
+                b.wait_if_needed()
+                b.record()
+                stamps.append(clock[0])
+        gaps = [y - x for x, y in zip(stamps, stamps[1:])]
+        self.assertTrue(all(g >= 10.0 - 1e-9 for g in gaps))
+        for i in range(len(stamps)):
+            self.assertLessEqual(sum(1 for t in stamps if stamps[i] <= t < stamps[i] + 60), 6)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class PinPerDbFailureCountsTest(unittest.TestCase):
+    def test_per_db_failure_sets_status(self):
+        import sys, types
+        from sources import jev as jevmod
+        fake = types.ModuleType("position_pin")
+        fake.load_pins = lambda: (set(), {("solana", "abc")})
+        fake.last_failed_count = lambda: 1
+        fake.last_status = {"paper_trading.db": "missing"}
+        old = sys.modules.get("position_pin")
+        sys.modules["position_pin"] = fake
+        try:
+            st = {}
+            toks = jevmod._load_pinned_tokens(st)
+        finally:
+            if old is None:
+                sys.modules.pop("position_pin", None)
+            else:
+                sys.modules["position_pin"] = old
+        self.assertTrue(st.get("failed"))
+        self.assertEqual(st["dbs"], {"paper_trading.db": "missing"})
+        self.assertEqual(len(toks), 1)

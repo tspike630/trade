@@ -40,7 +40,10 @@ from config import (
     JEV_MAX_PER_MIN,
     JEV_ON_NEW_LISTING,
     JEV_PENDING_PATH,
+    JEV_MIN_GAP_SEC,
+    JEV_PIN_MAX_SHARE,
     JEV_RAW_MAX_CHARS,
+    JEV_REFRESH_SHARE,
     JEV_REQUEST_TIMEOUT_SEC,
     USER_AGENT,
 )
@@ -76,6 +79,38 @@ CREATE INDEX IF NOT EXISTS idx_jev_signals_score
     ON jev_signals (jev_score);
 """
 
+# Append-only history: one row per successful fetch.
+JEV_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS jev_signals_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    stance TEXT,
+    jev_score REAL,
+    observed_score REAL,
+    coverage_pct REAL,
+    score_kind TEXT,
+    analyzed_at TEXT,
+    tier TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_jev_hist_token
+    ON jev_signals_history (chain_id, token_address, fetched_at);
+CREATE INDEX IF NOT EXISTS idx_jev_hist_fetched
+    ON jev_signals_history (fetched_at);
+"""
+_HISTORY_COLS = {
+    "chain_id": "TEXT", "token_address": "TEXT", "fetched_at": "TEXT",
+    "stance": "TEXT", "jev_score": "REAL", "observed_score": "REAL",
+    "coverage_pct": "REAL", "score_kind": "TEXT", "analyzed_at": "TEXT",
+    "tier": "TEXT",
+}
+# Nullable columns added to jev_signals (existing columns keep their meaning).
+_SIGNAL_EXTRA_COLS = {"last_error": "TEXT", "last_error_at": "TEXT"}
+
+HARD_MAX_PER_MIN = 6
+HARD_MIN_GAP_SEC = 10.0
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -94,11 +129,16 @@ def redact_url(url: str) -> str:
 
 
 class MinuteBudget:
-    """Sliding 60s window; blocks when count >= max_per_min."""
+    """Sliding 60s window + minimum gap between calls (even pacing).
 
-    def __init__(self, max_per_min: int = 7):
-        self.max_per_min = max(1, int(max_per_min))
+    Hard caps: <= HARD_MAX_PER_MIN per 60s and >= HARD_MIN_GAP_SEC between calls.
+    """
+
+    def __init__(self, max_per_min: int = 6, min_gap_sec: float = HARD_MIN_GAP_SEC):
+        self.max_per_min = max(1, min(int(max_per_min), HARD_MAX_PER_MIN))
+        self.min_gap_sec = max(float(min_gap_sec), HARD_MIN_GAP_SEC)
         self._ts: deque[float] = deque()
+        self._last: float | None = None
 
     def _prune(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -112,6 +152,11 @@ class MinuteBudget:
     def wait_if_needed(self) -> float:
         """Sleep until a slot opens; return seconds slept."""
         slept = 0.0
+        if self._last is not None:
+            gap = self.min_gap_sec - (time.monotonic() - self._last)
+            if gap > 0:
+                time.sleep(gap)
+                slept += gap
         while True:
             self._prune()
             if len(self._ts) < self.max_per_min:
@@ -123,7 +168,9 @@ class MinuteBudget:
 
     def record(self) -> None:
         self._prune()
-        self._ts.append(time.monotonic())
+        now = time.monotonic()
+        self._ts.append(now)
+        self._last = now
 
 
 class JevStore:
@@ -147,7 +194,62 @@ class JevStore:
 
     def ensure_schema(self) -> None:
         self._conn.executescript(JEV_SIGNALS_DDL)
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(jev_signals)")}
+        for c, t in _SIGNAL_EXTRA_COLS.items():
+            if c not in cols:
+                self._conn.execute(f"ALTER TABLE jev_signals ADD COLUMN {c} {t}")
+        # Reuse/align an existing jev_signals_history if one is already there.
+        self._conn.executescript(
+            "\n".join(
+                ln for ln in JEV_HISTORY_DDL.splitlines()
+                if not ln.startswith("CREATE INDEX") and "ON jev_signals_history" not in ln
+            )
+        )
+        hcols = {r[1] for r in self._conn.execute("PRAGMA table_info(jev_signals_history)")}
+        for c, t in _HISTORY_COLS.items():
+            if c not in hcols:
+                self._conn.execute(f"ALTER TABLE jev_signals_history ADD COLUMN {c} {t}")
+        self._conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_jev_hist_token
+                ON jev_signals_history (chain_id, token_address, fetched_at);
+            CREATE INDEX IF NOT EXISTS idx_jev_hist_fetched
+                ON jev_signals_history (fetched_at);
+            """
+        )
         self._conn.commit()
+
+    def mark_error(self, chain_id: str, token_address: str, error: str, at: str) -> None:
+        """Keep a successful row intact; only stamp last_error / last_error_at."""
+        self._conn.execute(
+            "UPDATE jev_signals SET last_error = ?, last_error_at = ? "
+            "WHERE chain_id = ? AND token_address = ?",
+            (error, at, norm_chain(chain_id), norm_address(token_address)),
+        )
+        self._conn.commit()
+
+    def append_history(self, row: dict[str, Any], tier: str | None = None) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO jev_signals_history (
+                chain_id, token_address, fetched_at, stance, jev_score,
+                observed_score, coverage_pct, score_kind, analyzed_at, tier
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                norm_chain(row["chain_id"]), norm_address(row["token_address"]),
+                row.get("fetched_at") or utc_now_iso(), row.get("stance"),
+                row.get("jev_score"), row.get("observed_score"),
+                row.get("coverage_pct"), row.get("score_kind"),
+                row.get("analyzed_at"), tier,
+            ),
+        )
+        self._conn.commit()
+
+    def count_history(self) -> int:
+        return int(
+            self._conn.execute("SELECT COUNT(*) FROM jev_signals_history").fetchone()[0]
+        )
 
     def upsert_signal(self, row: dict[str, Any]) -> None:
         chain_id = norm_chain(row["chain_id"])
@@ -168,6 +270,9 @@ class JevStore:
             "cached",
             "error",
         ]
+        for extra in _SIGNAL_EXTRA_COLS:
+            if extra in row:
+                cols.append(extra)
         values = []
         for c in cols:
             if c == "fetched_at":
@@ -237,36 +342,137 @@ class JevStore:
         return [dict(r) for r in rows]
 
     def list_due_hot(
-        self, *, limit: int, interval_sec: int
+        self,
+        *,
+        limit: int,
+        interval_sec: int,
+        refresh_share: float | None = None,
+        pins: set[tuple[str, str]] | None = None,
+        pin_max_share: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Hot tokens missing signal or fetched_at older than interval."""
+        """
+        Three tiers per pass (each row carries ``tier``):
+          1. pin     - open-position tokens (position_pin), oldest fetched first
+          2. refresh - hot tokens fetched before, oldest fetched_at first
+                       (only if older than interval_sec)
+          3. new     - hot tokens never fetched, most recently seen first
+        Remaining slots after pins split refresh/new by refresh_share
+        (default JEV_REFRESH_SHARE=0.5); unused slots spill to the other tier.
+        """
         limit = max(1, min(int(limit), 200))
+        share = JEV_REFRESH_SHARE if refresh_share is None else float(refresh_share)
+        share = min(1.0, max(0.0, share))
+        pshare = JEV_PIN_MAX_SHARE if pin_max_share is None else float(pin_max_share)
         cutoff_seen = datetime.fromtimestamp(
             time.time() - HOT_SEEN_WINDOW_SEC, tz=timezone.utc
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
         stale_before = datetime.fromtimestamp(
             time.time() - max(60, int(interval_sec)), tz=timezone.utc
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
-        rows = self._conn.execute(
-            """
-            SELECT t.chain_id, t.token_address, t.last_seen_at,
-                   j.fetched_at AS jev_fetched_at
-            FROM tokens t
-            LEFT JOIN jev_signals j
-              ON j.chain_id = t.chain_id AND j.token_address = t.token_address
-            WHERE t.has_pairs = 1
-              AND t.last_seen_at IS NOT NULL
-              AND t.last_seen_at >= ?
-              AND (j.fetched_at IS NULL OR j.fetched_at < ?)
-            ORDER BY
-                CASE WHEN j.fetched_at IS NULL THEN 0 ELSE 1 END ASC,
-                j.fetched_at ASC,
-                t.last_seen_at DESC
-            LIMIT ?
-            """,
-            (cutoff_seen, stale_before, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        if pins is None:
+            pins = _load_pinned_tokens()
+        out: list[dict[str, Any]] = []
+        taken: set[tuple[str, str]] = set()
+
+        # Tier 1: pinned positions (not required to be hot)
+        pin_rows = []
+        for chain, addr in {(norm_chain(c), norm_address(a)) for c, a in pins}:
+            r = self._conn.execute(
+                "SELECT fetched_at FROM jev_signals WHERE chain_id=? AND token_address=?",
+                (chain, addr),
+            ).fetchone()
+            fa = r["fetched_at"] if r else None
+            if fa is not None and fa >= stale_before:
+                continue
+            pin_rows.append({"chain_id": chain, "token_address": addr,
+                             "last_seen_at": None, "jev_fetched_at": fa, "tier": "pin"})
+        pin_rows.sort(key=lambda d: (d["jev_fetched_at"] is not None, d["jev_fetched_at"] or ""))
+        pin_cap = max(1, int(limit * max(0.0, min(1.0, pshare)))) if pin_rows else 0
+        for d in pin_rows[:pin_cap]:
+            out.append(d)
+            taken.add((d["chain_id"], d["token_address"]))
+
+        remaining = limit - len(out)
+        if remaining <= 0:
+            return out
+        fetch_n = remaining + len(taken)
+        refresh = [
+            dict(r, tier="refresh")
+            for r in self._conn.execute(
+                """
+                SELECT t.chain_id, t.token_address, t.last_seen_at,
+                       j.fetched_at AS jev_fetched_at
+                FROM tokens t
+                JOIN jev_signals j
+                  ON j.chain_id = t.chain_id AND j.token_address = t.token_address
+                WHERE t.has_pairs = 1
+                  AND t.last_seen_at IS NOT NULL
+                  AND t.last_seen_at >= ?
+                  AND j.fetched_at < ?
+                ORDER BY j.fetched_at ASC, t.last_seen_at DESC
+                LIMIT ?
+                """,
+                (cutoff_seen, stale_before, fetch_n),
+            ).fetchall()
+            if (r["chain_id"], r["token_address"]) not in taken
+        ]
+        new = [
+            dict(r, tier="new")
+            for r in self._conn.execute(
+                """
+                SELECT t.chain_id, t.token_address, t.last_seen_at,
+                       NULL AS jev_fetched_at
+                FROM tokens t
+                LEFT JOIN jev_signals j
+                  ON j.chain_id = t.chain_id AND j.token_address = t.token_address
+                WHERE t.has_pairs = 1
+                  AND t.last_seen_at IS NOT NULL
+                  AND t.last_seen_at >= ?
+                  AND j.fetched_at IS NULL
+                ORDER BY t.last_seen_at DESC
+                LIMIT ?
+                """,
+                (cutoff_seen, fetch_n),
+            ).fetchall()
+            if (r["chain_id"], r["token_address"]) not in taken
+        ]
+        n_refresh = int(round(remaining * share))
+        n_new = remaining - n_refresh
+        pick_r = refresh[:n_refresh]
+        pick_n = new[:n_new]
+        spare = remaining - len(pick_r) - len(pick_n)
+        if spare > 0 and len(pick_r) < len(refresh):
+            extra = refresh[len(pick_r): len(pick_r) + spare]
+            pick_r += extra
+            spare -= len(extra)
+        if spare > 0 and len(pick_n) < len(new):
+            pick_n += new[len(pick_n): len(pick_n) + spare]
+        return out + pick_r + pick_n
+
+
+def _load_pinned_tokens(status: dict[str, Any] | None = None) -> set[tuple[str, str]]:
+    """Open-position tokens via position_pin (optional module; failures -> empty).
+
+    On import/load failure logs a WARNING and, if ``status`` is given, sets
+    ``status["failed"] = True`` so callers can count pin_load_failed.
+    """
+    try:
+        import position_pin  # type: ignore
+
+        _pairs, tokens = position_pin.load_pins()
+        failed_dbs = getattr(position_pin, "last_failed_count", lambda: 0)()
+        if failed_dbs and status is not None:
+            # per-DB failures from position_pin (missing/no_table/missing_cols/error)
+            status["failed"] = True
+            status["error"] = f"failed_dbs={failed_dbs}"
+            status["dbs"] = dict(getattr(position_pin, "last_status", {}) or {})
+        return {(norm_chain(c), norm_address(a)) for c, a in tokens}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("position_pin load failed; pins skipped this round: %r", exc)
+        if status is not None:
+            status["failed"] = True
+            status["error"] = repr(exc)
+        return set()
 
 
 def _stance_from_payload(data: dict[str, Any]) -> str | None:
@@ -395,7 +601,7 @@ class JevClient:
         auth_mode: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
-        self.budget = MinuteBudget(max_per_min)
+        self.budget = MinuteBudget(max_per_min, JEV_MIN_GAP_SEC)
         self.timeout = timeout
         # Empty / unset → public mode (no auth headers or query params)
         key = (JEV_API_KEY if api_key is None else api_key) or ""
@@ -546,8 +752,13 @@ def fetch_and_store(
     client: JevClient,
     chain_id: str,
     token_address: str,
+    tier: str | None = None,
 ) -> dict[str, Any]:
-    """Fetch one token and upsert jev_signals. Exceptions → error row."""
+    """Fetch one token and upsert jev_signals. Exceptions → error row.
+
+    On error, an existing successful row is NOT overwritten; only
+    last_error/last_error_at are stamped. Successes append to history.
+    """
     chain_id = norm_chain(chain_id)
     api_addr = resolve_api_address(store, chain_id, token_address)
     token_address = norm_address(token_address)
@@ -561,7 +772,30 @@ def fetch_and_store(
         "token_address": token_address,
         **parsed,
     }
+    if row.get("error"):
+        err_at = row.get("fetched_at") or utc_now_iso()
+        try:
+            existing = store.get_signal(chain_id, token_address)
+        except sqlite3.OperationalError:
+            existing = None
+        if existing and existing.get("error") is None and existing.get("fetched_at"):
+            try:
+                store.mark_error(chain_id, token_address, str(row["error"]), err_at)
+            except sqlite3.OperationalError as exc:
+                log.warning("jev mark_error failed %s/%s err=%s",
+                            chain_id, token_address[:12], type(exc).__name__)
+            row["preserved"] = True
+            return row
+        row["last_error"] = row["error"]
+        row["last_error_at"] = err_at
+        _upsert_signal_with_retry(store, row, chain_id, token_address)
+        return row
     _upsert_signal_with_retry(store, row, chain_id, token_address)
+    try:
+        store.append_history(row, tier)
+    except sqlite3.OperationalError as exc:
+        log.warning("jev history append failed %s/%s err=%s",
+                    chain_id, token_address[:12], type(exc).__name__)
     return row
 
 
@@ -617,14 +851,18 @@ def run_pass(
     force: bool = False,
     limit: int | None = None,
     tokens: list[tuple[str, str]] | None = None,
+    sleep_fn=time.sleep,
 ) -> dict[str, int]:
     """
     Fetch JEV for hot tokens (and optional pending/explicit list).
     force=True ignores freshness interval (still rate-limited).
     """
-    stats = {"seen": 0, "ok": 0, "err": 0, "skip": 0}
+    stats = {"seen": 0, "ok": 0, "err": 0, "skip": 0, "preserved": 0,
+             "ok_pin": 0, "ok_refresh": 0, "ok_new": 0, "s429": 0,
+             "pin_load_failed": 0}
     lim = limit if limit is not None else JEV_HOT_LIMIT
     queue: list[tuple[str, str]] = []
+    tiers: dict[str, str] = {}
 
     if tokens:
         queue.extend(tokens)
@@ -635,8 +873,15 @@ def run_pass(
             for t in store.list_hot_tokens(limit=lim):
                 queue.append((t["chain_id"], t["token_address"]))
         else:
-            for t in store.list_due_hot(limit=lim, interval_sec=JEV_HOT_INTERVAL_SEC):
+            pin_status: dict[str, Any] = {}
+            pins = _load_pinned_tokens(status=pin_status)
+            if pin_status.get("failed"):
+                stats["pin_load_failed"] += 1
+            for t in store.list_due_hot(
+                limit=lim, interval_sec=JEV_HOT_INTERVAL_SEC, pins=pins
+            ):
                 queue.append((t["chain_id"], t["token_address"]))
+                tiers[f"{norm_chain(t['chain_id'])}|{norm_address(t['token_address'])}"] = t["tier"]
 
     # de-dupe preserving order
     seen_keys: set[str] = set()
@@ -648,11 +893,23 @@ def run_pass(
         seen_keys.add(k)
         uniq.append((norm_chain(chain), norm_address(addr)))
 
+    consec_429 = 0
     for chain_id, token_address in uniq[:lim] if not tokens else uniq:
         stats["seen"] += 1
-        row = fetch_and_store(store, client, chain_id, token_address)
+        tier = tiers.get(f"{chain_id}|{token_address}")
+        row = fetch_and_store(store, client, chain_id, token_address, tier=tier)
         if row.get("error"):
             stats["err"] += 1
+            if row.get("preserved"):
+                stats["preserved"] += 1
+            if row.get("error") == "status:429":
+                consec_429 += 1
+                stats["s429"] += 1
+                pause = min(600.0, 60.0 * (2 ** (consec_429 - 1)))
+                log.warning("jev consecutive 429 x%s; pausing %.0fs", consec_429, pause)
+                sleep_fn(pause)
+            else:
+                consec_429 = 0
             log.info(
                 "jev stored error %s/%s err=%s",
                 chain_id,
@@ -660,7 +917,10 @@ def run_pass(
                 row.get("error"),
             )
         else:
+            consec_429 = 0
             stats["ok"] += 1
+            if tier in ("pin", "refresh", "new"):
+                stats[f"ok_{tier}"] += 1
             log.info(
                 "jev ok %s/%s score=%s coverage=%s stance=%s",
                 chain_id,
@@ -670,6 +930,19 @@ def run_pass(
                 row.get("stance"),
             )
     return stats
+
+
+# Floor on the inter-round tail sleep so --interval 0 with no due tokens
+# cannot busy-loop (each pass would otherwise return immediately).
+JEV_MIN_ROUND_SLEEP_SEC = 30
+
+
+def _tail_sleep_sec(interval: int | float | None) -> int:
+    try:
+        val = int(interval or 0)
+    except (TypeError, ValueError):
+        val = 0
+    return max(JEV_MIN_ROUND_SLEEP_SEC, val)
 
 
 def run_loop(
@@ -689,18 +962,24 @@ def run_loop(
     with JevStore(db_path) as store, JevClient() as client:
         while True:
             try:
+                t0 = time.monotonic()
                 stats = run_pass(store, client, force=False, limit=limit)
                 log.info(
-                    "jev pass ok=%s err=%s seen=%s rows=%s remaining_budget=%s",
+                    "jev pass ok=%s err=%s seen=%s rows=%s remaining_budget=%s "
+                    "pin=%s refresh=%s new=%s pin_load_failed=%s preserved=%s s429=%s history=%s dur=%.0fs",
                     stats["ok"],
                     stats["err"],
                     stats["seen"],
                     store.count_signals(),
                     client.budget.remaining(),
+                    stats["ok_pin"], stats["ok_refresh"], stats["ok_new"],
+                    stats["pin_load_failed"], stats["preserved"], stats["s429"], store.count_history(),
+                    time.monotonic() - t0,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.exception("jev pass crashed: %s", exc)
-            time.sleep(max(30, int(interval)))
+            # Even pacing lives in MinuteBudget; this is only a tail wait.
+            time.sleep(_tail_sleep_sec(interval))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -718,7 +997,7 @@ def main(argv: list[str] | None = None) -> int:
         "--interval",
         type=int,
         default=None,
-        help=f"Loop sleep seconds (default {JEV_HOT_INTERVAL_SEC})",
+        help=f"Tail sleep seconds between passes (default {JEV_HOT_INTERVAL_SEC}; floored at {JEV_MIN_ROUND_SLEEP_SEC}s)",
     )
     parser.add_argument(
         "--limit",
