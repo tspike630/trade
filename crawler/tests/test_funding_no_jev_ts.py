@@ -48,5 +48,16 @@ class FundingNoJevTimestamp(unittest.TestCase):
         self.assertEqual(why, "jev_stale")
 
 
+class FutureTsTests(unittest.TestCase):
+    def test_future_ts(self):
+        from datetime import datetime, timedelta, timezone
+        from indicators.funding import jev_age_minutes
+        now = datetime(2026, 10, 21, tzinfo=timezone.utc)
+        iso = lambda d: (now + d).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertIsNone(jev_age_minutes(iso(timedelta(minutes=10)), now))
+        self.assertEqual(jev_age_minutes(iso(timedelta(minutes=1)), now), 0.0)
+        self.assertEqual(jev_age_minutes(iso(timedelta(minutes=-5)), now), 5.0)
+
+
 if __name__ == "__main__":
     unittest.main()
