@@ -167,6 +167,7 @@ PYTHONPATH=crawler python -m sources.news --once
 - [ ] 知 `factor_loop` 只收 M-2/M-3 已校准候选；权重仍 0；I-3/I-4 不掺
 - [ ] 知例行：周一 09:30 周报回群；RSS 有新写才通知
 - [ ] `python -m review.run --period 7d --report` 能跑通；改码后推 `tspike630/trade`
+- [ ] 知前沿调研只登记旁证/纪律：见 `docs/REVIEW_FRONTIER_LOG.md`（OBS-4、H-WC1、D-1、D-2）
 
 ---
 
