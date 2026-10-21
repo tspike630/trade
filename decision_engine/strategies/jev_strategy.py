@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -21,19 +22,31 @@ def stance_is_bullish(stance: Any) -> bool:
     s = str(stance or "").strip()
     return bool(s) and bool(_BULLISH_RE.search(s)) and not _NOT_BULLISH_RE.search(s)
 
+_CLOCK_SKEW_MIN = 2.0  # tolerated future skew (minutes) on legacy timestamps
+
 
 def jev_age_min(row: dict[str, Any], now: datetime | None = None) -> float | None:
     """Minutes since jev_signals.fetched_at (indicator layer's definition).
 
     Order: indicator column ``jev_age_min`` > ``jev_fetched_at`` (attached by the
     adapter from jev_signals) > ``jev_updated_at`` (= fetched_at or analyzed_at).
+    If the ``jev_age_min`` key is present but None/invalid, returns None (stale);
+    timestamp fallback applies only to legacy rows lacking the key entirely.
     """
-    v = row.get("jev_age_min")
-    if v is not None:
+    if "jev_age_min" in row:
+        # Indicator layer emits jev_age_min=None for jev rows without a real
+        # timestamp (while writing jev_updated_at=now as a placeholder). Treat
+        # that as unknown age -> stale; never fall back to jev_updated_at here.
+        v = row.get("jev_age_min")
+        if v is None:
+            return None
         try:
-            return float(v)
+            f = float(v)
         except (TypeError, ValueError):
-            pass
+            return None
+        if math.isnan(f) or math.isinf(f) or f < 0:
+            return None
+        return f
     ts = row.get("jev_fetched_at") or row.get("jev_updated_at")
     if not ts:
         return None
@@ -44,7 +57,11 @@ def jev_age_min(row: dict[str, Any], now: datetime | None = None) -> float | Non
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     now = now or datetime.now(timezone.utc)
-    return (now - dt).total_seconds() / 60.0
+    age = (now - dt).total_seconds() / 60.0
+    # Future-dated beyond small clock skew, or NaN -> unknown (stale).
+    if math.isnan(age) or age < -_CLOCK_SKEW_MIN:
+        return None
+    return max(age, 0.0)
 
 
 def jev_gate(row: dict[str, Any], max_age_min: float, require_bullish_stance: bool) -> tuple[str | None, dict[str, Any]]:
