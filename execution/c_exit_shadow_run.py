@@ -7,6 +7,10 @@ stream can be plugged in. Default stays decision_log purpose=live_candidate.
 Does NOT write paper_trading.db or execution_ledger.db.
 Does NOT change .env / live gates / main TP-SL-hold.
 
+Opens fill at buy_fill_price. Tick exits still trigger on the mark (mid).
+Sell and partial-sell fills use sell_fill_price: the close quote's liquidity
+when that quote has it, otherwise the entry liquidity stored on the position.
+
   python -m execution.c_exit_shadow_run --init
   python -m execution.c_exit_shadow_run --once
   python -m execution.c_exit_shadow_run --loop
@@ -319,10 +323,10 @@ def process_once(
     if last_id > since:
         ledger.set_last_processed_id(last_id)
 
-    def price_lookup(pos: dict[str, Any]) -> float | None:
+    def price_lookup(pos: dict[str, Any]) -> tuple[float | None, float | None]:
+        """Return (mark, current liquidity). Mark drives the exit; liq drives sell slip."""
         if not STOP_CONFIRM_ENABLED:
-            mid, _liq = _latest_mid(crawler_db, pos["chain_id"], pos["pair_address"])
-            return mid
+            return _latest_mid(crawler_db, pos["chain_id"], pos["pair_address"])
         try:
             con = _open_ro(crawler_db)
             try:
@@ -330,9 +334,9 @@ def process_once(
             finally:
                 con.close()
         except sqlite3.Error:
-            return None
+            return None, None
         if not q:
-            return None
+            return None, None
         try:
             liq = float(q["liquidity_usd"]) if q["liquidity_usd"] is not None else None
         except (TypeError, ValueError):
@@ -348,7 +352,7 @@ def process_once(
                 "stop-confirm pair=%s px=%s liq=%s verdict=%s",
                 pos["pair_address"][:12], q["price_usd"], liq, verdict,
             )
-        return mark
+        return mark, liq
 
     tick_closed = ledger.tick(price_lookup)
     return {
