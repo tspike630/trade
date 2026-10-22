@@ -7,6 +7,7 @@ from typing import Any
 from logging_setup import get_logger
 
 from decision_engine.strategies.base_strategy import BaseStrategy
+from decision_engine.strategies.entry_sizing import buy_size_fields
 
 log = get_logger("decision_engine.tech_strategy")
 
@@ -51,11 +52,15 @@ class TechMomentumStrategy(BaseStrategy):
                 continue
             if c5 >= self.min_change_5m and vs >= self.min_volume_strength:
                 hits += 1
+                sized = buy_size_fields(row, floor_pct=self.position_pct)
                 self.buy(
                     chain_id=str(row.get("chain_id") or ""),
                     token_address=str(row.get("token_address") or ""),
                     pair_address=row.get("primary_pair_address"),
-                    size_pct=self.position_pct,
+                    size_pct=float(sized["size_pct"]),
+                    size_tier=sized["size_tier"],
+                    entry_r3=sized["entry_r3"],
+                    size_blockers=sized["size_blockers"],
                     reason=(
                         f"change_5m={c5:.3f}>={self.min_change_5m}"
                         f" volume_strength={vs:.3f}>={self.min_volume_strength}"

@@ -80,6 +80,18 @@ DECISION_ENGINE_STEP1_RESULT.md
 
 逻辑：扫描 `list_hot_tokens(limit)`；若 `jev_strength >= min` 则 `buy`（附 `primary_pair_address`、`jev_signal`、`jev_score`）。
 
+## 厚池仓位（thick pool）
+
+纸面执行可以按满额名义成交。决策层不因此把旧买入一律写成 `size_pct=1`。
+
+买入 `size_pct`：
+
+- **约 1.0** 仅当四条同时成立：`liq_usd ≥ 150000`、池龄 `≥ 7` 天、R3=0、`jev_strength ≥ 0.15` 且流动性有测量。R3 与指标旁路同一条：`volatility_24h > 2.5` 且（`change_1h < 0` 或 `rsi_14 < 30` 或 `rsi_14 ≥ 70`）则为 R3=1，不满仓。
+- **其余买入** 保持现有地板 `size_pct=0.05`（显式更小的 `position_pct` 保留）。不抬到 0.25。
+- 入场地板不动：live 流动性 `≥ 50k`、策略强度阈值、回测 `coverage ≥ 10`。本规则只选仓位，不另开一道拒单。
+- 可选、默认不挡：`DECISION_THICK_STRICT_MIN_LIQ_USD=500000` 才把满仓流动性抬到 50 万。`supply_gaps` 未闭合窗口不在本层跳过买入。
+- 不改 live 开关、执行层 `PAPER_SIZE_MULT`、指标权重，也不读、不关 #71 `step2_blocked`。
+
 ## 配置（`decision_engine/config.py` / 环境变量）
 
 | 变量 | 默认 | 含义 |
@@ -89,7 +101,14 @@ DECISION_ENGINE_STEP1_RESULT.md
 | `DECISION_HOT_TOKEN_LIMIT` | `50` | hot 扫描上限 |
 | `DECISION_DEFAULT_STRATEGY` | `jev_strength_v1` | 默认策略 |
 | `DECISION_JEV_MIN_STRENGTH` | `0.3` | JEV 阈值 |
-| `DECISION_JEV_POSITION_PCT` | `0.05` | 信号仓位 |
+| `DECISION_JEV_POSITION_PCT` | `0.05` | 策略默认 `position_pct`。普通买入再被 `DECISION_ORDINARY_SIZE_PCT`（0.05）封顶 |
+| `DECISION_ORDINARY_SIZE_PCT` | `0.05` | 普通买入仓位上限。不抬到 0.25 |
+| `DECISION_THICK_POOL_SIZE_PCT` | `1.0` | 厚池满仓 `size_pct`。四条不齐则用不到 |
+| `DECISION_THICK_MIN_LIQ_USD` | `150000` | 厚池流动性。缺测量不算过 |
+| `DECISION_THICK_MIN_POOL_AGE_DAYS` | `7` | 厚池池龄（天） |
+| `DECISION_THICK_R3_VOL_THR` / `DECISION_THICK_R3_RSI_LO` / `DECISION_THICK_R3_RSI_HI` | `2.5` / `30` / `70` | R3 冻结阈值，与 `shadow_stop_prone.eval_r3` 对齐 |
+| `DECISION_THICK_MIN_JEV_STRENGTH` | `0.15` | 厚池才要求的强度。不替代策略自己的入场阈值 |
+| `DECISION_THICK_STRICT_MIN_LIQ_USD` | 未设 | 可选更严档。设 `500000` 才要求 50 万。不读 `supply_gaps` |
 | `DECISION_COOLDOWN_SEC` | `0` | 同一 `(strategy, chain, token)` 买入冷却秒数。代码默认 `0` = 关闭。临时 paper 观察在进程环境里设 `3600`，与回测 / paper 的 `max_hold_min=60`、`time_exit` 默认 `max_hold_seconds=3600` 对齐。不要把代码默认改成 3600。重启配方见 `DECISION_ENGINE_DRYRUN_24H.md`。冷却状态在进程内，重启清零 |
 | `DECISION_MIN_LIQ_USD` | `50000` | 实盘/dry-run 买入流动性下限（USD），与回测 `FilterConfig.min_liq=50000` 对齐。`liquidity_usd` 缺失（`no_liquidity`）或低于下限（`liq_below_min`）的 buy 在写入 `decision_log` 前丢弃。卖出不过滤。只做风险入场过滤，不改变 JEV 强度阈值、权重或 purpose |
 | `DECISION_USE_API_FALLBACK` | `0` | 是否走 API（Step 1 默认关） |

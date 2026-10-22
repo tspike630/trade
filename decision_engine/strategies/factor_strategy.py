@@ -15,6 +15,7 @@ from decision_engine.factors.base import FactorBuyBase, FactorSellBase
 from decision_engine.factors.buy import BUY_FACTOR_REGISTRY
 from decision_engine.factors.sell import SELL_FACTOR_REGISTRY
 from decision_engine.strategies.base_strategy import BaseStrategy
+from decision_engine.strategies.entry_sizing import buy_size_fields
 
 log = get_logger("decision_engine.factor_strategy")
 
@@ -70,13 +71,23 @@ class FactorStrategy(BaseStrategy):
             cand = self._first_hit(row)
             if cand is None:
                 continue
+            floor = cand.get("size_pct", self.params.get("position_pct", 0.05))
+            sized = buy_size_fields(row, floor_pct=float(floor))
+            extra = {
+                k: v
+                for k, v in cand.items()
+                if k not in ("size_pct", "reason", "size_tier", "entry_r3", "size_blockers")
+            }
             self.buy(
                 chain_id=str(row.get("chain_id") or ""),
                 token_address=str(row.get("token_address") or ""),
                 pair_address=row.get("primary_pair_address"),
-                size_pct=float(cand["size_pct"]),
+                size_pct=float(sized["size_pct"]),
                 reason=str(cand["reason"]),
-                **{k: v for k, v in cand.items() if k not in ("size_pct", "reason")},
+                size_tier=sized["size_tier"],
+                entry_r3=sized["entry_r3"],
+                size_blockers=sized["size_blockers"],
+                **extra,
             )
         # Sell chain: current dry-run has no positions → no-op (behavior equivalent).
         positions = data.get("open_positions") or []

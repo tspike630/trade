@@ -81,6 +81,20 @@ def _env_float(raw: str | None, default: float) -> float:
     return value
 
 
+def _env_optional_positive(name: str) -> float | None:
+    """Unset, blank, non-positive, or non-finite → None (feature off)."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
 # Live/dry-run buy liquidity floor (USD). Aligned with backtest
 # FilterConfig.min_liq in decision_engine/backtest/filters.py (50_000).
 # RiskManager drops a buy when liquidity_usd is missing (no_liquidity, fail-closed)
@@ -93,6 +107,38 @@ DECISION_MIN_LIQ_USD = _env_float(os.environ.get("DECISION_MIN_LIQ_USD", "50000"
 # JEV strength strategy defaults
 JEV_MIN_STRENGTH = float(os.environ.get("DECISION_JEV_MIN_STRENGTH", "0.3"))
 JEV_POSITION_PCT = float(os.environ.get("DECISION_JEV_POSITION_PCT", "0.05"))
+
+# Ordinary buy size. Paper notional is full-size at execution; this layer must
+# not answer by lifting every signal. Cap stays 0.05 (do not raise to 0.25).
+# A strategy position_pct below the cap is kept. Above the cap is clipped
+# unless the thick-pool rule below promotes the buy.
+# Env: DECISION_ORDINARY_SIZE_PCT. Invalid values fall back to 0.05.
+ORDINARY_SIZE_PCT = _env_float(os.environ.get("DECISION_ORDINARY_SIZE_PCT", "0.05"), 0.05)
+
+# Thick-pool full size. size_pct reaches this only when liquidity, pool age,
+# R3=0, and jev_strength all pass (see decision_engine.strategies.entry_sizing).
+# Does not change admission floors (50k liq / strength / coverage) or #71.
+# Env: DECISION_THICK_POOL_SIZE_PCT. Invalid values fall back to 1.0.
+THICK_POOL_SIZE_PCT = _env_float(os.environ.get("DECISION_THICK_POOL_SIZE_PCT", "1.0"), 1.0)
+THICK_MIN_LIQ_USD = _env_float(os.environ.get("DECISION_THICK_MIN_LIQ_USD", "150000"), 150_000.0)
+THICK_MIN_POOL_AGE_DAYS = _env_float(
+    os.environ.get("DECISION_THICK_MIN_POOL_AGE_DAYS", "7"), 7.0
+)
+# Frozen R3 sample-in thresholds. Same predicate as
+# crawler/indicators/shadow_stop_prone.eval_r3 (vol > 2.5 AND
+# (change_1h < 0 OR rsi < 30 OR rsi >= 70)).
+THICK_R3_VOL_THR = _env_float(os.environ.get("DECISION_THICK_R3_VOL_THR", "2.5"), 2.5)
+THICK_R3_RSI_LO = _env_float(os.environ.get("DECISION_THICK_R3_RSI_LO", "30"), 30.0)
+THICK_R3_RSI_HI = _env_float(os.environ.get("DECISION_THICK_R3_RSI_HI", "70"), 70.0)
+THICK_MIN_JEV_STRENGTH = _env_float(
+    os.environ.get("DECISION_THICK_MIN_JEV_STRENGTH", "0.15"), 0.15
+)
+
+# Optional stricter thick-pool liquidity tier. Unset = off (150k rule stands).
+# Set DECISION_THICK_STRICT_MIN_LIQ_USD=500000 to require liq >= 500k before
+# full size. Does not change the 50k admission floor and does not consult
+# supply_gaps.
+THICK_STRICT_MIN_LIQ_USD = _env_optional_positive("DECISION_THICK_STRICT_MIN_LIQ_USD")
 # Reject JEV buys whose jev_updated_at (or jev_age_min when the indicator layer
 # provides it) is older than this. 0 disables. Audit 2026-10-21: all 143 paper
 # trades used jev data 48-248h old.
