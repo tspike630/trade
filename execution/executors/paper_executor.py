@@ -7,6 +7,7 @@ with no retries. Does not touch live trading.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from pathlib import Path
@@ -32,6 +33,26 @@ DEFAULT_TP_PCT = 10.0
 DEFAULT_SL_PCT = 5.0
 DEFAULT_MAX_HOLD_MIN = 60.0
 EXECUTOR_NAME = "paper"
+PAPER_SIZE_MULT_ENV = "EXECUTION_PAPER_SIZE_MULT"
+
+
+def paper_size_mult() -> float:
+    """Main-book paper buy notional multiplier. Unusable values stay at 1.0.
+
+    Read on each buy so a process environment change is visible at the next
+    fill. This does not reload a ``.env`` file by itself. Values that are
+    unset, blank, non-numeric, non-finite, or ``<= 0`` apply ``1.0``.
+    """
+    raw = os.environ.get(PAPER_SIZE_MULT_ENV)
+    if raw is None or not str(raw).strip():
+        return 1.0
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(value) or value <= 0:
+        return 1.0
+    return value
 
 
 def _resolve_observe_db(observe_db: str | Path | None) -> Path | None:
@@ -265,13 +286,19 @@ class PaperExecutor:
         fill_price = buy_fill_price(mid, slip)
         eq = self.ledger.equity(self._marks())
         equity_usd = float(eq["equity_usd"])
-        requested_usd = size_pct * equity_usd
+        requested_usd_before_mult = size_pct * equity_usd
+        mult = paper_size_mult()
+        requested_usd = requested_usd_before_mult * mult
         cash = float(self.ledger.get_cash())
         truncated = False
         size_usd = requested_usd
         if size_usd > cash:
             size_usd = cash
             truncated = True
+        size_audit = {
+            "paper_size_mult": mult,
+            "requested_usd_before_mult": requested_usd_before_mult,
+        }
         if size_usd <= 0:
             return {
                 "ok": False,
@@ -279,6 +306,7 @@ class PaperExecutor:
                 "executor": EXECUTOR_NAME,
                 "cash_usd": cash,
                 "requested_usd": requested_usd,
+                **size_audit,
             }
 
         tp, sl, hold = tp_sl_hold_from_signal(sig)
@@ -290,6 +318,7 @@ class PaperExecutor:
                 "liquidity_usd": liq,
                 "requested_usd": requested_usd,
                 "truncated": truncated,
+                **size_audit,
                 "size_pct": size_pct,
                 "equity_usd": equity_usd,
                 "peak_price": mid,
@@ -321,6 +350,7 @@ class PaperExecutor:
             "size_usd": size_usd,
             "requested_usd": requested_usd,
             "truncated": truncated,
+            **size_audit,
             "tp_pct": tp,
             "sl_pct": sl,
             "max_hold_min": hold,

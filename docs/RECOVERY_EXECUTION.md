@@ -83,6 +83,8 @@ cd /workspace/dexscreener-crawler
 - **live 关**；实盘路径未开放前禁止当有效性。
 - exits 默认仍 **tp10 / sl5 / hold60**（分钟）——**禁止盘中改**。
 
+`EXECUTION_PAPER_SIZE_MULT` 只乘主纸面账本买单的名义金额（`size_pct * equity` 之后、按现金截断之前）。代码默认 `1.0`；未设置、空白、非数字、非有限或 `≤ 0` 都按 `1.0`。成交仍不超过账面现金，不造保证金。仓位 `meta.size_pct` 仍是信号比例，PM 的百分比上限不改口径。它不作用于 live，也不作用于 c_exit 旁簿的 `size_mult`。合入后若要今晚纸面名义 2 倍，在纸面进程环境设 `EXECUTION_PAPER_SIZE_MULT=2`（重启进程生效）；不要把该值写进仓库 `.env`。
+
 ### 杨授权的最小 PM 配置（paper 观察期，2026-10-14）
 
 仅在杨明确授权后打开；数值如下（**不写进仓库 `.env` 样例当默认开**）：
