@@ -58,6 +58,7 @@ from dashboard.c_exit_shadow import (
     load_c_exit_shadow,
     main_line as c_exit_main_line,
     rollback_hit_line,
+    sell_slip_card_lines,
     tag_line as c_exit_tag_line,
     verdict_line as c_exit_verdict_line,
 )
@@ -2987,6 +2988,12 @@ def _v2_phase1_counterfactual() -> None:
     ui.label(PHASE1_CF_NAIL).classes("v2-note")
 
 
+def _v2_sell_slip_notes() -> None:
+    """Book Σpnl from the side-book DBs, plus the #137 sell-slip annotation."""
+    for line in sell_slip_card_lines():
+        ui.label(line).classes("v2-note")
+
+
 def _mount_c_exit_shadow() -> None:
     """Read-only OVERVIEW card for the C-exit shadow book, beside Phase1."""
     _v2_comp(
@@ -3008,6 +3015,7 @@ def _v2_c_exit_shadow() -> None:
         ui.label(C_EXIT_DISCIPLINE).classes("v2-note")
         ui.label(C_EXIT_NAIL).classes("v2-note")
         _grid_registry_notes()
+        _v2_sell_slip_notes()
         return
     ui.label(C_EXIT_NAIL).classes("v2-note")
     ui.label(C_EXIT_DISCIPLINE).classes("v2-note")
@@ -3021,6 +3029,7 @@ def _v2_c_exit_shadow() -> None:
         if isinstance(live_n, int) and not isinstance(live_n, bool) and live_n < 30:
             ui.label(f"{row.tag} · 样本不足").classes("v2-note")
     ui.label(c_exit_main_line(report)).classes("v2-note")
+    _v2_sell_slip_notes()
     ui.label(c_exit_verdict_line(report)).classes("v2-note v2-note-grey")
     ui.label(C_EXIT_THRESHOLD).classes("v2-note")
     ui.label(C_EXIT_ROLLBACK).classes("v2-note")
@@ -3054,6 +3063,7 @@ def _v2_entry_c_exit_joint() -> None:
         ui.label(JOINT_LIQ_NAIL).classes("v2-note")
         ui.label(JOINT_LIQ_LIVE).classes("v2-note")
         ui.label(JOINT_DISCIPLINE).classes("v2-note")
+        _v2_sell_slip_notes()
         return
     if getattr(report, "side_missing", None):
         ui.label(f"只读对照 · 旁簿成交：缺失（{report.side_missing}）").classes("v2-note")
@@ -3074,6 +3084,7 @@ def _v2_entry_c_exit_joint() -> None:
     ui.label(SIDE_BOOK_RETURN_TAG).classes("v2-note")
     ui.label(joint_peak_line(report)).classes("v2-note")
     ui.label(JOINT_PNL_NOTE).classes("v2-note")
+    _v2_sell_slip_notes()
     ui.label(joint_verdict_line(report)).classes("v2-note")
     if report.note:
         ui.label(report.note).classes("v2-note")
