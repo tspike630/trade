@@ -2,6 +2,12 @@
 
 Never writes paper_trading.db or execution_ledger.db (main KPI).
 Cash and positions are partitioned by grid_tag.
+
+Tick triggers (TP / SL / trail / partial / max_hold) compare the mark (mid)
+to the entry fill. Sell and partial-sell fills are mark × (1 − slip), using
+the same liquidity tiers as ``execution.pricing``. Current liquidity at the
+close is preferred; otherwise entry ``meta_json.liquidity_usd``. Closed rows
+already in the book are not rewritten.
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ from execution.c_exit_grid import (
     cells,
 )
 from execution import c_exit_size_mult as size_mult
+from execution.pricing import sell_fill_price, slippage_rate
 
 BUSY_TIMEOUT_MS = 30_000
 DEFAULT_START_CASH = 10_000.0
@@ -31,6 +38,53 @@ def _utc() -> str:
 
 
 GAP_STOP_MULT = 2.0
+
+
+def _meta_dict(pos: dict[str, Any]) -> dict[str, Any]:
+    raw = pos.get("meta_json")
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _coerce_liquidity(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        liq = float(value)
+    except (TypeError, ValueError):
+        return None
+    if liq != liq:  # NaN
+        return None
+    return liq
+
+
+def _split_mark_liq(looked: Any) -> tuple[Any, Any]:
+    """``price_lookup`` returns a mark, or ``(mark, current_liquidity_usd)``."""
+    if isinstance(looked, tuple):
+        mark = looked[0] if len(looked) > 0 else None
+        current = looked[1] if len(looked) > 1 else None
+        return mark, current
+    return looked, None
+
+
+def _resolve_sell_liquidity(pos: dict[str, Any], current: Any) -> float | None:
+    """Current close liquidity, else entry liquidity stored on the position."""
+    liq = _coerce_liquidity(current)
+    if liq is not None:
+        return liq
+    return _coerce_liquidity(_meta_dict(pos).get("liquidity_usd"))
+
+
+def _sell_fill_from_mark(mark: float, liquidity_usd: float | None) -> tuple[float, float]:
+    slip = slippage_rate(liquidity_usd)
+    return sell_fill_price(mark, slip), slip
 
 
 def is_gap_stop(pnl_usd: float, size_usd: float, sl_pct: float | None) -> bool:
@@ -489,16 +543,30 @@ class CExitShadowLedger:
         return {"id": pid, "partial": True, "qty": sell_qty, "price": price, "grid_tag": tag}
 
     def tick(self, price_lookup, now: datetime | None = None) -> list[dict[str, Any]]:
-        """Apply per-row SL / trailing / partial TP / TP / max_hold."""
+        """Apply per-row SL / trailing / partial TP / TP / max_hold.
+
+        ``price_lookup`` returns the mark, or ``(mark, current_liquidity_usd)``.
+        Triggers and the trailing peak use the mark. Sell and partial-sell
+        fills use ``sell_fill_price`` on that mark. Slippage uses current
+        liquidity when the lookup provides it, otherwise entry
+        ``meta_json.liquidity_usd`` (unknown liquidity is the 2% tier).
+        ``close_position`` / ``partial_close`` record the price they are given;
+        only this path converts a mark into a slipped fill.
+        """
         if self.is_halted():
             return []
         closed: list[dict[str, Any]] = []
         now = now or datetime.now(timezone.utc)
         for pos in self.list_open():
-            px = price_lookup(pos)
-            if px is None:
+            mark, current_liq = _split_mark_liq(price_lookup(pos))
+            if mark is None:
                 continue
-            px = float(px)
+            try:
+                px = float(mark)
+            except (TypeError, ValueError):
+                continue
+            if px <= 0:
+                continue
             peak = max(float(pos.get("peak_price") or pos["entry_price"]), px)
             if pos.get("trail_pct") is not None and peak > float(pos.get("peak_price") or 0):
                 self.conn.execute(
@@ -510,12 +578,17 @@ class CExitShadowLedger:
             if act is None:
                 continue
             kind, reason = act
+            liq = _resolve_sell_liquidity(pos, current_liq)
+            fill, slip = _sell_fill_from_mark(px, liq)
             try:
                 if kind == "partial":
-                    self.partial_close(pos["id"], price=px, reason=reason)
+                    self.partial_close(pos["id"], price=fill, reason=reason)
                     continue
-                # sell fill ≈ mid (shadow skeleton)
-                result = self.close_position(pos["id"], price=px, reason=reason)
+                result = self.close_position(pos["id"], price=fill, reason=reason)
+                result["mid_price"] = px
+                result["fill_price"] = fill
+                result["slippage"] = slip
+                result["liquidity_usd"] = liq
                 closed.append(result)
             except Exception:
                 continue

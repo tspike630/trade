@@ -10,6 +10,7 @@ from pathlib import Path
 from execution import c_exit_size_mult as sm
 from execution.c_exit_grid import cell_by_tag, cell_exit_action, cells
 from execution.c_exit_shadow_ledger import CExitShadowLedger
+from execution.pricing import slippage_rate
 
 EXPECTED = [
     "c_sl4_h60", "c_sl5_h60", "c_sl4_h90", "c_sl5_h90",
@@ -74,8 +75,14 @@ class TestPartial(Base):
         self.led.tick(lambda p: 1.10)
         r = self.row(pid)
         self.assertEqual(r["exit_reason"], "take_profit")
-        self.assertAlmostEqual(r["pnl_usd"], 50 * 0.05 + 50 * 0.10)
-        self.assertAlmostEqual(self.led.get_cash("c_tp5half_sl5_h60"), 10_000 + 7.5)
+        # Empty meta → unknown liquidity → sell slip. Triggers stayed on the marks above.
+        slip = slippage_rate(None)
+        partial_fill = 1.05 * (1.0 - slip)
+        exit_fill = 1.10 * (1.0 - slip)
+        pnl = 50 * (partial_fill - 1.0) + 50 * (exit_fill - 1.0)
+        self.assertAlmostEqual(r["pnl_usd"], pnl)
+        self.assertAlmostEqual(r["exit_price"], exit_fill)
+        self.assertAlmostEqual(self.led.get_cash("c_tp5half_sl5_h60"), 10_000 + pnl)
 
     def test_half_then_sl(self):
         pid = self.open("c_tp5half_sl5_h60")
@@ -83,7 +90,9 @@ class TestPartial(Base):
         self.led.tick(lambda p: 0.95)
         r = self.row(pid)
         self.assertEqual(r["exit_reason"], "stop_loss")
-        self.assertAlmostEqual(r["pnl_usd"], 2.5 - 2.5)
+        slip = slippage_rate(None)
+        pnl = 50 * (1.05 * (1.0 - slip) - 1.0) + 50 * (0.95 * (1.0 - slip) - 1.0)
+        self.assertAlmostEqual(r["pnl_usd"], pnl)
 
 
 class TestTrail(Base):
@@ -97,7 +106,10 @@ class TestTrail(Base):
         self.led.tick(lambda p: 1.16)  # -3.3%
         r = self.row(pid)
         self.assertEqual(r["exit_reason"], "trailing_stop")
-        self.assertAlmostEqual(r["pnl_usd"], 16.0)
+        slip = slippage_rate(None)
+        self.assertAlmostEqual(r["peak_price"], 1.20)
+        self.assertAlmostEqual(r["pnl_usd"], 100 * (1.16 * (1.0 - slip) - 1.0))
+        self.assertLess(r["exit_price"], 1.16)
 
     def test_floor_sl(self):
         pid = self.open("c_trail3_h60")
