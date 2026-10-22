@@ -14,6 +14,7 @@ and does not promote a parameter onto the main book.
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -604,3 +605,282 @@ def load_c_exit_shadow(path: Path | None = None) -> CExitReport:
     if isinstance(live, str):
         return packaged_report(fallback_note(live))
     return _compose(live)
+
+
+# #137 (c6016d7) applied sell slippage on new C-exit / shadow010 fills only.
+# Execution posted a read-only recalc; the history rows in the side-book DBs
+# were not rewritten. These constants are that snapshot until an export lands.
+SELL_SLIP_CITE = "#137 c6016d7"
+SELL_SLIP_CSV_ENV = "C_EXIT_SELL_SLIP_CSV"
+SELL_SLIP_CSV_GLOB = "c_exit_sell_slip_recalc*.csv"
+SHADOW010_DB_ENV = "C_EXIT_SHADOW010_DB"
+SHADOW010_DB_NAME = "paper_trading_c_exit_shadow010.db"
+_SELL_SLIP_BOOKS = ("c_exit", "shadow010")
+_SELL_SLIP_FIELDS = ("book", "closed_n", "book_pnl_usd", "adjusted_pnl_usd", "delta_usd")
+# book, closed n, stored book pnl, after sell-slip, delta. Do not invent others.
+_SELL_SLIP_CONSTANT: tuple[tuple[str, int, str, str, str], ...] = (
+    ("c_exit", 4, "22.66", "-17.79", "-40.45"),
+    ("shadow010", 20, "-201.30", "-274.47", "-73.17"),
+)
+_PLAN_FAIL = frozenset({"missing", "unreadable", "schema", "empty", "no_closed", "bad"})
+
+BookId = Literal["c_exit", "shadow010"]
+SlipOrigin = Literal["export", "constant"]
+
+
+@dataclass(frozen=True)
+class BookCash:
+    """Closed pnl stored in one side-book DB. None means the read failed."""
+
+    book: BookId
+    closed_n: int | None
+    sum_pnl: Decimal | None
+    missing: str | None
+
+
+@dataclass(frozen=True)
+class SellSlipSnap:
+    """One book's #137 read-only sell-slip snapshot. Not a rewritten ledger."""
+
+    book: BookId
+    closed_n: int
+    book_pnl: Decimal
+    adjusted_pnl: Decimal
+    delta: Decimal
+    origin: SlipOrigin
+    origin_label: str
+
+
+def _book_id(value: str) -> BookId | None:
+    match value:
+        case "c_exit":
+            return "c_exit"
+        case "shadow010":
+            return "shadow010"
+        case _:
+            return None
+
+
+def shadow010_db_path() -> Path | None:
+    """shadow010 side book. ``C_EXIT_SHADOW010_DB`` wins, even when missing."""
+    override = os.environ.get(SHADOW010_DB_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    candidate = db_root() / SHADOW010_DB_NAME
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _book_db_path(book: BookId) -> Path | None:
+    match book:
+        case "c_exit":
+            return c_exit_db_path()
+        case "shadow010":
+            return shadow010_db_path()
+        case _ as unreachable:
+            return _never(unreachable)
+
+
+def book_cash_line(row: BookCash) -> str:
+    """Book Σpnl as stored. Missing stays missing, never a made-up zero."""
+    if row.sum_pnl is None or row.closed_n is None:
+        reason = row.missing or "不可读"
+        return f"{row.book} 旁簿账面 Σpnl 不可读（{reason}）"
+    return f"{row.book} 旁簿账面 Σpnl {fmt_cents_usd(row.sum_pnl)} · 已平 {row.closed_n}"
+
+
+def sell_slip_note_line(snap: SellSlipSnap) -> str:
+    """Visible #137 annotation. The history DB was not rewritten."""
+    return (
+        f"{SELL_SLIP_CITE} 卖出滑点补扣旁注 · 只读重算 {snap.book} {snap.closed_n} 笔已平 "
+        f"账面 {fmt_cents_usd(snap.book_pnl)} → 补扣后 {fmt_cents_usd(snap.adjusted_pnl)}"
+        f"（Δ {fmt_cents_usd(snap.delta)}）· 历史库未回写 · {snap.origin_label}"
+    )
+
+
+def _sum_closed(book: BookId, rows: list[sqlite3.Row]) -> BookCash:
+    saw_status = any(row["status"] is not None for row in rows)
+    closed_n = 0
+    total = Decimal("0")
+    for row in rows:
+        status = row["status"]
+        if not _is_closed(status, row["closed_at"], saw_status or status is not None):
+            continue
+        pnl = _parse_pnl(row["pnl"])
+        if pnl is None:
+            return BookCash(book, None, None, "坏数据")
+        closed_n += 1
+        total += _q_cents(pnl)
+    return BookCash(book, closed_n, _q_cents(total), None)
+
+
+def load_book_cash(book: BookId, path: Path | None = None) -> BookCash:
+    """Closed Σpnl from the side-book file. Read-only; does not rewrite it."""
+    target = path if path is not None else _book_db_path(book)
+    if target is None or not target.is_file():
+        return BookCash(book, None, None, "库不存在")
+    try:
+        with ro_connect(target) as conn:
+            plan = _read_plan(conn)
+            if plan in _PLAN_FAIL:
+                reason = "库空" if plan == "empty" else "缺列"
+                return BookCash(book, None, None, reason)
+            rows = list(conn.execute(plan))
+    except FileNotFoundError:
+        return BookCash(book, None, None, "库不存在")
+    except (OSError, sqlite3.Error, UnicodeError, ValueError):
+        log.warning("side book cash unreadable")
+        return BookCash(book, None, None, "库不可读")
+    return _sum_closed(book, rows)
+
+
+def _sell_slip_roots() -> list[Path]:
+    package_root = Path(__file__).resolve().parents[1]
+    repo = package_root.parent if package_root.name == "crawler" else package_root
+    roots = [repo, repo / "crawler", package_root]
+    try:
+        roots.append(db_root())
+    except Exception:
+        log.warning("sell slip csv root unavailable")
+    roots.append(Path.cwd())
+    return roots
+
+
+def sell_slip_export_path() -> Path | None:
+    """Newest ``exports/c_exit_sell_slip_recalc*.csv``, if one exists.
+
+    ``C_EXIT_SELL_SLIP_CSV`` wins when set, including when that path is missing,
+    so a test can force the labeled display constant.
+    """
+    override = os.environ.get(SELL_SLIP_CSV_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for root in _sell_slip_roots():
+        folder = root / "exports"
+        if not folder.is_dir():
+            continue
+        for candidate in folder.glob(SELL_SLIP_CSV_GLOB):
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved in seen or not resolved.is_file():
+                continue
+            seen.add(resolved)
+            found.append(resolved)
+    if not found:
+        return None
+    found.sort(key=lambda item: (item.stat().st_mtime_ns, item.name), reverse=True)
+    return found[0]
+
+
+def _parse_export_number(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    text = str(value).strip().replace("$", "").replace(",", "").replace("−", "-").replace(" ", "")
+    if text.startswith("+"):
+        text = text[1:]
+    if not text or text.casefold() in _NULL:
+        return None
+    try:
+        return _q_cents(Decimal(text))
+    except InvalidOperation:
+        return None
+
+
+def _parse_closed_n(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or text.casefold() in _NULL:
+        return None
+    try:
+        number = int(text)
+    except ValueError:
+        return None
+    if number < 0:
+        return None
+    return number
+
+
+def _constant_snaps(label: str) -> tuple[SellSlipSnap, SellSlipSnap]:
+    snaps: list[SellSlipSnap] = []
+    for book_name, closed_n, book_pnl, adjusted, delta in _SELL_SLIP_CONSTANT:
+        book = _book_id(book_name)
+        if book is None:
+            raise AssertionError(book_name)
+        snaps.append(
+            SellSlipSnap(
+                book=book,
+                closed_n=closed_n,
+                book_pnl=Decimal(book_pnl),
+                adjusted_pnl=Decimal(adjusted),
+                delta=Decimal(delta),
+                origin="constant",
+                origin_label=label,
+            )
+        )
+    return (snaps[0], snaps[1])
+
+
+def _load_sell_slip_export(path: Path) -> tuple[SellSlipSnap, SellSlipSnap] | None:
+    try:
+        with path.open("r", newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            names = {name for name in (reader.fieldnames or []) if name}
+            if not set(_SELL_SLIP_FIELDS).issubset(names):
+                return None
+            parsed: dict[BookId, SellSlipSnap] = {}
+            for row in reader:
+                book = _book_id(str(row.get("book") or "").strip())
+                if book is None:
+                    continue
+                closed_n = _parse_closed_n(row.get("closed_n"))
+                book_pnl = _parse_export_number(row.get("book_pnl_usd"))
+                adjusted = _parse_export_number(row.get("adjusted_pnl_usd"))
+                delta = _parse_export_number(row.get("delta_usd"))
+                if closed_n is None or book_pnl is None or adjusted is None or delta is None:
+                    return None
+                parsed[book] = SellSlipSnap(
+                    book=book,
+                    closed_n=closed_n,
+                    book_pnl=book_pnl,
+                    adjusted_pnl=adjusted,
+                    delta=delta,
+                    origin="export",
+                    origin_label=f"导出 {path.name}",
+                )
+    except (OSError, UnicodeError, csv.Error):
+        log.warning("sell slip export unreadable")
+        return None
+    snaps: list[SellSlipSnap] = []
+    for book in _SELL_SLIP_BOOKS:
+        found = parsed.get(book)
+        if found is None:
+            return None
+        snaps.append(found)
+    return (snaps[0], snaps[1])
+
+
+def load_sell_slip_snaps() -> tuple[SellSlipSnap, SellSlipSnap]:
+    """Export under ``exports/`` when present; otherwise the labeled constant."""
+    path = sell_slip_export_path()
+    if path is None or not path.is_file():
+        return _constant_snaps("旁注常量")
+    loaded = _load_sell_slip_export(path)
+    if loaded is None:
+        log.warning("sell slip export unreadable")
+        return _constant_snaps("旁注常量（导出不可读）")
+    return loaded
+
+
+def sell_slip_card_lines() -> tuple[str, ...]:
+    """DB book Σpnl, then the #137 sell-slip note, for c_exit and shadow010."""
+    lines: list[str] = []
+    for snap in load_sell_slip_snaps():
+        lines.append(book_cash_line(load_book_cash(snap.book)))
+        lines.append(sell_slip_note_line(snap))
+    return tuple(lines)

@@ -129,6 +129,8 @@ _TOUCHED = (
     "SHADOW_PHASE0_CSV",
     "PHASE1_CF_CSV",
     "C_EXIT_SHADOW_DB",
+    "C_EXIT_SHADOW010_DB",
+    "C_EXIT_SELL_SLIP_CSV",
     "ENTRY_C_EXIT_JOINT_CSV",
     "DB_PATH",
     "PAPER_DB_PATH",
@@ -2429,7 +2431,7 @@ class DashboardSmokeTest(unittest.TestCase):
             "只读倒推 · 不改闸 · 不改 .env · 开杠杆由五层互批",
         )
         cases = [name for name in DashboardSmokeTest.__dict__ if name.startswith("test_")]
-        self.assertEqual(len(cases), 31)
+        self.assertEqual(len(cases), 32)
 
         missing = DataStore(
             DbPaths(
@@ -3839,6 +3841,130 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("JOINT_LIQ_LIVE", card_src)
         self.assertNotIn("place_order", card_src)
         self.assertNotIn("place_order", mount_src)
+
+    def test_sell_slip_note_shows_db_book_and_pr137_annotation(self) -> None:
+        """#137 snapshot is a display note. The book line is the unread DB sum."""
+        c_exit_note = (
+            "#137 c6016d7 卖出滑点补扣旁注 · 只读重算 c_exit 4 笔已平 "
+            "账面 +$22.66 → 补扣后 −$17.79（Δ −$40.45）· 历史库未回写 · 旁注常量"
+        )
+        shadow_note = (
+            "#137 c6016d7 卖出滑点补扣旁注 · 只读重算 shadow010 20 笔已平 "
+            "账面 −$201.30 → 补扣后 −$274.47（Δ −$73.17）· 历史库未回写 · 旁注常量"
+        )
+        os.environ["C_EXIT_SELL_SLIP_CSV"] = str(self.root / "no-such-sell-slip.csv")
+        os.environ["C_EXIT_SHADOW_DB"] = str(self.root / "no-such-c-exit.db")
+        os.environ["C_EXIT_SHADOW010_DB"] = str(self.root / "no-such-shadow010.db")
+        lines = c_exit_module.sell_slip_card_lines()
+        joined = "\n".join(lines)
+        self.assertIn(c_exit_note, lines)
+        self.assertIn(shadow_note, lines)
+        self.assertIn("c_exit 旁簿账面 Σpnl 不可读（库不存在）", lines)
+        self.assertIn("shadow010 旁簿账面 Σpnl 不可读（库不存在）", lines)
+        self.assertIn("历史库未回写", joined)
+        self.assertNotIn("22.67", joined)
+        self.assertNotIn("73.16", joined)
+
+        c_exit_db = self.root / "c-exit-book.db"
+        conn = sqlite3.connect(c_exit_db)
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, grid_tag TEXT, status TEXT, exit_reason TEXT, pnl_usd REAL)"
+        )
+        conn.executemany(
+            "INSERT INTO positions (grid_tag, status, exit_reason, pnl_usd) VALUES (?, ?, ?, ?)",
+            [
+                ("c_sl5_h60", "closed", "take_profit", 30),
+                ("c_sl5_h60", "closed", "stop_loss", -7.34),
+                ("c_sl4_h90", "open", "stop_loss", -999),
+            ],
+        )
+        conn.commit()
+        conn.close()
+        shadow_db = self.root / "shadow010-book.db"
+        conn = sqlite3.connect(shadow_db)
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, grid_tag TEXT, status TEXT, pnl_usd REAL, closed_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO positions (grid_tag, status, pnl_usd, closed_at) "
+            "VALUES ('c_sl5_h60', 'closed', -201.3, '2026-10-21T00:00:00Z')"
+        )
+        conn.commit()
+        conn.close()
+        before = (c_exit_db.stat().st_mtime_ns, shadow_db.stat().st_mtime_ns)
+        os.environ["C_EXIT_SHADOW_DB"] = str(c_exit_db)
+        os.environ["C_EXIT_SHADOW010_DB"] = str(shadow_db)
+        live = c_exit_module.sell_slip_card_lines()
+        self.assertEqual((c_exit_db.stat().st_mtime_ns, shadow_db.stat().st_mtime_ns), before)
+        self.assertIn("c_exit 旁簿账面 Σpnl +$22.66 · 已平 2", live)
+        self.assertIn("shadow010 旁簿账面 Σpnl −$201.30 · 已平 1", live)
+        self.assertIn(c_exit_note, live)
+        self.assertIn(shadow_note, live)
+
+        export = self.root / "c_exit_sell_slip_recalc.csv"
+        export.write_text(
+            "book,closed_n,book_pnl_usd,adjusted_pnl_usd,delta_usd\n"
+            "shadow010,20,-201.30,-274.47,-73.17\n"
+            "c_exit,4,22.66,-17.79,-40.45\n",
+            encoding="utf-8",
+        )
+        os.environ["C_EXIT_SELL_SLIP_CSV"] = str(export)
+        exported = "\n".join(c_exit_module.sell_slip_card_lines())
+        self.assertIn("补扣后 −$17.79（Δ −$40.45）", exported)
+        self.assertIn("补扣后 −$274.47（Δ −$73.17）", exported)
+        self.assertIn("历史库未回写", exported)
+        self.assertIn("导出 c_exit_sell_slip_recalc.csv", exported)
+        self.assertNotIn("旁注常量", exported)
+        self.assertIn("c_exit 旁簿账面 Σpnl +$22.66 · 已平 2", exported)
+
+        bad = self.root / "bad-sell-slip.csv"
+        bad.write_text("book,closed_n\nc_exit,4\n", encoding="utf-8")
+        os.environ["C_EXIT_SELL_SLIP_CSV"] = str(bad)
+        fallback = "\n".join(c_exit_module.sell_slip_card_lines())
+        self.assertIn("旁注常量（导出不可读）", fallback)
+        self.assertIn("补扣后 −$17.79", fallback)
+        self.assertIn("历史库未回写", fallback)
+
+        null_pnl = self.root / "null-pnl-c-exit.db"
+        conn = sqlite3.connect(null_pnl)
+        conn.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, grid_tag TEXT, status TEXT, pnl_usd REAL)"
+        )
+        conn.execute(
+            "INSERT INTO positions (grid_tag, status, pnl_usd) VALUES ('c_sl5_h60', 'closed', NULL)"
+        )
+        conn.commit()
+        conn.close()
+        os.environ["C_EXIT_SHADOW_DB"] = str(null_pnl)
+        os.environ["C_EXIT_SELL_SLIP_CSV"] = str(self.root / "no-such-sell-slip.csv")
+        unreadable = "\n".join(c_exit_module.sell_slip_card_lines())
+        self.assertIn("c_exit 旁簿账面 Σpnl 不可读（坏数据）", unreadable)
+        self.assertIn(c_exit_note, unreadable)
+
+        note_src = inspect.getsource(c_exit_module.sell_slip_card_lines)
+        reader_src = inspect.getsource(c_exit_module.load_book_cash)
+        for src in (note_src, reader_src, inspect.getsource(c_exit_module)):
+            self.assertNotIn("place_order", src)
+            self.assertNotIn("PAPER_OPEN_PAUSED", src)
+            self.assertNotIn("LIVE_TRADING_ENABLED", src)
+            self.assertNotIn("sqlite3.connect", src)
+
+        os.environ["C_EXIT_SHADOW_DB"] = str(self.root / "no-such-c-exit.db")
+        os.environ["C_EXIT_SHADOW010_DB"] = str(self.root / "no-such-shadow010.db")
+        os.environ["C_EXIT_SELL_SLIP_CSV"] = str(self.root / "no-such-sell-slip.csv")
+        os.environ["ENTRY_C_EXIT_JOINT_CSV"] = str(self.root / "no-such-joint.csv")
+        for build in (app_module._v2_c_exit_shadow, app_module._v2_entry_c_exit_joint):
+            rendered = "\n".join(_rendered_card_texts(build))
+            self.assertIn(c_exit_note, rendered)
+            self.assertIn(shadow_note, rendered)
+            self.assertIn("历史库未回写", rendered)
+            self.assertIn("#137", rendered)
+            self.assertIn("c6016d7", rendered)
+            self.assertIn("c_exit 旁簿账面 Σpnl 不可读（库不存在）", rendered)
+            self.assertIn("shadow010 旁簿账面 Σpnl 不可读（库不存在）", rendered)
 
     def test_m7_s0_s1_shadow_card(self) -> None:
         missing_csv = self.root / "no-such-m7.csv"
