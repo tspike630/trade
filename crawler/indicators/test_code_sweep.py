@@ -910,6 +910,153 @@ class TechnicalPriorityPassTest(unittest.TestCase):
             ["hot1", "warm1", "hot2", "warm2", "hot3", "warm3"],
         )
 
+    def _stub_upsert(self, calls: list[str]):
+        def _upsert(
+            chain_id: str,
+            token_address: str,
+            *,
+            tier: str | None = None,
+            force_full: bool = False,
+        ) -> dict[str, str | None]:
+            del force_full
+            calls.append(token_address)
+            self.store.upsert_token_indicators(
+                {
+                    "chain_id": chain_id,
+                    "token_address": token_address,
+                    "tier": tier,
+                    "tech_updated_at": utc_now_iso(),
+                }
+            )
+            return {"tier": tier}
+
+        return _upsert
+
+    def test_tail_budget_returns_with_cold_left(self) -> None:
+        """A selective round must return before a long cold tail is finished."""
+        now = datetime.now(timezone.utc)
+        window = HOT_SEEN_WINDOW_SEC
+        cold_ids = [f"cold{i}" for i in range(5)]
+        self._add("hotdue", _iso(now))
+        for index, address in enumerate(cold_ids):
+            self._add(
+                address, _iso(now - timedelta(seconds=window * 6 + 3600 + index))
+            )
+        tech = self._open()
+        listed = {row["token_address"]: row for row in self.store.list_tokens_with_history()}
+        self.store.list_tokens_with_history = lambda: [  # type: ignore[method-assign]
+            listed["hotdue"],
+            *[listed[address] for address in cold_ids],
+        ]
+        calls: list[str] = []
+        tech.upsert_one = self._stub_upsert(calls)  # type: ignore[method-assign]
+        stats = tech.run_batch(
+            only_due=True,
+            hot_interval_sec=300,
+            max_tail_tokens=2,
+            _monotonic=lambda: 0.0,
+        )
+        self.assertEqual(calls, ["hotdue", "cold0", "cold1"])
+        self.assertEqual(stats["tail_left"], 3)
+        self.assertEqual(stats["round_budget_hit"], 1)
+        self.assertEqual(stats["hot"], 1)
+        self.assertEqual(stats["cold"], 2)
+
+    def test_round_budget_stops_before_the_next_slice(self) -> None:
+        now = datetime.now(timezone.utc)
+        window = HOT_SEEN_WINDOW_SEC
+        self._add("cold1", _iso(now - timedelta(seconds=window * 6 + 3600)))
+        self._add("cold2", _iso(now - timedelta(seconds=window * 6 + 7200)))
+        self._add("hotdue", _iso(now))
+        tech = self._open()
+        listed = {row["token_address"]: row for row in self.store.list_tokens_with_history()}
+        self.store.list_tokens_with_history = lambda: [  # type: ignore[method-assign]
+            listed["cold1"],
+            listed["cold2"],
+            listed["hotdue"],
+        ]
+        clock = {"t": 0.0}
+        calls: list[str] = []
+
+        def _upsert(
+            chain_id: str,
+            token_address: str,
+            *,
+            tier: str | None = None,
+            force_full: bool = False,
+        ) -> dict[str, str | None]:
+            del force_full
+            calls.append(token_address)
+            if token_address == "hotdue":
+                self.store.upsert_token_indicators(
+                    {
+                        "chain_id": chain_id,
+                        "token_address": token_address,
+                        "tier": tier,
+                        "tech_updated_at": utc_now_iso(),
+                    }
+                )
+            elif token_address == "cold1":
+                self.store.upsert_token_indicators(
+                    {
+                        "chain_id": "solana",
+                        "token_address": "hotdue",
+                        "tier": "hot",
+                        "tech_updated_at": "2020-01-01T00:00:00Z",
+                    }
+                )
+                clock["t"] = 10_000.0
+            return {"tier": tier}
+
+        tech.upsert_one = _upsert  # type: ignore[method-assign]
+        stats = tech.run_batch(
+            only_due=True,
+            hot_interval_sec=300,
+            round_budget_sec=300,
+            _monotonic=lambda: clock["t"],
+        )
+        self.assertEqual(calls, ["hotdue", "cold1"])
+        self.assertEqual(stats["tail_left"], 1)
+        self.assertEqual(stats["round_budget_hit"], 1)
+
+    def test_next_round_continues_due_cold(self) -> None:
+        """Tokens refreshed this round are not the prefix of the next round."""
+        now = datetime.now(timezone.utc)
+        window = HOT_SEEN_WINDOW_SEC
+        cold_ids = [f"cold{i}" for i in range(4)]
+        self._add("hotdue", _iso(now))
+        for index, address in enumerate(cold_ids):
+            self._add(
+                address, _iso(now - timedelta(seconds=window * 6 + 3600 + index))
+            )
+        tech = self._open()
+        listed = {row["token_address"]: row for row in self.store.list_tokens_with_history()}
+        self.store.list_tokens_with_history = lambda: [  # type: ignore[method-assign]
+            listed["hotdue"],
+            *[listed[address] for address in cold_ids],
+        ]
+        calls: list[str] = []
+        tech.upsert_one = self._stub_upsert(calls)  # type: ignore[method-assign]
+        first = tech.run_batch(
+            only_due=True,
+            hot_interval_sec=300,
+            max_tail_tokens=2,
+            _monotonic=lambda: 0.0,
+        )
+        self.assertEqual(calls, ["hotdue", "cold0", "cold1"])
+        self.assertEqual(first["round_budget_hit"], 1)
+        second_calls: list[str] = []
+        tech.upsert_one = self._stub_upsert(second_calls)  # type: ignore[method-assign]
+        second = tech.run_batch(
+            only_due=True,
+            hot_interval_sec=300,
+            max_tail_tokens=2,
+            _monotonic=lambda: 0.0,
+        )
+        self.assertEqual(second_calls, ["cold2", "cold3"])
+        self.assertEqual(second["round_budget_hit"], 1)
+        self.assertGreater(second["tail_left"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

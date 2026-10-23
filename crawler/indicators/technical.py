@@ -267,15 +267,26 @@ def technical_pass_rank(
 
     0 — hot and due (tech_updated_at NULL, or older than the hot interval)
     1 — warm and due (NULL, or older than the warm interval)
-    2 — cold / other tiers, and hot/warm still inside their interval
+    2 — cold / other tiers that are due
+    3 — any tier still inside its interval
+
+    Due cold is ahead of rows still inside their interval so a bounded round
+    refreshes stale cold tokens first. The next round then starts on the
+    remaining due cold set instead of re-walking a fresh prefix. Due hot and
+    due warm stay ahead of cold. A hot row that becomes due while a round is
+    in progress is still picked up by the per-slice due-hot drain.
 
     ``force_full`` still places every hot token, then every warm token, ahead of
     the rest. Due-ness is technical_refresh_due: NULL is due, and the shared
     updated_at column is not read.
     """
-    if tier not in ("hot", "warm"):
+    if force_full:
+        if tier == "hot":
+            return 0
+        if tier == "warm":
+            return 1
         return 2
-    needs_refresh = force_full or technical_refresh_due(
+    needs_refresh = technical_refresh_due(
         tech_updated_at,
         tier=tier,
         now=now,
@@ -284,10 +295,12 @@ def technical_pass_rank(
         cold_interval_sec=cold_interval_sec,
     )
     if not needs_refresh:
-        return 2
+        return 3
     if tier == "hot":
         return 0
-    return 1
+    if tier == "warm":
+        return 1
+    return 2
 
 
 def order_technical_tokens(
@@ -301,7 +314,7 @@ def order_technical_tokens(
     cold_interval_sec: int,
     force_full: bool = False,
 ) -> list[dict[str, Any]]:
-    """Stable order: due hot, then due warm, then cold and everything else."""
+    """Stable order: due hot, then due warm, then due cold, then not-yet-due."""
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     for index, tok in enumerate(tokens):
         rank = technical_pass_rank(
@@ -549,15 +562,18 @@ class TechnicalIndicators:
         hot_interval_sec: int = 300,
         warm_interval_sec: int = 1800,
         cold_interval_sec: int = 14400,
+        round_budget_sec: float | None = None,
+        max_tail_tokens: int | None = None,
         _monotonic: Callable[[], float] | None = None,
     ) -> dict[str, int]:
         """
         Process tokens that have pair_history.
 
         Order when a refresh is selective (``only_due``) or full:
-        due hot, then due warm, then cold and other tiers. Due means
-        tech_updated_at IS NULL or older than that tier's interval.
-        Shared updated_at is not consulted. NULL tech_updated_at is due.
+        due hot, then due warm, then due cold, then tokens still inside
+        their interval. Due means tech_updated_at IS NULL or older than
+        that tier's interval. Shared updated_at is not consulted.
+        NULL tech_updated_at is due.
 
         While warm tokens or the cold tail are still in progress, due hot is
         drained again every hot interval, measured from the start of the
@@ -569,6 +585,12 @@ class TechnicalIndicators:
         runs so the lower tiers keep moving. A hot row updated while its
         due-hot set finishes inside one interval is therefore refreshed
         again before two hot intervals have elapsed.
+
+        ``round_budget_sec`` and ``max_tail_tokens`` apply only to that
+        selective loop (``only_due`` and not ``force_full``). ``None`` keeps
+        the full drain. A hit returns immediately with ``round_budget_hit``
+        1 and ``tail_left`` still counting unvisited cold-tail rows. Hot,
+        then warm, still runs before the tail inside a slice.
         """
         stats = {
             "seen": 0,
@@ -580,6 +602,8 @@ class TechnicalIndicators:
             "cold": 0,
             "hot_due": 0,
             "warm_due": 0,
+            "tail_left": 0,
+            "round_budget_hit": 0,
         }
         universe = self.store.list_tokens_with_history()
         if not universe:
@@ -651,6 +675,16 @@ class TechnicalIndicators:
 
         interval = max(1, int(hot_interval_sec))
         tail_index = 0
+        tail_taken = 0
+        tail_cap = None if max_tail_tokens is None else max(0, int(max_tail_tokens))
+        round_started = monotonic()
+        slice_n = 0
+
+        def _finish(hit: bool) -> dict[str, int]:
+            stats["tail_left"] = max(0, len(tail) - tail_index)
+            stats["round_budget_hit"] = 1 if hit else 0
+            return stats
+
         # Warm is queued once per token per pass (appended if it becomes due
         # later). Hot uses a separate cursor: unserved due hot first, then
         # hot that has already been refreshed this pass and is due again.
@@ -689,6 +723,19 @@ class TechnicalIndicators:
             return taken
 
         while True:
+            if (
+                round_budget_sec is not None
+                and slice_n > 0
+                and monotonic() - round_started >= float(round_budget_sec)
+            ):
+                log.info(
+                    "technical round budget sec=%s tail_left=%s warm_left=%s",
+                    round_budget_sec,
+                    max(0, len(tail) - tail_index),
+                    max(0, len(warm_queue) - warm_index),
+                )
+                return _finish(True)
+            slice_n += 1
             drain_started = monotonic()
             # Deadline is anchored to the slice start so the next hot refresh
             # is one hot interval later, inside the decision window (2×),
@@ -754,10 +801,18 @@ class TechnicalIndicators:
                 slice_now = datetime.now(timezone.utc)
                 slice_recency = self.store.map_token_recency()
                 while tail_index < len(tail):
+                    if tail_cap is not None and tail_taken >= tail_cap:
+                        log.info(
+                            "technical tail budget tokens=%s tail_left=%s",
+                            tail_cap,
+                            max(0, len(tail) - tail_index),
+                        )
+                        return _finish(True)
                     if took_lower and monotonic() >= deadline:
                         break
                     tok = tail[tail_index]
                     tail_index += 1
+                    tail_taken += 1
                     took_lower = True
                     advanced += 1
                     tier = tier_from_token_row(
@@ -768,4 +823,4 @@ class TechnicalIndicators:
                     _run(tok, tier)
             if advanced == 0:
                 break
-        return stats
+        return _finish(False)

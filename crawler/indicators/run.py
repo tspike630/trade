@@ -14,6 +14,10 @@ while that tail is still running.
 
 ``--funding-only`` never enters that technical pass, so a cold tail cannot
 block a JEV refresh. ``jev_updated_at`` is the signal's ``fetched_at``.
+
+A selective ``run_pass`` also bounds technical to one due-hot re-drain
+(2× the hot interval) and ``TECHNICAL_ROUND_TAIL_TOKENS`` cold-tail rows,
+then runs funding. ``--full`` stays unbounded.
 """
 
 from __future__ import annotations
@@ -49,6 +53,13 @@ from indicators.technical import TechnicalIndicators  # noqa: E402
 
 log = get_logger("indicators.run")
 
+# Selective technical round, then yield so funding can run.
+# Wall clock is 2× the hot interval: one due-hot re-drain inside the
+# decision window, then return. The tail cap bounds a fast cold walk.
+# Due cold is ordered ahead of fresh rows, so the next round continues
+# the remaining due set. ``--full`` passes neither cap.
+TECHNICAL_ROUND_TAIL_TOKENS = 20_000
+
 
 def run_funding_pass(
     store: IndicatorStore,
@@ -78,15 +89,25 @@ def run_pass(
         vol_window_sec=INDICATORS_VOLATILITY_WINDOW_SEC,
         write_history_for_hot=INDICATORS_WRITE_HISTORY_HOT,
     )
-    # Due hot, then due warm, then the cold tail. While the tail runs, the
-    # hot-then-warm queue is drained again each hot interval.
-    stats = tech.run_batch(
-        force_full=force_full,
-        only_due=only_due and not force_full,
-        hot_interval_sec=INDICATORS_HOT_INTERVAL_SEC,
-        warm_interval_sec=INDICATORS_WARM_INTERVAL_SEC,
-        cold_interval_sec=INDICATORS_COLD_INTERVAL_SEC,
-    )
+    # Due hot, then due warm, then due cold. A selective pass returns after
+    # one due-hot re-drain so this function can reach funding. --full does not.
+    selective = bool(only_due and not force_full)
+    stats: dict[str, int] = {"seen": 0, "ok": 0, "skip": 0, "err": 0}
+    try:
+        stats = tech.run_batch(
+            force_full=force_full,
+            only_due=selective,
+            hot_interval_sec=INDICATORS_HOT_INTERVAL_SEC,
+            warm_interval_sec=INDICATORS_WARM_INTERVAL_SEC,
+            cold_interval_sec=INDICATORS_COLD_INTERVAL_SEC,
+            round_budget_sec=(
+                float(INDICATORS_HOT_INTERVAL_SEC) * 2 if selective else None
+            ),
+            max_tail_tokens=TECHNICAL_ROUND_TAIL_TOKENS if selective else None,
+        )
+    except Exception as exc:  # noqa: BLE001 — funding must still run
+        log.exception("technical pass crashed: %s", exc)
+        stats = {"seen": 0, "ok": 0, "skip": 0, "err": 1}
     # Funding (JEV) — READ jev_signals only; isolated from technical failures
     try:
         run_funding_pass(store, force_full=force_full)

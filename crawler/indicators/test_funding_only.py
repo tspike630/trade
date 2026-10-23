@@ -13,10 +13,17 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from config import INDICATORS_HOT_INTERVAL_SEC
 from indicators.base import IndicatorStore
 from indicators.funding import compute_funding_fields, direction_coef, map_jev_signal
-from indicators.run import main, run_funding_pass
+from indicators.run import (
+    TECHNICAL_ROUND_TAIL_TOKENS,
+    main,
+    run_funding_pass,
+    run_pass,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -193,6 +200,87 @@ class FundingOnlyTests(unittest.TestCase):
         finally:
             os.chdir(prev)
         self.assertEqual(rc, 0)
+
+
+class RunPassBudgetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ind.db"
+        self.store = IndicatorStore(self.db_path)
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self._tmp.cleanup()
+
+    def test_selective_pass_bounds_technical_then_funds(self) -> None:
+        seen: dict[str, object] = {}
+
+        def tech_batch(self, **kwargs: object) -> dict[str, int]:
+            del self
+            seen["tech"] = kwargs
+            return {"seen": 0, "ok": 0, "skip": 0, "err": 0}
+
+        def fund_batch(self, **kwargs: object) -> dict[str, int]:
+            del self, kwargs
+            seen["funded"] = True
+            return {"seen": 2, "ok": 2, "skip": 0, "err": 0}
+
+        with (
+            mock.patch("indicators.run.TechnicalIndicators.run_batch", tech_batch),
+            mock.patch("indicators.run.FundingIndicators.run_batch", fund_batch),
+        ):
+            stats = run_pass(self.store, force_full=False, only_due=True)
+        tech_kwargs = seen["tech"]
+        assert isinstance(tech_kwargs, dict)
+        self.assertEqual(
+            tech_kwargs["round_budget_sec"],
+            float(INDICATORS_HOT_INTERVAL_SEC) * 2,
+        )
+        self.assertEqual(tech_kwargs["max_tail_tokens"], TECHNICAL_ROUND_TAIL_TOKENS)
+        self.assertTrue(seen["funded"])
+        self.assertEqual(stats["err"], 0)
+
+    def test_full_pass_does_not_cap_technical(self) -> None:
+        seen: dict[str, object] = {}
+
+        def tech_batch(self, **kwargs: object) -> dict[str, int]:
+            del self
+            seen["tech"] = kwargs
+            return {"seen": 0, "ok": 1, "skip": 0, "err": 0}
+
+        with (
+            mock.patch("indicators.run.TechnicalIndicators.run_batch", tech_batch),
+            mock.patch(
+                "indicators.run.FundingIndicators.run_batch",
+                lambda self, **kwargs: {"seen": 0, "ok": 0, "skip": 0, "err": 0},
+            ),
+        ):
+            run_pass(self.store, force_full=True, only_due=False)
+        tech_kwargs = seen["tech"]
+        assert isinstance(tech_kwargs, dict)
+        self.assertIsNone(tech_kwargs["round_budget_sec"])
+        self.assertIsNone(tech_kwargs["max_tail_tokens"])
+        self.assertTrue(tech_kwargs["force_full"])
+
+    def test_funding_runs_when_technical_raises(self) -> None:
+        seen: list[str] = []
+
+        def tech_batch(self, **kwargs: object) -> dict[str, int]:
+            del self, kwargs
+            raise RuntimeError("cold tail")
+
+        def fund_batch(self, **kwargs: object) -> dict[str, int]:
+            del self, kwargs
+            seen.append("fund")
+            return {"seen": 1, "ok": 1, "skip": 0, "err": 0}
+
+        with (
+            mock.patch("indicators.run.TechnicalIndicators.run_batch", tech_batch),
+            mock.patch("indicators.run.FundingIndicators.run_batch", fund_batch),
+        ):
+            stats = run_pass(self.store, force_full=False, only_due=True)
+        self.assertEqual(seen, ["fund"])
+        self.assertEqual(stats["err"], 1)
 
 
 if __name__ == "__main__":
