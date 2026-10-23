@@ -4,11 +4,16 @@ CLI entry for the indicators 旁路 process (Step 1–3: technical + funding + s
   python -m indicators.run --full
   python -m indicators.run --loop --interval 300
   python -m indicators.run --once          # due-only pass (tier intervals)
+  python -m indicators.run --funding-only  # JEV → token_indicators only
+  python -m indicators.run --funding-only --loop --interval 300
 
 Technical due-only passes refresh hot tokens whose tech_updated_at is NULL or
 older than the hot interval, then warm tokens past the warm interval, before
 the cold tail. The hot-then-warm queue is drained again each hot interval
 while that tail is still running.
+
+``--funding-only`` never enters that technical pass, so a cold tail cannot
+block a JEV refresh. ``jev_updated_at`` is the signal's ``fetched_at``.
 """
 
 from __future__ import annotations
@@ -45,6 +50,23 @@ from indicators.technical import TechnicalIndicators  # noqa: E402
 log = get_logger("indicators.run")
 
 
+def run_funding_pass(
+    store: IndicatorStore,
+    *,
+    force_full: bool = False,
+) -> dict[str, int]:
+    """Map ``jev_signals`` into ``token_indicators`` funding columns.
+
+    No technical work. ``force_full`` is accepted for call-site compatibility;
+    funding always reads the latest ``jev_signals`` snapshot.
+    """
+    fstats = FundingIndicators(
+        store, write_history_for_hot=INDICATORS_WRITE_HISTORY_HOT
+    ).run_batch(force_full=force_full)
+    log.info("funding pass %s", fstats)
+    return fstats
+
+
 def run_pass(
     store: IndicatorStore,
     *,
@@ -67,10 +89,7 @@ def run_pass(
     )
     # Funding (JEV) — READ jev_signals only; isolated from technical failures
     try:
-        fstats = FundingIndicators(
-            store, write_history_for_hot=INDICATORS_WRITE_HISTORY_HOT
-        ).run_batch(force_full=force_full)
-        log.info("funding pass %s", fstats)
+        run_funding_pass(store, force_full=force_full)
     except Exception as exc:  # noqa: BLE001
         log.warning("funding error: %s", exc)
     # Sentiment (X) — READ x_watch / social alerts only; isolated failures
@@ -112,6 +131,42 @@ def _purge_indicator_history(store: IndicatorStore) -> None:
         log.warning("indicator_history purge skipped: %s", exc)
 
 
+def _funding_only_main(
+    store: IndicatorStore,
+    *,
+    db_path: str,
+    loop: bool,
+    interval: int,
+) -> int:
+    """Refresh funding and return. ``loop`` repeats until the process exits."""
+
+    def once() -> dict[str, int]:
+        log.info("indicators --funding-only start db=%s", db_path)
+        stats = run_funding_pass(store)
+        log.info("indicators --funding-only done %s", stats)
+        return stats
+
+    if not loop:
+        try:
+            stats = once()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("funding-only crashed: %s", exc)
+            return 1
+        return 0 if stats["err"] == 0 or stats["ok"] > 0 else 1
+
+    log.info(
+        "indicators --funding-only --loop interval=%ss db=%s",
+        interval,
+        db_path,
+    )
+    while True:
+        try:
+            once()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("funding-only crashed: %s", exc)
+        time.sleep(max(5, int(interval)))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DexScreener indicators 旁路 (Step 1–3)")
     parser.add_argument(
@@ -128,6 +183,15 @@ def main(argv: list[str] | None = None) -> int:
         "--loop",
         action="store_true",
         help="Loop forever, due-only passes",
+    )
+    parser.add_argument(
+        "--funding-only",
+        action="store_true",
+        help=(
+            "Refresh funding only (jev_signals → token_indicators.jev_*). "
+            "Skips technical, sentiment, and composite so a cold tail cannot "
+            "block it. Combine with --loop to repeat. Explicit operator action."
+        ),
     )
     parser.add_argument(
         "--interval",
@@ -148,18 +212,33 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     setup_logging()
-    # --full is an explicit operator action (always allowed).
-    if not INDICATORS_ENABLED and not args.force_enabled and not args.full:
-        log.warning("INDICATORS_ENABLED=0; pass --force-enabled or --full to run")
+    # --full / --funding-only are explicit operator actions (always allowed).
+    if (
+        not INDICATORS_ENABLED
+        and not args.force_enabled
+        and not args.full
+        and not args.funding_only
+    ):
+        log.warning(
+            "INDICATORS_ENABLED=0; pass --force-enabled, --full, or --funding-only to run"
+        )
         return 2
 
-    if not args.full and not args.once and not args.loop:
-        parser.error("specify --full, --once, or --loop")
+    if not args.full and not args.once and not args.loop and not args.funding_only:
+        parser.error("specify --full, --once, --loop, or --funding-only")
 
     db_path = args.db or DB_PATH
     interval = args.interval if args.interval is not None else INDICATORS_LOOP_INTERVAL_SEC
 
     with IndicatorStore(db_path) as store:
+        if args.funding_only:
+            return _funding_only_main(
+                store,
+                db_path=str(db_path),
+                loop=bool(args.loop),
+                interval=interval,
+            )
+
         if args.full:
             log.info("indicators --full start db=%s", db_path)
             stats = run_pass(store, force_full=True, only_due=False)
