@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Thin wrapper: python scripts/run_indicators.py --full | --loop --interval 300"""
+"""Thin wrapper: python scripts/run_indicators.py --full | --loop --interval 300 | --funding-only
+
+``--funding-only`` refreshes JEV fields without waiting for a technical pass.
+See ``python -m indicators.run --help``.
+"""
 
 from __future__ import annotations
 
