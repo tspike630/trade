@@ -24,7 +24,7 @@ from decision_engine.strategies.entry_sizing import (
     thresholds_from_config,
 )
 from decision_engine.strategies.factor_strategy import FactorStrategy
-from decision_engine.strategies.jev_strategy import JevStrengthStrategy
+from decision_engine.strategies.jev_strategy import JevStrengthStrategy, jev_age_min
 
 NOW = datetime(2026, 10, 22, tzinfo=timezone.utc)
 DAY_MS = 86_400_000
@@ -49,6 +49,19 @@ def _thick(**overrides: object) -> dict:
     }
     row.update(overrides)
     return row
+
+
+def _strategy_thick(**overrides: object) -> dict:
+    """Same row as ``_thick``, with a JEV stamp fresh against ``jev_gate``'s wall clock.
+
+    ResolveTests keep the frozen ``NOW`` stamp. Strategy ``on_tick`` calls
+    ``jev_gate``, which treats ``jev_updated_at`` older than ``max_age_min``
+    (1440) as ``jev_stale``.
+    """
+    fresh = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    merged: dict[str, object] = {"jev_updated_at": fresh}
+    merged.update(overrides)
+    return _thick(**merged)
 
 
 class ThresholdTests(unittest.TestCase):
@@ -189,44 +202,52 @@ class ResolveTests(unittest.TestCase):
 
 
 class StrategyOutputTests(unittest.TestCase):
+    def test_fixture_stamp_stays_inside_jev_window(self) -> None:
+        age = jev_age_min(_strategy_thick())
+        self.assertIsNotNone(age)
+        assert age is not None
+        self.assertLess(age, 2.0)
+
     def test_jev_full_only_on_thick_pool(self) -> None:
         strategy = JevStrengthStrategy(min_jev_strength=0.15, position_pct=0.05)
-        full = strategy.on_tick({"hot_tokens": [_thick(jev_strength=0.4)]})
+        full = strategy.on_tick({"hot_tokens": [_strategy_thick(jev_strength=0.4)]})
         self.assertEqual(len(full), 1)
         self.assertAlmostEqual(full[0]["size_pct"], 1.0)
         self.assertEqual(full[0]["size_tier"], "thick_pool")
         self.assertEqual(full[0]["entry_r3"], 0)
 
-        ordinary = strategy.on_tick({"hot_tokens": [_thick(jev_strength=0.4, liquidity_usd=60_000)]})
+        ordinary = strategy.on_tick({"hot_tokens": [_strategy_thick(jev_strength=0.4, liquidity_usd=60_000)]})
         self.assertEqual(len(ordinary), 1)
         self.assertAlmostEqual(ordinary[0]["size_pct"], 0.05)
         self.assertLessEqual(ordinary[0]["size_pct"], 0.05)
         self.assertEqual(ordinary[0]["size_tier"], "ordinary")
 
         capped = JevStrengthStrategy(min_jev_strength=0.15, position_pct=0.25)
-        raised = capped.on_tick({"hot_tokens": [_thick(jev_strength=0.4, pool_age_days=1)]})
+        raised = capped.on_tick({"hot_tokens": [_strategy_thick(jev_strength=0.4, pool_age_days=1)]})
         self.assertAlmostEqual(raised[0]["size_pct"], 0.05)
 
     def test_stale_jev_still_emits_nothing(self) -> None:
         strategy = JevStrengthStrategy(min_jev_strength=0.15, max_age_min=1440, require_bullish_stance=True)
-        row = _thick(jev_strength=0.9, jev_age_min=None)
+        row = _strategy_thick(jev_strength=0.9, jev_age_min=None)
         self.assertEqual(strategy.on_tick({"hot_tokens": [row]}), [])
         self.assertEqual(strategy.rejected["jev_stale"], 1)
 
     def test_factor_twin_and_tech(self) -> None:
         factor = get_strategy("factor_jev_strength_v1", min_jev_strength=0.15, position_pct=0.05)
-        out = factor.on_tick({"hot_tokens": [_thick(jev_strength=0.4)]})
+        out = factor.on_tick({"hot_tokens": [_strategy_thick(jev_strength=0.4)]})
         self.assertAlmostEqual(out[0]["size_pct"], 1.0)
-        thin = factor.on_tick({"hot_tokens": [_thick(jev_strength=0.4, liquidity_usd=None)]})
+        thin = factor.on_tick({"hot_tokens": [_strategy_thick(jev_strength=0.4, liquidity_usd=None)]})
         self.assertAlmostEqual(thin[0]["size_pct"], 0.05)
 
         tech = get_strategy("tech_momentum_v1", position_pct=0.05)
-        tech_row = _thick(change_5m=3.0, volume_strength=0.8, jev_strength=None)
+        tech_row = _strategy_thick(change_5m=3.0, volume_strength=0.8, jev_strength=None)
         missed = tech.on_tick({"hot_tokens": [tech_row]})
         self.assertEqual(len(missed), 1)
         self.assertAlmostEqual(missed[0]["size_pct"], 0.05)
         self.assertIn("jev_missing", missed[0]["size_blockers"])
-        tech_full = tech.on_tick({"hot_tokens": [_thick(change_5m=3.0, volume_strength=0.8, jev_strength=0.2)]})
+        tech_full = tech.on_tick(
+            {"hot_tokens": [_strategy_thick(change_5m=3.0, volume_strength=0.8, jev_strength=0.2)]}
+        )
         self.assertAlmostEqual(tech_full[0]["size_pct"], 1.0)
 
     def test_sell_size_is_not_resized(self) -> None:
