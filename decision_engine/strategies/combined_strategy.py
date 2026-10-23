@@ -7,8 +7,8 @@ from typing import Any
 from logging_setup import get_logger
 
 from decision_engine.strategies.base_strategy import BaseStrategy
-
-from decision_engine.strategies.jev_strategy import gate_defaults, jev_gate  # noqa: E402
+from decision_engine.strategies.entry_sizing import buy_size_fields
+from decision_engine.strategies.jev_strategy import gate_defaults, jev_gate
 
 log = get_logger("decision_engine.combined_strategy")
 
@@ -69,11 +69,15 @@ class CombinedJevTechStrategy(BaseStrategy):
                     log.info("combined jev reject reason=%s token=%s", why, str(row.get("token_address") or "")[:16])
                     continue
                 hits += 1
+                sized = buy_size_fields(row, floor_pct=self.position_pct)
                 self.buy(
                     chain_id=str(row.get("chain_id") or ""),
                     token_address=str(row.get("token_address") or ""),
                     pair_address=row.get("primary_pair_address"),
-                    size_pct=self.position_pct,
+                    size_pct=float(sized["size_pct"]),
+                    size_tier=sized["size_tier"],
+                    entry_r3=sized["entry_r3"],
+                    size_blockers=sized["size_blockers"],
                     reason=(
                         f"jev={s:.4f}>={self.min_jev_strength}"
                         f" change_5m={c5:.3f}>={self.min_change_5m}"

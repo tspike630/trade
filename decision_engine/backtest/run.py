@@ -84,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         "dexscreener.decision_engine.jev_strategy",
         "dexscreener.decision_engine.tech_strategy",
         "dexscreener.decision_engine.combined_strategy",
+        "dexscreener.decision_engine.entry_sizing",
     ):
         logging.getLogger(name).setLevel(logging.WARNING)
     known = ", ".join(list_strategies())

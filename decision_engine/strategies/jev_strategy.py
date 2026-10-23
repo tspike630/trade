@@ -10,6 +10,7 @@ from typing import Any
 from logging_setup import get_logger
 
 from decision_engine.strategies.base_strategy import BaseStrategy
+from decision_engine.strategies.entry_sizing import buy_size_fields
 
 log = get_logger("decision_engine.jev_strategy")
 
@@ -134,11 +135,15 @@ class JevStrengthStrategy(BaseStrategy):
                              why, str(row.get("token_address") or "")[:16], jx["jev_age_min"],
                              jx["jev_stance_raw"], row.get("jev_signal"))
                     continue
+                sized = buy_size_fields(row, floor_pct=self.position_pct)
                 self.buy(
                     chain_id=str(row.get("chain_id") or ""),
                     token_address=str(row.get("token_address") or ""),
                     pair_address=row.get("primary_pair_address"),
-                    size_pct=self.position_pct,
+                    size_pct=float(sized["size_pct"]),
+                    size_tier=sized["size_tier"],
+                    entry_r3=sized["entry_r3"],
+                    size_blockers=sized["size_blockers"],
                     reason=(
                         f"jev_strength={s:.4f}>={self.min_jev_strength}"
                         f" signal={row.get('jev_signal')} score={row.get('jev_score')}"
