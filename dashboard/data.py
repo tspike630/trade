@@ -79,6 +79,12 @@ _WRITE_RE = re.compile(
     r"(?i)\b(insert|update|delete|replace|alter|drop|create|attach|detach|vacuum|reindex)\b"
 )
 _CLOSED_STATUS = {"closed", "close", "cancelled", "canceled", "liquidated", "expired"}
+# Display copy of decision_engine.strategies.jev_strategy.stance_is_bullish.
+# The dashboard does not import that gate and does not open trades.
+_NOT_BULLISH_RE = re.compile(r"\bNOT\s+BULLISH\b", re.I)
+_BULLISH_RE = re.compile(r"\b(BUY|BULLISH|LONG)\b", re.I)
+_STANCE_CAP = 6
+_CLOCK_SKEW = timedelta(minutes=2)
 _POSITION_FIELDS = (
     "id",
     "chain_id",
@@ -364,6 +370,34 @@ class PaperClosedReport:
     stop_loss_share: float | None = None
     # Indicator method: stop-loss losses ÷ all negative PnL (main figure).
     stop_loss_loss_share: float | None = None
+
+
+@dataclass(frozen=True)
+class JevSignalClock:
+    """Read-only empty-book clock. None fields were not queried, not a stored zero."""
+
+    max_jev_updated_at: str | None
+    clock_source: str
+    strength_positive: int | None
+    strength_column: str
+    bullish_24h: int | None
+    bullish_source: str
+    stance_counts: tuple[tuple[str, int], ...]
+    stance_more: int
+    gap_note: str
+
+
+@dataclass(frozen=True)
+class EquityAside:
+    """Realized-pnl aside. None means the figure was not computable."""
+
+    closed_n: int
+    max_drawdown_usd: float | None
+    max_drawdown_pct: float | None
+    stop_of_neg: float | None
+    days_since_last_close: int | None
+    last_closed_at: str | None
+    gap_note: str
 
 
 @dataclass(frozen=True)
@@ -1015,6 +1049,12 @@ def _optional_ts(value: Any) -> datetime | None:
         return parse_ts(text)
     except (TypeError, ValueError):
         return None
+
+
+def _stance_is_bullish(stance: object) -> bool:
+    """True only for an explicit, non-negated bullish stance. Display only."""
+    text = str(stance or "").strip()
+    return bool(text) and bool(_BULLISH_RE.search(text)) and not _NOT_BULLISH_RE.search(text)
 
 
 def dashboard_repo_root() -> Path:
@@ -2044,6 +2084,24 @@ class DataStore:
         except Exception as exc:
             log.warning("read failed paper_goal_pace: %s", type(exc).__name__)
             return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_goal_pace")
+
+    def jev_signal_clock(self, *, now: datetime | None = None) -> DataResult:
+        """Observe-only JEV clock on dexscreener.db. Does not open paper trades."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._jev_signal_clock(started, now), "jev_signal_clock")
+        except Exception as exc:
+            log.warning("read failed jev_signal_clock: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "jev_signal_clock")
+
+    def paper_equity_aside(self, *, now: datetime | None = None) -> DataResult:
+        """Observe-only realized drawdown aside. Leaves the $20k book untouched."""
+        started = time.perf_counter()
+        try:
+            return _finish(self._paper_equity_aside(started, now), "paper_equity_aside")
+        except Exception as exc:
+            log.warning("read failed paper_equity_aside: %s", type(exc).__name__)
+            return _finish(_unavail(f"查询失败：{_safe_exc(exc)}", started), "paper_equity_aside")
 
     def paper_kpi_reverse(self, *, now: datetime | None = None) -> DataResult:
         """Observe-only reverse of the $20k pace into per-close pnl.
@@ -3106,6 +3164,257 @@ class DataStore:
                 samples=tuple(samples),
                 limit=window,
                 total_dedup=dedup_token_count(age_events),
+            ),
+            started,
+        )
+
+    def _jev_signal_clock(self, started: float, now: datetime | None) -> DataResult:
+        path = self.paths.main
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        as_of = now or datetime.now(timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
+        cutoff = as_of - timedelta(hours=24)
+        gaps: list[str] = []
+        max_at: str | None = None
+        clock_source = ""
+        strength_positive: int | None = None
+        strength_column = ""
+        bullish_24h: int | None = None
+        bullish_source = ""
+        stance_counts: list[tuple[str, int]] = []
+        stance_more = 0
+        try:
+            with ro_connect(path) as conn:
+                has_ti = _table_exists(conn, "token_indicators")
+                has_jev = _table_exists(conn, "jev_signals")
+                if not has_ti and not has_jev:
+                    return _unavail(
+                        "缺少数据表：token_indicators / jev_signals（dexscreener.db）",
+                        started,
+                    )
+                if has_ti:
+                    cols = _columns(conn, "token_indicators")
+                    if "jev_updated_at" in cols:
+                        row = _exec(
+                            conn,
+                            "SELECT MAX(jev_updated_at) AS mx FROM token_indicators "
+                            "WHERE jev_updated_at IS NOT NULL AND TRIM(jev_updated_at) != ''",
+                        ).fetchone()
+                        raw = None if row is None else row["mx"]
+                        if raw is not None and str(raw).strip():
+                            max_at = str(raw).strip()
+                            clock_source = "token_indicators.jev_updated_at"
+                    else:
+                        gaps.append("缺少字段：jev_updated_at")
+                    if "jev_strength" in cols:
+                        strength_column = "jev_strength"
+                    elif "strength" in cols:
+                        strength_column = "strength"
+                    else:
+                        gaps.append("缺少字段：jev_strength")
+                    if strength_column:
+                        counted = _exec(
+                            conn,
+                            f"SELECT COUNT(*) AS n FROM token_indicators WHERE {_ident(strength_column)} > 0",
+                        ).fetchone()
+                        strength_positive = int(counted["n"]) if counted is not None else 0
+                else:
+                    gaps.append("缺少数据表：token_indicators")
+                if has_jev:
+                    jcols = _columns(conn, "jev_signals")
+                    time_col = (
+                        "fetched_at"
+                        if "fetched_at" in jcols
+                        else ("analyzed_at" if "analyzed_at" in jcols else "")
+                    )
+                    if "stance" not in jcols:
+                        gaps.append("缺少字段：stance")
+                    else:
+                        grouped = _exec(
+                            conn,
+                            "SELECT stance AS stance, COUNT(*) AS n FROM jev_signals "
+                            "GROUP BY stance ORDER BY n DESC, stance",
+                        ).fetchall()
+                        for item in grouped:
+                            label = str(item["stance"] or "").strip() or "(空)"
+                            stance_counts.append((label, int(item["n"])))
+                        if len(stance_counts) > _STANCE_CAP:
+                            stance_more = len(stance_counts) - _STANCE_CAP
+                            stance_counts = stance_counts[:_STANCE_CAP]
+                        if time_col:
+                            timed = _exec(
+                                conn,
+                                f"SELECT stance AS stance, {_ident(time_col)} AS ts FROM jev_signals",
+                            ).fetchall()
+                            bullish = 0
+                            for item in timed:
+                                stamp = _optional_ts(item["ts"])
+                                if stamp is None or stamp < cutoff or stamp > as_of + _CLOCK_SKEW:
+                                    continue
+                                if _stance_is_bullish(item["stance"]):
+                                    bullish += 1
+                            bullish_24h = bullish
+                            bullish_source = f"jev_signals.{time_col}"
+                        else:
+                            gaps.append("缺少字段：fetched_at")
+                    if max_at is None:
+                        fallback = (
+                            "fetched_at"
+                            if "fetched_at" in jcols
+                            else ("analyzed_at" if "analyzed_at" in jcols else "")
+                        )
+                        if fallback:
+                            row = _exec(
+                                conn,
+                                f"SELECT MAX({_ident(fallback)}) AS mx FROM jev_signals "
+                                f"WHERE {_ident(fallback)} IS NOT NULL AND TRIM({_ident(fallback)}) != ''",
+                            ).fetchone()
+                            raw = None if row is None else row["mx"]
+                            if raw is not None and str(raw).strip():
+                                max_at = str(raw).strip()
+                                clock_source = f"jev_signals.{fallback}"
+                else:
+                    gaps.append("缺少数据表：jev_signals")
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        return _ok(
+            JevSignalClock(
+                max_jev_updated_at=max_at,
+                clock_source=clock_source,
+                strength_positive=strength_positive,
+                strength_column=strength_column,
+                bullish_24h=bullish_24h,
+                bullish_source=bullish_source,
+                stance_counts=tuple(stance_counts),
+                stance_more=stance_more,
+                gap_note=" · ".join(gaps),
+            ),
+            started,
+        )
+
+    def _paper_equity_aside(self, started: float, now: datetime | None) -> DataResult:
+        path = self.paths.paper
+        if not path.is_file():
+            return _unavail(f"数据库文件不存在：{path.name}", started)
+        as_of = now or datetime.now(timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
+        try:
+            with ro_connect(path) as conn:
+                missing = _missing_table(conn, "positions", path.name)
+                if missing:
+                    return _unavail(missing, started)
+                cols = _columns(conn, "positions")
+                wanted = [
+                    name
+                    for name in ("status", "closed_at", "pnl_usd", "exit_reason")
+                    if name in cols
+                ]
+                if not wanted:
+                    return _unavail(
+                        f"缺少字段：status, closed_at, pnl_usd（{path.name}）",
+                        started,
+                    )
+                rows = _exec(conn, f"SELECT {', '.join(wanted)} FROM positions").fetchall()
+        except sqlite3.Error as exc:
+            return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
+        fetched = set(wanted)
+        gaps: list[str] = []
+        closed = [row for row in rows if not _is_open(row, fetched)]
+        closed_n = len(closed)
+        if closed_n == 0:
+            gaps.append("无已平仓")
+        if "pnl_usd" not in fetched:
+            gaps.append("缺少字段：pnl_usd")
+        if "closed_at" not in fetched:
+            gaps.append("缺少字段：closed_at")
+        if "exit_reason" not in fetched:
+            gaps.append("缺少字段：exit_reason")
+        max_dd: float | None = None
+        max_dd_pct: float | None = None
+        stop_of_neg: float | None = None
+        days_since: int | None = None
+        last_at: str | None = None
+        if "pnl_usd" in fetched and "closed_at" in fetched and closed_n:
+            curve: list[tuple[datetime, float]] = []
+            pnl_gaps = 0
+            time_gaps = 0
+            for row in closed:
+                stamp = _optional_ts(_cell(row, "closed_at"))
+                pnl = safe_float(_cell(row, "pnl_usd"))
+                if stamp is None:
+                    time_gaps += 1
+                if pnl is None:
+                    pnl_gaps += 1
+                if stamp is not None and pnl is not None:
+                    curve.append((stamp, pnl))
+            if time_gaps:
+                gaps.append(f"{time_gaps} 笔平仓时间不可读")
+            if pnl_gaps:
+                gaps.append(f"{pnl_gaps} 笔缺 pnl_usd")
+            if time_gaps == 0 and pnl_gaps == 0 and curve:
+                curve.sort(key=lambda item: item[0])
+                cum = 0.0
+                peak = 0.0
+                drawdown = 0.0
+                for _stamp, pnl in curve:
+                    cum += pnl
+                    if cum > peak:
+                        peak = cum
+                    drop = peak - cum
+                    if drop > drawdown:
+                        drawdown = drop
+                max_dd = round(drawdown, 4)
+                if peak > 0:
+                    max_dd_pct = round(drawdown / peak, 4)
+        if "pnl_usd" in fetched and "exit_reason" in fetched and closed_n:
+            neg_all = 0.0
+            neg_sl = 0.0
+            saw_stop = False
+            incomplete = False
+            for row in closed:
+                pnl = safe_float(_cell(row, "pnl_usd"))
+                if pnl is None:
+                    incomplete = True
+                    continue
+                if pnl < 0:
+                    neg_all += pnl
+                    if str(_cell(row, "exit_reason") or "").strip() == "stop_loss":
+                        saw_stop = True
+                        neg_sl += pnl
+            if incomplete:
+                if not any("pnl_usd" in item for item in gaps):
+                    gaps.append("止损占负缺 pnl，未计算")
+            elif neg_all < 0:
+                stop_of_neg = round(neg_sl / neg_all, 4)
+        if "closed_at" in fetched and closed_n and not any("平仓时间不可读" in item for item in gaps):
+            stamps: list[tuple[datetime, str]] = []
+            for row in closed:
+                stamp = _optional_ts(_cell(row, "closed_at"))
+                if stamp is None:
+                    stamps = []
+                    gaps.append(f"{closed_n} 笔平仓时间不可读")
+                    break
+                stamps.append((stamp, str(_cell(row, "closed_at") or "")))
+            if stamps:
+                latest, raw = max(stamps, key=lambda item: item[0])
+                last_at = raw
+                day_count = (as_of - latest).days
+                if day_count < 0:
+                    gaps.append("最近平仓时间在观察时刻之后")
+                else:
+                    days_since = day_count
+        return _ok(
+            EquityAside(
+                closed_n=closed_n,
+                max_drawdown_usd=max_dd,
+                max_drawdown_pct=max_dd_pct,
+                stop_of_neg=stop_of_neg,
+                days_since_last_close=days_since,
+                last_closed_at=last_at,
+                gap_note=" · ".join(dict.fromkeys(gaps)),
             ),
             started,
         )
