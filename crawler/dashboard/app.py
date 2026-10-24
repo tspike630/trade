@@ -748,6 +748,7 @@ body { margin: 0; }
 .v2-kv .v { font-size: var(--v2-num); color: var(--v2-fg); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; font-family: var(--v2-mono); }
 .v2-kv .v.up { color: var(--v2-up); }
 .v2-kv .v.down { color: var(--v2-down); }
+.v2-kv .v.warn { color: var(--v2-warn); }
 .v2-kv .v.mute { color: var(--v2-mute); }
 
 /* ---- 组件内表格（模板同款，无分页） ---- */
@@ -1141,6 +1142,9 @@ def _render_dashboard(*, insecure: bool, section: Section) -> None:
                     foot="门槛 n≥15 / unique≥10",
                     tools=("过滤后",),
                 )
+                _mount_jev_clock(store)
+                _mount_supply_wal()
+                _mount_equity_aside(store)
                 _v2_comp(
                     ("市场", "基准（hot）"),
                     "span-8",
@@ -2610,6 +2614,13 @@ def _goal_short_text(value: object) -> tuple[str, str]:
 
 _DEPLOY_TONE = {"ok": "up", "red": "down", "yellow": "warn", "unreported": "mute", "unknown": "mute"}
 _DEPLOY_WORD = {"ok": "一致", "red": "不符", "yellow": "需留意", "unreported": "未报", "unknown": "无法比对"}
+_JEV_CLOCK_NAIL = "BULLISH=0 ⇒ 预期无新纸面开仓 · 展示≠发明信号"
+_WAL_NAIL = "断供旁证 · 缺文件不记 0 · 不改闸"
+_EQUITY_ASIDE_NAIL = "已实现旁注 · 不改保守账与距 $20k · 不改闸"
+_DEPLOY_FOOT = (
+    "红=声明 sha 与文件不符 · 黄=磁盘比进程新，或声明 sha 落后 tip 且文件与 tip 一致"
+    "（旁注，非进程退出）· 未报=目录无 DEPLOY_SHA · 只读 git ls-tree，不 fetch"
+)
 
 
 def _v2_deploy_sha() -> None:
@@ -2631,6 +2642,8 @@ def _v2_deploy_sha() -> None:
                 parts.append("未报")
             if "磁盘已换" in row.detail:
                 parts.append("磁盘已换、进程未重启")
+            if "落后 tip" in row.detail:
+                parts.append("声明落后 tip")
             if board_truth.main_diff_nonzero(row.detail):
                 parts.append("与 main 有差异")
             word = " · ".join(parts) or word
@@ -2653,7 +2666,157 @@ def _v2_deploy_sha() -> None:
     ui.label(f"采集看门心跳：{wd_text}").classes(
         "v2-note v2-note-warn" if wd_tone == "warn" else "v2-note"
     )
-    ui.label("红=声明 sha 与文件不符 · 黄=磁盘比进程新（未重启）· 未报=目录无 DEPLOY_SHA · 只读 git ls-tree，不 fetch").classes("v2-note")
+    ui.label(_DEPLOY_FOOT).classes("v2-note")
+
+
+def _clock_text(value: str | None) -> str:
+    if not value:
+        return "—"
+    return value if len(value) <= 22 else value[:22]
+
+
+def _age_label(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "—"
+    whole = int(seconds)
+    if whole < 90:
+        return f"{whole} 秒"
+    minutes = whole // 60
+    if minutes < 90:
+        return f"{minutes} 分"
+    return f"{minutes // 60} 小时"
+
+
+def _wal_label(size: int | None) -> str:
+    if size is None:
+        return "—"
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size / 1024 / 1024:.1f} MiB"
+
+
+def _ratio_pct(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value * 100:.1f}%"
+
+
+def _v2_jev_clock(store: DataStore) -> None:
+    try:
+        result = store.jev_signal_clock()
+    except Exception:
+        log.warning("jev clock card failed")
+        ui.label("—").classes("v2-note")
+        ui.label(_JEV_CLOCK_NAIL).classes("v2-note")
+        return
+    if not result.available or result.data is None:
+        ui.label(result.reason or "data gap").classes("v2-note")
+        ui.label(_JEV_CLOCK_NAIL).classes("v2-note")
+        return
+    report = result.data
+    bullish = report.bullish_24h
+    bullish_text = "—" if bullish is None else str(bullish)
+    strength = report.strength_positive
+    strength_text = "—" if strength is None else str(strength)
+    _v2_kv([
+        ("最近 JEV", _clock_text(report.max_jev_updated_at), "mute"),
+        ("strength>0", strength_text, "mute"),
+        ("24h BULLISH", bullish_text, "warn" if bullish == 0 else "mute"),
+    ])
+    if report.clock_source:
+        ui.label(report.clock_source).classes("v2-note")
+    if report.stance_counts:
+        parts = [f"{name} {count}" for name, count in report.stance_counts]
+        if report.stance_more:
+            parts.append(f"另有 {report.stance_more}")
+        ui.label("立场 " + " · ".join(parts)).classes("v2-note")
+    if report.gap_note:
+        ui.label(report.gap_note).classes("v2-note")
+    ui.label(_JEV_CLOCK_NAIL).classes("v2-note v2-note-warn" if bullish == 0 else "v2-note")
+
+
+def _v2_supply_wal() -> None:
+    try:
+        snap = board_truth.supply_wal_lock()
+    except Exception:
+        log.warning("supply wal card failed")
+        ui.label("—").classes("v2-note")
+        ui.label(_WAL_NAIL).classes("v2-note")
+        return
+    status = snap.status or "—"
+    kv_tone = {"ok": "up", "warn": "warn", "mute": "mute"}.get(snap.tone, "mute")
+    _v2_kv([
+        ("心跳年龄", _age_label(snap.age_seconds), kv_tone),
+        ("status", status, kv_tone),
+        ("WAL", _wal_label(snap.wal_bytes), "mute"),
+    ])
+    if snap.mtime_hkt:
+        ui.label(f"mtime {snap.mtime_hkt}").classes("v2-note")
+    if snap.where:
+        ui.label(snap.where).classes("v2-note")
+    if snap.note:
+        ui.label(snap.note).classes("v2-note v2-note-warn" if snap.tone == "warn" else "v2-note")
+    ui.label(_WAL_NAIL).classes("v2-note")
+
+
+def _v2_equity_aside(store: DataStore) -> None:
+    try:
+        result = store.paper_equity_aside()
+    except Exception:
+        log.warning("equity aside card failed")
+        ui.label("—").classes("v2-note")
+        ui.label(_EQUITY_ASIDE_NAIL).classes("v2-note")
+        return
+    if not result.available or result.data is None:
+        ui.label(result.reason or "data gap").classes("v2-note")
+        ui.label(_EQUITY_ASIDE_NAIL).classes("v2-note")
+        return
+    report = result.data
+    dd = "—" if report.max_drawdown_usd is None else f"${report.max_drawdown_usd:,.2f}"
+    if report.max_drawdown_pct is not None:
+        dd = f"{dd} · {_ratio_pct(report.max_drawdown_pct)}"
+    days = "—" if report.days_since_last_close is None else f"{report.days_since_last_close} 日"
+    _v2_kv([
+        ("最大回撤", dd, "mute"),
+        ("止损占负", _ratio_pct(report.stop_of_neg), "mute"),
+        ("距上次平仓", days, "mute"),
+    ])
+    ui.label(f"已平 {report.closed_n}").classes("v2-note")
+    if report.gap_note:
+        ui.label(report.gap_note).classes("v2-note")
+    ui.label(_EQUITY_ASIDE_NAIL).classes("v2-note")
+
+
+def _mount_jev_clock(store: DataStore) -> None:
+    _v2_comp(
+        ("JEV", "时钟"),
+        "span-4",
+        lambda: _v2_jev_clock(store),
+        foot="空簿旁证 · 只读",
+        tools=("只读",),
+    )
+
+
+def _mount_supply_wal() -> None:
+    _v2_comp(
+        ("供锁", "WAL"),
+        "span-4",
+        _v2_supply_wal,
+        foot="只读",
+        tools=("只读",),
+    )
+
+
+def _mount_equity_aside(store: DataStore) -> None:
+    _v2_comp(
+        ("权益", "旁注"),
+        "span-4",
+        lambda: _v2_equity_aside(store),
+        foot="只读",
+        tools=("只读",),
+    )
 
 
 def _mount_deploy_sha() -> None:

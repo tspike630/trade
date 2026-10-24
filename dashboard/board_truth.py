@@ -7,11 +7,12 @@ an explicit "missing" reason, never as a zero or a hardcoded fallback.
 from __future__ import annotations
 
 import csv
-import re
 import hashlib
 import io
+import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -393,6 +394,39 @@ def _git(repo: Path, *args: str) -> str | None:
     return done.stdout if done.returncode == 0 else None
 
 
+def _git_rc(repo: Path, *args: str) -> int | None:
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.returncode
+
+
+def declared_lags_tip(repo: Path, declared: str) -> bool | None:
+    """True when ``declared`` is a strict ancestor of ``origin/main``.
+
+    None means git could not answer. A lag is a stamp note, not a dead process.
+    """
+    tip = _git(repo, "rev-parse", "--verify", "origin/main")
+    if tip is None:
+        return None
+    tip_sha = tip.strip()
+    declared_sha = declared.strip()
+    if not tip_sha or not declared_sha:
+        return None
+    if declared_sha == tip_sha:
+        return False
+    code = _git_rc(repo, "merge-base", "--is-ancestor", declared_sha, "origin/main")
+    if code == 0:
+        return True
+    if code == 1:
+        return False
+    return None
+
+
 def _tree(repo: Path, rev: str, sub: str) -> dict[str, str] | None:
     out = _git(repo, "ls-tree", "-r", rev, "--", sub)
     if out is None:
@@ -505,6 +539,8 @@ def compare_component(root: Path, repo: Path | None, name: str, proc: str) -> De
     disk = _disk_files(folder)
     notes: list[str] = []
     status = "ok"
+    blobs_match_tip = False
+    declared_mismatch: str | None = None
     if declared is None:
         status = "unreported"
         notes.append("未报")
@@ -528,6 +564,7 @@ def compare_component(root: Path, repo: Path | None, name: str, proc: str) -> De
             )
             gone = sum(1 for rel in tracked if rel not in disk)
             notes.append(f"对 main：{diff} 文件不同 · {gone} 缺")
+            blobs_match_tip = diff == 0 and gone == 0
             if (diff or gone) and status == "ok":
                 status = "yellow"
         if declared is not None:
@@ -544,9 +581,21 @@ def compare_component(root: Path, repo: Path | None, name: str, proc: str) -> De
                 ) + sum(1 for rel in want if rel not in disk)
                 if bad:
                     status = "red"
-                    notes.append(f"声明 sha {declared[:8]} 与文件不符 {bad} 个")
+                    declared_mismatch = f"声明 sha {declared[:8]} 与文件不符 {bad} 个"
+                    notes.append(declared_mismatch)
                 else:
                     notes.append(f"声明 sha {declared[:8]} 与文件一致")
+    if (
+        status == "red"
+        and blobs_match_tip
+        and declared_mismatch is not None
+        and declared is not None
+        and repo is not None
+        and declared_lags_tip(repo, declared) is True
+    ):
+        status = "yellow"
+        lag = f"声明 sha {declared[:8]} 落后 tip，文件与 tip 一致"
+        notes = [lag if note == declared_mismatch else note for note in notes]
     if tree_sha:
         h = hashlib.sha256()
         for rel in sorted(disk):
@@ -602,3 +651,117 @@ def watchdog_status(path: Path | None = None, *, now: float | None = None) -> tu
     if age > WATCHDOG_STALE_SECONDS:
         return "warn", f"心跳过期 {int(age // 60)} 分钟（{stamp}）"
     return "ok", f"心跳正常（{stamp}）"
+
+
+# ---------------------------------------------------------------- supply / wal lock
+
+# Crawler heartbeat (crawler/config.py HEARTBEAT_STALE_SEC). Display only.
+SUPPLY_HEARTBEAT_REL = Path("logs") / "heartbeat.json"
+SUPPLY_HEARTBEAT_STALE_SEC = 120
+SUPPLY_WAL_NAME = "dexscreener.db-wal"
+_STATUS_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+
+
+@dataclass(frozen=True)
+class SupplyWalLock:
+    """File evidence beside the db root. None numbers were not observed."""
+
+    tone: str  # ok / warn / mute
+    age_seconds: float | None
+    mtime_hkt: str | None
+    status: str | None
+    wal_bytes: int | None
+    where: str
+    note: str
+
+
+def supply_heartbeat_candidates(root: Path | None = None) -> tuple[tuple[str, Path], ...]:
+    base = root if root is not None else _root()
+    return (
+        ("DASHBOARD_DB_ROOT/logs/heartbeat.json", base / SUPPLY_HEARTBEAT_REL),
+        ("上级/logs/heartbeat.json", base.parent / SUPPLY_HEARTBEAT_REL),
+    )
+
+
+def _supply_tone(age: float | None, status: str | None, json_ok: bool) -> str:
+    if age is None:
+        return "mute"
+    bad = status in {"error", "failed", "degraded"}
+    if age < 0:
+        return "warn" if bad or not json_ok else "mute"
+    stale = age > SUPPLY_HEARTBEAT_STALE_SEC
+    if stale or bad or not json_ok:
+        return "warn"
+    if status == "ok":
+        return "ok"
+    return "mute"
+
+
+def supply_wal_lock(root: Path | None = None, *, now: float | None = None) -> SupplyWalLock:
+    """Heartbeat mtime plus optional WAL size. Missing files stay blank."""
+    base = root if root is not None else _root()
+    clock = time.time() if now is None else now
+    where = ""
+    target: Path | None = None
+    for label, path in supply_heartbeat_candidates(base):
+        try:
+            exists = path.is_file()
+        except OSError:
+            continue
+        if exists:
+            where = label
+            target = path
+            break
+    age: float | None = None
+    mtime_hkt: str | None = None
+    status: str | None = None
+    notes: list[str] = []
+    tone = "mute"
+    if target is None:
+        notes.append("心跳文件缺失")
+    else:
+        try:
+            mtime = target.stat().st_mtime
+        except OSError:
+            notes.append("心跳文件不可读")
+        else:
+            age = clock - mtime
+            mtime_hkt = datetime.fromtimestamp(mtime, HKT).strftime("%m-%d %H:%M HKT")
+            json_ok = False
+            try:
+                payload = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                notes.append("心跳 JSON 不可读")
+            else:
+                if not isinstance(payload, dict):
+                    notes.append("心跳 JSON 不可读")
+                else:
+                    json_ok = True
+                    raw_status = payload.get("status")
+                    if isinstance(raw_status, str) and _STATUS_RE.fullmatch(raw_status.strip()):
+                        status = raw_status.strip()
+                    elif raw_status is None or (isinstance(raw_status, str) and not raw_status.strip()):
+                        notes.append("无 status 字段")
+                    else:
+                        notes.append("status 不可读")
+            if age < 0:
+                notes.append("mtime 在未来")
+            tone = _supply_tone(age, status, json_ok)
+    wal_bytes: int | None = None
+    wal_path = base / SUPPLY_WAL_NAME
+    try:
+        if wal_path.is_file():
+            wal_bytes = wal_path.stat().st_size
+        else:
+            notes.append("WAL 无")
+    except OSError:
+        notes.append("WAL 不可读")
+    return SupplyWalLock(
+        tone=tone,
+        age_seconds=age,
+        mtime_hkt=mtime_hkt,
+        status=status,
+        wal_bytes=wal_bytes,
+        where=where,
+        note=" · ".join(notes),
+    )

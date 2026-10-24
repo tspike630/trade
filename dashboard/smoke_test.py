@@ -2750,7 +2750,7 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertNotIn("os.environ", read_src)
         mirror = Path(__file__).resolve().parent.parent / "crawler" / "dashboard"
         if mirror.is_dir():
-            for name in ("data.py", "app.py", "smoke_test.py"):
+            for name in ("data.py", "app.py", "smoke_test.py", "board_truth.py"):
                 self.assertEqual(
                     (Path(__file__).resolve().parent / name).read_bytes(),
                     (mirror / name).read_bytes(),
@@ -5071,6 +5071,323 @@ class BoardTruthSmokeTest(unittest.TestCase):
         row = bt.compare_component(self.root, None, "execution", "no-such-proc-xyz")
         self.assertEqual(row.status, "unreported")
         self.assertIn("未报", row.detail)
+
+    def test_stamp_lag_with_tip_blobs_is_yellow(self) -> None:
+        from dashboard import board_truth as bt
+        folder = self.root / "execution"
+        folder.mkdir()
+        (folder / "a.py").write_text("x=1\n")
+        (folder / "DEPLOY_SHA").write_text("oldsha12\n")
+        tip_blob = bt._blob_sha(b"x=1\n")
+
+        def fake_tree(_repo: object, rev: str, _sub: str) -> dict[str, str]:
+            if rev == "origin/main":
+                return {"a.py": tip_blob}
+            if rev == "oldsha12":
+                return {"a.py": "ab" * 20}
+            return {}
+
+        with patch.object(bt, "_tree", side_effect=fake_tree), patch.object(
+            bt, "declared_lags_tip", return_value=True
+        ):
+            row = bt.compare_component(self.root, self.root, "execution", "no-such-proc-xyz")
+        self.assertEqual(row.status, "yellow")
+        self.assertIn("落后 tip", row.detail)
+        self.assertIn("文件与 tip 一致", row.detail)
+        self.assertNotIn("与文件不符", row.detail)
+        self.assertNotIn("进程已退出", row.detail)
+        self.assertNotIn("执行中断", row.detail)
+        self.assertEqual(app_module._DEPLOY_TONE[row.status], "warn")
+        self.assertIn("落后 tip", app_module._DEPLOY_FOOT)
+        self.assertIn("非进程退出", app_module._DEPLOY_FOOT)
+        self.assertIn("声明落后 tip", inspect.getsource(app_module._v2_deploy_sha))
+
+    def test_stamp_mismatch_stays_red_when_tip_blobs_differ(self) -> None:
+        from dashboard import board_truth as bt
+        folder = self.root / "execution"
+        folder.mkdir()
+        (folder / "a.py").write_text("x=1\n")
+        (folder / "DEPLOY_SHA").write_text("oldsha12\n")
+
+        def fake_tree(_repo: object, rev: str, _sub: str) -> dict[str, str]:
+            if rev == "origin/main":
+                return {"a.py": "ff" * 20}
+            if rev == "oldsha12":
+                return {"a.py": "ab" * 20}
+            return {}
+
+        with patch.object(bt, "_tree", side_effect=fake_tree), patch.object(
+            bt, "declared_lags_tip", return_value=True
+        ):
+            row = bt.compare_component(self.root, self.root, "execution", "no-such-proc-xyz")
+        self.assertEqual(row.status, "red")
+        self.assertIn("与文件不符", row.detail)
+        self.assertNotIn("落后 tip", row.detail)
+
+    def test_stamp_lag_not_yellow_without_ancestor(self) -> None:
+        from dashboard import board_truth as bt
+        folder = self.root / "execution"
+        folder.mkdir()
+        (folder / "a.py").write_text("x=1\n")
+        (folder / "DEPLOY_SHA").write_text("oldsha12\n")
+        tip_blob = bt._blob_sha(b"x=1\n")
+
+        def fake_tree(_repo: object, rev: str, _sub: str) -> dict[str, str]:
+            if rev == "origin/main":
+                return {"a.py": tip_blob}
+            if rev == "oldsha12":
+                return {"a.py": "ab" * 20}
+            return {}
+
+        with patch.object(bt, "_tree", side_effect=fake_tree), patch.object(
+            bt, "declared_lags_tip", return_value=False
+        ):
+            row = bt.compare_component(self.root, self.root, "execution", "no-such-proc-xyz")
+        self.assertEqual(row.status, "red")
+        self.assertIn("与文件不符", row.detail)
+
+    def test_declared_lags_tip_on_real_history(self) -> None:
+        from dashboard import board_truth as bt
+        work = self._git_repo_with_ledger("a")
+        origin = self.root / "origin"
+        old = subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "origin/main"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        (origin / "docs" / "x.md").write_text("newer\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(origin), "commit", "-qm", "newer"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(work), "fetch", "-q", "origin"], check=True, capture_output=True)
+        tip = subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "origin/main"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertNotEqual(old, tip)
+        self.assertTrue(bt.declared_lags_tip(work, old))
+        self.assertFalse(bt.declared_lags_tip(work, tip))
+        self.assertIsNone(bt.declared_lags_tip(work, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"))
+
+    def test_supply_wal_missing_and_parent_heartbeat(self) -> None:
+        from dashboard import board_truth as bt
+        blank = bt.supply_wal_lock(self.root, now=1_000.0)
+        self.assertEqual(blank.tone, "mute")
+        self.assertIsNone(blank.age_seconds)
+        self.assertIsNone(blank.status)
+        self.assertIsNone(blank.wal_bytes)
+        self.assertIn("心跳文件缺失", blank.note)
+        self.assertIn("WAL 无", blank.note)
+
+        dbroot = self.root / "dbroot"
+        dbroot.mkdir()
+        parent_logs = self.root / "logs"
+        parent_logs.mkdir()
+        heartbeat = parent_logs / "heartbeat.json"
+        heartbeat.write_text(
+            json.dumps({"status": "ok", "last_error": "supersecretvalue"}),
+            encoding="utf-8",
+        )
+        os.utime(heartbeat, (1_000, 1_000))
+        fresh = bt.supply_wal_lock(dbroot, now=1_030.0)
+        self.assertEqual(fresh.tone, "ok")
+        self.assertEqual(fresh.status, "ok")
+        self.assertEqual(fresh.where, "上级/logs/heartbeat.json")
+        self.assertAlmostEqual(fresh.age_seconds or 0, 30.0, delta=0.1)
+        self.assertNotIn("supersecretvalue", fresh.note)
+        self.assertIsNone(fresh.wal_bytes)
+        stale = bt.supply_wal_lock(dbroot, now=1_000.0 + bt.SUPPLY_HEARTBEAT_STALE_SEC + 5)
+        self.assertEqual(stale.tone, "warn")
+
+        direct_logs = dbroot / "logs"
+        direct_logs.mkdir()
+        direct = direct_logs / "heartbeat.json"
+        direct.write_text(json.dumps({"status": "degraded"}), encoding="utf-8")
+        degraded = bt.supply_wal_lock(dbroot, now=time.time())
+        self.assertEqual(degraded.where, "DASHBOARD_DB_ROOT/logs/heartbeat.json")
+        self.assertEqual(degraded.status, "degraded")
+        self.assertEqual(degraded.tone, "warn")
+        (dbroot / "dexscreener.db-wal").write_bytes(b"abc")
+        sized = bt.supply_wal_lock(dbroot, now=time.time())
+        self.assertEqual(sized.wal_bytes, 3)
+        direct.write_text(json.dumps({"status": "error"}), encoding="utf-8")
+        self.assertEqual(bt.supply_wal_lock(dbroot, now=time.time()).tone, "warn")
+        direct.write_text("{", encoding="utf-8")
+        broken = bt.supply_wal_lock(dbroot, now=time.time())
+        self.assertEqual(broken.tone, "warn")
+        self.assertIsNone(broken.status)
+        self.assertIn("心跳 JSON 不可读", broken.note)
+
+
+class ObserveAsideSmokeTest(unittest.TestCase):
+    """JEV clock, WAL card, and realized-equity aside. Missing stays blank."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._env = dict(os.environ)
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._env)
+        self._tmp.cleanup()
+
+    def _paths(self) -> DbPaths:
+        return DbPaths(
+            main=self.root / "dexscreener.db",
+            execution=self.root / "execution_ledger.db",
+            paper=self.root / "paper_trading.db",
+            backtest=self.root / "backtest_ledger.db",
+            news=self.root / "news_events.db",
+        )
+
+    def test_jev_clock_missing_degrades(self) -> None:
+        store = DataStore(self._paths())
+        result = store.jev_signal_clock()
+        self.assertFalse(result.available)
+        self.assertIsNone(result.data)
+        texts = _rendered_card_texts(lambda: app_module._v2_jev_clock(store))
+        self.assertTrue(any("dexscreener.db" in text for text in texts))
+        self.assertTrue(any(app_module._JEV_CLOCK_NAIL in text for text in texts))
+        empty = self.root / "dexscreener.db"
+        sqlite3.connect(empty).close()
+        store = DataStore(self._paths())
+        gap = store.jev_signal_clock()
+        self.assertFalse(gap.available)
+        self.assertIn("token_indicators", gap.reason)
+        gap_texts = _rendered_card_texts(lambda: app_module._v2_jev_clock(store))
+        self.assertTrue(any("缺少数据表" in text for text in gap_texts))
+
+    def test_jev_clock_counts_without_inventing_bullish(self) -> None:
+        as_of = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
+        fresh = "2026-10-24T11:00:00Z"
+        old = "2026-10-20T00:00:00Z"
+        main = self.root / "dexscreener.db"
+        with sqlite3.connect(main) as conn:
+            conn.execute(
+                "CREATE TABLE token_indicators ("
+                "chain_id TEXT, token_address TEXT, jev_strength REAL, jev_updated_at TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO token_indicators VALUES (?, ?, ?, ?)",
+                [
+                    ("solana", "a", 0.4, fresh),
+                    ("solana", "b", 0, fresh),
+                    ("solana", "c", -0.2, fresh),
+                    ("solana", "d", 0.2, old),
+                    ("solana", "e", None, None),
+                ],
+            )
+            conn.execute(
+                "CREATE TABLE jev_signals ("
+                "chain_id TEXT, token_address TEXT, stance TEXT, fetched_at TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO jev_signals VALUES (?, ?, ?, ?)",
+                [
+                    ("solana", "a", "BULLISH", fresh),
+                    ("solana", "b", "NOT BULLISH", fresh),
+                    ("solana", "c", "NEUTRAL", old),
+                    ("solana", "d", "BUY", fresh),
+                    ("solana", "e", "not bullish", fresh),
+                ],
+            )
+        report = DataStore(self._paths()).jev_signal_clock(now=as_of)
+        self.assertTrue(report.available)
+        clock = report.data
+        self.assertEqual(clock.max_jev_updated_at, fresh)
+        self.assertEqual(clock.clock_source, "token_indicators.jev_updated_at")
+        self.assertEqual(clock.strength_positive, 2)
+        self.assertEqual(clock.strength_column, "jev_strength")
+        self.assertEqual(clock.bullish_24h, 2)
+        labels = dict(clock.stance_counts)
+        self.assertEqual(labels["BULLISH"], 1)
+        self.assertEqual(labels["NOT BULLISH"], 1)
+        self.assertEqual(labels["NEUTRAL"], 1)
+        texts = _rendered_card_texts(lambda: app_module._v2_jev_clock(DataStore(self._paths())))
+        self.assertTrue(any(app_module._JEV_CLOCK_NAIL in text for text in texts))
+        self.assertIn("ro_connect", inspect.getsource(DataStore._jev_signal_clock))
+        self.assertNotIn("os.environ", inspect.getsource(DataStore._jev_signal_clock))
+
+    def test_jev_clock_zero_bullish_is_a_real_zero(self) -> None:
+        as_of = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
+        fresh = "2026-10-24T11:00:00Z"
+        main = self.root / "dexscreener.db"
+        with sqlite3.connect(main) as conn:
+            conn.execute(
+                "CREATE TABLE token_indicators (jev_strength REAL, jev_updated_at TEXT)"
+            )
+            conn.execute("INSERT INTO token_indicators VALUES (0.1, ?)", (fresh,))
+            conn.execute("CREATE TABLE jev_signals (stance TEXT, fetched_at TEXT)")
+            conn.execute("INSERT INTO jev_signals VALUES ('NEUTRAL', ?)", (fresh,))
+        clock = DataStore(self._paths()).jev_signal_clock(now=as_of).data
+        self.assertEqual(clock.bullish_24h, 0)
+        self.assertEqual(clock.strength_positive, 1)
+        pinned = DataStore(self._paths())
+
+        def _render() -> None:
+            original = pinned.jev_signal_clock
+
+            def _fixed(*, now: datetime | None = None) -> object:
+                return original(now=as_of)
+
+            pinned.jev_signal_clock = _fixed  # type: ignore[method-assign]
+            app_module._v2_jev_clock(pinned)
+
+        texts = _rendered_card_texts(_render)
+        self.assertIn("0", texts)
+        self.assertTrue(any(app_module._JEV_CLOCK_NAIL in text for text in texts))
+
+    def test_equity_aside_drawdown_and_missing(self) -> None:
+        store = DataStore(self._paths())
+        missing = store.paper_equity_aside()
+        self.assertFalse(missing.available)
+        texts = _rendered_card_texts(lambda: app_module._v2_equity_aside(store))
+        self.assertTrue(any("paper_trading.db" in text for text in texts))
+        self.assertTrue(any(app_module._EQUITY_ASIDE_NAIL in text for text in texts))
+        paper = self.root / "paper_trading.db"
+        with sqlite3.connect(paper) as conn:
+            conn.execute(
+                "CREATE TABLE positions ("
+                "id TEXT, status TEXT, closed_at TEXT, pnl_usd REAL, exit_reason TEXT, size_usd REAL)"
+            )
+            conn.executemany(
+                "INSERT INTO positions VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("1", "closed", "2026-10-20T00:00:00Z", 100, "tp", 10),
+                    ("2", "closed", "2026-10-21T00:00:00Z", -40, "stop_loss", 10),
+                    ("3", "closed", "2026-10-22T00:00:00Z", -10, "stop_loss", 10),
+                    ("4", "closed", "2026-10-23T00:00:00Z", 5, "tp", 10),
+                    ("5", "open", None, None, None, 10),
+                ],
+            )
+        as_of = datetime(2026, 10, 24, 0, 0, tzinfo=timezone.utc)
+        report = DataStore(self._paths()).paper_equity_aside(now=as_of)
+        self.assertTrue(report.available)
+        aside = report.data
+        self.assertEqual(aside.closed_n, 4)
+        self.assertAlmostEqual(aside.max_drawdown_usd or 0, 50.0)
+        self.assertAlmostEqual(aside.max_drawdown_pct or 0, 0.5)
+        self.assertAlmostEqual(aside.stop_of_neg or 0, 1.0)
+        self.assertEqual(aside.days_since_last_close, 1)
+        rendered = _rendered_card_texts(lambda: app_module._v2_equity_aside(DataStore(self._paths())))
+        self.assertTrue(any("不改保守账" in text for text in rendered))
+        self.assertIn("ro_connect", inspect.getsource(DataStore._paper_equity_aside))
+        goal = inspect.getsource(DataStore._paper_goal_pace)
+        self.assertIn("equity_conservative_usd", goal)
+        overview = inspect.getsource(app_module._render_dashboard)
+        self.assertLess(overview.index("_mount_equity_aside"), overview.index("_mount_goal_20k"))
+        self.assertLess(overview.index("_mount_jev_clock"), overview.index("_mount_supply_wal"))
+        self.assertIn("span-4", inspect.getsource(app_module._mount_jev_clock))
+        self.assertIn("span-4", inspect.getsource(app_module._mount_supply_wal))
+        self.assertIn("span-4", inspect.getsource(app_module._mount_equity_aside))
+
+    def test_supply_wal_card_renders_missing(self) -> None:
+        os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
+        texts = _rendered_card_texts(app_module._v2_supply_wal)
+        self.assertTrue(any("心跳文件缺失" in text for text in texts))
+        self.assertTrue(any(app_module._WAL_NAIL in text for text in texts))
+        self.assertNotIn("0 B", texts)
+        self.assertNotIn("0 秒", texts)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
