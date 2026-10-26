@@ -1,0 +1,105 @@
+{
+  "asof": "2026-10-26T08:48:00+08:00",
+  "window": {
+    "start": "2026-10-19T08:48:00+08:00",
+    "end": "2026-10-26T08:48:00+08:00",
+    "label": "2026-10-19～26 HKT（≈7d）",
+    "fwd_horizon": "≈1h"
+  },
+  "sample_meta": {
+    "hourly_snaps": 12626,
+    "valid_fwd_pairs": 10081,
+    "tokens": 2095,
+    "overall_up_rate": 0.427,
+    "weights_all_zero": true,
+    "note": "小时抽样12626→有效配对10081/token2095；全体上涨率42.7%；INDICATORS_WEIGHT_*全0；高档mean常被左尾拖累，禁止本周接闸"
+  },
+  "rows": [
+    {
+      "item": "change_24h",
+      "status": "建议落地",
+      "category": "可上调观察",
+      "evidence": "lift_up≈1.28；Q4–Q1≈+11.0pp；高档mean左尾；§10 指标→fwd≈1h 分层",
+      "tendency": "仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "change_4h",
+      "status": "建议落地",
+      "category": "可上调观察",
+      "evidence": "lift_up≈1.20；差≈+9.2pp；§10 指标→fwd≈1h 分层",
+      "tendency": "仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "change_1h",
+      "status": "建议落地",
+      "category": "弱正区分可上调观察",
+      "evidence": "lift_up≈1.11；差≈+5.1pp；弱于上周；§10 指标→fwd≈1h 分层",
+      "tendency": "仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "change_15m",
+      "status": "建议落地",
+      "category": "降权/维持0",
+      "evidence": "lift≈1.19但Q2塌陷≈29%；非单调；§10 指标→fwd≈1h 分层",
+      "tendency": "仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "change_5m",
+      "status": "建议落地",
+      "category": "降权/维持0",
+      "evidence": "分层混乱；短窗勿线性上调；§10 指标→fwd≈1h 分层",
+      "tendency": "仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "volume_strength",
+      "status": "建议落地",
+      "category": "降权/维持0",
+      "evidence": "lift_up≈0.88；高档警示；§10 指标→fwd≈1h 分层",
+      "tendency": "仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "volatility_24h",
+      "status": "观察中",
+      "category": "风险旁路/观察中",
+      "evidence": "非单调；不宜做多信号；§10 指标→fwd≈1h 分层",
+      "tendency": "继续观察；不调权"
+    },
+    {
+      "item": "jev_strength",
+      "status": "观察中",
+      "category": "旁路观察（非开仓臂）",
+      "evidence": "lift_up≈0.96；meanQ4≈+2.3%；max<0.3；§10 指标→fwd≈1h 分层",
+      "tendency": "继续观察；不调权"
+    },
+    {
+      "item": "sentiment_heat_score",
+      "status": "观察中",
+      "category": "观察中",
+      "evidence": "n=688薄；lift≈1.20；§10 指标→fwd≈1h 分层",
+      "tendency": "继续观察；不调权"
+    },
+    {
+      "item": "rsi_14",
+      "status": "建议落地",
+      "category": "旁路可上调观察",
+      "evidence": "lift_up≈1.17；差≈+12.4pp；不进权重；§10 指标→fwd≈1h 分层",
+      "tendency": "仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "macd_hist",
+      "status": "建议落地",
+      "category": "降权/维持0",
+      "evidence": "lift≈1.09；Q3最差；§10 指标→fwd≈1h 分层",
+      "tendency": "仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "spike/spike_ratio",
+      "status": "观察中",
+      "category": "观察中",
+      "evidence": "n=688；分位塌缩；突热只观察；§10 指标→fwd≈1h 分层",
+      "tendency": "继续观察；不调权"
+    }
+  ],
+  "verdict": "本周不对任何 INDICATORS_WEIGHT_* 改值；权重保持全 0，待人工/周检裁决；高档 mean 常被左尾拖累，禁止本周接闸。「建议落地」≠允许自动开权。",
+  "self_survival_footnote": "self_survival 16.12d n=96136 存活 1h/4h/24h/7d=99.8%/99.5%/62.4%/17.4%；权仍0；与 JEV up_1h 口径不同只脚注"
+}
