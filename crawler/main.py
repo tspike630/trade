@@ -72,6 +72,8 @@ def _print_summary(summary: dict) -> None:
     print(f"  skipped (has_pairs=0):  {summary['enrich_skipped_no_pairs']}")
     print(f"  skipped (not due):      {summary.get('enrich_skipped_not_due', 0)}")
     print(f"  batches sent:           {summary['enrich_batches']}")
+    if summary.get("enrich_batches_deferred"):
+        print(f"  batches deferred (cap): {summary['enrich_batches_deferred']}")
     print(f"  batch sizes:            {summary['enrich_batch_sizes']}")
     print(f"  async concurrency:      {summary.get('enrich_async_concurrency')}")
     print(f"  async peak in-flight:   {summary.get('enrich_async_peak_in_flight', 0)}")

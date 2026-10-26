@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -25,6 +26,10 @@ from config import (
     ASYNC_MAX_CONCURRENCY,
     BATCH_SIZE,
     DB_PATH,
+    ENRICH_BATCHES_PER_CYCLE_CAP,
+    ENRICH_HEARTBEAT_EVERY_K_BATCHES,
+    ENRICH_HEARTBEAT_MIN_INTERVAL_SEC,
+    ENRICH_SEGMENT_HEARTBEAT,
     PENDING_ENRICH_LOAD_CAP,
     HOT_ENRICH_MIN_INTERVAL_SEC,
     HOT_SEEN_WINDOW_SEC,
@@ -126,6 +131,9 @@ def _empty_summary(
         "enrich_skipped_not_due": 0,
         "enrich_from_pending": 0,
         "enrich_batches": 0,
+        "enrich_batches_capped": 0,
+        "enrich_batches_deferred": 0,
+        "enrich_batches_total_est": 0,
         "enrich_batch_sizes": [],
         "enrich_batch_errors": [],
         "enrich_pending_remaining": 0,
@@ -539,6 +547,135 @@ def _plan_batches(
     return planned, remainders
 
 
+_EnrichResult = tuple[int, str, list[str], list[dict[str, Any]] | None, str | None, bool]
+
+
+def _apply_enrich_batch_cap(
+    planned: list[tuple[str, list[str], bool]],
+    cap: int,
+) -> tuple[list[tuple[str, list[str], bool]], list[tuple[str, list[str], bool]]]:
+    """Keep the first ``cap`` planned batches. ``cap <= 0`` leaves the list unchanged."""
+    if cap <= 0 or len(planned) <= cap:
+        return planned, []
+    return planned[:cap], planned[cap:]
+
+
+def _defer_enrich_batches(
+    store: Store,
+    batches: list[tuple[str, list[str], bool]],
+) -> None:
+    rows = [
+        (chain_id, addr)
+        for chain_id, batch, _is_flush in batches
+        for addr in batch
+    ]
+    store.add_pending_enrich_many(rows)
+
+
+def _segment_heartbeat_interval_sec() -> float:
+    """Seconds between time-based enrich heartbeats. Non-positive values use 30s."""
+    try:
+        interval = float(ENRICH_HEARTBEAT_MIN_INTERVAL_SEC)
+    except (TypeError, ValueError):
+        return 30.0
+    if interval <= 0:
+        return 30.0
+    return interval
+
+
+def _segment_heartbeat_every_k() -> int:
+    try:
+        return int(ENRICH_HEARTBEAT_EVERY_K_BATCHES)
+    except (TypeError, ValueError):
+        return 10
+
+
+def _emit_enrich_segment_heartbeat(
+    store: Store,
+    summary: dict[str, Any],
+    batches_total_est: int | None,
+) -> None:
+    """Liveness write. status stays ok; phase is not supply readiness.
+
+    A failed mid-cycle write must not abort enrich.
+    """
+    try:
+        write_heartbeat(
+            cycle_id=summary.get("cycle_id") or "-",
+            status="ok",
+            stats=summary,
+            counters=store.get_counters(),
+            phase="enriching",
+            extra_stats={
+                "batches_done": int(summary.get("enrich_batches") or 0),
+                "batches_total_est": batches_total_est,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "enrich segment heartbeat failed cycle_id=%s",
+            summary.get("cycle_id"),
+            exc_info=True,
+        )
+
+
+def _accept_enrich_result(
+    store: Store,
+    summary: dict[str, Any],
+    stop_flag: StopFlag | None,
+    result: _EnrichResult,
+) -> bool:
+    """Record one fetched batch. Return False when the cycle should stop."""
+    idx, chain_id, batch, pairs, err, is_flush = result
+    if stop_flag and stop_flag():
+        summary["interrupted"] = True
+        return False
+    summary["enrich_batches"] += 1
+    summary["enrich_batch_sizes"].append(len(batch))
+    if err is not None:
+        msg = f"{'flush ' if is_flush else ''}batch {chain_id} size={len(batch)}: {err}"
+        log.error(
+            "batch failed after retries cycle_id=%s chain=%s batch_size=%s err=%s",
+            summary["cycle_id"],
+            chain_id,
+            len(batch),
+            err,
+        )
+        summary["enrich_batch_errors"].append(msg)
+        summary["errors"].append(msg)
+        store.update_checkpoint(
+            summary["cycle_id"],
+            step="enriching",
+            last_batch_meta={
+                "chain_id": chain_id,
+                "batch_size": len(batch),
+                "batch_index": idx,
+                "ok": False,
+                "error": err,
+                "flush": is_flush,
+            },
+            stats=summary,
+        )
+        return True
+
+    assert pairs is not None
+    _process_batch(store, chain_id, batch, pairs, summary)
+    store.update_checkpoint(
+        summary["cycle_id"],
+        step="enriching",
+        last_batch_meta={
+            "chain_id": chain_id,
+            "batch_size": len(batch),
+            "batch_index": idx,
+            "pairs": len(pairs),
+            "ok": True,
+            "flush": is_flush,
+        },
+        stats=summary,
+    )
+    return True
+
+
 async def _run_enrich_async(
     client: AsyncDexScreenerClient,
     store: Store,
@@ -548,9 +685,26 @@ async def _run_enrich_async(
     stop_flag: StopFlag | None,
 ) -> bool:
     planned, remainders = _plan_batches(queues, flush_pending)
+    try:
+        cap = int(ENRICH_BATCHES_PER_CYCLE_CAP)
+    except (TypeError, ValueError):
+        cap = 0
+    planned, overflow = _apply_enrich_batch_cap(planned, cap)
+    summary["enrich_batches_capped"] = 1 if overflow else 0
+    summary["enrich_batches_deferred"] = len(overflow)
+    summary["enrich_batches_total_est"] = len(planned)
     for chain_id, addrs in remainders.items():
         for addr in addrs:
             store.add_pending_enrich(chain_id, addr)
+    _defer_enrich_batches(store, overflow)
+    if overflow:
+        log.info(
+            "enrich batch cap cycle_id=%s cap=%s kept=%s deferred_batches=%s",
+            summary.get("cycle_id"),
+            cap,
+            len(planned),
+            len(overflow),
+        )
 
     if not planned:
         return True
@@ -566,7 +720,7 @@ async def _run_enrich_async(
 
     async def fetch_one(
         idx: int, chain_id: str, batch: list[str], is_flush: bool
-    ) -> tuple[int, str, list[str], list[dict[str, Any]] | None, str | None, bool]:
+    ) -> _EnrichResult:
         nonlocal in_flight, max_in_flight
         async with sem:
             async with lock:
@@ -590,62 +744,56 @@ async def _run_enrich_async(
                 async with lock:
                     in_flight -= 1
 
+    # Fetch every kept batch, then record in index order. Segmented heartbeat
+    # only adds file writes; it does not change fetch or checkpoint order.
     tasks = [
         fetch_one(i + 1, chain_id, batch, is_flush)
         for i, (chain_id, batch, is_flush) in enumerate(planned)
     ]
-    results = await asyncio.gather(*tasks)
+    total_est = len(planned)
+    pulse_stop: asyncio.Event | None = None
+    pulse_task: asyncio.Task[None] | None = None
+    last_write = time.monotonic()
+    if ENRICH_SEGMENT_HEARTBEAT:
+        _emit_enrich_segment_heartbeat(store, summary, total_est)
+        last_write = time.monotonic()
+        pulse_stop = asyncio.Event()
+
+        async def _pulse() -> None:
+            nonlocal last_write
+            assert pulse_stop is not None
+            while True:
+                try:
+                    await asyncio.wait_for(pulse_stop.wait(), timeout=_segment_heartbeat_interval_sec())
+                    return
+                except asyncio.TimeoutError:
+                    _emit_enrich_segment_heartbeat(store, summary, total_est)
+                    last_write = time.monotonic()
+
+        pulse_task = asyncio.create_task(_pulse())
+
+    try:
+        results = await asyncio.gather(*tasks)
+    finally:
+        if pulse_stop is not None and pulse_task is not None:
+            pulse_stop.set()
+            await pulse_task
 
     summary["enrich_async_peak_in_flight"] = max_in_flight
+    every_k = _segment_heartbeat_every_k() if ENRICH_SEGMENT_HEARTBEAT else 0
+    interval = _segment_heartbeat_interval_sec() if ENRICH_SEGMENT_HEARTBEAT else 0.0
 
     # Process in index order for stable checkpoints
-    for idx, chain_id, batch, pairs, err, is_flush in sorted(results, key=lambda r: r[0]):
-        if stop_flag and stop_flag():
-            summary["interrupted"] = True
+    for result in sorted(results, key=lambda r: r[0]):
+        if not _accept_enrich_result(store, summary, stop_flag, result):
             return False
-        summary["enrich_batches"] += 1
-        summary["enrich_batch_sizes"].append(len(batch))
-        if err is not None:
-            msg = f"{'flush ' if is_flush else ''}batch {chain_id} size={len(batch)}: {err}"
-            log.error(
-                "batch failed after retries cycle_id=%s chain=%s batch_size=%s err=%s",
-                summary["cycle_id"],
-                chain_id,
-                len(batch),
-                err,
-            )
-            summary["enrich_batch_errors"].append(msg)
-            summary["errors"].append(msg)
-            store.update_checkpoint(
-                summary["cycle_id"],
-                step="enriching",
-                last_batch_meta={
-                    "chain_id": chain_id,
-                    "batch_size": len(batch),
-                    "batch_index": idx,
-                    "ok": False,
-                    "error": err,
-                    "flush": is_flush,
-                },
-                stats=summary,
-            )
+        if not ENRICH_SEGMENT_HEARTBEAT:
             continue
-
-        assert pairs is not None
-        _process_batch(store, chain_id, batch, pairs, summary)
-        store.update_checkpoint(
-            summary["cycle_id"],
-            step="enriching",
-            last_batch_meta={
-                "chain_id": chain_id,
-                "batch_size": len(batch),
-                "batch_index": idx,
-                "pairs": len(pairs),
-                "ok": True,
-                "flush": is_flush,
-            },
-            stats=summary,
-        )
+        k_due = every_k > 0 and int(summary["enrich_batches"]) % every_k == 0
+        time_due = (time.monotonic() - last_write) >= interval
+        if k_due or time_due:
+            _emit_enrich_segment_heartbeat(store, summary, total_est)
+            last_write = time.monotonic()
     return True
 
 
@@ -957,12 +1105,23 @@ def _finalize_ops(
 
     counters = store.get_counters()
     summary["counters"] = counters
+    phase: str | None = None
+    extra_stats: dict[str, Any] | None = None
+    if ENRICH_SEGMENT_HEARTBEAT:
+        phase = "done" if status in ("ok", "degraded") else status
+        total_est = summary.get("enrich_batches_total_est")
+        extra_stats = {
+            "batches_done": int(summary.get("enrich_batches") or 0),
+            "batches_total_est": total_est,
+        }
     write_heartbeat(
         cycle_id=summary.get("cycle_id") or "-",
         status=status,
         stats=summary,
         last_error=last_error,
         counters=counters,
+        phase=phase,
+        extra_stats=extra_stats,
     )
 
 
