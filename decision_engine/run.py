@@ -35,6 +35,8 @@ from decision_engine.core.token_cooldown import DEFAULT_TOKEN_COOLDOWN_MIN, Toke
 from decision_engine.core.signal_bus import (  # noqa: E402
     PURPOSE_LIVE_CANDIDATE,
     PURPOSE_SAMPLE,
+    PURPOSE_SHADOW_010,
+    PURPOSE_SHADOW_SELFBUILT_A,
     SignalBus,
     resolve_run_purpose,
 )
@@ -252,16 +254,11 @@ def build_strategies(args: argparse.Namespace) -> list:
         # factor_* twins take the same CLI thresholds as the legacy id.
         # Default strategy stays jev_strength_v1; this only applies when the
         # caller names the strategy (or --all).
+        # YANG_20261025: pass position_pct to ALL strategies (selfbuilt 全仓口令).
+        kwargs = {"position_pct": args.position_pct}
         if sid in ("jev_strength_v1", "factor_jev_strength_v1"):
-            out.append(
-                get_strategy(
-                    sid,
-                    min_jev_strength=args.min_jev_strength,
-                    position_pct=args.position_pct,
-                )
-            )
-        else:
-            out.append(get_strategy(sid))
+            kwargs["min_jev_strength"] = args.min_jev_strength
+        out.append(get_strategy(sid, **kwargs))
     return out
 
 
@@ -325,7 +322,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--purpose",
-        choices=(PURPOSE_LIVE_CANDIDATE, PURPOSE_SAMPLE),
+        choices=(
+            PURPOSE_LIVE_CANDIDATE,
+            PURPOSE_SAMPLE,
+            PURPOSE_SHADOW_010,
+            PURPOSE_SHADOW_SELFBUILT_A,
+        ),
         default=None,
         help=(
             "Why this run emits decision_log rows. "
@@ -422,9 +424,14 @@ def main(argv: list[str] | None = None) -> int:
         log.error("--shadow-liq-cohorts requires --output-db != --db (isolation)")
         return 2
     if args.shadow_liq_cohorts or out_db != db_path:
-        if purpose != "shadow_010":
-            log.warning("shadow mode: forcing purpose=shadow_010 (was %s)", purpose)
-        purpose = "shadow_010"
+        # Keep an explicit shadow_* purpose (e.g. shadow_selfbuilt_a); otherwise
+        # isolate to shadow_010 so output-db never writes paper-eligible rows.
+        if str(purpose).startswith("shadow_"):
+            log.info("shadow mode: keeping purpose=%s (output-db isolation)", purpose)
+        else:
+            if purpose != PURPOSE_SHADOW_010:
+                log.warning("shadow mode: forcing purpose=%s (was %s)", PURPOSE_SHADOW_010, purpose)
+            purpose = PURPOSE_SHADOW_010
     risk = ShadowCohortRisk() if args.shadow_liq_cohorts else RiskManager()
     if isinstance(risk, ShadowCohortRisk):
         risk.read_db = db_path

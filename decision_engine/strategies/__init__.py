@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 from decision_engine.strategies.combined_strategy import CombinedJevTechStrategy
 from decision_engine.strategies.factor_strategy import FactorStrategy
 from decision_engine.strategies.jev_strategy import JevStrengthStrategy
+from decision_engine.strategies.selfbuilt_momentum_a import SelfbuiltMomentumAStrategy
 from decision_engine.strategies.tech_strategy import TechMomentumStrategy
 
 # Legacy strategies stay registered (behavior unchanged; regression baseline).
@@ -17,6 +18,7 @@ STRATEGY_REGISTRY: dict[str, type] = {
     JevStrengthStrategy.strategy_id: JevStrengthStrategy,
     TechMomentumStrategy.strategy_id: TechMomentumStrategy,
     CombinedJevTechStrategy.strategy_id: CombinedJevTechStrategy,
+    SelfbuiltMomentumAStrategy.strategy_id: SelfbuiltMomentumAStrategy,
 }
 
 # Plan 03: factor_ combos. Tuple is (buy, sell, sell_params, mode).
@@ -88,6 +90,7 @@ STRATEGY_ALIASES: dict[str, str] = {
     "jev": "jev_strength_v1",
     "tech": "tech_momentum_v1",
     "combined": "combined_jev_tech_v1",
+    "selfbuilt_a": "selfbuilt_momentum_a_v1",
 }
 
 

@@ -56,7 +56,7 @@ def _rows(db: Path) -> list[sqlite3.Row]:
 
 class PurposeEnumTests(unittest.TestCase):
     def test_documented_values(self) -> None:
-        self.assertEqual(PURPOSES, frozenset({PURPOSE_SAMPLE, PURPOSE_LIVE_CANDIDATE, "shadow_010"}))
+        self.assertEqual(PURPOSES, frozenset({PURPOSE_SAMPLE, PURPOSE_LIVE_CANDIDATE, "shadow_010", "shadow_selfbuilt_a"}))
         self.assertEqual(DEFAULT_PURPOSE, PURPOSE_LIVE_CANDIDATE)
 
     def test_resident_loop_and_once_default_live_candidate(self) -> None:
