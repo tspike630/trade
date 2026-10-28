@@ -1,6 +1,6 @@
 # Decision Engine — 警示事例（执行单 → 已有控制）
 
-**Time (HK / UTC+8):** 2026-10-17 ~10:15 HKT（假因子/拥挤 + Alpha衰减误判）  
+**Time (HK / UTC+8):** 2026-10-17 00:32 HKT（假因子/拥挤加速衰减）  
 **用途：** 把执行单 / 看板平仓旁证里的三条警示，映射到**已经有的**控制。不新造阈值，不改代码默认。
 
 本文件**不算有效性**。不改 `JEV_MIN_STRENGTH`（仍是 **0.3**）、因子权重、`DECISION_COOLDOWN_SEC` 代码默认（仍是 **0**）、`DECISION_MIN_LIQ_USD` 默认（仍是 **50000**）。临时 `--min-jev-strength 0.15` 且 `purpose=live_candidate` 的行保持未标记，不得标成 accepted。2026-10-19 周检的 cooldown / `min_liq` 分桶 / 临时 0.15 三行仍是观察登记，见 `DECISION_ENGINE_WEEKLY_CHECK.md`。
@@ -74,18 +74,6 @@
 
 **不算有效性。** 不改 `JEV_MIN_STRENGTH`（0.3）、`DECISION_MIN_LIQ_USD`（50000）、`DECISION_COOLDOWN_SEC` 代码默认（0）、TP/SL。候选≠生效。
 
-## Alpha 衰减误判（2026-10-17 旁证）
-
-来源：`docs/ALPHA_DECAY_DIALECTIC_2026-10-17.md`（#92）+ 跨层补丁 `docs/ALPHA_DECAY_CROSS_LAYER_2026-10-17.md`（Early Bird / Cong–Victor / Lou–Polk / 执行 CFM·FlashBoys）。**不算有效性。不改运行参。**
-
-| 警示 | 看到什么 | 已有控制 / 登记 | 不要做 |
-|------|----------|-----------------|--------|
-| **执行侵蚀误判为 Alpha 死亡** | 止损占亏主导（纸面旁证可至 ~71%）、半胜仍亏、图谱「滑点吞噬 Alpha」 | #71 硬旁证；上文「半胜仍亏」；滑点/止损 = **退出质量**，不是 JEV 信号失效 | 不要否决 JEV；不要盘中改 strength / hold / TP / SL；不要把执行亏写成「真衰减」去下线策略 |
-| **半衰期冲动缩仓** | 「信号只能持有更短 → 动态缩 hold / 拧 TP」 | hold60、cooldown 观察；文献半衰期多为**月级**，与我方 5s paper loop 不是同一调参证据 | 不要动态缩短 `max_hold`；不要拧 TP/SL |
-| **拥挤熔断冲动** | 日均 buy↑、unique/buy↓、图谱「高拥挤降杠杆」、**衰减残差当 crowding** | **#78** 只旁证、强制入周检健康度笔记；**不否决 Step2**；2512.11913：残差≠拥挤识别 | 不要升格硬否决；不要用衰减残差升格 #78；不要据此改 cooldown / min_liq / strength |
-| **公开特征商品化误读为新 Alpha** | 公共量价/标签可见度↑、再叠浅层 Dex 量价「新因子」 | Early Bird 宣传窗后收益消散；INTEL/浅层量价**权重 0**；交叉补丁 §3(c) | 不要加权重或接线；不要把商品化供给当边际 alpha |
-| **假量/洗盘污染误读为信号** | 短窗成交量飙升、图谱「对倒假放量」、LPI 叙事 | Cong/Victor + **Midsummer 2507.01963**（高收益 meme wash/LPI 文内 82.8%）；AMM/LPI **不可**照搬进闸；`high_bot_skip` **未接** | 不要把量飙升当买入信号；不要接 skip；**不要把 70%/30%/82.8% 拷进过滤** |
-
 ## 归属
 
 | 项 | 谁做 | 本文件 |
@@ -102,4 +90,19 @@
 - **M-6**：高信心≠高收益，信号强度≠胜率（PolyBench / Prediction Arena）。只作解读，不加新过滤。临时 `purpose=live_candidate` 且 `--min-jev-strength 0.15` 的行保持未标记，**不算有效性**。第二批文献（Prophet Arena / LiveTradeBench / When Agents Trade / FinPos / PredictionMarketBench）同样只作解读：**校准好 ≠ 赚钱**，**回测好看 ≠ 有效**；已被本条与 M-1 功效脚注覆盖（`DECISION_ENGINE_WEEKLY_CHECK.md`「统计功效标注」，[#54](https://github.com/tspike630/trade/pull/54)）。**不加新过滤。**
 - 文献映射（第一批不上 LLM 决策主路径、不上 agent 栈；第二批只读；**AlphaAgent 准入三门槛**）见 `DECISION_ENGINE_RESEARCH_MAPPING.md`（`crawler/` 同文）。
 - **假因子 / 拥挤加速衰减**（#78 健康度旁证强制入周检笔记；INTEL 权重0裸跑风险）：只旁证，不改运行参，不否决 Step2。
-- **Alpha 衰减误判**（执行侵蚀≠信号失效；半衰期勿缩 hold；拥挤勿熔断；**公开特征商品化**勿叠量价；**假量污染**勿当信号、不接 `high_bot_skip`）：见上文；#92 `docs/ALPHA_DECAY_DIALECTIC_2026-10-17.md` + 跨层 `docs/ALPHA_DECAY_CROSS_LAYER_2026-10-17.md`。**不改** strength / min_liq / cooldown / TP/SL / hold / max_open。
+
+
+## W-2026-10-21 前沿周研警示（只读）
+
+- **最优格≠edge**：多格搜索后挑最好的一格必带选择偏差（Bailey & López de Prado DSR/PBO）；报最优格须附累计试验数，C4 单流预登记为准。
+- **止损不必然止损**：随机游走下止损溢价恒负（Kaminski & Lo）；止损占负高先查亏损段是动量还是回复，不据此删止损（meme 有归零尾部）。
+- **假热度**：高涨幅 meme 多数带刷量/LPI 证据（arXiv:2507.01963）；量与热度特征可读性打折，不据此直接加过滤。
+
+
+## W-2026-10-28 前沿周研警示（只读）
+
+- **φ≠执行误判：** AI 采纳 \(\phi\)（arXiv:2605.23905）量的是信号生产不是执行；半胜仍亏/止损占亏先走 #71/#72 退出质量，禁止写成「信号灭绝」。18mo 半衰期禁止迁 meme。
+- **半衰期冲动缩仓：** depth-not-strength（arXiv:2607.02695）→ 半衰期不含 \(g(0)\)；禁止因「强度弱/半衰期短」拧 hold/TP/SL。
+- **拥挤熔断冲动：** 拥挤=预报互可压缩（同文）；#78 只健康度旁证，禁止毛敞口熔断。
+- **阳性 LLM 因子目录：** 审计 arXiv:2610.29500 — 度量粒混母体 + 丢掉负 OOS →「零反转」无信息；正 IC≠可交易；继续 #90 三门槛 + 不上 LLM 主路径。
+- **榜单 PnL 污染：** Bitquery Pump.fun（2026-10-22）六位数赢利仅约 26% 真交易利润；展示聪明钱≠可复制；不接 `high_bot_skip`、不改评分权。

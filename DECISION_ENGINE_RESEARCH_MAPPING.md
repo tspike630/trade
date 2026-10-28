@@ -74,3 +74,29 @@ Prophet Arena、LiveTradeBench、When Agents Trade、FinPos、PredictionMarketBe
 4. **拥挤/半衰期。** 本轮无新自读全文，沿用 `crawler/docs/ALPHA_DECAY_DIALECTIC_2026-10-17.md` 口径，不重复。
 
 对照现有机制：#71/#72 硬旁证门槛不变；#78 拥挤健康度仍只作旁证；#90 AlphaAgent 三门槛对新候选（池龄分层若要升格）照用。警示映射见 `DECISION_ENGINE_WARNING_CASES.md`。
+
+
+## 量化失效前沿周研 2026-10-28（只读，不改闸）
+
+决策侧自读全文/可核验 HTML；与指标/复盘同日笔记交叉但不冒充未自读。**不算有效性**；不改 TP/SL/hold/cooldown/min_liq/strength/max_open；不上 LLM 决策主路径；不接 `high_bot_skip`。live/#71 关；禁注资。详页：`docs/QUANT_DECAY_FRONTIER_WEEKLY_DECISION_2026-10-28.md`。
+
+### URL 清单（防漏读）
+
+| URL | 状态 | 一句机制摘录 |
+|-----|------|--------------|
+| [Meng & Chen arXiv:2605.23905](https://arxiv.org/html/2605.23905) / [PDF](https://arxiv.org/pdf/2605.23905.pdf) | 已打开 | \(h(\phi)=\ln2/[\theta+\delta(\phi)]\)；**\(\phi\)=信号生产/组合权重，≠算法执行**；拥挤走相关预测；18mo vs 5–7yr 为权益/13F 仿真标定 |
+| [Noguer i Alonso arXiv:2607.02695](https://arxiv.org/html/2607.02695) / [PDF](https://arxiv.org/pdf/2607.02695.pdf) | 已打开 | \(t_{1/2}=\ln2/(\lambda\gamma)\)；**depth-not-strength**（半衰期不含 \(g(0)\)）；拥挤=预报流互可压缩；发表=市场预算一次性上跳；agentic 同质化加速浅带衰减 |
+| [He arXiv:2610.29500](https://arxiv.org/html/2610.29500) / [PDF](https://arxiv.org/pdf/2610.29500.pdf) | 已打开 | LLM 挖因审计：度量粒混母体 + 阳性保留目录使「零反转」无信息；全队列 923 可计分中 671+/252− rank-IC，且朴素参照亦为正 → **正 IC≠增量技能/可交易利润** |
+| [Bitquery Pump.fun $100K wins](https://bitquery.io/investigations/who-got-rich-on-pumpfun) | 已打开 | 3170 笔 ≥$100K 账面 $752.5M：约 **26%** 真买卖利润、**51%** 手递手、**13%** wash loop；Top25 中 15/25 为 wash；展示 PnL≠可复制 alpha |
+| [Wu & Yang Det-MASO arXiv:2610.34936](https://arxiv.org/pdf/2610.34936.pdf) | 已打开 | 多智能体共享目标易因子同质化；log-det 相关惩罚保多样性；报告 IC+1.1%/Sharpe+0.33（A股/美股日频） |
+| [Chorok Lee arXiv:2512.11913](https://arxiv.org/abs/2512.11913) | 打开失败 | 已撤稿（v2）；ar5iv HTML「No content」；**永不引作证据** |
+| Fuji 2610.35738 / LineageEvo 2610.29663 / Pockets of predictability | 延后 | 指标/采集已全文；本轮决策未自读，不引用其数字 |
+
+### 辩证对照（对照 #71/#72/#78/#90 与现网 paper）
+
+1. **执行侵蚀 ≠ 信号失效（φ 钉死分栏）。** 2605 显式：\(\phi\) 量信号生产，不含 VWAP/路由。现网半胜仍亏、止损占亏、MAX_OPEN=1、hold≈60、日损拒单 → **#71/#72 退出质量栏**，不是「α 半衰期耗尽 / 信号灭绝」。夸大勿跟：18mo/5–7yr **禁止**迁 Solana meme。可进周检观察脚注：凡写「衰减」须标明属执行栏还是信号栏。
+2. **真假衰减 / 半衰期冲动（depth-not-strength）。** 2607：半衰期由浅度 \(\lambda\)×群体预算增速 \(\gamma\) 决定，**与信号强度 \(g(0)\) 无关**。对照 meme 5s·hold60：持仓错配叙事 ≠ 证据要拧 hold/TP。夸大勿跟：动态缩 hold / 跟半衰期拧参。可进周检观察脚注：禁止用「强度变弱」单独论证缩 hold。
+3. **拥挤（#78）。** 2607 拥挤=预报互可压缩，非仅毛敞口；2605 拥挤通道=相关预测。→ **#78 继续只健康度旁证、不熔断**；监视语言可写信号同质化/互相关。夸大勿跟：毛名义敞口自动熔断、拥挤选因子赚 alpha（2512 撤稿且其自身也写 crowding 不产生均值 alpha）。
+4. **LLM/假因子/公开特征商品化。** 2610.29500 强化 #90：全队列保留负例 + 度量粒对齐；阳性目录≠OOS 泛化。Det-MASO 同质化机制支持「候选池勿堆同构动量变体」**文档纪律**，回测增益错数量级、**不上 LLM 主路径**。Bitquery：榜单/聪明钱 PnL 可读性污染；**不接 high_bot_skip**。夸大勿跟：把 26% 写成「全市场洗盘率」或「JEV/自建 A 已证伪」。
+
+**本轮故意不改：** strength / cooldown / min_liq / TP / SL / hold / max_open / SIZE_MULT；live/#71；禁注资；不接 high_bot_skip。
