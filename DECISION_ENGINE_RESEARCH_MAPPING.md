@@ -100,3 +100,17 @@ Prophet Arena、LiveTradeBench、When Agents Trade、FinPos、PredictionMarketBe
 4. **LLM/假因子/公开特征商品化。** 2610.29500 强化 #90：全队列保留负例 + 度量粒对齐；阳性目录≠OOS 泛化。Det-MASO 同质化机制支持「候选池勿堆同构动量变体」**文档纪律**，回测增益错数量级、**不上 LLM 主路径**。Bitquery：榜单/聪明钱 PnL 可读性污染；**不接 high_bot_skip**。夸大勿跟：把 26% 写成「全市场洗盘率」或「JEV/自建 A 已证伪」。
 
 **本轮故意不改：** strength / cooldown / min_liq / TP / SL / hold / max_open / SIZE_MULT；live/#71；禁注资；不接 high_bot_skip。
+
+### 2026-10-28 补读（估参幻觉 / MRP / Profit Mirage / MEV）
+
+| URL | 状态 | 一句机制摘录 |
+|-----|------|--------------|
+| [Gonçalves et al. 2024 OOS Alphas](https://finance-conference.wpcarey.asu.edu/sites/g/files/litvpz3416/files/2025-01/Out-of-Sample%20Alphas%20Post%20Publication.pdf) | 已打开 | 发表后 IS 仍正；pre-pub 权重 OS 均值≈−0.7% → 估参不可收获 |
+| [Dadoo & Gao 2026](https://journals.gmu.edu/index.php/jssr/article/view/5634) | 已打开摘要 | 0.61→0.42→0.30；发表 kink 在年 FE 后≈0 |
+| [MRP / Alexander–Fabozzi](https://arxiv.org/pdf/2604.08356.pdf) | 已打开 | 最差制度夏普=衰减风险诊断 |
+| [Profit Mirage 2510.07920](https://arxiv.org/pdf/2510.07920.pdf) | 已打开 | 知识截止后蒸发 + 预训练泄漏 → 不上 LLM 主路径 |
+| [MEV Slip 2309.13648](https://arxiv.org/pdf/2309.13648.pdf) | 已打开 | PEPE 对抗滑点概率约+80% vs USDC；对照 #71/#72 |
+| [Deng–Zhou 2411.05803](https://arxiv.org/pdf/2411.05803.pdf) | 已打开 | 流动性跳+扩散洗盘检测；观察不改权 |
+| Hua/Brogaard SSRN | 打开失败 | — |
+
+可进周检观察脚注；不算有效性；不改闸。

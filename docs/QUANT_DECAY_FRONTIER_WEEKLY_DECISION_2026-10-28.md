@@ -55,3 +55,19 @@
 ## 群结论意向
 
 有可核对新机制（φ≠exec、depth-not-strength、LLM 审计、榜单 PnL 污染）→ 短中文贴「我要赚米」；不改闸。
+
+## 补读增量（同日执行器核验，决策自打开）
+
+相对上文首轮帖的**新增**已打开条目：
+
+| URL | 状态 | 一句机制 |
+|-----|------|----------|
+| [Gonçalves/Loudis/Ogden 2024 PDF](https://finance-conference.wpcarey.asu.edu/sites/g/files/litvpz3416/files/2025-01/Out-of-Sample%20Alphas%20Post%20Publication.pdf) | 已打开 | 发表后 IS alpha 仍正；用**发表前最优权重**算 OS 均值约 **−0.7%≈0** → 估参不可收获 ≠ 单纯拥挤死亡 |
+| [Dadoo & Gao 2026 JSSR](https://journals.gmu.edu/index.php/jssr/article/view/5634) | 已打开（摘要 HTML；全文 PDF 404） | 0.61→0.42→0.30%/月（−51%）；堆叠 DiD 发表拐点在 cohort×年 FE 后 −0.05（t=−0.6）→ 多为 OOS/风格，非发表日猝死 |
+| [Alexander & Fabozzi MRP](https://arxiv.org/pdf/2604.08356.pdf)（本地 `strategy_decay.pdf`） | 已打开 | MRP＝跨制度最差风险调整收益；高全样本 Sharpe ≠ 耐用 |
+| [Profit Mirage arXiv:2510.07920](https://arxiv.org/pdf/2510.07920.pdf) | 已打开 | LLM 过知识截止后收益蒸发（文称约 50–62% 量级衰减）+ 预训练泄漏/记忆；FinLeak-Bench |
+| [Don’t Let MEV Slip arXiv:2309.13648](https://arxiv.org/pdf/2309.13648.pdf) | 已打开 | PEPE 对抗滑点概率约 **+80%** vs USDC；大单冲击+滑点主导（ETH Uniswap，量级勿硬迁 Solana） |
+| [Deng & Zhou wash liq jump/diffusion](https://arxiv.org/pdf/2411.05803.pdf) | 已打开 | 流动性跳+扩散联合抬升刻画洗盘；量价可读性污染观察 |
+| Hua/Brogaard SSRN | 打开失败（403） | — |
+
+**辩证补丁：** 估参幻觉（Gonçalves）与「发表猝死」弱化（Dadoo）→ 短窗仍有 IC/半胜 ≠ live edge，也勿把每次 OOS 下滑写成拥挤死亡。MRP 只作周检观察诊断。Profit Mirage 泄漏通道加固不上 LLM 主路径（相对 #90 同质化另加一条）。MEV/PEPE → #71/#72 退出质量栏，执行≠信号失效。
