@@ -23,3 +23,18 @@
 | D-2 | 用 txns/笔数做强度或质量证据时，须并报平均每笔金额；单看笔数不算证据 | 纪律 |
 
 未读全文、不引用：SSRN 7555279（打开失败，延后 10-28）。
+
+## 2026-10-28 · IC/alpha 半衰期 × 执行≠信号死 × LLM 同质化反例
+
+文献（均已读全文；2511.08571 Forecast-to-Fill **显式延后**，不引用）：
+- Meng & Chen, *AI-Driven Alpha Decay…*, arXiv:2605.23905：\(h(\phi)=\ln2/[\theta+\delta(\phi)]\)；\(\phi\) = AI **信号生产/组合**占比，**不是**算法执行；基线标定约 18 月 vs pre-AI 5–7 年（权益/13F **校准仿真**）；competence illusion；signal extinction cascade。
+- Noguer i Alonso, *Financial Epiplexity…*, arXiv:2607.02695 §8：\(t_{1/2}=\ln2/(\lambda\gamma)\)；**depth-not-strength**（半衰期不含 \(g(0)\)）；拥挤≈预测流互可压缩；容量≈交易比特泄漏；§10.7 同质化基础模型 → 浅带衰减最快。
+
+| 编号 | 内容 | 状态 |
+|---|---|---|
+| OBS-W1028-R1 | 文献 \(\phi\)=信号生产 ≠ 执行算法 → 周检/归因分栏：I-3 滑点、日损拒单、MAX_OPEN、短 hold = **执行/约束伪衰减**；半胜仍亏先查退出质量（#71/#72）。**禁止**把 18mo/5–7yr 迁到 Solana meme 或写成「信号已死」 | 只文档；零改闸 |
+| OBS-W1028-R2 | \(t_{1/2}=\ln2/(\lambda\gamma)\) + 拥挤=预报互可压缩 → #78 继续**只健康度旁证、不熔断**；监视语言可用信号/预报同质化，禁止毛名义敞口自动熔断 | 只文档；加固既有 #78 |
+| D-3 | 不上 LLM 主信号：Epiplexity agentic 同质化 + Meng Red Queen 作**反例加固**；不登记 LLM 主链、不进 M-A*；衰减≠JEV 证伪 | 纪律 |
+
+全文辩证：`docs/QUANT_DECAY_FRONTIER_WEEKLY_2026-10-28_REVIEW.md`；R1 脚注草案：`docs/OBS_W1028_REVIEW_phi_vs_exec_and_depth.md`。
+相对 10-21/10-26/指标 10-28：机制族内已知，**新增**可落文档点仅为 \(\phi\)≠执行分栏与 depth-not-strength/#78 语言；**无**运行时参数变更。
