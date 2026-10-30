@@ -46,8 +46,16 @@ PURPOSE_SAMPLE = "sample"
 PURPOSE_LIVE_CANDIDATE = "live_candidate"
 PURPOSE_SHADOW_010 = "shadow_010"  # shadow entry book; never paper-eligible (gateway rejects)
 PURPOSE_SHADOW_SELFBUILT_A = "shadow_selfbuilt_a"  # parallel selfbuilt A; never paper-eligible
+# Entry sidebook B1. shadow_ prefix so the main gateway rejects it. Not a live_candidate rule.
+PURPOSE_SHADOW_ENTRY_IH_GE1H = "shadow_entry_ih_ge1h"
 PURPOSES = frozenset(
-    {PURPOSE_SAMPLE, PURPOSE_LIVE_CANDIDATE, PURPOSE_SHADOW_010, PURPOSE_SHADOW_SELFBUILT_A}
+    {
+        PURPOSE_SAMPLE,
+        PURPOSE_LIVE_CANDIDATE,
+        PURPOSE_SHADOW_010,
+        PURPOSE_SHADOW_SELFBUILT_A,
+        PURPOSE_SHADOW_ENTRY_IH_GE1H,
+    }
 )
 DEFAULT_PURPOSE = PURPOSE_LIVE_CANDIDATE
 

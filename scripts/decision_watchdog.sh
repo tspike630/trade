@@ -38,6 +38,12 @@ while true; do
   ensure_one selfbuilt_a_live \
     'strategy selfbuilt_momentum_a_v1 .*--purpose live_candidate' \
     '-m decision_engine.run --strategy selfbuilt_momentum_a_v1 --dry-run --interval 60 --purpose live_candidate --limit 2000 --token-cooldown-min 60 --position-pct 0.05'
+  # Entry sidebook B1. Default off. The live_candidate command above is unchanged.
+  if [[ "${DECISION_ENTRY_IH_SIDEBOOK:-0}" == "1" ]]; then
+    ensure_one entry_ih_ge1h \
+      'strategy selfbuilt_momentum_a_v1 .*--purpose shadow_entry_ih_ge1h' \
+      "-m decision_engine.run --strategy selfbuilt_momentum_a_v1 --dry-run --interval 60 --purpose shadow_entry_ih_ge1h --limit 2000 --token-cooldown-min 60 --position-pct 0.05 --entry-ih-min-hours 1.0 --output-db $ROOT/decision_entry_ih_ge1h.db"
+  fi
   rewrite_role
   sleep 120
 done

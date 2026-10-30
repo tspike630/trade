@@ -320,6 +320,71 @@ class IndicatorDataAdapter:
         )
         return self._attach_jev_stance(self._attach_liquidity([dict(r) for r in rows]))
 
+    def latest_indicator_history_recorded_at(
+        self,
+        chain_id: str,
+        token_address: str,
+        pair_address: str | None = None,
+    ) -> str | None:
+        """Latest indicator_history.recorded_at for this token, else None.
+
+        History is token-keyed (chain_id, token_address) when that column
+        exists. A pair column is used only when the table has no
+        token_address column. Missing table, missing row, or blank timestamp
+        returns None — never ``0``.
+        """
+        if not self._table_exists("indicator_history"):
+            return None
+        cols = self._table_columns("indicator_history")
+        if "recorded_at" not in cols or "chain_id" not in cols:
+            return None
+        chain = str(chain_id or "").strip()
+        if not chain:
+            return None
+
+        def _latest(where_sql: str, params: tuple[Any, ...]) -> str | None:
+            try:
+                row = self.conn.execute(
+                    f"""
+                    SELECT recorded_at FROM indicator_history
+                    WHERE {where_sql}
+                      AND recorded_at IS NOT NULL
+                      AND TRIM(recorded_at) != ''
+                    ORDER BY recorded_at DESC
+                    LIMIT 1
+                    """,
+                    params,
+                ).fetchone()
+            except sqlite3.Error as exc:
+                log.warning("indicator_history recorded_at lookup failed: %s", exc)
+                return None
+            if row is None or row["recorded_at"] is None:
+                return None
+            text = str(row["recorded_at"]).strip()
+            return text or None
+
+        if "token_address" in cols:
+            token = str(token_address or "").strip()
+            if not token:
+                return None
+            return _latest(
+                "chain_id = ? AND token_address = ?",
+                (chain, token),
+            )
+
+        pair_col: str | None = None
+        if "pair_address" in cols:
+            pair_col = "pair_address"
+        elif "primary_pair_address" in cols:
+            pair_col = "primary_pair_address"
+        pair = None if pair_address is None else str(pair_address).strip() or None
+        if pair_col is None or pair is None:
+            return None
+        return _latest(
+            f"chain_id = ? AND {pair_col} = ?",
+            (chain, pair),
+        )
+
     def get_indicators(self, chain_id: str, token_address: str) -> dict[str, Any] | None:
         if not self._table_exists("token_indicators"):
             return None
