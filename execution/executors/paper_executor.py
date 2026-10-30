@@ -34,6 +34,9 @@ DEFAULT_SL_PCT = 5.0
 DEFAULT_MAX_HOLD_MIN = 60.0
 EXECUTOR_NAME = "paper"
 PAPER_SIZE_MULT_ENV = "EXECUTION_PAPER_SIZE_MULT"
+PAPER_TP_PCT_ENV = "EXECUTION_PAPER_TP_PCT"
+PAPER_SL_PCT_ENV = "EXECUTION_PAPER_SL_PCT"
+PAPER_MAX_HOLD_MIN_ENV = "EXECUTION_PAPER_MAX_HOLD_MIN"
 
 
 def paper_size_mult() -> float:
@@ -149,13 +152,43 @@ def _pick_float(sources: list[dict[str, Any]], keys: tuple[str, ...], default: f
     return float(default)
 
 
+def _env_float_or(name: str, hardcoded: float) -> float:
+    """Parse a positive-or-any finite env float; blank/bad → hardcoded default."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return float(hardcoded)
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return float(hardcoded)
+    if not math.isfinite(value):
+        return float(hardcoded)
+    return value
+
+
+def paper_tp_sl_hold_defaults() -> tuple[float, float, float]:
+    """Env-overridable paper TP/SL/hold defaults (peer exit synth).
+
+    ``EXECUTION_PAPER_TP_PCT`` / ``EXECUTION_PAPER_SL_PCT`` /
+    ``EXECUTION_PAPER_MAX_HOLD_MIN`` fill only when the signal omits the field.
+    Unset or unusable env keeps hardcoded DEFAULT_TP_PCT / DEFAULT_SL_PCT /
+    DEFAULT_MAX_HOLD_MIN (10 / 5 / 60). Does not touch SIZE_MULT / live / C-exit.
+    """
+    return (
+        _env_float_or(PAPER_TP_PCT_ENV, DEFAULT_TP_PCT),
+        _env_float_or(PAPER_SL_PCT_ENV, DEFAULT_SL_PCT),
+        _env_float_or(PAPER_MAX_HOLD_MIN_ENV, DEFAULT_MAX_HOLD_MIN),
+    )
+
+
 def tp_sl_hold_from_signal(sig: dict[str, Any]) -> tuple[float, float, float]:
     extras = sig.get("extras") if isinstance(sig.get("extras"), dict) else {}
     raw = sig.get("raw") if isinstance(sig.get("raw"), dict) else {}
     sources = [sig, extras, raw]
-    tp = _pick_float(sources, ("tp_pct", "tp"), DEFAULT_TP_PCT)
-    sl = _pick_float(sources, ("sl_pct", "sl"), DEFAULT_SL_PCT)
-    hold = _pick_float(sources, ("max_hold_min", "max_hold"), DEFAULT_MAX_HOLD_MIN)
+    tp_default, sl_default, hold_default = paper_tp_sl_hold_defaults()
+    tp = _pick_float(sources, ("tp_pct", "tp"), tp_default)
+    sl = _pick_float(sources, ("sl_pct", "sl"), sl_default)
+    hold = _pick_float(sources, ("max_hold_min", "max_hold"), hold_default)
     return tp, sl, hold
 
 
