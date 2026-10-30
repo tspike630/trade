@@ -6,6 +6,11 @@ CLI for execution management Step A/B/C.
   python -m execution.run --once --paper-enabled --paper-db /tmp/paper_smoke.db
   python -m execution.run --loop --paper-enabled --paper-tick
   # Step C PM_* env; default PM_ENABLED=0 (pass-through)
+  # Peer paper (isolated ledger + accept-purpose; never share main execution_ledger.db):
+  #   python -m execution.run --loop --paper-enabled --paper-tick \
+  #     --paper-db paper_eq_rsi_bounce.db \
+  #     --ledger execution_ledger_race_rsi_bounce.db \
+  #     --accept-purpose race_rsi_bounce
 """
 
 from __future__ import annotations
@@ -39,21 +44,99 @@ def _default_paper_db() -> str | None:
     )
 
 
-def _shadow_isolation_guard(explicit_db) -> str | None:
+def _parse_accept_purposes(
+    cli_values: list[str] | None,
+) -> frozenset[str] | None:
+    """CLI ``--accept-purpose`` (repeatable) or env ``EXECUTION_ACCEPT_PURPOSE``.
+
+    Returns None when unset → main-book default (live_candidate only).
+    A non-empty frozenset enables peer allowlist mode for this process.
+    """
+    values: list[str] = []
+    if cli_values:
+        values.extend(cli_values)
+    else:
+        env = os.environ.get("EXECUTION_ACCEPT_PURPOSE", "").strip()
+        if env:
+            values.extend(env.split(","))
+    cleaned = [v.strip() for v in values if v and str(v).strip()]
+    if not cleaned:
+        return None
+    return frozenset(cleaned)
+
+
+def _default_main_ledger_path() -> Path:
+    """Path of the shared main execution_ledger.db (no env / explicit override)."""
+    try:
+        from decision_engine.config import DB_PATH as _DE_DB
+
+        root = Path(_DE_DB).resolve().parent
+    except Exception:  # noqa: BLE001
+        root = _ROOT
+    return (root / "execution_ledger.db").resolve()
+
+
+def _peer_isolation_guard(
+    *,
+    accept_purposes: frozenset[str] | None,
+    ledger_path: Path,
+    paper_db: str | Path | None,
+    paper_enabled: bool,
+) -> str | None:
+    """When accept-purpose is set, require isolated ledger + non-main paper DB.
+
+    Prevents race_*/shadow_* fills from colliding on execution_ledger.db or
+    polluting paper_trading.db (the baseline peer book).
+    """
+    if accept_purposes is None:
+        return None
+    if not accept_purposes:
+        return "EXECUTION_ACCEPT_PURPOSE / --accept-purpose resolved empty"
+    main_ledger = _default_main_ledger_path()
+    if ledger_path.resolve() == main_ledger:
+        return (
+            "peer mode requires isolated --ledger / EXECUTION_LEDGER_PATH "
+            f"(not shared {main_ledger.name})"
+        )
+    if not paper_enabled:
+        return "peer mode (--accept-purpose) requires --paper-enabled"
+    if not paper_db or not str(paper_db).strip():
+        return "peer mode requires --paper-db / EXECUTION_PAPER_DB"
+    paper_path = Path(str(paper_db)).expanduser()
+    if not paper_path.is_absolute():
+        paper_path = (Path.cwd() / paper_path).resolve()
+    else:
+        paper_path = paper_path.resolve()
+    if paper_path.name == "paper_trading.db":
+        return (
+            "peer mode must not target paper_trading.db "
+            "(use paper_eq_*.db); race_*/shadow_* must not pollute main book"
+        )
+    return None
+
+
+def _shadow_isolation_guard(explicit_db, *, peer_mode: bool = False) -> str | None:
     """Main book must read dexscreener.db and never a shadow_* signal store.
 
     Set EXECUTION_ALLOW_NONSTANDARD_DECISION_DB=1 to skip the filename check
-    (tests / smoke runs on temp DBs). The shadow_* purpose check always applies.
+    (tests / smoke runs on temp DBs). The shadow_* purpose *row* check applies
+    to the main book; peer mode (accept-purpose set) skips it because the
+    purpose gate filters per process and peers may consume shadow_entry_*.
     """
-    import os
     import sqlite3
 
     from execution.gateway import resolve_decision_db
 
     path = resolve_decision_db(explicit_db)
-    allow = os.environ.get("EXECUTION_ALLOW_NONSTANDARD_DECISION_DB", "").strip() in ("1", "true", "yes")
+    allow = os.environ.get("EXECUTION_ALLOW_NONSTANDARD_DECISION_DB", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
     if path.name != "dexscreener.db" and not allow:
         return f"decision db {path} is not dexscreener.db"
+    if peer_mode:
+        return None
     if path.exists():
         try:
             con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -110,8 +193,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--ledger",
+        "--ledger-db",
+        dest="ledger",
         default=None,
-        help="execution_ledger.db path (default EXECUTION_LEDGER_PATH or next to main DB)",
+        help=(
+            "execution ledger sqlite path "
+            "(default EXECUTION_LEDGER_PATH / EXECUTION_LEDGER_DB or next to main DB). "
+            "Peer mode must pass an isolated path, not execution_ledger.db."
+        ),
+    )
+    parser.add_argument(
+        "--accept-purpose",
+        action="append",
+        default=None,
+        dest="accept_purpose",
+        help=(
+            "peer mode: decision_log.purpose allowlist for THIS process only "
+            "(repeatable). Env EXECUTION_ACCEPT_PURPOSE (comma-separated) when "
+            "flag omitted. Unset → main book live_candidate-only gate. "
+            "Requires isolated --ledger and --paper-db not paper_trading.db."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -168,13 +269,25 @@ def main(argv: list[str] | None = None) -> int:
     paper_enabled = bool(args.paper_enabled)
     paper_tick = bool(args.paper_tick) and paper_enabled
     pm_enabled = bool(args.pm_enabled)
+    accept_purposes = _parse_accept_purposes(args.accept_purpose)
+    peer_mode = accept_purposes is not None
 
     if paper_enabled and not args.paper_db:
         log.error("--paper-enabled requires --paper-db or EXECUTION_PAPER_DB / PAPER_DB_PATH")
         return 2
 
+    peer_err = _peer_isolation_guard(
+        accept_purposes=accept_purposes,
+        ledger_path=ledger_path,
+        paper_db=args.paper_db,
+        paper_enabled=paper_enabled,
+    )
+    if peer_err:
+        log.error("refusing to start: %s", peer_err)
+        return 2
+
     log.info(
-        "execution start once=%s interval=%s ledger=%s since_id=%s paper_enabled=%s paper_db=%s paper_tick=%s pm_enabled=%s",
+        "execution start once=%s interval=%s ledger=%s since_id=%s paper_enabled=%s paper_db=%s paper_tick=%s pm_enabled=%s accept_purposes=%s",
         run_once,
         interval,
         ledger_path,
@@ -183,9 +296,10 @@ def main(argv: list[str] | None = None) -> int:
         args.paper_db if paper_enabled else None,
         paper_tick,
         pm_enabled,
+        sorted(accept_purposes) if accept_purposes is not None else None,
     )
 
-    guard_err = _shadow_isolation_guard(args.db)
+    guard_err = _shadow_isolation_guard(args.db, peer_mode=peer_mode)
     if guard_err:
         log.error("refusing to start: %s", guard_err)
         return 2
@@ -196,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
         paper_enabled=paper_enabled,
         paper_db=args.paper_db if (paper_enabled or pm_enabled) else None,
         pm_enabled=pm_enabled,
+        accept_purposes=accept_purposes,
     ) as gw:
 
         def tick(since_id: int | None) -> dict:
@@ -217,6 +332,9 @@ def main(argv: list[str] | None = None) -> int:
                 "cursor": gw.ledger.get_last_processed_id(),
                 "paper_enabled": paper_enabled,
                 "pm_enabled": pm_enabled,
+                "accept_purposes": (
+                    sorted(accept_purposes) if accept_purposes is not None else None
+                ),
                 "paper_tick_closed": tick_actions,
                 "sample": stats.receipts[:3] if stats.receipts else [],
             }
