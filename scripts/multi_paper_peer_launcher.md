@@ -19,10 +19,11 @@
 
 Safety: when `--accept-purpose` is set, the process refuses to start if ledger resolves to the main `execution_ledger.db` or paper DB is `paper_trading.db`. Other purposes (including `live_candidate` unless listed) are rejected for that process.
 
-## Start the 5 race peers
+## Start peers (5 race_* + entry_ih)
 
 ```bash
 # After paper_eq_*.db exist (scripts/init_multi_paper_peers.sh):
+# decision PR#148: shadow_entry_ih_ge1h stream → decision_entry_ih_ge1h.db
 ./scripts/start_multi_paper_race_peers.sh
 ```
 
@@ -34,6 +35,14 @@ python -m execution.run --loop --paper-enabled --paper-tick \
   --ledger execution_ledger_race_rsi_bounce.db \
   --accept-purpose race_rsi_bounce
 # … selfbuilt_a / macd_cross / boll_breakout / tech_mom similarly
+
+# entry_ih sidebook (decision_entry_ih_ge1h.db — not dexscreener.db)
+EXECUTION_ALLOW_NONSTANDARD_DECISION_DB=1 \
+python -m execution.run --loop --paper-enabled --paper-tick \
+  --db decision_entry_ih_ge1h.db \
+  --paper-db paper_eq_entry_ih1h.db \
+  --ledger execution_ledger_shadow_entry_ih1h.db \
+  --accept-purpose shadow_entry_ih_ge1h
 ```
 
 ## Main baseline (unchanged)
@@ -49,15 +58,4 @@ python -m execution.run --loop
 python -m execution.c_exit_shadow_run --status
 # only if Yang unhalts:
 # python -m execution.c_exit_shadow_run --loop
-```
-
-## entry_ih peer (when decision stream exists)
-
-```bash
-python -m execution.run --loop --paper-enabled --paper-tick \
-  --paper-db paper_eq_entry_ih1h.db \
-  --ledger execution_ledger_shadow_entry_ih1h.db \
-  --accept-purpose shadow_entry_ih_ge1h
-# If signal DB is not dexscreener.db:
-#   EXECUTION_ALLOW_NONSTANDARD_DECISION_DB=1 --db decision_entry_ih_ge1h.db …
 ```
