@@ -1490,6 +1490,7 @@ def _render_chat(store: DataStore) -> None:
 
 
 def _clock_text() -> str:
+    """UTC wall clock for the header. No arguments; the row truncator is _short_stamp."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
@@ -2669,7 +2670,8 @@ def _v2_deploy_sha() -> None:
     ui.label(_DEPLOY_FOOT).classes("v2-note")
 
 
-def _clock_text(value: str | None) -> str:
+def _short_stamp(value: str | None) -> str:
+    """Truncate a stored timestamp for dense status rows such as recent JEV."""
     if not value:
         return "—"
     return value if len(value) <= 22 else value[:22]
@@ -2721,7 +2723,7 @@ def _v2_jev_clock(store: DataStore) -> None:
     strength = report.strength_positive
     strength_text = "—" if strength is None else str(strength)
     _v2_kv([
-        ("最近 JEV", _clock_text(report.max_jev_updated_at), "mute"),
+        ("最近 JEV", _short_stamp(report.max_jev_updated_at), "mute"),
         ("strength>0", strength_text, "mute"),
         ("24h BULLISH", bullish_text, "warn" if bullish == 0 else "mute"),
     ])
