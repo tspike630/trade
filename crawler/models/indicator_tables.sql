@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS token_indicators (
     change_1h REAL,
     change_4h REAL,
     change_24h REAL,
+    -- ~7d price change and mean daily volume. NULL when pair_history is short.
+    change_7d REAL,
+    volume_7d_avg REAL,
     volatility_24h REAL,
     volume_strength REAL,
     -- pandas-ta ADD-ON (weight 0; nullable)
@@ -74,6 +77,8 @@ CREATE TABLE IF NOT EXISTS indicator_history (
     change_1h REAL,
     change_4h REAL,
     change_24h REAL,
+    change_7d REAL,
+    volume_7d_avg REAL,
     volatility_24h REAL,
     volume_strength REAL,
     rsi_14 REAL,
