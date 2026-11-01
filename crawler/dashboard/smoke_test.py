@@ -5334,6 +5334,7 @@ class ObserveAsideSmokeTest(unittest.TestCase):
 
         texts = _rendered_card_texts(_render)
         self.assertIn("0", texts)
+        self.assertIn(fresh, texts)
         self.assertTrue(any(app_module._JEV_CLOCK_NAIL in text for text in texts))
 
     def test_equity_aside_drawdown_and_missing(self) -> None:
@@ -5379,6 +5380,25 @@ class ObserveAsideSmokeTest(unittest.TestCase):
         self.assertIn("span-4", inspect.getsource(app_module._mount_jev_clock))
         self.assertIn("span-4", inspect.getsource(app_module._mount_supply_wal))
         self.assertIn("span-4", inspect.getsource(app_module._mount_equity_aside))
+
+    def test_utc_clock_and_short_stamp_do_not_collide(self) -> None:
+        wall = app_module._clock_text()
+        self.assertRegex(wall, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$")
+        self.assertEqual(len(inspect.signature(app_module._clock_text).parameters), 0)
+        self.assertEqual(app_module._short_stamp(None), "—")
+        self.assertEqual(app_module._short_stamp(""), "—")
+        fresh = "2026-10-24T11:00:00Z"
+        self.assertEqual(app_module._short_stamp(fresh), fresh)
+        long = "2026-10-24T11:00:00.1234567890Z"
+        self.assertEqual(app_module._short_stamp(long), long[:22])
+        self.assertEqual(len(app_module._short_stamp(long)), 22)
+        source = Path(app_module.__file__).read_text(encoding="utf-8")
+        self.assertEqual(source.count("def _clock_text"), 1)
+        self.assertEqual(source.count("def _short_stamp"), 1)
+        self.assertIn("_clock_text()", inspect.getsource(app_module._render_dashboard))
+        jev_src = inspect.getsource(app_module._v2_jev_clock)
+        self.assertIn("_short_stamp(report.max_jev_updated_at)", jev_src)
+        self.assertNotIn("_clock_text(", jev_src)
 
     def test_supply_wal_card_renders_missing(self) -> None:
         os.environ["DASHBOARD_DB_ROOT"] = str(self.root)
