@@ -82,13 +82,30 @@ def _x_watch_max_rows() -> int:
         return 200
 
 
-def norm_chain(chain_id: str) -> str:
-    return chain_id.strip().lower()
+def _as_text(value: str | bytes | bytearray | memoryview | None) -> str | None:
+    """Coerce sqlite TEXT-or-BLOB payloads to str (post-rebuild BLOB affinity)."""
+    if value is None:
+        return None
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return str(value)
 
 
-def norm_address(address: str) -> str:
+def norm_chain(chain_id: str | bytes | bytearray | memoryview) -> str:
+    text = _as_text(chain_id)
+    if text is None:
+        raise TypeError("chain_id is required")
+    return text.strip().lower()
+
+
+def norm_address(address: str | bytes | bytearray | memoryview) -> str:
     """Force lowercase for stable PKs / batch keys (API accepts lowercased addrs)."""
-    return address.strip().lower()
+    text = _as_text(address)
+    if text is None:
+        raise TypeError("address is required")
+    return text.strip().lower()
 
 
 def fetch_latest_pair_price(

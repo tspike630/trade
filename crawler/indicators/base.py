@@ -159,9 +159,13 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def parse_iso(ts: str | None) -> datetime | None:
+def parse_iso(ts: str | bytes | bytearray | memoryview | None) -> datetime | None:
     if not ts:
         return None
+    if isinstance(ts, memoryview):
+        ts = ts.tobytes()
+    if isinstance(ts, (bytes, bytearray)):
+        ts = bytes(ts).decode("utf-8", "replace")
     try:
         return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
