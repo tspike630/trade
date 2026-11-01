@@ -28,6 +28,7 @@ INTERVAL_SEC = {
     "change_1h": 60 * 60,
     "change_4h": 4 * 60 * 60,
     "change_24h": 24 * 60 * 60,
+    "change_7d": 7 * 24 * 60 * 60,
 }
 
 # All updatable columns on token_indicators (excluding PK + updated_at)
@@ -37,6 +38,8 @@ TOKEN_INDICATOR_COLS = [
     "change_1h",
     "change_4h",
     "change_24h",
+    "change_7d",
+    "volume_7d_avg",
     "volatility_24h",
     "volume_strength",
     "rsi_14",
@@ -83,6 +86,8 @@ _HISTORY_FILL_IF_ABSENT = (
     "change_1h",
     "change_4h",
     "change_24h",
+    "change_7d",
+    "volume_7d_avg",
     "volatility_24h",
     "volume_strength",
     "rsi_14",
@@ -133,6 +138,9 @@ _MIGRATE_TOKEN_INDICATORS = [
     ("spike", "INTEGER"),
     # Technical freshness. Funding/sentiment/composite must not write this.
     ("tech_updated_at", "TEXT"),
+    # Lifecycle deltas (Spec A). NULL until pair_history covers the window.
+    ("change_7d", "REAL"),
+    ("volume_7d_avg", "REAL"),
     # JEV freshness (2026-10-21): age at compute time + verbatim stance
     ("jev_age_min", "REAL"),
     ("jev_stance_raw", "TEXT"),
@@ -153,6 +161,8 @@ _MIGRATE_INDICATOR_HISTORY = [
     ("spike", "INTEGER"),
     ("jev_age_min", "REAL"),
     ("jev_stance_raw", "TEXT"),
+    ("change_7d", "REAL"),
+    ("volume_7d_avg", "REAL"),
 ]
 
 def utc_now_iso() -> str:
@@ -461,8 +471,15 @@ class IndicatorStore:
         pair_address: str,
         *,
         since: str | None = None,
+        until: str | None = None,
         limit: int = 5000,
+        newest: bool = False,
     ) -> list[dict[str, Any]]:
+        """Pair snapshots in time order.
+
+        ``newest=True`` keeps the latest ``limit`` rows (then returns them
+        oldest-first). The default keeps the oldest ``limit`` rows.
+        """
         chain_id = norm_chain(chain_id)
         pair_address = norm_address(pair_address)
         limit = max(1, min(int(limit), 10000))
@@ -476,9 +493,18 @@ class IndicatorStore:
         if since:
             sql += " AND recorded_at >= ?"
             params.append(since)
-        sql += " ORDER BY recorded_at ASC LIMIT ?"
+        if until:
+            sql += " AND recorded_at <= ?"
+            params.append(until)
+        if newest:
+            sql += " ORDER BY recorded_at DESC, id DESC LIMIT ?"
+        else:
+            sql += " ORDER BY recorded_at ASC LIMIT ?"
         params.append(limit)
-        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+        rows = [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+        if newest:
+            rows.reverse()
+        return rows
 
     def load_token_history(
         self,
@@ -594,6 +620,7 @@ class IndicatorStore:
             INSERT INTO indicator_history (
                 chain_id, token_address, recorded_at,
                 change_5m, change_15m, change_1h, change_4h, change_24h,
+                change_7d, volume_7d_avg,
                 volatility_24h, volume_strength,
                 rsi_14, macd, macd_signal, macd_hist,
                 boll_upper, boll_mid, boll_lower,
@@ -603,7 +630,12 @@ class IndicatorStore:
                 spike_ratio, spike,
                 composite_score,
                 tier, primary_pair_address
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?
+            )
             """,
             (
                 chain_id,
@@ -614,6 +646,8 @@ class IndicatorStore:
                 payload.get("change_1h"),
                 payload.get("change_4h"),
                 payload.get("change_24h"),
+                payload.get("change_7d"),
+                payload.get("volume_7d_avg"),
                 payload.get("volatility_24h"),
                 payload.get("volume_strength"),
                 payload.get("rsi_14"),

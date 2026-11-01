@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from decision_engine import config as de_config
-from decision_engine.backtest.replay import merge_bar_rows
+from decision_engine.backtest.replay import HistoryReplay, merge_bar_rows
 from decision_engine.core.data_adapter import _INDICATOR_COLS, IndicatorDataAdapter
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import SignalBus
@@ -136,6 +136,10 @@ class BollColumnTests(unittest.TestCase):
         self.assertIn("boll_lower", _INDICATOR_COLS)
         self.assertNotIn("boll_up", _INDICATOR_COLS)
         self.assertNotIn("boll_low", _INDICATOR_COLS)
+        self.assertIn("change_7d", _INDICATOR_COLS)
+        self.assertIn("volume_7d_avg", _INDICATOR_COLS)
+        self.assertIn("change_7d", HistoryReplay._IND_COLS)
+        self.assertIn("volume_7d_avg", HistoryReplay._IND_COLS)
 
     def test_factor_reads_boll_upper(self) -> None:
         factor = BollBreakoutBuyFactor()

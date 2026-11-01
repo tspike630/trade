@@ -26,6 +26,8 @@ _INDICATOR_COLS = (
     "change_1h",
     "change_4h",
     "change_24h",
+    "change_7d",
+    "volume_7d_avg",
     "volatility_24h",
     "volume_strength",
     "jev_raw_score",

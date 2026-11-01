@@ -1,7 +1,10 @@
 """Technical indicators from pair_history: interval returns, volatility, volume strength.
 
 Also fills ADD-ON pandas-ta fields (rsi_14 / macd* / boll_*) via technical_lib.
-Existing change_*/volatility_24h/volume_strength logic is unchanged.
+change_pct / volatility_24h / volume_strength keep their formulas. The history
+load covers the 7d lookback plus the change_pct skew band so change_24h can
+see an anchor the old ~25h cutoff dropped. change_7d and volume_7d_avg stay
+NULL when that window is short.
 """
 
 from __future__ import annotations
@@ -41,6 +44,8 @@ TIER_FIELDS: dict[str, frozenset[str]] = {
             "change_1h",
             "change_4h",
             "change_24h",
+            "change_7d",
+            "volume_7d_avg",
             "volatility_24h",
             "volume_strength",
         }
@@ -51,6 +56,8 @@ TIER_FIELDS: dict[str, frozenset[str]] = {
             "change_1h",
             "change_4h",
             "change_24h",
+            "change_7d",
+            "volume_7d_avg",
             "volatility_24h",
             "volume_strength",
         }
@@ -59,6 +66,8 @@ TIER_FIELDS: dict[str, frozenset[str]] = {
         {
             "change_1h",
             "change_24h",
+            "change_7d",
+            "volume_7d_avg",
             "volume_strength",
         }
     ),
@@ -105,6 +114,11 @@ def _price_near(
     return None
 
 
+def _lookback_skew_sec(lookback_sec: float) -> float:
+    """Max |snapshot - target| accepted by change_pct. Upper bound is 6h."""
+    return min(max(float(lookback_sec) * 0.5, 120.0), 6 * 3600.0)
+
+
 def change_pct(
     series: list[dict[str, Any]],
     lookback_sec: int,
@@ -113,7 +127,8 @@ def change_pct(
 ) -> float | None:
     """
     (price_now - price_then) / price_then * 100.
-    price_then: snapshot nearest to now-lookback within skew = max(lookback*0.5, 120s).
+    price_then: snapshot nearest to now-lookback within skew = max(lookback*0.5, 120s),
+    capped at 6h.
     """
     if not series:
         return None
@@ -132,7 +147,7 @@ def change_pct(
     ref_now = now_epoch if now_epoch is not None else ep_now
     target = ref_now - lookback_sec
     # Allow generous skew for sparse cold history: half the lookback, min 2 min, max 6h
-    skew = min(max(lookback_sec * 0.5, 120.0), 6 * 3600.0)
+    skew = _lookback_skew_sec(lookback_sec)
     p_then = _price_near(priced, target, max_skew_sec=skew)
     if p_then is None or p_then <= 0:
         return None
@@ -225,6 +240,74 @@ def volume_strength(series: list[dict[str, Any]], *, window_sec: int = DEFAULT_V
     if mean_v <= 0:
         return None
     return current / mean_v
+
+
+def volume_7d_avg(
+    series: list[dict[str, Any]],
+    *,
+    now_epoch: float | None = None,
+) -> float | None:
+    """Mean daily volume over a ~7×24h window on one pair series.
+
+    Each 24h bucket contributes the latest ``volume_h24`` in that bucket
+    (already a trailing-day notional). The earliest reading must sit inside
+    the same skew ``change_pct`` uses for a 7d lookback, and at least two
+    buckets must have a reading. Empty buckets are left out.
+
+    Short history returns None. A lone ``volume_h24`` is not divided by 7,
+    and ``volume_h1`` is not scaled up to a day.
+    """
+    if not series:
+        return None
+    last_ep = to_epoch(series[-1].get("recorded_at"))
+    if last_ep is None:
+        return None
+    end = last_ep if now_epoch is None else now_epoch
+    window = float(INTERVAL_SEC["change_7d"])
+    day = 24 * 60 * 60
+    n_days = int(window // day)
+    if n_days < 2:
+        return None
+    target = end - window
+    skew = _lookback_skew_sec(window)
+    buckets: dict[int, tuple[float, float]] = {}
+    oldest: float | None = None
+    for row in series:
+        ep = to_epoch(row.get("recorded_at"))
+        vol = _num(row.get("volume_h24"))
+        if ep is None or vol is None or vol < 0:
+            continue
+        if ep < target - skew or ep > end + 60:
+            continue
+        if oldest is None or ep < oldest:
+            oldest = ep
+        idx = int((ep - target) // day)
+        if idx < 0:
+            idx = 0
+        elif idx > n_days - 1:
+            idx = n_days - 1
+        prev = buckets.get(idx)
+        if prev is None or ep >= prev[0]:
+            buckets[idx] = (ep, vol)
+    if oldest is None or oldest > target + skew or len(buckets) < 2:
+        return None
+    total = sum(vol for _ep, vol in buckets.values())
+    return total / len(buckets)
+
+
+def _iso_from_epoch(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _merge_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        key = (row.get("id"), row.get("recorded_at"), row.get("pair_address"))
+        merged[key] = row
+    return sorted(
+        merged.values(),
+        key=lambda row: (str(row.get("recorded_at") or ""), int(row.get("id") or 0)),
+    )
 
 
 def _token_key(tok: dict[str, Any]) -> tuple[str, str]:
@@ -354,6 +437,55 @@ class TechnicalIndicators:
         self.vol_window_sec = int(vol_window_sec)
         self.write_history_for_hot = write_history_for_hot
 
+    def _load_price_series(self, chain_id: str, pair: str) -> list[dict[str, Any]]:
+        """Primary-pair snapshots covering ~7d plus the change_pct skew band.
+
+        The previous window was the volatility window plus one hour (~25h).
+        change_24h still accepts an anchor up to 6h before that 24h mark, so
+        the short cutoff dropped valid prices and left the column NULL. A
+        capped read keeps the newest rows. If that tail starts after an
+        anchor band, the band is merged in. change_pct itself is unchanged.
+        """
+        span = (
+            max(self.vol_window_sec, INTERVAL_SEC["change_7d"])
+            + int(_lookback_skew_sec(INTERVAL_SEC["change_7d"]))
+            + 3600
+        )
+        since = (
+            datetime.now(timezone.utc) - timedelta(seconds=span)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        series = self.store.load_pair_history(
+            chain_id, pair, since=since, limit=10000, newest=True
+        )
+        if len(series) < 2:
+            series = self.store.load_pair_history(
+                chain_id, pair, limit=10000, newest=True
+            )
+        if len(series) < 1:
+            return series
+        last_ep = to_epoch(series[-1].get("recorded_at"))
+        first_ep = to_epoch(series[0].get("recorded_at"))
+        if last_ep is None or first_ep is None:
+            return series
+        extra: list[dict[str, Any]] = []
+        for lookback in (INTERVAL_SEC["change_24h"], INTERVAL_SEC["change_7d"]):
+            target = last_ep - lookback
+            skew = _lookback_skew_sec(lookback)
+            if first_ep <= target + skew:
+                continue
+            extra.extend(
+                self.store.load_pair_history(
+                    chain_id,
+                    pair,
+                    since=_iso_from_epoch(target - skew),
+                    until=_iso_from_epoch(target + skew),
+                    limit=500,
+                )
+            )
+        if not extra:
+            return series
+        return _merge_history([*series, *extra])
+
     def resolve_tier(self, chain_id: str, token_address: str) -> str:
         # Reuse crawler tier logic (hot/warm/cold from last_seen_at)
         try:
@@ -377,13 +509,7 @@ class TechnicalIndicators:
         if not primary:
             return None
 
-        # Load enough history for 24h lookback (+ buffer)
-        since_dt = datetime.now(timezone.utc) - timedelta(seconds=self.vol_window_sec + 3600)
-        since = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        series = self.store.load_pair_history(chain_id, primary, since=since, limit=5000)
-        if len(series) < 2:
-            # fall back to all history for this pair
-            series = self.store.load_pair_history(chain_id, primary, limit=5000)
+        series = self._load_price_series(chain_id, primary)
         if len(series) < 1:
             return None
 
@@ -408,6 +534,8 @@ class TechnicalIndicators:
             "change_1h",
             "change_4h",
             "change_24h",
+            "change_7d",
+            "volume_7d_avg",
             "volatility_24h",
             "volume_strength",
         )
@@ -421,6 +549,8 @@ class TechnicalIndicators:
                     out[key] = volume_strength(
                         series, window_sec=self.vol_window_sec
                     )
+                elif key == "volume_7d_avg":
+                    out[key] = volume_7d_avg(series)
                 else:
                     out[key] = change_pct(series, INTERVAL_SEC[key])
             elif prev is not None and prev.get(key) is not None:
