@@ -76,9 +76,11 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_iso(ts: str | None) -> datetime | None:
+def _parse_iso(ts: str | bytes | None) -> datetime | None:
     if not ts:
         return None
+    if isinstance(ts, (bytes, bytearray)):
+        ts = ts.decode("utf-8", errors="replace")
     try:
         if ts.endswith("Z"):
             return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -585,7 +587,8 @@ def check_indicators_p0(report: CheckReport, db_path: Path) -> None:
     # --- process presence (hints only; do not kill anything) ---
     patterns = {
         "main.py": "main.py",
-        "indicators.run": "indicators.run",
+        # scripts/run_indicators.py --loop 与 -m indicators.run 都算指标进程
+        "indicators.run": "run_indicators.py|indicators.run",
         "sources.jev": "sources.jev",
     }
     found: dict[str, list[int]] = {k: [] for k in patterns}
@@ -594,14 +597,19 @@ def check_indicators_p0(report: CheckReport, db_path: Path) -> None:
         import subprocess
 
         for label, pat in patterns.items():
-            try:
-                out = subprocess.check_output(
-                    ["pgrep", "-f", pat], text=True, stderr=subprocess.DEVNULL
-                )
-                pids = [int(x) for x in out.split() if x.strip().isdigit()]
-                found[label] = pids
-            except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-                found[label] = []
+            pids: list[int] = []
+            for piece in pat.split("|"):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                try:
+                    out = subprocess.check_output(
+                        ["pgrep", "-f", piece], text=True, stderr=subprocess.DEVNULL
+                    )
+                    pids.extend(int(x) for x in out.split() if x.strip().isdigit())
+                except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+                    pass
+            found[label] = sorted(set(pids))
     except Exception:  # noqa: BLE001
         pass
 
@@ -654,10 +662,17 @@ def check_indicators_p0(report: CheckReport, db_path: Path) -> None:
             ind_n = int(
                 conn.execute("SELECT COUNT(*) FROM token_indicators").fetchone()[0]
             )
+            # BLOB 残留行会抬高/搅乱 MAX；新鲜度只看 text 时间戳（指标侧约定）
             row = conn.execute(
-                "SELECT MAX(updated_at) AS m FROM token_indicators"
+                "SELECT MAX(updated_at) AS m FROM token_indicators "
+                "WHERE typeof(updated_at)='text'"
             ).fetchone()
             max_updated = row["m"] if row else None
+            if max_updated is None:
+                row = conn.execute(
+                    "SELECT MAX(updated_at) AS m FROM token_indicators"
+                ).fetchone()
+                max_updated = row["m"] if row else None
             try:
                 sent_n = int(
                     conn.execute(
@@ -1311,6 +1326,21 @@ def run_checks(*, db: str, stale_sec: int | None) -> CheckReport:
     return report
 
 
+def _json_sanitize(obj: Any) -> Any:
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="replace")
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(k, (bytes, bytearray)):
+                k = k.decode("utf-8", errors="replace")
+            out[k] = _json_sanitize(v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize(x) for x in obj]
+    return obj
+
+
 def write_json(report: CheckReport, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     day = _now_hk().strftime("%Y%m%d")
@@ -1322,6 +1352,7 @@ def write_json(report: CheckReport, out_dir: Path) -> Path:
         "exit_code": 1 if report.has_fail else 0,
         "checks": report.checks,
     }
+    payload = _json_sanitize(payload)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path
 
