@@ -49,11 +49,33 @@ DATE = datetime.now(HK).strftime("%Y%m%d")
 HORIZONS_H = (1, 4, 24, 168)  # 1h / 4h / 24h / 7d
 
 
-def parse_ts(s: str):
-    """Parse ISO recorded_at → aware UTC datetime. Returns None on failure."""
+def _as_iso_text(s):
+    """Normalize recorded_at cell to ISO text (handles post-rebuild BLOB stamps)."""
+    if s is None:
+        return None
+    if isinstance(s, memoryview):
+        s = s.tobytes()
+    if isinstance(s, (bytes, bytearray)):
+        try:
+            s = s.decode("utf-8")
+        except Exception:
+            return None
+    s = str(s).strip()
+    # Guard against accidental str(bytes) form: b'2026-...'
+    if len(s) >= 3 and s[0] == "b" and s[1] in ("'", '"') and s[-1] == s[1]:
+        s = s[2:-1]
+    return s or None
+
+
+def parse_ts(s):
+    """Parse ISO recorded_at → aware UTC datetime. Returns None on failure.
+
+    pair_history.recorded_at may be TEXT or BLOB (UTF-8 ISO). Prefer CAST AS TEXT
+    in SQL; this still accepts raw bytes from uncast queries.
+    """
+    s = _as_iso_text(s)
     if not s:
         return None
-    s = str(s).strip()
     try:
         if s.endswith("Z"):
             return datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -100,8 +122,9 @@ def main():
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_indicators'"
     ).fetchone()
 
+    # CAST AS TEXT so BLOB ISO stamps (post 10-31 rebuild) sort/compare with TEXT rows
     global_min, global_max, n_hist = conn.execute(
-        "SELECT MIN(recorded_at), MAX(recorded_at), COUNT(*) FROM pair_history"
+        "SELECT MIN(CAST(recorded_at AS TEXT)), MAX(CAST(recorded_at AS TEXT)), COUNT(*) FROM pair_history"
     ).fetchone()
     g0, g1 = parse_ts(global_min), parse_ts(global_max)
     crawler_window_h = None
@@ -111,8 +134,8 @@ def main():
     rows = conn.execute(
         """
         SELECT chain_id, token_address,
-               MIN(recorded_at) AS first_seen,
-               MAX(recorded_at) AS last_seen,
+               MIN(CAST(recorded_at AS TEXT)) AS first_seen,
+               MAX(CAST(recorded_at AS TEXT)) AS last_seen,
                COUNT(*) AS n_ticks
         FROM pair_history
         WHERE token_address IS NOT NULL AND token_address != ''
@@ -295,7 +318,7 @@ def main():
             "max": round(spans_min[-1], 1) if spans_min else None,
         },
         "crawler_window_h": round(crawler_window_h, 2) if crawler_window_h is not None else None,
-        "recorded_at_range": [global_min, global_max],
+        "recorded_at_range": [_as_iso_text(global_min), _as_iso_text(global_max)],
         "sparse": sparse,
         "warnings": warnings,
         "note": "观测跨度≠链上寿命；短 crawler 窗口会压低 7d；anti-假象已扫描",
