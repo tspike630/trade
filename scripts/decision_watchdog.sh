@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 自建 A live_candidate；杨口令 SIZE_MULT=20≈全仓（size_pct=0.05×20）；废 jev；不开 live/#71
+# 自建 A race_selfbuilt_a（平权旁簿；已废默认 live_candidate 主槽）
+# 杨口令 SIZE_MULT=20≈全仓；废主簿特权；不开 live/#71
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -29,15 +30,20 @@ ensure_one() {
 
 rewrite_role() {
   local main_pid
-  main_pid="$(pgrep -f 'strategy selfbuilt_momentum_a_v1.*purpose live_candidate' | head -1 || echo '?')"
-  printf '%s\n' "${main_pid} selfbuilt_a live_candidate size_pct=0.05 × SIZE_MULT=20 ≈全仓（watchdog $(ts)）" >"$ROLE"
+  main_pid="$(pgrep -f 'strategy selfbuilt_momentum_a_v1.*purpose race_selfbuilt_a' | head -1 || echo '?')"
+  printf '%s\n' "${main_pid} selfbuilt_a race_selfbuilt_a size_pct=0.05 × SIZE_MULT=20 ≈全仓（平权；watchdog $(ts)）" >"$ROLE"
 }
 
-echo "$(ts) decision_watchdog start selfbuilt_a size_pct=0.05 SIZE_MULT=20" >>"$LOG"
+echo "$(ts) decision_watchdog start race_selfbuilt_a (no live_candidate) SIZE_MULT=20" >>"$LOG"
 while true; do
-  ensure_one selfbuilt_a_live \
-    'strategy selfbuilt_momentum_a_v1 .*--purpose live_candidate' \
-    '-m decision_engine.run --strategy selfbuilt_momentum_a_v1 --dry-run --interval 60 --purpose live_candidate --limit 2000 --token-cooldown-min 60 --position-pct 0.05'
+  ensure_one selfbuilt_a_race \
+    'strategy selfbuilt_momentum_a_v1 .*--purpose race_selfbuilt_a' \
+    '-m decision_engine.run --strategy selfbuilt_momentum_a_v1 --dry-run --interval 60 --purpose race_selfbuilt_a --limit 2000 --token-cooldown-min 60 --position-pct 0.05'
+  if [[ "${DECISION_ENTRY_IH_SIDEBOOK:-0}" == "1" ]]; then
+    ensure_one entry_ih_ge1h \
+      'strategy selfbuilt_momentum_a_v1 .*--purpose shadow_entry_ih_ge1h' \
+      "-m decision_engine.run --strategy selfbuilt_momentum_a_v1 --dry-run --interval 60 --purpose shadow_entry_ih_ge1h --limit 2000 --token-cooldown-min 60 --position-pct 0.05 --entry-ih-min-hours 1.0 --output-db $ROOT/decision_entry_ih_ge1h.db"
+  fi
   rewrite_role
   sleep 120
 done

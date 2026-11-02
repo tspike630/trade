@@ -10,6 +10,7 @@ from logging_setup import get_logger
 from decision_engine.core.data_adapter import IndicatorDataAdapter
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import SignalBus
+from decision_engine.entry_ih_age import filter_buys_by_entry_ih_age
 from decision_engine.strategies.base_strategy import BaseStrategy
 
 log = get_logger("decision_engine.engine")
@@ -25,6 +26,7 @@ class DecisionEngine:
         risk: RiskManager | None = None,
         hot_limit: int = 50,
         token_cooldown: Any = None,
+        entry_ih_min_hours: float | None = None,
     ):
         self.adapter = adapter
         self.bus = bus
@@ -32,6 +34,9 @@ class DecisionEngine:
         self.risk = risk or RiskManager()
         self.hot_limit = hot_limit
         self.token_cooldown = token_cooldown
+        self.entry_ih_min_hours = (
+            None if entry_ih_min_hours is None else float(entry_ih_min_hours)
+        )
         self.tick_count = 0
         resolved = getattr(adapter, "db_path", None)
         if resolved is not None:
@@ -62,15 +67,29 @@ class DecisionEngine:
             except Exception as exc:  # noqa: BLE001
                 log.exception("strategy %s failed: %s", strat.strategy_id, exc)
 
+        entry_ih_rejected: dict[str, int] | None = None
+        if self.entry_ih_min_hours is not None:
+            candidates, entry_ih_rejected = filter_buys_by_entry_ih_age(
+                candidates,
+                self.adapter.latest_indicator_history_recorded_at,
+                min_hours=self.entry_ih_min_hours,
+            )
+            log.info(
+                "entry_ih_gate min_hours=%s rejected=%s remaining=%s",
+                self.entry_ih_min_hours,
+                dict(sorted(entry_ih_rejected.items())),
+                len(candidates),
+            )
+
         if not candidates:
             log.info("tick#%s 无信号 (no candidates)", self.tick_count)
-            return {
-                "tick": self.tick_count,
-                "hot_loaded": len(hot),
-                "indicators_total": n_ind,
-                "candidates": 0,
-                "emitted": 0,
-            }
+            return self._tick_payload(
+                hot_loaded=len(hot),
+                indicators_total=n_ind,
+                candidates=0,
+                emitted=0,
+                entry_ih_rejected=entry_ih_rejected,
+            )
 
         # Shared buy choke point: every strategy's candidates pass through
         # RiskManager before SignalBus.emit. Liquidity comes from the scanned
@@ -87,13 +106,33 @@ class DecisionEngine:
             len(candidates),
             len(emitted),
         )
-        return {
+        return self._tick_payload(
+            hot_loaded=len(hot),
+            indicators_total=n_ind,
+            candidates=len(candidates),
+            emitted=len(emitted),
+            entry_ih_rejected=entry_ih_rejected,
+        )
+
+    def _tick_payload(
+        self,
+        *,
+        hot_loaded: int,
+        indicators_total: int,
+        candidates: int,
+        emitted: int,
+        entry_ih_rejected: dict[str, int] | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "tick": self.tick_count,
-            "hot_loaded": len(hot),
-            "indicators_total": n_ind,
-            "candidates": len(candidates),
-            "emitted": len(emitted),
+            "hot_loaded": hot_loaded,
+            "indicators_total": indicators_total,
+            "candidates": candidates,
+            "emitted": emitted,
         }
+        if entry_ih_rejected is not None:
+            payload["entry_ih_rejected"] = entry_ih_rejected
+        return payload
 
     def _stamp_buy_liquidity(
         self,

@@ -13,11 +13,20 @@ Weekly sampling (WEEKLY_CHECK, threshold 0.15) writes purpose=sample:
 
 mode stays dry_run either way. Passing --min-jev-strength below the live
 default also selects sample when --purpose is omitted.
+
+Entry sidebook B1 (off unless DECISION_ENTRY_IH_SIDEBOOK=1 starts the sibling):
+
+  python -m decision_engine.run --strategy selfbuilt_momentum_a_v1 --dry-run \
+      --purpose shadow_entry_ih_ge1h --position-pct 0.05 \
+      --entry-ih-min-hours 1.0 --output-db decision_entry_ih_ge1h.db
+
+That purpose never writes the indicator db. live_candidate admission is unchanged.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -36,7 +45,9 @@ from decision_engine.core.signal_bus import (  # noqa: E402
     PURPOSE_LIVE_CANDIDATE,
     PURPOSE_SAMPLE,
     PURPOSE_SHADOW_010,
+    PURPOSE_SHADOW_ENTRY_IH_GE1H,
     PURPOSE_SHADOW_SELFBUILT_A,
+    PURPOSES,
     SignalBus,
     resolve_run_purpose,
 )
@@ -262,6 +273,41 @@ def build_strategies(args: argparse.Namespace) -> list:
     return out
 
 
+def _entry_ih_min_hours(
+    explicit: float | None,
+    purpose: str,
+    out_db: str,
+    db_path: str,
+) -> float | None | str:
+    """Hours floor for the entry-ih sidebook, or an error string.
+
+    None leaves admission unchanged. ``shadow_entry_ih_ge1h`` always filters
+    (default 1.0) and must write a different file than the indicator db.
+    Any other purpose refuses ``--entry-ih-min-hours``.
+    """
+    if purpose == PURPOSE_SHADOW_ENTRY_IH_GE1H:
+        if out_db == db_path:
+            return (
+                f"purpose={purpose} requires --output-db different from --db "
+                "(shadow rows must not land in the main decision db)"
+            )
+        if explicit is None:
+            return 1.0
+        try:
+            hours = float(explicit)
+        except (TypeError, ValueError):
+            return f"invalid --entry-ih-min-hours: {explicit!r}"
+        if not math.isfinite(hours) or hours < 0:
+            return f"invalid --entry-ih-min-hours: {explicit!r}"
+        return hours
+    if explicit is not None:
+        return (
+            f"--entry-ih-min-hours is refused for purpose={purpose}; "
+            f"use purpose={PURPOSE_SHADOW_ENTRY_IH_GE1H} on a separate output db"
+        )
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Decision engine Step 1 (dry-run signals; no execution)"
@@ -322,12 +368,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--purpose",
-        choices=(
-            PURPOSE_LIVE_CANDIDATE,
-            PURPOSE_SAMPLE,
-            PURPOSE_SHADOW_010,
-            PURPOSE_SHADOW_SELFBUILT_A,
-        ),
+        choices=sorted(PURPOSES),
         default=None,
         help=(
             "Why this run emits decision_log rows. "
@@ -363,6 +404,16 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=de_config.JEV_POSITION_PCT,
         help=f"JEV buy size_pct (default {de_config.JEV_POSITION_PCT})",
+    )
+    parser.add_argument(
+        "--entry-ih-min-hours",
+        type=float,
+        default=None,
+        help=(
+            "With purpose=shadow_entry_ih_ge1h, emit buys only when "
+            "entry_ih_age_h >= this value (that purpose defaults to 1.0). "
+            "Refused for every other purpose so live_candidate admission is unchanged."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -432,6 +483,17 @@ def main(argv: list[str] | None = None) -> int:
             if purpose != PURPOSE_SHADOW_010:
                 log.warning("shadow mode: forcing purpose=%s (was %s)", PURPOSE_SHADOW_010, purpose)
             purpose = PURPOSE_SHADOW_010
+    entry_ih_min_hours = _entry_ih_min_hours(args.entry_ih_min_hours, purpose, out_db, db_path)
+    if isinstance(entry_ih_min_hours, str):
+        log.error("%s", entry_ih_min_hours)
+        return 2
+    if entry_ih_min_hours is not None:
+        log.info(
+            "entry_ih_sidebook min_hours=%s purpose=%s output_db=%s",
+            entry_ih_min_hours,
+            purpose,
+            out_db,
+        )
     risk = ShadowCohortRisk() if args.shadow_liq_cohorts else RiskManager()
     if isinstance(risk, ShadowCohortRisk):
         risk.read_db = db_path
@@ -449,6 +511,7 @@ def main(argv: list[str] | None = None) -> int:
             risk=risk,
             hot_limit=hot_limit,
             token_cooldown=token_cooldown,
+            entry_ih_min_hours=entry_ih_min_hours,
         )
         results = engine.run(
             once=args.once,

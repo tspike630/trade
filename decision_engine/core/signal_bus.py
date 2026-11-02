@@ -46,8 +46,137 @@ PURPOSE_SAMPLE = "sample"
 PURPOSE_LIVE_CANDIDATE = "live_candidate"
 PURPOSE_SHADOW_010 = "shadow_010"  # shadow entry book; never paper-eligible (gateway rejects)
 PURPOSE_SHADOW_SELFBUILT_A = "shadow_selfbuilt_a"  # parallel selfbuilt A; never paper-eligible
+PURPOSE_SHADOW_ENTRY_IH_GE1H = "shadow_entry_ih_ge1h"  # entry_ih≥1h sidebook; gateway rejects
+# Equal-status paper race arms (isolated DBs). Main gateway rejects non-live_candidate.
+PURPOSE_RACE_SELFBUILT_A = "race_selfbuilt_a"  # peer A book; not main live_candidate
+PURPOSE_RACE_RSI_BOUNCE = "race_rsi_bounce"
+PURPOSE_RACE_MACD_CROSS = "race_macd_cross"
+PURPOSE_RACE_BOLL_BREAKOUT = "race_boll_breakout"
+PURPOSE_RACE_TECH_MOM = "race_tech_mom"
+PURPOSE_RACE_JEV_TIMEEXIT = "race_jev_timeexit"
+PURPOSE_RACE_JEV_TRAIL = "race_jev_trail"
+PURPOSE_RACE_JEV_RSI_AND = "race_jev_rsi_and"
+PURPOSE_RACE_COMBINED_JEV_TECH = "race_combined_jev_tech"
+PURPOSE_RACE_RSI_MACD_AND = "race_rsi_macd_and"
+PURPOSE_RACE_MACD_BOLL_AND = "race_macd_boll_and"
+PURPOSE_RACE_RSI_BOLL_AND = "race_rsi_boll_and"
+PURPOSE_RACE_TECH_MACD_AND = "race_tech_macd_and"
+PURPOSE_RACE_TECH_RSI_AND = "race_tech_rsi_and"
+PURPOSE_RACE_TECH_BOLL_AND = "race_tech_boll_and"
+PURPOSE_RACE_JEV_MACD_AND = "race_jev_macd_and"
+PURPOSE_RACE_JEV_BOLL_AND = "race_jev_boll_and"
+PURPOSE_RACE_RSI_MACD_TIMEEXIT = "race_rsi_macd_timeexit"
+PURPOSE_RACE_MACD_TRAIL = "race_macd_trail"
+PURPOSE_RACE_JEV_STRENGTH = "race_jev_strength"
+PURPOSE_RACE_EXIT_TRAIL_TDECAY = "race_exit_trail_tdecay"
+PURPOSE_RACE_FILT_OBS_WINDOW = "race_filt_obs_window"
+PURPOSE_RACE_EXIT_TIER_72H7D = "race_exit_tier_72h7d"
+PURPOSE_RACE_EXIT_TIMESTOP_48H = "race_exit_timestop_48h"
+PURPOSE_RACE_SWING_ESTABLISHED = "race_swing_established"
+PURPOSE_BENCH_ARTEMIS_F1 = "bench_artemis_f1"
+PURPOSE_RACE_REL_STRENGTH_M = "race_rel_strength_m"
+PURPOSE_RACE_A_TRAIL = "race_a_trail"
+PURPOSE_RACE_A_TIMEEXIT_1H = "race_a_timeexit_1h"
+PURPOSE_RACE_A_TIMESTOP_48H = "race_a_timestop_48h"
+PURPOSE_RACE_A_TIER_72H7D = "race_a_tier_72h7d"
+
+PURPOSE_RACE_VOL_SPIKE_ENTRY = "race_vol_spike_entry"
+PURPOSE_RACE_LIQ_BUCKET_HIGH = "race_liq_bucket_high"
+PURPOSE_RACE_LIQ_BUCKET_MID = "race_liq_bucket_mid"
+PURPOSE_RACE_AND_SELFBUILT_MACD = "race_and_selfbuilt_macd"
+PURPOSE_RACE_AND_VOL_SQUEEZE_BREAK = "race_and_vol_squeeze_break"
+PURPOSE_RACE_FILT_KILLFIRST_QF = "race_filt_killfirst_qf"
+PURPOSE_RACE_FILT_OBS_BS_RATIO = "race_filt_obs_bs_ratio"
+PURPOSE_RACE_FILT_OBS_BUYERS_N = "race_filt_obs_buyers_n"
+PURPOSE_RACE_REL_STRENGTH_10D = "race_rel_strength_10d"
+PURPOSE_RACE_SWING_PULLBACK = "race_swing_pullback"
+PURPOSE_RACE_FILT_LIQ_LADDER = "race_filt_liq_ladder"
+PURPOSE_RACE_VOL_CLIMAX_MCAP_BAND = "race_vol_climax_mcap_band"
+PURPOSE_RACE_CS_MOM_1W = "race_cs_mom_1w"
+PURPOSE_RACE_LIFECYCLE_MOMENTUM = "race_lifecycle_momentum"
+PURPOSE_RACE_FUNDING_Z_FADE = "race_funding_z_fade"
+PURPOSE_RACE_AND_VOL_CLIMAX_SWING = "race_and_vol_climax_swing"
+PURPOSE_RACE_AND_VOL_CLIMAX_SELFBUILT = "race_and_vol_climax_selfbuilt"
+PURPOSE_RACE_AND_SWING_SELFBUILT = "race_and_swing_selfbuilt"
+PURPOSE_RACE_TECH_FADE = "race_tech_fade"
+PURPOSE_RACE_CS_FADE_1W = "race_cs_fade_1w"
+PURPOSE_RACE_RS_FADE_10D = "race_rs_fade_10d"
+PURPOSE_RACE_VOL_SPIKE_FADE = "race_vol_spike_fade"
+PURPOSE_RACE_RSI_BOUNCE_FADE = "race_rsi_bounce_fade"
+PURPOSE_RACE_TECH_BOLL_FADE = "race_tech_boll_fade"
+PURPOSE_RACE_RSI_BOLL_FADE = "race_rsi_boll_fade"
+PURPOSE_RACE_PORTFOLIO_RISK_SLEEVES = "race_portfolio_risk_sleeves"  # legacy drain
+PURPOSE_RACE_PORTFOLIO_RISK = "race_portfolio_risk"  # locked tonight primary
+PURPOSE_RACE_PORTFOLIO_TIGHT_SL = "race_portfolio_tight_sl"
+PURPOSE_RACE_PORTFOLIO_AND_BLEND = "race_portfolio_and_blend"  # side experiment
 PURPOSES = frozenset(
-    {PURPOSE_SAMPLE, PURPOSE_LIVE_CANDIDATE, PURPOSE_SHADOW_010, PURPOSE_SHADOW_SELFBUILT_A}
+    {
+        PURPOSE_SAMPLE,
+        PURPOSE_LIVE_CANDIDATE,
+        PURPOSE_SHADOW_010,
+        PURPOSE_SHADOW_SELFBUILT_A,
+        PURPOSE_SHADOW_ENTRY_IH_GE1H,
+        PURPOSE_RACE_SELFBUILT_A,
+        PURPOSE_RACE_RSI_BOUNCE,
+        PURPOSE_RACE_MACD_CROSS,
+        PURPOSE_RACE_BOLL_BREAKOUT,
+        PURPOSE_RACE_TECH_MOM,
+        PURPOSE_RACE_JEV_TIMEEXIT,
+        PURPOSE_RACE_JEV_TRAIL,
+        PURPOSE_RACE_JEV_RSI_AND,
+        PURPOSE_RACE_COMBINED_JEV_TECH,
+        PURPOSE_RACE_RSI_MACD_AND,
+        PURPOSE_RACE_MACD_BOLL_AND,
+        PURPOSE_RACE_RSI_BOLL_AND,
+        PURPOSE_RACE_TECH_MACD_AND,
+        PURPOSE_RACE_TECH_RSI_AND,
+        PURPOSE_RACE_TECH_BOLL_AND,
+        PURPOSE_RACE_JEV_MACD_AND,
+        PURPOSE_RACE_JEV_BOLL_AND,
+        PURPOSE_RACE_RSI_MACD_TIMEEXIT,
+        PURPOSE_RACE_MACD_TRAIL,
+        PURPOSE_RACE_JEV_STRENGTH,
+        PURPOSE_RACE_EXIT_TRAIL_TDECAY,
+        PURPOSE_RACE_FILT_OBS_WINDOW,
+        PURPOSE_RACE_EXIT_TIER_72H7D,
+        PURPOSE_RACE_EXIT_TIMESTOP_48H,
+        PURPOSE_RACE_SWING_ESTABLISHED,
+        PURPOSE_BENCH_ARTEMIS_F1,
+        PURPOSE_RACE_REL_STRENGTH_M,
+        PURPOSE_RACE_A_TRAIL,
+        PURPOSE_RACE_A_TIMEEXIT_1H,
+        PURPOSE_RACE_A_TIMESTOP_48H,
+        PURPOSE_RACE_A_TIER_72H7D,
+        PURPOSE_RACE_VOL_SPIKE_ENTRY,
+        PURPOSE_RACE_LIQ_BUCKET_HIGH,
+        PURPOSE_RACE_LIQ_BUCKET_MID,
+        PURPOSE_RACE_AND_SELFBUILT_MACD,
+        PURPOSE_RACE_AND_VOL_SQUEEZE_BREAK,
+        PURPOSE_RACE_FILT_KILLFIRST_QF,
+        PURPOSE_RACE_FILT_OBS_BS_RATIO,
+        PURPOSE_RACE_FILT_OBS_BUYERS_N,
+        PURPOSE_RACE_REL_STRENGTH_10D,
+        PURPOSE_RACE_SWING_PULLBACK,
+        PURPOSE_RACE_FILT_LIQ_LADDER,
+        PURPOSE_RACE_VOL_CLIMAX_MCAP_BAND,
+        PURPOSE_RACE_CS_MOM_1W,
+        PURPOSE_RACE_LIFECYCLE_MOMENTUM,
+        PURPOSE_RACE_FUNDING_Z_FADE,
+        PURPOSE_RACE_AND_VOL_CLIMAX_SWING,
+        PURPOSE_RACE_AND_VOL_CLIMAX_SELFBUILT,
+        PURPOSE_RACE_AND_SWING_SELFBUILT,
+        PURPOSE_RACE_TECH_FADE,
+        PURPOSE_RACE_CS_FADE_1W,
+        PURPOSE_RACE_RS_FADE_10D,
+        PURPOSE_RACE_VOL_SPIKE_FADE,
+        PURPOSE_RACE_RSI_BOUNCE_FADE,
+        PURPOSE_RACE_TECH_BOLL_FADE,
+        PURPOSE_RACE_RSI_BOLL_FADE,
+        PURPOSE_RACE_PORTFOLIO_RISK_SLEEVES,
+        PURPOSE_RACE_PORTFOLIO_RISK,
+        PURPOSE_RACE_PORTFOLIO_TIGHT_SL,
+        PURPOSE_RACE_PORTFOLIO_AND_BLEND,
+    }
 )
 DEFAULT_PURPOSE = PURPOSE_LIVE_CANDIDATE
 

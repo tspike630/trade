@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from decision_engine import config as de_config
-from decision_engine.core.data_adapter import IndicatorDataAdapter, liquidity_usd_from_raw
+from decision_engine.core.data_adapter import IndicatorDataAdapter, liquidity_usd_from_raw, price_usd_from_raw
 from decision_engine.core.engine import DecisionEngine
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import PURPOSE_LIVE_CANDIDATE, SignalBus
@@ -63,6 +63,14 @@ class LiquidityParseTests(unittest.TestCase):
         self.assertIsNone(liquidity_usd_from_raw("{"))
         self.assertIsNone(liquidity_usd_from_raw(json.dumps({"liquidity": 12})))
         self.assertIsNone(liquidity_usd_from_raw(json.dumps({"liquidity": {"usd": None}})))
+
+    def test_price_usd_from_raw(self) -> None:
+        self.assertEqual(price_usd_from_raw(json.dumps({"priceUsd": "0.1"})), 0.1)
+        self.assertEqual(price_usd_from_raw({"priceUsd": 1.25}), 1.25)
+        self.assertIsNone(price_usd_from_raw("{"))
+        self.assertIsNone(price_usd_from_raw(json.dumps({"priceUsd": None})))
+        self.assertIsNone(price_usd_from_raw(json.dumps({"priceUsd": "nan"})))
+        self.assertIsNone(price_usd_from_raw(json.dumps({})))
 
 
 class RiskFloorTests(unittest.TestCase):
@@ -254,6 +262,78 @@ class AdapterLiquidityTests(unittest.TestCase):
             self.assertIsNotNone(snap)
             assert snap is not None
             self.assertEqual(snap["liquidity_usd"], 12_000.0)
+
+    def test_list_hot_tokens_attaches_price_usd_for_boll(self) -> None:
+        """raw_json.priceUsd → row.price_usd so boll_breakout is not permanently None."""
+        from decision_engine.factors.buy.boll_breakout import BollBreakoutBuyFactor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ind.db"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT, token_address TEXT, tier TEXT,
+                    jev_strength REAL, primary_pair_address TEXT, updated_at TEXT,
+                    boll_upper REAL, volume_strength REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE pairs (
+                    chain_id TEXT, pair_address TEXT, token_address TEXT,
+                    raw_json TEXT, updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO token_indicators VALUES (?, ?, 'hot', ?, ?, ?, ?, ?)",
+                ("solana", "breakout", 0.9, "pair-bo", "2026-01-01T00:00:00Z", 1.0, 1.0),
+            )
+            conn.execute(
+                "INSERT INTO token_indicators VALUES (?, ?, 'hot', ?, ?, ?, ?, ?)",
+                ("solana", "noprice", 0.8, "pair-np", "2026-01-01T00:00:00Z", 1.0, 1.0),
+            )
+            conn.execute(
+                "INSERT INTO pairs VALUES (?, ?, ?, ?, ?)",
+                (
+                    "solana",
+                    "pair-bo",
+                    "breakout",
+                    json.dumps(
+                        {
+                            "liquidity": {"usd": 80_000},
+                            "priceUsd": "1.5",
+                        }
+                    ),
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO pairs VALUES (?, ?, ?, ?, ?)",
+                (
+                    "solana",
+                    "pair-np",
+                    "noprice",
+                    json.dumps({"liquidity": {"usd": 80_000}}),
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+            conn.commit()
+            conn.close()
+            with IndicatorDataAdapter(path) as adapter:
+                rows = adapter.list_hot_tokens(limit=10)
+            by_token = {r["token_address"]: r for r in rows}
+            self.assertEqual(by_token["breakout"]["price_usd"], 1.5)
+            self.assertIsNone(by_token["noprice"]["price_usd"])
+            factor = BollBreakoutBuyFactor()
+            hit = factor.fit_tick(by_token["breakout"])
+            self.assertIsNotNone(hit)
+            assert hit is not None
+            self.assertIn("boll_breakout", hit["reason"])
+            miss = factor.fit_tick(by_token["noprice"])
+            self.assertIsNone(miss)
 
 
 class _BuyAndSell(BaseStrategy):

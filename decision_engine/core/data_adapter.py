@@ -98,6 +98,60 @@ def liquidity_usd_from_raw(raw: Any) -> float | None:
     return _safe_float(liquidity.get("usd"))
 
 
+def _parse_raw_json(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def price_usd_from_raw(raw: Any) -> float | None:
+    """Read priceUsd from a pairs.raw_json blob. Missing/invalid → None."""
+    parsed = _parse_raw_json(raw)
+    if parsed is None:
+        return None
+    return _safe_float(parsed.get("priceUsd"))
+
+
+def volume_txns_from_raw(raw: Any) -> dict[str, float | None]:
+    """Extract volume/txns/mcap/fdv from pairs.raw_json (DexScreener shape).
+
+    Keys (always present; value None when missing/invalid — never invent):
+      volume_1h, volume_h24, txns_h1_buys, txns_h1_sells, market_cap, fdv
+    """
+    out: dict[str, float | None] = {
+        "volume_1h": None,
+        "volume_h24": None,
+        "txns_h1_buys": None,
+        "txns_h1_sells": None,
+        "market_cap": None,
+        "fdv": None,
+    }
+    parsed = _parse_raw_json(raw)
+    if parsed is None:
+        return out
+    volume = parsed.get("volume")
+    if isinstance(volume, dict):
+        out["volume_1h"] = _safe_float(volume.get("h1"))
+        out["volume_h24"] = _safe_float(volume.get("h24"))
+    txns = parsed.get("txns")
+    if isinstance(txns, dict):
+        h1 = txns.get("h1")
+        if isinstance(h1, dict):
+            out["txns_h1_buys"] = _safe_float(h1.get("buys"))
+            out["txns_h1_sells"] = _safe_float(h1.get("sells"))
+    # Prefer marketCap; fdv is separate side-channel (never invent either)
+    out["market_cap"] = _safe_float(parsed.get("marketCap"))
+    out["fdv"] = _safe_float(parsed.get("fdv"))
+    return out
+
+
 class IndicatorDataAdapter:
     """
     Open DB read-only (URI mode=ro). Never writes indicator / crawl tables.
@@ -380,9 +434,12 @@ class IndicatorDataAdapter:
         if not {"chain_id", "pair_address", "raw_json"} <= columns:
             return found
         want_created = "pair_created_at" in columns
+        want_mcap_col = "market_cap" in columns
         select_cols = "chain_id, pair_address, raw_json"
         if want_created:
             select_cols += ", pair_created_at"
+        if want_mcap_col:
+            select_cols += ", market_cap"
         chunk_size = 80
         for start in range(0, len(keys), chunk_size):
             chunk = keys[start : start + chunk_size]
@@ -399,9 +456,21 @@ class IndicatorDataAdapter:
                 log.warning("pair meta lookup failed: %s", exc)
                 return found
             for row in fetched:
+                raw_json = row["raw_json"]
                 meta: dict[str, Any] = {
-                    "liquidity_usd": liquidity_usd_from_raw(row["raw_json"]),
+                    "liquidity_usd": liquidity_usd_from_raw(raw_json),
+                    "price_usd": price_usd_from_raw(raw_json),
                 }
+                meta.update(volume_txns_from_raw(raw_json))
+                # pairs.market_cap column fills only when raw marketCap missing
+                if meta.get("market_cap") is None and want_mcap_col:
+                    try:
+                        col_mcap = row["market_cap"]
+                    except (KeyError, IndexError):
+                        col_mcap = None
+                    got = _safe_float(col_mcap)
+                    if got is not None:
+                        meta["market_cap"] = got
                 if want_created:
                     raw_created = row["pair_created_at"]
                     if raw_created is not None:
@@ -460,26 +529,48 @@ class IndicatorDataAdapter:
         found = self._pair_meta_by_pair(keys)
         with_liq = 0
         with_created = 0
+        with_price = 0
+        with_volume_1h = 0
+        _EXTRA_KEYS = (
+            "price_usd",
+            "volume_1h",
+            "volume_h24",
+            "txns_h1_buys",
+            "txns_h1_sells",
+            "market_cap",
+            "fdv",
+        )
         for row in rows:
             chain_id = str(row.get("chain_id") or "")
             pair = row.get("primary_pair_address")
             if not chain_id or pair is None or str(pair).strip() == "":
                 row["liquidity_usd"] = None
+                for k in _EXTRA_KEYS:
+                    row[k] = None
                 continue
             meta = found.get((chain_id, str(pair))) or {}
             liquidity = meta.get("liquidity_usd")
             row["liquidity_usd"] = liquidity
             if liquidity is not None:
                 with_liq += 1
+            for k in _EXTRA_KEYS:
+                row[k] = meta.get(k)
+            if row.get("price_usd") is not None:
+                with_price += 1
+            if row.get("volume_1h") is not None:
+                with_volume_1h += 1
             created = meta.get("pair_created_at")
             if created is not None:
                 row["pair_created_at"] = created
                 with_created += 1
         log.info(
-            "liquidity_usd attached rows=%s with_liq=%s missing=%s with_pair_created_at=%s",
+            "liquidity_usd attached rows=%s with_liq=%s missing=%s "
+            "with_price_usd=%s with_volume_1h=%s with_pair_created_at=%s",
             len(rows),
             with_liq,
             len(rows) - with_liq,
+            with_price,
+            with_volume_1h,
             with_created,
         )
         return rows
