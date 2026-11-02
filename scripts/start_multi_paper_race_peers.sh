@@ -85,7 +85,7 @@ PEERS=(
   "race_liq_bucket_high|paper_eq_liq_bucket_high.db|execution_ledger_race_liq_bucket_high.db|"
   "race_liq_bucket_mid|paper_eq_liq_bucket_mid.db|execution_ledger_race_liq_bucket_mid.db|"
   "race_and_selfbuilt_macd|paper_eq_and_selfbuilt_macd.db|execution_ledger_race_and_selfbuilt_macd.db|"
-  "race_and_vol_squeeze_break|paper_eq_and_vol_squeeze_break.db|execution_ledger_race_and_vol_squeeze_break.db|"
+  # ABOLISHED race_and_vol_squeeze_break: "race_and_vol_squeeze_break|paper_eq_and_vol_squeeze_break.db|execution_ledger_race_and_vol_squeeze_break.db|"
   "race_filt_killfirst_qf|paper_eq_filt_killfirst_qf.db|execution_ledger_race_filt_killfirst_qf.db|"
   "race_filt_obs_bs_ratio|paper_eq_filt_obs_bs_ratio.db|execution_ledger_race_filt_obs_bs_ratio.db|"
   "race_filt_obs_buyers_n|paper_eq_filt_obs_buyers_n.db|execution_ledger_race_filt_obs_buyers_n.db|"
@@ -108,6 +108,7 @@ PEERS=(
   # ABOLISHED race_rsi_boll_fade: "race_rsi_boll_fade|paper_eq_rsi_boll_fade.db|execution_ledger_race_rsi_boll_fade.db|"
   "race_portfolio_risk_sleeves|paper_eq_portfolio_risk_sleeves.db|execution_ledger_race_portfolio_risk_sleeves.db|"
   "race_portfolio_and_blend|paper_eq_portfolio_and_blend.db|execution_ledger_race_portfolio_and_blend.db|"
+  "race_vol_squeeze_fade|paper_eq_vol_squeeze_fade.db|execution_ledger_race_vol_squeeze_fade.db|"
 )
 
 # Map purpose → EXECUTION_PAPER_MAX_HOLD_MIN (+ trail fake note). TP/SL documented as 10/5.
