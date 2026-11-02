@@ -1,0 +1,121 @@
+{
+  "asof": "2026-11-02T08:52:00+08:00",
+  "window": {
+    "start": "2026-10-31T14:52:00+08:00",
+    "end": "2026-11-02T08:11:00+08:00",
+    "label": "2026-10-31～11-02 HKT（≈1.7d 文本窗；非满7d；10-31换库后）",
+    "fwd_horizon": "≈1h"
+  },
+  "sample_meta": {
+    "hourly_snaps": 31788,
+    "valid_fwd_pairs": 30279,
+    "tokens": 10554,
+    "overall_up_rate": 0.281,
+    "weights_all_zero": true,
+    "note": "小时抽样31788→有效配对30279/token10554；全体上涨率28.1%（短窗偏空）；只用 typeof(recorded_at)='text' 的 indicator_history×pair_history；换库后文本窗≈1.7d，blob旧戳不参与分层；change_7d/volume_7d_avg/sentiment_heat/spike 文本史全NULL（不假填）；jev_strength 文本史全0（JEV近24h 403）；INDICATORS_WEIGHT_*全0；高档mean常被左尾拖累（已对fwd winsor±50%仅作旁证），禁止本周接闸",
+    "db_path": "/workspace/dexscreener-crawler/dexscreener.db",
+    "join": "indicator_history(primary_pair_address,chain_id,recorded_at text) → pair_history(chain_id,pair_address) price@t±15m & price@t+1h±20m"
+  },
+  "rows": [
+    {
+      "item": "change_24h",
+      "status": "观察中",
+      "category": "可上调观察",
+      "evidence": "lift_up≈1.30；Q4–Q1≈+14.0pp；n=3460；missing≈89%；Q1..Q4 up=[47.3, 36.9, 47.6, 61.3]%；mono+=False；§10 指标→fwd≈1h 分层；覆盖薄（换库后短史）",
+      "tendency": "短窗·继续攒满7d；仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "change_4h",
+      "status": "观察中",
+      "category": "可上调观察",
+      "evidence": "lift_up≈1.40；Q4–Q1≈+17.8pp；n=8448；missing≈72%；Q1..Q4 up=[44.8, 39.4, 56.1, 62.6]%；mono+=False；§10 指标→fwd≈1h 分层；missing≈72%；Q2略塌",
+      "tendency": "短窗可上调观察；仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "change_1h",
+      "status": "观察中",
+      "category": "弱正区分可上调观察",
+      "evidence": "lift_up≈1.91；Q4–Q1≈+22.6pp；n=14035；missing≈54%；Q1..Q4 up=[25.0, 26.3, 57.6, 47.6]%；mono+=False；§10 指标→fwd≈1h 分层；Q2/Q3结构不稳；missing≈54%",
+      "tendency": "短窗弱观察；仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "change_15m",
+      "status": "观察中",
+      "category": "降权/维持0",
+      "evidence": "lift_up≈1.77；Q4–Q1≈+20.7pp；n=21220；missing≈30%；Q1..Q4 up=[26.9, 13.9, 57.2, 47.6]%；mono+=False；§10 指标→fwd≈1h 分层；Q2塌陷≈14%；非单调；短窗勿线性上调",
+      "tendency": "降权倾向；仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "change_5m",
+      "status": "观察中",
+      "category": "降权/维持0",
+      "evidence": "lift_up≈1.49；Q4–Q1≈+16.5pp；n=24128；missing≈20%；Q1..Q4 up=[33.8, 12.8, 57.1, 50.2]%；mono+=False；§10 指标→fwd≈1h 分层；Q2塌陷≈13%；分位极不均；短窗勿线性上调",
+      "tendency": "降权倾向；仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "change_7d",
+      "status": "观察中",
+      "category": "观察中",
+      "evidence": "不可算：all NULL in joined text window；n=0；missing≈100%；短窗文本史；§10 指标→fwd≈1h 分层；规格短史NULL，禁×7假填",
+      "tendency": "等文本窗攒满≥7d后再分层；不调权"
+    },
+    {
+      "item": "volume_strength",
+      "status": "建议落地",
+      "category": "降权/维持0",
+      "evidence": "lift_up≈0.71；Q4–Q1≈-12.9pp；n=28070；missing≈7%；Q1..Q4 up=[44.7, 21.4, 22.8, 31.8]%；mono+=False；§10 指标→fwd≈1h 分层；高档警示（Q4 up低于Q1）",
+      "tendency": "仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "volatility_24h",
+      "status": "观察中",
+      "category": "风险旁路/观察中",
+      "evidence": "lift_up≈1.08；Q4–Q1≈+1.3pp；n=22622；missing≈25%；Q1..Q4 up=[15.5, 55.8, 36.7, 16.8]%；mono+=False；§10 指标→fwd≈1h 分层；非单调（Q2最好、Q1/Q4差）；不宜做多信号",
+      "tendency": "继续观察；不调权"
+    },
+    {
+      "item": "jev_strength",
+      "status": "观察中",
+      "category": "旁路观察（非开仓臂）",
+      "evidence": "不可算：value collapse unique=1；n=9184；missing≈70%；短窗文本史；§10 指标→fwd≈1h 分层；文本史全0；JEV近24h大量403；只旁路入库不作开仓/BULLISH门槛",
+      "tendency": "继续观察；不调权；不盘中追认"
+    },
+    {
+      "item": "sentiment_heat_score",
+      "status": "观察中",
+      "category": "观察中",
+      "evidence": "不可算：all NULL in joined text window；n=0；missing≈100%；短窗文本史；§10 指标→fwd≈1h 分层；history文本全NULL；token_indicators当前非空仅≈620，无法做fwd分层",
+      "tendency": "继续攒样本；不调权"
+    },
+    {
+      "item": "rsi_14",
+      "status": "建议落地",
+      "category": "旁路可上调观察",
+      "evidence": "lift_up≈1.57；Q4–Q1≈+24.5pp；n=8992；missing≈70%；Q1..Q4 up=[43.0, 44.5, 50.0, 67.5]%；mono+=True；§10 指标→fwd≈1h 分层；本周唯一近似单调；旁路不上权",
+      "tendency": "仍须R4；本周维持权重0，禁止接闸；不进INDICATORS_WEIGHT_*"
+    },
+    {
+      "item": "macd_hist",
+      "status": "观察中",
+      "category": "降权/维持0",
+      "evidence": "lift_up≈1.05；Q4–Q1≈+2.8pp；n=6648；missing≈78%；Q1..Q4 up=[53.2, 45.9, 52.9, 56.0]%；mono+=False；§10 指标→fwd≈1h 分层；弱lift；Q2最差；missing≈78%",
+      "tendency": "短窗降权倾向；仍须R4；本周维持权重0，禁止接闸"
+    },
+    {
+      "item": "spike/spike_ratio",
+      "status": "观察中",
+      "category": "观察中",
+      "evidence": "history文本全NULL；token_indicators当前非空仅≈620；无法fwd分层；突热只观察；§10 指标→fwd≈1h 分层",
+      "tendency": "继续观察；不调权、不告警、不进决策"
+    },
+    {
+      "item": "新候选旁路（本周）",
+      "status": "观察中",
+      "category": "新候选旁路",
+      "evidence": "文本窗内无超出清单且可分层的新字段；rsi_14已列旁路；change_7d/sentiment/spike不可算；不扩权",
+      "tendency": "不新增旁路开权；短窗后再扫"
+    }
+  ],
+  "verdict": "本周不对任何 INDICATORS_WEIGHT_* 改值；权重保持全 0，待人工/周检裁决；文本窗仅≈1.7d（10-31换库后），高档 mean 常被左尾拖累，禁止本周接闸。「建议落地」≠允许自动开权。",
+  "self_survival_footnote": "self_survival ≈23.50d n=114377 存活 1h/4h/24h/7d=99.4%/98.0%/59.7%/20.7%；权仍0；口径=pair_history观测跨度（含blob旧戳），与本周文本窗fwd分层不同只脚注；见 data/prior/exports/self_survival_20261102.md"
+}
