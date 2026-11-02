@@ -4,10 +4,13 @@ Step A (default): validate + ledger receipt only (executed=0).
 Step B: when EXECUTION_PAPER_ENABLED / paper_enabled, validated buy/sell → PaperExecutor.
 Step C: PositionManager after validation, before executor (PM_ENABLED=0 → pass-through).
 Pre-trade risk (EXECUTION_RISK_ENABLED=0 default) runs after PM and before the executor.
-Purpose gate (P2-38): only decision purpose ``live_candidate`` may reach validation
-or a fill. ``sample``, NULL/missing, and any other value are rejected with
-executed=0 and the cursor still advances. Paper / PM / risk stay default off.
-Never calls LiveExecutor. Main decision DB is read-only.
+Purpose gate (P2-38): by default only decision purpose ``live_candidate`` may
+reach validation or a fill. ``sample``, NULL/missing, and any other value are
+rejected with executed=0 and the cursor still advances. Peer runners may pass
+``accept_purposes`` (CLI ``--accept-purpose`` / env ``EXECUTION_ACCEPT_PURPOSE``)
+to allow a single alternate purpose such as ``race_*`` or ``shadow_entry_ih_ge1h``
+for that process only; other purposes stay rejected. Paper / PM / risk stay
+default off. Never calls LiveExecutor. Main decision DB is read-only.
 """
 
 from __future__ import annotations
@@ -161,13 +164,33 @@ def paper_open_paused(flag: str | Path | None = None) -> bool:
     return path.exists()
 
 
-def purpose_reject_reason(purpose: str | None) -> str | None:
-    """None only for executable ``live_candidate``. Otherwise a reject code.
+def purpose_reject_reason(
+    purpose: str | None,
+    *,
+    accept_purposes: frozenset[str] | set[str] | None = None,
+) -> str | None:
+    """None when ``purpose`` is executable for this process. Otherwise a reject code.
+
+    Default (``accept_purposes`` is None): only ``live_candidate`` passes — the
+    main / baseline paper book gate (P2-38).
+
+    Peer mode (``accept_purposes`` is a non-None set): only purposes in that set
+    pass. ``live_candidate`` does *not* auto-pass unless listed. Used by isolated
+    paper peers that consume ``race_*`` / ``shadow_entry_ih_ge1h`` into their own
+    PaperLedger + execution ledger.
 
     ``purpose`` is already stripped by ``read_decision_purpose``. Blank is missing.
     """
     if purpose is None or purpose == "":
         return PURPOSE_REJECT_MISSING
+    if accept_purposes is not None:
+        if purpose in accept_purposes:
+            return None
+        if purpose == PURPOSE_SAMPLE:
+            return PURPOSE_REJECT_SAMPLE
+        if purpose.startswith("shadow_"):
+            return PURPOSE_REJECT_SHADOW
+        return PURPOSE_REJECT_INVALID
     if purpose == PURPOSE_LIVE_CANDIDATE:
         return None
     if purpose == PURPOSE_SAMPLE:
@@ -281,6 +304,7 @@ class ExecutionGateway:
         paper_executor: Any | None = None,
         position_manager: Any | None = None,
         pm_enabled: bool | None = None,
+        accept_purposes: frozenset[str] | set[str] | tuple[str, ...] | list[str] | None = None,
     ) -> None:
         self.decision_db = resolve_decision_db(decision_db)
         self._owns_ledger = ledger is None
@@ -296,6 +320,13 @@ class ExecutionGateway:
         self.pm_enabled = bool(pm_enabled)
         self._position_manager = position_manager
         self._owns_pm = False
+        # None → default live_candidate-only gate. Non-None set → peer allowlist.
+        if accept_purposes is None:
+            self.accept_purposes: frozenset[str] | None = None
+        else:
+            self.accept_purposes = frozenset(
+                str(p).strip() for p in accept_purposes if str(p).strip()
+            )
         # Order-event table lives on the execution ledger only. Flag off → no write.
         if EXECUTION_EVENTS_ENABLED:
             init_events(self.ledger.path)
@@ -980,7 +1011,9 @@ class ExecutionGateway:
         sig: dict[str, Any] | None = None
         try:
             sig = parse_decision_row(row)
-            reason = purpose_reject_reason(sig.get("purpose"))
+            reason = purpose_reject_reason(
+                sig.get("purpose"), accept_purposes=self.accept_purposes
+            )
             if reason is not None:
                 return self._reject_purpose(sig, reason)
             if (
