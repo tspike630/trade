@@ -41,6 +41,8 @@ Compare after strip, case-sensitive. The only executable value is `live_candidat
 
 The cursor advances. `order_events` (when `EXECUTION_EVENTS_ENABLED`) are `new` then `rejected` with `stage=purpose`, in the same transaction as the receipt. Dry-run (`EXECUTION_PAPER_ENABLED=0`) still writes that receipt — a sample row is not skipped silently. This does not turn on paper, PM, or risk.
 
+**Peer allowlist (optional):** `--accept-purpose` / `EXECUTION_ACCEPT_PURPOSE` switches this process to an allowlist gate (e.g. `race_rsi_bounce`). Only listed purposes pass; `live_candidate` does not auto-pass unless listed. Peer mode requires an isolated `--ledger` (not shared `execution_ledger.db`) and a `--paper-db` that is not `paper_trading.db`. See `scripts/multi_paper_peer_launcher.md` and `scripts/start_multi_paper_race_peers.sh`.
+
 ### PositionManager rules (Step C)
 
 Master switch **`PM_ENABLED=0`** (default) → all buys allowed (pass-through).

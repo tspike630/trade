@@ -30,14 +30,17 @@ def resolve_ledger_path(explicit: str | Path | None = None) -> Path:
 
     Priority:
       1. explicit argument
-      2. EXECUTION_LEDGER_PATH env
+      2. EXECUTION_LEDGER_PATH or EXECUTION_LEDGER_DB env
       3. default ``execution_ledger.db`` next to decision_engine DB (project root style)
     """
     if explicit is not None and str(explicit).strip():
         p = Path(str(explicit)).expanduser()
         return p if p.is_absolute() else (Path.cwd() / p).resolve()
 
-    env = os.environ.get("EXECUTION_LEDGER_PATH", "").strip()
+    env = (
+        os.environ.get("EXECUTION_LEDGER_PATH", "").strip()
+        or os.environ.get("EXECUTION_LEDGER_DB", "").strip()
+    )
     if env:
         p = Path(env).expanduser()
         return p if p.is_absolute() else (Path.cwd() / p).resolve()
