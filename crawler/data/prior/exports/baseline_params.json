@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "20261026",
+    "date": "20261102",
     "sources": [
       "redpump",
       "solrpds",
@@ -73,33 +73,33 @@
     "monitor_span_min_p50": 1.6
   },
   "self_db": {
-    "n": 96136,
-    "n_history_rows": 5506053,
+    "n": 114377,
+    "n_history_rows": 6304381,
     "db": "dexscreener.db",
     "table": "pair_history",
     "survive_basis": "last_seen - first_seen > t  (MIN/MAX recorded_at per chain_id+token_address)",
     "survive": {
-      "1h": 0.9978,
-      "4h": 0.995,
-      "24h": 0.624,
-      "168h": 0.1739
+      "1h": 0.9944,
+      "4h": 0.9803,
+      "24h": 0.5971,
+      "168h": 0.2072
     },
     "survive_n": {
-      "1h": 95921,
-      "4h": 95654,
-      "24h": 59987,
-      "168h": 16719
+      "1h": 113741,
+      "4h": 112124,
+      "24h": 68295,
+      "168h": 23698
     },
     "span_min": {
-      "p25": 1364.3,
-      "p50": 1641.8,
-      "p75": 6185.9,
-      "max": 22827.8
+      "p25": 1349.8,
+      "p50": 1546.3,
+      "p75": 7209.6,
+      "max": 30923.2
     },
-    "crawler_window_h": 386.82,
+    "crawler_window_h": 564.09,
     "recorded_at_range": [
       "2026-10-09T12:00:00Z",
-      "2026-10-25T14:49:28Z"
+      "2026-11-02T00:05:15Z"
     ],
     "sparse": false,
     "warnings": [],
