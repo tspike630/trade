@@ -41,6 +41,7 @@ from decision_engine.strategies.vol_spike_fade import VolSpikeFadeStrategy
 from decision_engine.strategies.rsi_bounce_fade import RsiBounceFadeStrategy
 from decision_engine.strategies.tech_boll_fade import TechBollFadeStrategy
 from decision_engine.strategies.rsi_boll_fade import RsiBollFadeStrategy
+from decision_engine.strategies.vol_squeeze_fade import VolSqueezeFadeStrategy
 
 # Legacy strategies stay registered (behavior unchanged; regression baseline).
 STRATEGY_REGISTRY: dict[str, type] = {
@@ -79,6 +80,7 @@ STRATEGY_REGISTRY: dict[str, type] = {
     RsiBounceFadeStrategy.strategy_id: RsiBounceFadeStrategy,
     TechBollFadeStrategy.strategy_id: TechBollFadeStrategy,
     RsiBollFadeStrategy.strategy_id: RsiBollFadeStrategy,
+    VolSqueezeFadeStrategy.strategy_id: VolSqueezeFadeStrategy,
 }
 
 # Plan 03: factor_ combos. Tuple is (buy, sell, sell_params, mode).
@@ -299,6 +301,8 @@ STRATEGY_ALIASES: dict[str, str] = {
     "race_tech_boll_fade": "tech_boll_fade_v1",
     "rsi_boll_fade": "rsi_boll_fade_v1",
     "race_rsi_boll_fade": "rsi_boll_fade_v1",
+    "vol_squeeze_fade": "vol_squeeze_fade_v1",
+    "race_vol_squeeze_fade": "vol_squeeze_fade_v1",
 }
 
 
