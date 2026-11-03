@@ -37,6 +37,12 @@ PAPER_SIZE_MULT_ENV = "EXECUTION_PAPER_SIZE_MULT"
 PAPER_TP_PCT_ENV = "EXECUTION_PAPER_TP_PCT"
 PAPER_SL_PCT_ENV = "EXECUTION_PAPER_SL_PCT"
 PAPER_MAX_HOLD_MIN_ENV = "EXECUTION_PAPER_MAX_HOLD_MIN"
+PAPER_MAX_NOTIONAL_ENV = "EXECUTION_PAPER_MAX_NOTIONAL_USD"
+PAPER_MAX_LIQ_FRAC_ENV = "EXECUTION_PAPER_MAX_LIQ_FRAC"
+PAPER_JUMP_RATIO_ENV = "EXECUTION_PAPER_JUMP_RATIO"
+DEFAULT_HARD_CAP_USD = 20_000.0
+DEFAULT_LIQ_FRAC = 0.25
+DEFAULT_JUMP_RATIO = 50.0
 
 
 def paper_size_mult() -> float:
@@ -56,6 +62,108 @@ def paper_size_mult() -> float:
     if not math.isfinite(value) or value <= 0:
         return 1.0
     return value
+
+
+
+def paper_hard_cap_usd() -> float:
+    """Hard USD notional cap per paper open. Unusable env → DEFAULT_HARD_CAP_USD."""
+    value = _env_float_or(PAPER_MAX_NOTIONAL_ENV, DEFAULT_HARD_CAP_USD)
+    if value <= 0:
+        return float(DEFAULT_HARD_CAP_USD)
+    return float(value)
+
+
+def paper_max_liq_frac() -> float:
+    """Max fraction of pair liquidity_usd allowed on a paper open."""
+    value = _env_float_or(PAPER_MAX_LIQ_FRAC_ENV, DEFAULT_LIQ_FRAC)
+    if value <= 0 or value > 1:
+        return float(DEFAULT_LIQ_FRAC)
+    return float(value)
+
+
+def paper_jump_ratio() -> float:
+    """Exit/entry ratio beyond which close PnL is rejected (and reciprocal)."""
+    value = _env_float_or(PAPER_JUMP_RATIO_ENV, DEFAULT_JUMP_RATIO)
+    if not math.isfinite(value) or value < 2.0:
+        return float(DEFAULT_JUMP_RATIO)
+    return float(value)
+
+
+def cap_requested_notional_usd(
+    *,
+    requested_usd: float,
+    equity_usd: float,
+    size_pct: float,
+    mult: float,
+    liquidity_usd: float | None,
+    hard_cap_usd: float | None = None,
+    liq_frac: float | None = None,
+) -> tuple[float, dict[str, Any]]:
+    """Apply SIZE_MULT then min(equity·pct·mult, HARD_CAP, liq·LIQ_FRAC).
+
+    Caller must already require a usable mid. Missing/non-positive liquidity
+    is not capped here — caller rejects the open (unbounded without liq).
+    """
+    hard = float(hard_cap_usd if hard_cap_usd is not None else paper_hard_cap_usd())
+    frac = float(liq_frac if liq_frac is not None else paper_max_liq_frac())
+    equity_cap = float(equity_usd) * float(size_pct) * float(mult)
+    caps = [float(requested_usd), equity_cap, hard]
+    liq_cap = None
+    if liquidity_usd is not None and math.isfinite(float(liquidity_usd)) and float(liquidity_usd) > 0:
+        liq_cap = float(liquidity_usd) * frac
+        caps.append(liq_cap)
+    capped = min(caps)
+    if not math.isfinite(capped) or capped < 0:
+        capped = 0.0
+    audit = {
+        "hard_cap_usd": hard,
+        "liq_frac": frac,
+        "equity_pct_mult_cap_usd": equity_cap,
+        "liq_cap_usd": liq_cap,
+        "requested_usd_after_cap": capped,
+        "notional_capped": capped + 1e-12 < float(requested_usd),
+    }
+    return capped, audit
+
+
+def close_pnl_jump_verdict(
+    *,
+    entry_price: float,
+    exit_price: float,
+    size_usd: float,
+    qty: float,
+    equity_usd: float,
+    hard_cap_usd: float | None = None,
+    jump_ratio: float | None = None,
+) -> tuple[bool, str]:
+    """Return (reject, reason) when a close would book absurd PnL.
+
+    Rejects when exit/entry is > jump_ratio or < 1/jump_ratio, or when
+    absolute PnL would exceed HARD_CAP or 100% of pre-trade equity.
+    """
+    hard = float(hard_cap_usd if hard_cap_usd is not None else paper_hard_cap_usd())
+    ratio_lim = float(jump_ratio if jump_ratio is not None else paper_jump_ratio())
+    try:
+        entry = float(entry_price)
+        exit_px = float(exit_price)
+        size = float(size_usd)
+        q = float(qty)
+        eq = float(equity_usd)
+    except (TypeError, ValueError):
+        return True, "jump_reject:bad_price_inputs"
+    if not all(math.isfinite(x) for x in (entry, exit_px, size, q, eq)):
+        return True, "jump_reject:non_finite"
+    if entry <= 0 or exit_px <= 0 or q <= 0 or size <= 0:
+        return True, "jump_reject:non_positive"
+    ratio = exit_px / entry
+    if ratio > ratio_lim or ratio < (1.0 / ratio_lim):
+        return True, f"jump_reject:ratio:{ratio:.6g}"
+    pnl = q * exit_px - size
+    if abs(pnl) > hard:
+        return True, f"jump_reject:pnl_hard_cap:{pnl:.6g}"
+    if eq > 0 and abs(pnl) > eq:
+        return True, f"jump_reject:pnl_gt_equity:{pnl:.6g}"
+    return False, ""
 
 
 def _resolve_observe_db(observe_db: str | Path | None) -> Path | None:
@@ -315,6 +423,14 @@ class PaperExecutor:
         mid, slip, liq = self._mid_and_slip(chain_id, pair_address)
         if mid is None or mid <= 0:
             return {"ok": False, "error": "no_price", "executor": EXECUTOR_NAME}
+        # Liquidity required so SIZE_MULT cannot open unbounded notionals.
+        if liq is None or not math.isfinite(float(liq)) or float(liq) <= 0:
+            return {
+                "ok": False,
+                "error": "no_liquidity",
+                "executor": EXECUTOR_NAME,
+                "liquidity_usd": liq,
+            }
 
         fill_price = buy_fill_price(mid, slip)
         eq = self.ledger.equity(self._marks())
@@ -322,6 +438,13 @@ class PaperExecutor:
         requested_usd_before_mult = size_pct * equity_usd
         mult = paper_size_mult()
         requested_usd = requested_usd_before_mult * mult
+        requested_usd, cap_audit = cap_requested_notional_usd(
+            requested_usd=requested_usd,
+            equity_usd=equity_usd,
+            size_pct=size_pct,
+            mult=mult,
+            liquidity_usd=float(liq),
+        )
         cash = float(self.ledger.get_cash())
         truncated = False
         size_usd = requested_usd
@@ -331,6 +454,7 @@ class PaperExecutor:
         size_audit = {
             "paper_size_mult": mult,
             "requested_usd_before_mult": requested_usd_before_mult,
+            **cap_audit,
         }
         if size_usd <= 0:
             return {
@@ -508,11 +632,37 @@ class PaperExecutor:
 
         fill_price = sell_fill_price(mid, slip)
         self._note_peak(pos, mid)
-        closed = self.ledger.close_position(
-            pos["id"],
-            price=fill_price,
+        equity_usd = float(self.ledger.equity(self._marks())["equity_usd"])
+        closed, jump_meta = self._close_with_jump_guard(
+            pos,
+            fill_price=fill_price,
             reason="signal_sell",
+            equity_usd=equity_usd,
+            reject_close=True,
         )
+        if closed is None:
+            log.warning(
+                "paper SELL jump-reject pos=%s fill=%.8g entry=%.8g reason=%s",
+                pos["id"],
+                fill_price,
+                float(pos.get("entry_price") or 0.0),
+                jump_meta.get("jump_reject_reason"),
+            )
+            return {
+                "ok": False,
+                "error": jump_meta.get("jump_reject_reason") or "jump_reject",
+                "executor": EXECUTOR_NAME,
+                "position_id": pos["id"],
+                "chain_id": chain_id,
+                "pair_address": pos_pair,
+                "token_address": pos.get("token_address") or token_address,
+                "mid_price": mid,
+                "fill_price": fill_price,
+                "slippage": slip,
+                "liquidity_usd": liq,
+                "strategy_id": strategy_id,
+                **jump_meta,
+            }
         self._record_observe(str(pos["id"]), source="signal_sell", mid_price=mid)
         out = {
             "ok": True,
@@ -523,7 +673,7 @@ class PaperExecutor:
             "pair_address": pos_pair,
             "token_address": pos.get("token_address") or token_address,
             "mid_price": mid,
-            "fill_price": fill_price,
+            "fill_price": float(closed.get("exit_price") or fill_price),
             "slippage": slip,
             "liquidity_usd": liq,
             "pnl_usd": closed.get("pnl_usd"),
@@ -534,13 +684,15 @@ class PaperExecutor:
             "meta": self._meta(sig),
             "equity": self.ledger.equity(self._marks()),
             "closed": closed,
+            **jump_meta,
         }
         log.info(
-            "paper SELL pos=%s pnl=%.6f fill=%.8g slip=%.4f",
+            "paper SELL pos=%s pnl=%.6f fill=%.8g slip=%.4f jump_clipped=%s",
             pos["id"],
             float(closed.get("pnl_usd") or 0.0),
-            fill_price,
+            float(closed.get("exit_price") or fill_price),
             slip,
+            bool(jump_meta.get("jump_clipped")),
         )
         return out
 
@@ -560,7 +712,39 @@ class PaperExecutor:
         orders and do not change exit rules. Peak maintenance itself happens
         inside ``paper_tick`` for every open position.
         """
-        actions = paper_tick(self.ledger, self.store)
+        equity_usd = float(self.ledger.equity(self._marks())["equity_usd"])
+        original_close = self.ledger.close_position
+
+        def _guarded_close(pid: str, *, price: float, reason: str) -> dict[str, Any]:
+            nonlocal equity_usd
+            row = self.ledger.get_position(pid)
+            if not isinstance(row, dict):
+                return original_close(pid, price=price, reason=reason)
+            closed, jump_meta = self._close_with_jump_guard(
+                row,
+                fill_price=float(price),
+                reason=reason,
+                equity_usd=equity_usd,
+                reject_close=False,
+                closer=original_close,
+            )
+            assert closed is not None
+            if jump_meta.get("jump_clipped"):
+                closed = dict(closed)
+                closed["jump_clipped"] = True
+                closed["jump_reject_reason"] = jump_meta.get("jump_reject_reason")
+                closed["prospective_fill_price"] = jump_meta.get(
+                    "prospective_fill_price"
+                )
+            # Refresh equity baseline after each close for subsequent guards.
+            equity_usd = float(self.ledger.equity(self._marks())["equity_usd"])
+            return closed
+
+        self.ledger.close_position = _guarded_close  # type: ignore[method-assign]
+        try:
+            actions = paper_tick(self.ledger, self.store)
+        finally:
+            self.ledger.close_position = original_close  # type: ignore[method-assign]
         for closed in actions:
             pid = closed.get("id")
             if not pid:
@@ -572,6 +756,65 @@ class PaperExecutor:
                 mid_f = None
             self._record_observe(str(pid), source="tick", mid_price=mid_f)
         return actions
+
+
+    def _close_with_jump_guard(
+        self,
+        pos: dict[str, Any],
+        *,
+        fill_price: float,
+        reason: str,
+        equity_usd: float,
+        reject_close: bool,
+        closer: Any | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """Close with absurd-jump PnL protection.
+
+        When the prospective exit/entry ratio or PnL is absurd:
+        - ``reject_close=True`` (signal sell): do not close; return (None, meta).
+        - ``reject_close=False`` (tick TP/SL/hold): close flat at entry so cash
+          is restored without booking the jump PnL; reason annotated.
+
+        ``closer`` defaults to ``ledger.close_position``. Tick passes the unbound
+        original so a temporary wrapper cannot recurse into itself.
+        """
+        close_fn = closer or self.ledger.close_position
+        entry = float(pos.get("entry_price") or 0.0)
+        size_usd = float(pos.get("size_usd") or 0.0)
+        qty = float(pos.get("qty") or 0.0)
+        reject, why = close_pnl_jump_verdict(
+            entry_price=entry,
+            exit_price=fill_price,
+            size_usd=size_usd,
+            qty=qty,
+            equity_usd=equity_usd,
+        )
+        meta: dict[str, Any] = {
+            "jump_reject_reason": why or None,
+            "jump_clipped": False,
+            "prospective_fill_price": float(fill_price),
+        }
+        if not reject:
+            closed = close_fn(pos["id"], price=float(fill_price), reason=reason)
+            return closed, meta
+
+        if reject_close:
+            return None, meta
+
+        # Tick path: flatten at entry — cash += size_usd, pnl≈0.
+        clip_reason = f"{reason}:{why}" if why else f"{reason}:jump_reject"
+        log.warning(
+            "paper close jump-clip pos=%s reason=%s fill=%.8g entry=%.8g equity=%.4f",
+            pos.get("id"),
+            clip_reason,
+            float(fill_price),
+            entry,
+            float(equity_usd),
+        )
+        closed = close_fn(pos["id"], price=entry, reason=clip_reason)
+        meta["jump_clipped"] = True
+        meta["jump_reject_reason"] = why
+        return closed, meta
 
     def _note_peak(self, pos: dict[str, Any], price: float | None) -> None:
         """Raise meta peak before a signal sell. Failures do not block the close."""

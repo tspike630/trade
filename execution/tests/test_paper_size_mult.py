@@ -22,9 +22,17 @@ CRAWLER = ROOT / "crawler"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CRAWLER))
 
-from execution.executors.paper_executor import PaperExecutor  # noqa: E402
+from execution.executors.paper_executor import (  # noqa: E402
+    PaperExecutor,
+    cap_requested_notional_usd,
+    close_pnl_jump_verdict,
+    paper_hard_cap_usd,
+)
 
 ENV = "EXECUTION_PAPER_SIZE_MULT"
+HARD_ENV = "EXECUTION_PAPER_MAX_NOTIONAL_USD"
+LIQ_ENV = "EXECUTION_PAPER_MAX_LIQ_FRAC"
+JUMP_ENV = "EXECUTION_PAPER_JUMP_RATIO"
 CASH = 10_000.0
 
 
@@ -98,21 +106,24 @@ def _buy(ex: PaperExecutor, size_pct: float) -> dict[str, Any]:
 
 class PaperSizeMultTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._prev = os.environ.get(ENV)
-        os.environ.pop(ENV, None)
+        self._prev = {k: os.environ.get(k) for k in (ENV, HARD_ENV, LIQ_ENV, JUMP_ENV)}
+        for k in (ENV, HARD_ENV, LIQ_ENV, JUMP_ENV):
+            os.environ.pop(k, None)
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
-        _PriceDB(root / "crawler.db")
-        self.ex = PaperExecutor(paper_db=root / "paper.db", crawler_db=root / "crawler.db")
+        self.crawler_db = root / "crawler.db"
+        _PriceDB(self.crawler_db)
+        self.ex = PaperExecutor(paper_db=root / "paper.db", crawler_db=self.crawler_db)
         self.ex.ledger.set_cash(CASH)
 
     def tearDown(self) -> None:
         self.ex.close()
         self._tmp.cleanup()
-        if self._prev is None:
-            os.environ.pop(ENV, None)
-        else:
-            os.environ[ENV] = self._prev
+        for k, v in self._prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def _meta(self, result: dict[str, Any]) -> dict[str, Any]:
         self.assertTrue(result["ok"], result)
@@ -213,6 +224,264 @@ class PaperSizeMultTests(unittest.TestCase):
         self.assertEqual(closed["status"], "closed")
         self.assertAlmostEqual(float(closed["size_usd"]), opened_size)
         self.assertAlmostEqual(opened_size, 1000.0)
+
+
+
+class PaperNotionalCapTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prev = {k: os.environ.get(k) for k in (ENV, HARD_ENV, LIQ_ENV, JUMP_ENV)}
+        for k in (ENV, HARD_ENV, LIQ_ENV, JUMP_ENV):
+            os.environ.pop(k, None)
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.crawler_db = root / "crawler.db"
+        _PriceDB(self.crawler_db)
+        self.ex = PaperExecutor(paper_db=root / "paper.db", crawler_db=self.crawler_db)
+        self.ex.ledger.set_cash(CASH)
+
+    def tearDown(self) -> None:
+        self.ex.close()
+        self._tmp.cleanup()
+        for k, v in self._prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _set_pair(self, *, price: float = 2.0, liquidity: float | None = 1_000_000.0) -> None:
+        now = _iso(datetime.now(timezone.utc))
+        conn = sqlite3.connect(str(self.crawler_db))
+        conn.execute("DELETE FROM pair_history")
+        conn.execute("DELETE FROM pairs")
+        conn.execute(
+            """
+            INSERT INTO pair_history (
+                chain_id, pair_address, token_address, recorded_at, price_usd
+            ) VALUES ('solana', 'pair1', 'token1', ?, ?)
+            """,
+            (now, price),
+        )
+        raw_obj: dict[str, Any] = {"priceUsd": price}
+        if liquidity is not None:
+            raw_obj["liquidity"] = {"usd": liquidity}
+        conn.execute(
+            """
+            INSERT INTO pairs (
+                chain_id, pair_address, token_address, raw_json, source, updated_at
+            ) VALUES ('solana', 'pair1', 'token1', ?, 'test', ?)
+            """,
+            (json.dumps(raw_obj), now),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_hard_cap_default_20000(self) -> None:
+        self.assertAlmostEqual(paper_hard_cap_usd(), 20_000.0)
+
+    def test_mult20_huge_equity_cannot_exceed_hard_cap(self) -> None:
+        os.environ[ENV] = "20"
+        # Inject huge equity via cash; size_pct=0.05 → before_mult=5e5 → *20=1e7
+        self.ex.ledger.set_cash(10_000_000.0)
+        result = _buy(self.ex, 0.05)
+        self.assertTrue(result["ok"], result)
+        self.assertAlmostEqual(result["requested_usd_before_mult"], 500_000.0)
+        self.assertEqual(result["paper_size_mult"], 20.0)
+        self.assertAlmostEqual(result["requested_usd"], 20_000.0)
+        self.assertAlmostEqual(result["size_usd"], 20_000.0)
+        self.assertTrue(result["notional_capped"])
+        self.assertAlmostEqual(result["hard_cap_usd"], 20_000.0)
+        self.assertLessEqual(result["requested_usd"], result["hard_cap_usd"] + 1e-9)
+
+    def test_hard_cap_env_override(self) -> None:
+        os.environ[ENV] = "20"
+        os.environ[HARD_ENV] = "5000"
+        self.ex.ledger.set_cash(10_000_000.0)
+        result = _buy(self.ex, 0.05)
+        self.assertTrue(result["ok"], result)
+        self.assertAlmostEqual(result["requested_usd"], 5_000.0)
+        self.assertAlmostEqual(result["hard_cap_usd"], 5_000.0)
+
+    def test_liq_frac_caps_notional(self) -> None:
+        os.environ[ENV] = "20"
+        os.environ[LIQ_ENV] = "0.25"
+        self._set_pair(price=2.0, liquidity=10_000.0)  # liq cap = 2500
+        self.ex.ledger.set_cash(100_000.0)
+        result = _buy(self.ex, 0.05)
+        self.assertTrue(result["ok"], result)
+        # before: 0.05*100k*20=100k; hard=20k; liq=2500 → 2500
+        self.assertAlmostEqual(result["requested_usd"], 2_500.0)
+        self.assertAlmostEqual(result["liq_cap_usd"], 2_500.0)
+        self.assertTrue(result["notional_capped"])
+
+    def test_missing_liquidity_rejects_open(self) -> None:
+        self._set_pair(price=2.0, liquidity=None)
+        result = _buy(self.ex, 0.05)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "no_liquidity")
+        self.assertEqual(len(self.ex.ledger.list_open()), 0)
+
+    def test_cap_helper_min_formula(self) -> None:
+        capped, audit = cap_requested_notional_usd(
+            requested_usd=1_000_000.0,
+            equity_usd=10_000_000.0,
+            size_pct=0.05,
+            mult=20.0,
+            liquidity_usd=100_000.0,
+            hard_cap_usd=20_000.0,
+            liq_frac=0.25,
+        )
+        self.assertAlmostEqual(capped, 20_000.0)  # hard binds before liq 25k
+        self.assertTrue(audit["notional_capped"])
+
+
+class PaperJumpRejectTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prev = {k: os.environ.get(k) for k in (ENV, HARD_ENV, LIQ_ENV, JUMP_ENV)}
+        for k in (ENV, HARD_ENV, LIQ_ENV, JUMP_ENV):
+            os.environ.pop(k, None)
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.crawler_db = root / "crawler.db"
+        _PriceDB(self.crawler_db)
+        self.ex = PaperExecutor(paper_db=root / "paper.db", crawler_db=self.crawler_db)
+        self.ex.ledger.set_cash(CASH)
+
+    def tearDown(self) -> None:
+        self.ex.close()
+        self._tmp.cleanup()
+        for k, v in self._prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _set_price(self, price: float, liquidity: float = 1_000_000.0) -> None:
+        now = _iso(datetime.now(timezone.utc))
+        conn = sqlite3.connect(str(self.crawler_db))
+        conn.execute("DELETE FROM pair_history")
+        conn.execute("DELETE FROM pairs")
+        conn.execute(
+            """
+            INSERT INTO pair_history (
+                chain_id, pair_address, token_address, recorded_at, price_usd
+            ) VALUES ('solana', 'pair1', 'token1', ?, ?)
+            """,
+            (now, price),
+        )
+        raw = json.dumps({"priceUsd": price, "liquidity": {"usd": liquidity}})
+        conn.execute(
+            """
+            INSERT INTO pairs (
+                chain_id, pair_address, token_address, raw_json, source, updated_at
+            ) VALUES ('solana', 'pair1', 'token1', ?, 'test', ?)
+            """,
+            (raw, now),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_verdict_ratio_50x(self) -> None:
+        reject, why = close_pnl_jump_verdict(
+            entry_price=1.0,
+            exit_price=51.0,
+            size_usd=1000.0,
+            qty=1000.0,
+            equity_usd=10_000.0,
+        )
+        self.assertTrue(reject)
+        self.assertIn("jump_reject:ratio", why)
+
+    def test_verdict_ratio_reciprocal(self) -> None:
+        reject, why = close_pnl_jump_verdict(
+            entry_price=1.0,
+            exit_price=0.01,
+            size_usd=1000.0,
+            qty=1000.0,
+            equity_usd=10_000.0,
+        )
+        self.assertTrue(reject)
+        self.assertIn("jump_reject:ratio", why)
+
+    def test_verdict_pnl_hard_cap(self) -> None:
+        # ratio 2x < 50, but pnl = +30k > hard 20k
+        reject, why = close_pnl_jump_verdict(
+            entry_price=1.0,
+            exit_price=2.0,
+            size_usd=30_000.0,
+            qty=30_000.0,
+            equity_usd=1_000_000.0,
+            hard_cap_usd=20_000.0,
+        )
+        self.assertTrue(reject)
+        self.assertIn("pnl_hard_cap", why)
+
+    def test_verdict_pnl_gt_equity(self) -> None:
+        reject, why = close_pnl_jump_verdict(
+            entry_price=1.0,
+            exit_price=3.0,
+            size_usd=5_000.0,
+            qty=5_000.0,
+            equity_usd=8_000.0,  # pnl=+10k > 8k equity; ratio=3 < 50
+            hard_cap_usd=100_000.0,
+        )
+        self.assertTrue(reject)
+        self.assertIn("pnl_gt_equity", why)
+
+    def test_verdict_ok_normal(self) -> None:
+        reject, why = close_pnl_jump_verdict(
+            entry_price=1.0,
+            exit_price=1.1,
+            size_usd=1_000.0,
+            qty=1_000.0,
+            equity_usd=10_000.0,
+        )
+        self.assertFalse(reject)
+        self.assertEqual(why, "")
+
+    def test_signal_sell_rejects_absurd_jump(self) -> None:
+        opened = _buy(self.ex, 0.1)
+        self.assertTrue(opened["ok"], opened)
+        pid = opened["position_id"]
+        cash_before = float(self.ex.ledger.get_cash())
+        # ~100x mid jump (entry fill ≈ 2*1.003)
+        self._set_price(200.0)
+        sold = self.ex.execute(
+            {
+                "action": "sell",
+                "chain_id": "solana",
+                "pair_address": "pair1",
+                "token_address": "token1",
+                "size_pct": 1.0,
+                "strategy_id": "strat_a",
+            }
+        )
+        self.assertFalse(sold["ok"], sold)
+        self.assertIn("jump_reject", str(sold.get("error")))
+        pos = self.ex.ledger.get_position(pid)
+        self.assertEqual(pos["status"], "open")
+        self.assertAlmostEqual(float(self.ex.ledger.get_cash()), cash_before)
+
+    def test_tick_clips_absurd_jump_flat(self) -> None:
+        opened = _buy(self.ex, 0.1)
+        self.assertTrue(opened["ok"], opened)
+        pid = opened["position_id"]
+        pos = self.ex.ledger.get_position(pid)
+        entry = float(pos["entry_price"])
+        size = float(pos["size_usd"])
+        # Force take_profit via huge mid; jump guard should flat-close.
+        self._set_price(entry * 100.0)
+        # shorten max_hold so we don't depend solely on TP path — TP will fire first
+        actions = self.ex.tick()
+        self.assertTrue(actions, "expected a tick close")
+        closed = self.ex.ledger.get_position(pid)
+        self.assertEqual(closed["status"], "closed")
+        self.assertIn("jump_reject", str(closed.get("exit_reason") or ""))
+        self.assertAlmostEqual(float(closed["exit_price"]), entry)
+        self.assertAlmostEqual(float(closed["pnl_usd"]), 0.0, places=6)
+        # cash restored to start
+        self.assertAlmostEqual(float(self.ex.ledger.get_cash()), CASH, places=4)
+        self.assertAlmostEqual(size, 1000.0)
+
 
 
 if __name__ == "__main__":

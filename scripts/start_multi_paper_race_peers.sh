@@ -99,7 +99,7 @@ PEERS=(
   "race_and_vol_climax_swing|paper_eq_and_vol_climax_swing.db|execution_ledger_race_and_vol_climax_swing.db|"
   "race_and_vol_climax_selfbuilt|paper_eq_and_vol_climax_selfbuilt.db|execution_ledger_race_and_vol_climax_selfbuilt.db|"
   "race_and_swing_selfbuilt|paper_eq_and_swing_selfbuilt.db|execution_ledger_race_and_swing_selfbuilt.db|"
-  "race_tech_fade|paper_eq_tech_fade.db|execution_ledger_race_tech_fade.db|"
+  # DIRTY/OUTLIER race_tech_fade (Yang fix 2026-11-03): "race_tech_fade|paper_eq_tech_fade.db|execution_ledger_race_tech_fade.db|"
   "race_cs_fade_1w|paper_eq_cs_fade_1w.db|execution_ledger_race_cs_fade_1w.db|"
   # ABOLISHED race_rs_fade_10d: "race_rs_fade_10d|paper_eq_rs_fade_10d.db|execution_ledger_race_rs_fade_10d.db|"
   "race_vol_spike_fade|paper_eq_vol_spike_fade.db|execution_ledger_race_vol_spike_fade.db|"
