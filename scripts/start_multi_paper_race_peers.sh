@@ -100,15 +100,18 @@ PEERS=(
   "race_and_vol_climax_selfbuilt|paper_eq_and_vol_climax_selfbuilt.db|execution_ledger_race_and_vol_climax_selfbuilt.db|"
   "race_and_swing_selfbuilt|paper_eq_and_swing_selfbuilt.db|execution_ledger_race_and_swing_selfbuilt.db|"
   # DIRTY/OUTLIER race_tech_fade (Yang fix 2026-11-03): "race_tech_fade|paper_eq_tech_fade.db|execution_ledger_race_tech_fade.db|"
-  "race_cs_fade_1w|paper_eq_cs_fade_1w.db|execution_ledger_race_cs_fade_1w.db|"
+  # ABOLISHED race_cs_fade_1w (ret<=-90% Yang 2026-11-03): "race_cs_fade_1w|paper_eq_cs_fade_1w.db|execution_ledger_race_cs_fade_1w.db|"
   # ABOLISHED race_rs_fade_10d: "race_rs_fade_10d|paper_eq_rs_fade_10d.db|execution_ledger_race_rs_fade_10d.db|"
   "race_vol_spike_fade|paper_eq_vol_spike_fade.db|execution_ledger_race_vol_spike_fade.db|"
-  "race_rsi_bounce_fade|paper_eq_rsi_bounce_fade.db|execution_ledger_race_rsi_bounce_fade.db|"
+  # ABOLISHED race_rsi_bounce_fade (ret<=-90% Yang 2026-11-03): "race_rsi_bounce_fade|paper_eq_rsi_bounce_fade.db|execution_ledger_race_rsi_bounce_fade.db|"
   "race_tech_boll_fade|paper_eq_tech_boll_fade.db|execution_ledger_race_tech_boll_fade.db|"
   # ABOLISHED race_rsi_boll_fade: "race_rsi_boll_fade|paper_eq_rsi_boll_fade.db|execution_ledger_race_rsi_boll_fade.db|"
   "race_portfolio_risk_sleeves|paper_eq_portfolio_risk_sleeves.db|execution_ledger_race_portfolio_risk_sleeves.db|"
   "race_portfolio_and_blend|paper_eq_portfolio_and_blend.db|execution_ledger_race_portfolio_and_blend.db|"
   "race_vol_squeeze_fade|paper_eq_vol_squeeze_fade.db|execution_ledger_race_vol_squeeze_fade.db|"
+  # R90 re-invert 2026-11-03 Yang「亏到负90」fade→再反做 (禁复用旧 fade 库)
+  "race_cs_mom_1w_r90|paper_eq_cs_mom_1w_r90.db|execution_ledger_race_cs_mom_1w_r90.db|"
+  "race_rsi_bounce_r90|paper_eq_rsi_bounce_r90.db|execution_ledger_race_rsi_bounce_r90.db|"
 )
 
 # Map purpose → EXECUTION_PAPER_MAX_HOLD_MIN (+ trail fake note). TP/SL documented as 10/5.
