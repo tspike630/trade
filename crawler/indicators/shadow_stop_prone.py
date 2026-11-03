@@ -174,6 +174,12 @@ def asof_indicator(
     *,
     max_lag: timedelta = MAX_LAG,
 ) -> dict[str, Any] | None:
+    """As-of join against indicator_history.
+
+    Spec A / DB-swap rows may store chain_id, token_address, recorded_at as
+    BLOBs. CAST to TEXT so text keys from paper positions still match; do not
+    invent features when no row is in the lag window.
+    """
     if not chain_id or not token_address or not opened_at:
         return None
     opened_dt = _parse_ts(opened_at)
@@ -181,15 +187,16 @@ def asof_indicator(
         return None
     row = dex.execute(
         """
-        SELECT id, recorded_at, volatility_24h, change_1h, rsi_14,
+        SELECT id, CAST(recorded_at AS TEXT) AS recorded_at,
+               volatility_24h, change_1h, rsi_14,
                volume_strength, primary_pair_address
         FROM indicator_history
-        WHERE chain_id = ?
-          AND token_address = ?
-          AND recorded_at <= ?
+        WHERE CAST(chain_id AS TEXT) = ?
+          AND CAST(token_address AS TEXT) = ?
+          AND CAST(recorded_at AS TEXT) <= ?
         ORDER BY
             (rsi_14 IS NULL) ASC,
-            recorded_at DESC,
+            CAST(recorded_at AS TEXT) DESC,
             id DESC
         LIMIT 1
         """,
@@ -198,15 +205,16 @@ def asof_indicator(
     if row is None:
         row = dex.execute(
             """
-            SELECT id, recorded_at, volatility_24h, change_1h, rsi_14,
+            SELECT id, CAST(recorded_at AS TEXT) AS recorded_at,
+                   volatility_24h, change_1h, rsi_14,
                    volume_strength, primary_pair_address
             FROM indicator_history
-            WHERE chain_id = ?
-              AND lower(token_address) = lower(?)
-              AND recorded_at <= ?
+            WHERE CAST(chain_id AS TEXT) = ?
+              AND lower(CAST(token_address AS TEXT)) = lower(?)
+              AND CAST(recorded_at AS TEXT) <= ?
             ORDER BY
                 (rsi_14 IS NULL) ASC,
-                recorded_at DESC,
+                CAST(recorded_at AS TEXT) DESC,
                 id DESC
             LIMIT 1
             """,
