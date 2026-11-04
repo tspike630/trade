@@ -114,3 +114,19 @@ Prophet Arena、LiveTradeBench、When Agents Trade、FinPos、PredictionMarketBe
 | Hua/Brogaard SSRN | 打开失败 | — |
 
 可进周检观察脚注；不算有效性；不改闸。
+
+## 2026-11-04 · 决策失效周研增量（相对 10-28）
+
+| 源 | 状态 | 决策侧映射（观察脚注，不算有效性） |
+|----|------|-------------------------------------|
+| [Promote 2611.03384](https://arxiv.org/abs/2611.03384) | 已打开 | 出生后 e-过程 + 晋升≠同日部署 + funded revalidation → 对照 `promo_cpcv_gate_v0`/#90 冠名（满窗∧n≥30/50·跨窗·首笔 fill）；非权重门禁 |
+| [Penalize Common Trade 2611.03453](https://arxiv.org/abs/2611.03453) | 已打开 | 信号碰撞/共同交易通行费；φ 周频 MDD 数值勿迁 meme；→ #78 健康度「策略正交≠交易正交」；不熔断、不拧 SIZE_MULT |
+| [Herding or Racing 2611.02616](https://arxiv.org/abs/2611.02616) | 已打开 | h 混 p/κ；小单高 h 低 κ；→ 禁止把跨钱包共向写成 `high_bot_skip` |
+| [AIDA 2611.01656](https://arxiv.org/abs/2611.01656) | 已打开 | AI 中断抑新 executor、已部署量不变 → 执行/工程摩擦 ≠ 信号衰减；对照 #71/#72 |
+| [FactorBench 2610.06947](https://arxiv.org/abs/2610.06947) | 已打开 | 训练 IC 塌、残差近 0、无一范式全链占优 → 加固 #90 + 不上 LLM 主路径；训练 IC≠冠名 |
+| [Substack: factor keep working…](https://youngandcalculated.substack.com/p/a-factor-can-keep-working-and-still) | 已打开（公开段） | 信号仍在 ≠ 可交易；拥挤→尾部/成本；对照出口质量栏 |
+| [2512.11913 修订稿](https://arxiv.org/abs/2512.11913) | 已打开·勿强证 | 衰减残差 crowding 代理不稳健；勿引 v1 交易数字 |
+| Chigireva SSRN / Hua Feng | 延后/打开失败 | — |
+| 现网锚 tech_boll_fade | 旁证 | +117.56% n30 未满窗不冠；TP 集中 + OOS EV↓ + 止损占负≈82% → #72，勿写成信号死 |
+
+全文：`docs/QUANT_DECAY_FRONTIER_WEEKLY_DECISION_2026-11-04.md`。零改闸；不接 high_bot_skip；不上 LLM 主路径。

@@ -114,3 +114,14 @@
 - **高夏普≠耐用：** MRP 最差制度诊断只观察。
 - **Profit Mirage 泄漏：** 过知识截止收益蒸发 — 加固不上 LLM 主路径。
 - **MEV/对抗滑点：** meme 对成熟对约 +80% 对抗滑点概率（ETH）— 执行侵蚀栏，勿写成信号失效；量级勿硬迁 Solana。
+
+## W-2026-11-04 · 决策失效周研警示（Promote / Collision / Herding / FactorBench / 出口）
+
+1. **勿把 Promote e-过程接成盘中晋升闸或同日部署开关。** 文献自限：证书控历史假晋升，不保证部署后赚钱。现网仍只认 `promo_cpcv_gate_v0` 满窗·n·跨窗·首笔 fill；满窗前不冠。
+2. **勿用 collision φ / ETF 周频 MDD 拧 SIZE_MULT、max_open 或 peer 熔断。** bootstrap 区间可含 0；meme 5s·hold60 拒绝迁入周频半衰期数值。#78 仅健康度旁证。
+3. **勿把跨钱包共向 / 高 bot_trade_share 接 `high_bot_skip`。** Herding κ 显示 h≠κ；缺条件化时共向更像拆单或 CEX 竞速。
+4. **勿把 FactorBench 训练 IC / LLM 池 CAGR 当冠名或上 LLM 决策主路径。** 残差 IC 常塌；无一范式全链占优。
+5. **勿把 tech_boll_fade 的 OOS EV↓ / TP 命中集中 / 止损占负写成「信号死」。** 先走 #71/#72 退出质量栏；日历未满 S7 不冠。AI 掉线停新代码≠已部署信号通道死（AIDA）。
+6. **勿复活 2512.11913 v1 拥挤交易数字。** 修订稿已削弱残差 crowding 代理。
+
+仍有效：live/#71 关；真金不注资；SIZE_MULT=20；ret≤−90%→WIPE+反做；一策一盘。
