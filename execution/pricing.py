@@ -103,6 +103,10 @@ def limit_exit_fill_price(
     Fill is ``min(mid * (1 - slip), limit)``. When the slipped mid is already
     at/below the limit, behavior matches ``sell_fill_price`` unchanged.
 
+    ``mid`` must be the **raw pre-slip** quote at close time. Never pass an
+    already-slipped price (such as a stored ``exit_price``, which is
+    ``mid * (1 - slip)``): that applies slippage twice.
+
     Returns ``(fill_price, clamped, limit_price)``. ``limit_price`` is None
     when ``tp_pct`` is missing/unusable (no clamp applied).
     """

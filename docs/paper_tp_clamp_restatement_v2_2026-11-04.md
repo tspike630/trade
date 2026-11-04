@@ -2,6 +2,23 @@
 
 Generated at 2026-11-04T03:30:23Z (UTC). **Read-only** — source `paper_eq_*.db` untouched.
 
+## Notation (read this before recomputing)
+
+`positions.exit_price` in the paper DBs is **already slipped**: it equals
+`mid_raw * (1 - slip)` at close time, not the raw quote. So:
+
+- Code path: `fill = limit_exit_fill_price(entry, tp_pct, mid=mid_raw, slip)`
+  = `min(mid_raw * (1 - slip), entry * (1 + tp%/100))`.
+- Restatement on stored rows: `fill = min(exit_price, entry * (1 + tp%/100))`.
+- These are the **same number**. Do not multiply `exit_price` by `(1 - slip)`
+  a second time — that double-counts slippage (e.g. `tech_boll_fade`
+  9 TPs: 13,961.88 vs 13,214.36; book net +7,054.75 vs +6,307.23).
+- `meta_json.mid_price` is the **entry-time** mid, not the close-time quote.
+  Using it as the exit mid produces garbage (a naive replay there yields
+  about -97% on this book).
+
+Headline for this book stays **+7,054.75 / +70.6%** under the shipped rule.
+
 ## Rules (v2)
 
 1. **TP clamp**: `take_profit` with `exit > entry*(1+tp%/100)` → fill at limit.
