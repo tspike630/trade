@@ -106,6 +106,8 @@ PURPOSE_RACE_RSI_BOUNCE_FADE = "race_rsi_bounce_fade"
 PURPOSE_RACE_TECH_BOLL_FADE = "race_tech_boll_fade"
 PURPOSE_RACE_RSI_BOLL_FADE = "race_rsi_boll_fade"
 PURPOSE_RACE_VOL_SQUEEZE_FADE = "race_vol_squeeze_fade"
+PURPOSE_RACE_CS_MOM_1W_R90 = "race_cs_mom_1w_r90"
+PURPOSE_RACE_RSI_BOUNCE_R90 = "race_rsi_bounce_r90"
 PURPOSE_RACE_PORTFOLIO_RISK_SLEEVES = "race_portfolio_risk_sleeves"  # legacy drain
 PURPOSE_RACE_PORTFOLIO_RISK = "race_portfolio_risk"  # locked tonight primary
 PURPOSE_RACE_PORTFOLIO_TIGHT_SL = "race_portfolio_tight_sl"
@@ -174,6 +176,8 @@ PURPOSES = frozenset(
         PURPOSE_RACE_TECH_BOLL_FADE,
         PURPOSE_RACE_RSI_BOLL_FADE,
         PURPOSE_RACE_VOL_SQUEEZE_FADE,
+        PURPOSE_RACE_CS_MOM_1W_R90,
+        PURPOSE_RACE_RSI_BOUNCE_R90,
         PURPOSE_RACE_PORTFOLIO_RISK_SLEEVES,
         PURPOSE_RACE_PORTFOLIO_RISK,
         PURPOSE_RACE_PORTFOLIO_TIGHT_SL,

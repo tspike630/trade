@@ -42,6 +42,8 @@ from decision_engine.strategies.rsi_bounce_fade import RsiBounceFadeStrategy
 from decision_engine.strategies.tech_boll_fade import TechBollFadeStrategy
 from decision_engine.strategies.rsi_boll_fade import RsiBollFadeStrategy
 from decision_engine.strategies.vol_squeeze_fade import VolSqueezeFadeStrategy
+from decision_engine.strategies.cs_mom_1w_r90 import CsMom1wR90Strategy
+from decision_engine.strategies.rsi_bounce_r90 import RsiBounceR90Strategy
 
 # Legacy strategies stay registered (behavior unchanged; regression baseline).
 STRATEGY_REGISTRY: dict[str, type] = {
@@ -81,6 +83,8 @@ STRATEGY_REGISTRY: dict[str, type] = {
     TechBollFadeStrategy.strategy_id: TechBollFadeStrategy,
     RsiBollFadeStrategy.strategy_id: RsiBollFadeStrategy,
     VolSqueezeFadeStrategy.strategy_id: VolSqueezeFadeStrategy,
+    CsMom1wR90Strategy.strategy_id: CsMom1wR90Strategy,
+    RsiBounceR90Strategy.strategy_id: RsiBounceR90Strategy,
 }
 
 # Plan 03: factor_ combos. Tuple is (buy, sell, sell_params, mode).
@@ -303,6 +307,10 @@ STRATEGY_ALIASES: dict[str, str] = {
     "race_rsi_boll_fade": "rsi_boll_fade_v1",
     "vol_squeeze_fade": "vol_squeeze_fade_v1",
     "race_vol_squeeze_fade": "vol_squeeze_fade_v1",
+    "cs_mom_1w_r90": "cs_mom_1w_r90_v1",
+    "race_cs_mom_1w_r90": "cs_mom_1w_r90_v1",
+    "rsi_bounce_r90": "rsi_bounce_r90_v1",
+    "race_rsi_bounce_r90": "rsi_bounce_r90_v1",
 }
 
 
