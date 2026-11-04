@@ -25,6 +25,7 @@ sys.path.insert(0, str(CRAWLER))
 
 from execution.executors.paper_executor import PaperExecutor  # noqa: E402
 from execution.pricing import (  # noqa: E402
+    is_dead_pool_close,
     limit_exit_fill_price,
     paper_close_min_liq_usd,
     paper_tp_clamp_enabled,
@@ -149,6 +150,28 @@ class LimitExitFillPriceUnitTests(unittest.TestCase):
             self.assertFalse(paper_tp_clamp_enabled())
         with mock.patch.dict(os.environ, {MIN_LIQ_ENV: "0"}):
             self.assertAlmostEqual(paper_close_min_liq_usd(), 0.0)
+
+    def test_dead_pool_helper_profit_only(self) -> None:
+        self.assertTrue(
+            is_dead_pool_close(
+                naive_fill=2.0, entry_price=1.0, liquidity_usd=0.02, min_liq_usd=1000.0
+            )
+        )
+        self.assertFalse(
+            is_dead_pool_close(
+                naive_fill=0.5, entry_price=1.0, liquidity_usd=0.02, min_liq_usd=1000.0
+            )
+        )
+        self.assertFalse(
+            is_dead_pool_close(
+                naive_fill=2.0, entry_price=1.0, liquidity_usd=None, min_liq_usd=1000.0
+            )
+        )
+        self.assertFalse(
+            is_dead_pool_close(
+                naive_fill=2.0, entry_price=1.0, liquidity_usd=5000.0, min_liq_usd=1000.0
+            )
+        )
 
 
 class TpClampIntegrationTests(unittest.TestCase):
@@ -275,13 +298,13 @@ class TpClampIntegrationTests(unittest.TestCase):
         # Move clearly above +10% limit
         self.assertGreater(expected, entry * 1.10)
 
-    def test_dead_pool_flattens_at_entry(self) -> None:
+    def test_dead_pool_profit_flattens_at_entry(self) -> None:
         opened = _buy(self.ex, 0.1, tp_pct=10.0)
         self.assertTrue(opened["ok"], opened)
         pid = opened["position_id"]
         entry = float(self.ex.ledger.get_position(pid)["entry_price"])
         size = float(self.ex.ledger.get_position(pid)["size_usd"])
-        # Spike mid + dead liquidity (rug tip).
+        # Spike mid (~+900%) + dead liquidity (rug tip) → flatten profit.
         self.prices.set_quote(entry * 10.0, liquidity=0.02)
         actions = self.ex.tick()
         self.assertEqual(len(actions), 1)
@@ -290,6 +313,7 @@ class TpClampIntegrationTests(unittest.TestCase):
         self.assertIn("dead_pool", str(act["reason"]))
         self.assertAlmostEqual(float(act["fill_price"]), entry)
         self.assertAlmostEqual(float(act["close_liq_usd"]), 0.02)
+        self.assertEqual(act["close_liq_source"], "pair_raw")
         closed = self.ex.ledger.get_position(pid)
         self.assertIn("dead_pool", str(closed["exit_reason"]))
         self.assertAlmostEqual(float(closed["exit_price"]), entry)
@@ -297,8 +321,87 @@ class TpClampIntegrationTests(unittest.TestCase):
         meta = json.loads(closed["meta_json"] or "{}")
         self.assertTrue(meta.get("dead_pool_clipped"))
         self.assertAlmostEqual(float(meta["close_liq_usd"]), 0.02)
+        self.assertEqual(meta.get("close_liq_source"), "pair_raw")
         self.assertAlmostEqual(float(self.ex.ledger.get_cash()), CASH, places=4)
         self.assertAlmostEqual(size, 1000.0)
+
+    def test_dead_pool_loss_keeps_worse_fill(self) -> None:
+        opened = _buy(self.ex, 0.1, tp_pct=10.0, sl_pct=5.0)
+        self.assertTrue(opened["ok"], opened)
+        pid = opened["position_id"]
+        entry = float(self.ex.ledger.get_position(pid)["entry_price"])
+        # −50% with low liq (still above jump-reject 1/50 floor). Must keep
+        # the loss — dead-pool must NOT flatten losers to pnl≈0.
+        mid = entry * 0.50
+        self.prices.set_quote(mid, liquidity=0.02)
+        actions = self.ex.tick()
+        self.assertEqual(len(actions), 1)
+        act = actions[0]
+        self.assertFalse(act["dead_pool_clipped"])
+        self.assertNotIn("dead_pool", str(act["reason"]))
+        expected = sell_fill_price(mid, 0.02)  # liq 0.02 → 2% slip tier
+        self.assertAlmostEqual(float(act["fill_price"]), expected)
+        closed = self.ex.ledger.get_position(pid)
+        self.assertEqual(closed["exit_reason"], "stop_loss")
+        self.assertLess(float(closed["pnl_usd"]), 0.0)
+        self.assertAlmostEqual(float(closed["exit_price"]), expected)
+
+    def test_dead_pool_liq_none_no_clip(self) -> None:
+        opened = _buy(self.ex, 0.1, tp_pct=10.0)
+        self.assertTrue(opened["ok"], opened)
+        pid = opened["position_id"]
+        entry = float(self.ex.ledger.get_position(pid)["entry_price"])
+        # History mid high enough for TP; pairs.raw_json omits liquidity → None.
+        now = _iso(datetime.now(timezone.utc))
+        conn = sqlite3.connect(str(self.prices.path))
+        conn.execute("DELETE FROM pair_history")
+        conn.execute("DELETE FROM pairs")
+        conn.execute(
+            """
+            INSERT INTO pair_history (
+                chain_id, pair_address, token_address, recorded_at, price_usd
+            ) VALUES ('solana', 'pair1', 'token1', ?, ?)
+            """,
+            (now, entry * 1.5),
+        )
+        # priceUsd only — no liquidity key → liquidity_usd_from_raw → None
+        raw = json.dumps({"priceUsd": entry * 1.5})
+        conn.execute(
+            """
+            INSERT INTO pairs (
+                chain_id, pair_address, token_address, raw_json, source, updated_at
+            ) VALUES ('solana', 'pair1', 'token1', ?, 'test', ?)
+            """,
+            (raw, now),
+        )
+        conn.commit()
+        conn.close()
+        actions = self.ex.tick()
+        self.assertEqual(len(actions), 1)
+        act = actions[0]
+        self.assertFalse(act["dead_pool_clipped"])
+        self.assertEqual(act["close_liq_source"], "missing")
+        self.assertIsNone(act["close_liq_usd"])
+        # TP clamp still applies on the profit spike.
+        self.assertTrue(act["tp_clamped"])
+        self.assertAlmostEqual(float(act["fill_price"]), entry * 1.10)
+
+    def test_dead_pool_liq_zero_loss_keeps_loss(self) -> None:
+        opened = _buy(self.ex, 0.1, tp_pct=10.0, sl_pct=5.0)
+        self.assertTrue(opened["ok"], opened)
+        pid = opened["position_id"]
+        entry = float(self.ex.ledger.get_position(pid)["entry_price"])
+        mid = entry * 0.50
+        # liq=0 is often a missing-field placeholder; loss side must stay a loss.
+        self.prices.set_quote(mid, liquidity=0.0)
+        actions = self.ex.tick()
+        self.assertEqual(len(actions), 1)
+        act = actions[0]
+        self.assertFalse(act["dead_pool_clipped"])
+        expected = sell_fill_price(mid, 0.02)
+        self.assertAlmostEqual(float(act["fill_price"]), expected)
+        closed = self.ex.ledger.get_position(pid)
+        self.assertLess(float(closed["pnl_usd"]), 0.0)
 
     def test_dead_pool_env_zero_disables(self) -> None:
         os.environ[MIN_LIQ_ENV] = "0"

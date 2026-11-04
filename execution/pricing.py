@@ -122,3 +122,42 @@ def limit_exit_fill_price(
     if raw > limit + 1e-15:
         return float(limit), True, float(limit)
     return float(raw), False, float(limit)
+
+
+def is_dead_pool_close(
+    *,
+    naive_fill: float,
+    entry_price: float,
+    liquidity_usd: float | None,
+    min_liq_usd: float | None = None,
+) -> bool:
+    """Whether a tick close should flatten at entry for a dead pool.
+
+    Rules:
+    - ``liquidity_usd is None`` → never (unknown is not dead).
+    - ``liquidity_usd < min_liq`` (default env/1000) → candidate.
+    - Only when ``naive_fill > entry_price`` (unrealized *profit* is not
+      tradable). Loss-side marks keep the worse fill — do not beautify.
+    """
+    if liquidity_usd is None:
+        return False
+    min_liq = (
+        float(DEFAULT_CLOSE_MIN_LIQ_USD)
+        if min_liq_usd is None
+        else float(min_liq_usd)
+    )
+    if min_liq <= 0:
+        return False
+    try:
+        liq = float(liquidity_usd)
+        fill = float(naive_fill)
+        entry = float(entry_price)
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(x) for x in (liq, fill, entry)):
+        return False
+    if entry <= 0 or liq >= min_liq:
+        return False
+    # Profit-direction gate only.
+    return fill > entry
+

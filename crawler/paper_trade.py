@@ -24,8 +24,8 @@ Exits: ``tick`` calls ``execution.exits.scan_exits`` (same rules as backtest).
 The trigger price is the mid mark. The base close fill is mid × (1 − slippage),
 matching PaperExecutor signal sells. Take-profit fills clamp to the TP limit
 price; stop_loss does not. Low close-time liquidity flattens at entry
-(``dead_pool``). TP/SL compare mid to the entry fill (entry already includes
-buy slippage). Equity marks use mid, not the fill.
+(``dead_pool``) only on the profit side. TP/SL compare mid to the entry fill
+(entry already includes buy slippage). Equity marks use mid, not the fill.
 """
 
 from __future__ import annotations
@@ -51,6 +51,7 @@ from config import (  # noqa: E402
 from execution.exits import scan_exits  # noqa: E402
 from execution.shadow_c3 import refresh_open_peaks  # noqa: E402
 from execution.pricing import (  # noqa: E402
+    is_dead_pool_close,
     limit_exit_fill_price,
     liquidity_usd_from_raw,
     paper_close_min_liq_usd,
@@ -481,7 +482,9 @@ def tick(
     limit (``entry × (1 + tp_pct/100)``) so a limit sell cannot book above its
     trigger; stop_loss / max_hold are not clamped. When close-time
     ``liquidity_usd`` is below ``EXECUTION_PAPER_CLOSE_MIN_LIQ_USD`` (default
-    1000), the close flattens at entry (pnl≈0) with reason ``{reason}:dead_pool``.
+    1000) *and* the naive fill is above entry (profit side only), the close
+    flattens at entry (pnl≈0) with reason ``{reason}:dead_pool``. Loss-side
+    dead marks keep the worse fill. ``liquidity_usd is None`` does nothing.
 
     Does not write execution_log / order_events: the entry receipt already
     owns decision_log_id (unique). The close is on the paper position
@@ -525,21 +528,26 @@ def tick(
         px = price_lookup(pos)
         if px is None:
             continue
-        fill, slip, liq = _close_fill(store, pos["chain_id"], pos["pair_address"], px)
+        naive_fill, slip, liq = _close_fill(
+            store, pos["chain_id"], pos["pair_address"], px
+        )
+        fill = naive_fill
         tp_clamped = False
         tp_limit_price: float | None = None
         dead_pool_clipped = False
         close_reason = reason
         entry = float(pos.get("entry_price") or 0.0)
+        close_liq_source = "pair_raw" if liq is not None else "missing"
 
         min_liq = paper_close_min_liq_usd()
-        if (
-            liq is not None
-            and min_liq > 0
-            and float(liq) < float(min_liq)
-            and entry > 0
+        # Dead pool (profit-side only) before TP clamp: wipe untradable spike
+        # gains. Loss-side low-liq marks keep the worse fill.
+        if is_dead_pool_close(
+            naive_fill=naive_fill,
+            entry_price=entry,
+            liquidity_usd=liq,
+            min_liq_usd=min_liq,
         ):
-            # Dead pool: spike marks are not tradable. Flatten at entry.
             fill = entry
             dead_pool_clipped = True
             close_reason = f"{reason}:dead_pool"
@@ -550,7 +558,8 @@ def tick(
                         pos["id"],
                         {
                             "dead_pool_clipped": True,
-                            "close_liq_usd": float(liq),
+                            "close_liq_usd": float(liq) if liq is not None else None,
+                            "close_liq_source": close_liq_source,
                         },
                     )
                 except Exception:
@@ -572,6 +581,7 @@ def tick(
         closed["tp_limit_price"] = tp_limit_price
         closed["dead_pool_clipped"] = bool(dead_pool_clipped)
         closed["close_liq_usd"] = float(liq) if liq is not None else None
+        closed["close_liq_source"] = close_liq_source
         actions.append(closed)
     return actions
 

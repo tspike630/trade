@@ -1,24 +1,27 @@
-# Paper TP fill clamp + dead-pool close (2026-11-04)
+# Paper TP fill clamp + profit-side dead-pool close (2026-11-04)
 
 记账修正（不动入场闸 / live / #71 / SIZE_MULT）。
 
 ## 改动
 
 1. **TP 成交价夹到触发价**（限价卖语义）  
-   - 位置：`execution/pricing.py::limit_exit_fill_price`，由 `crawler/paper_trade.py::tick` 在 `_close_fill` 之后、`close_position` / jump-guard 之前调用。  
-   - `fill = min(mid*(1-slip), entry*(1+tp_pct/100))`；仅 `exit_reason == take_profit`。  
-   - SL / max_hold **不夹**（跳空按更差价记账）。
+   - `execution/pricing.py::limit_exit_fill_price`，由 `crawler/paper_trade.py::tick` 在 jump-guard 之前调用。  
+   - 仅 `take_profit`；SL / max_hold **不夹**。
 
-2. **死池平仓**  
-   - tick 平仓时若 `liquidity_usd < EXECUTION_PAPER_CLOSE_MIN_LIQ_USD`（默认 1000），按 **entry** 平仓、pnl≈0，`exit_reason={reason}:dead_pool`，meta 标 `dead_pool_clipped` / `close_liq_usd`。
+2. **死池平仓（仅浮盈）** — v2  
+   - Helper：`execution/pricing.py::is_dead_pool_close(naive_fill, entry, liq, min_liq)`。  
+   - 条件：`liq is not None` 且 `liq < EXECUTION_PAPER_CLOSE_MIN_LIQ_USD`（默认 1000）**且** `naive_fill > entry`。  
+   - 满足 → 按 entry 平、pnl≈0、`reason={reason}:dead_pool`。  
+   - **浮亏不夹**（崩盘亏损照记）。`liq is None` 不动作。  
+   - 审计：`close_liq_usd` + `close_liq_source`（`pair_raw` / `missing`）。
 
-3. **审计字段**（tick actions）：`tp_clamped` / `tp_limit_price` / `dead_pool_clipped` / `close_liq_usd`。
+3. 死池分支优先于 TP 夹价（抵掉超限浮盈）。
 
-## Env（默认开）
+## Env
 
 | Env | Default | Role |
 |-----|---------|------|
-| `EXECUTION_PAPER_TP_CLAMP` | **1** | TP 限价夹；`0/false/off` 关 |
+| `EXECUTION_PAPER_TP_CLAMP` | **1** | TP 限价夹；`0` 关 |
 | `EXECUTION_PAPER_CLOSE_MIN_LIQ_USD` | **1000** | 死池阈值；`≤0` 关 |
 
-`execution/exits.py` 未改（回测共用触发逻辑不变）。`PaperExecutor._close_with_jump_guard` 仍在夹价之后；夹后 fill 再交给它，避免两层重复夹。
+重述 v2：`docs/paper_tp_clamp_restatement_v2_2026-11-04.md`。
