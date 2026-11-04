@@ -17,7 +17,33 @@ Generated at 2026-11-04T03:30:23Z (UTC). **Read-only** — source `paper_eq_*.db
   Using it as the exit mid produces garbage (a naive replay there yields
   about -97% on this book).
 
-Headline for this book stays **+7,054.75 / +70.6%** under the shipped rule.
+### Three operation orders (do not mix them)
+
+| order | formula | `tech_boll_fade` net | return | shipped? |
+|---|---|---:|---:|---|
+| A | `min(exit_price, entry*1.10)` — slip once | **+7,054.75** | **+70.6%** | **yes, this is the code** |
+| B | `min(exit_price*0.99, entry*1.10)` — slip twice | +6,307.23 | +63.1% | no (hypothetical) |
+| C | `min(exit_price, entry*1.10)*0.99` — slip on the cap too | +5,492.32 | +54.9% | no (hypothetical) |
+
+Fingerprint that separates A from B on this book's 9 TPs:
+
+- A: 6 clamped at the limit (10.60 / 10.68 / 12.31 / 13.29 / 13.93 / 36.42),
+  3 recorded as-is (8.91 / 9.84 / 9.89).
+- B: only 4 clamped (12.31 / 13.29 / 13.93 / 36.42); 5 cut (10.60 / 10.68
+  demoted from limit to slip, plus the three fine ones). The B-only loss is
+  exactly 747.53 across those three fine TPs (217.82 + 211.78 + 200.02) plus
+  43.93 + 73.96 on the two demoted ones.
+
+Headline for this book stays **+7,054.75 / +70.6%** (order A) under the
+shipped rule. B and C are sensitivity rows only.
+
+### Snapshot caveat
+
+Totals here are a **snapshot** taken at 2026-11-04T03:30:23Z. Running books
+keep closing trades, so re-summing the DBs later will not match this table
+(by 12:17 HKT the pool read -185,088.21 vs -185,413.09 here, the whole gap
+being one later close in `and_vol_climax_swing`, +324.88). Quote the
+timestamp whenever these totals are cited.
 
 ## Rules (v2)
 
@@ -26,6 +52,13 @@ Headline for this book stays **+7,054.75 / +70.6%** under the shipped rule.
 3. **Dead pool loss kept**: `liq < 1000` but `exit <= entry` → **keep original loss** (do not beautify).
 4. `liq is None` → never dead-pool.
 5. OUTLIER books excluded from main totals.
+6. **SL is deliberately NOT clamped.** TP is a resting limit sell, so it
+   fills at the limit — that is what rule 1 models. SL is a stop *market*,
+   so it fills at the gapped price; all 7 SL closes in this book realized
+   -6.29% to -11.12% against a -5% trigger (worst breach 6.12pp). Clamping SL
+   to its trigger would fake the left tail, the same mistake as v1 of the
+   dead-pool rule (flattening real -$10,470.17 of crashes to zero). Any
+   "symmetric execution" model is an optimistic bound, not the reference.
 
 ## Headline — 主表全库（剔 OUTLIER）三组净利
 
@@ -107,6 +140,21 @@ Headline for this book stays **+7,054.75 / +70.6%** under the shipped rule.
 | vol_spike_fade | 7 | -1,296.20 | -1,296.20 | -1,296.20 | 0.00 | 0.00 | 0 | 0 | 0 | 0 |
 | vol_squeeze_fade | 8 | -1,293.01 | -1,293.01 | -1,293.01 | 0.00 | 0.00 | 0 | 0 | 0 | 0 |
 | **TOTAL** |  | -185,413.09 | -204,777.60 | -206,898.57 | -19,364.51 | -2,120.96 | 105 | 65 | 30 | 9 |
+
+### Concentration shift caused by the clamp (do not compare across 口径)
+
+`tech_boll_fade`, same 30 closes, before → after order A:
+
+| metric | 现网 | 落码后 A |
+|---|---:|---:|
+| top-3 trades / net | 74.1% | 77.7% |
+| top-5 trades / net | 105.8% | 125.6% |
+| top pair / net | 94.7% | **105.2%** |
+
+Top pair above 100% means the book is net **negative** without that one pair.
+Shrinking the denominator raises concentration, so any concentration or EV
+number computed after the clamp is a different measurement from the one
+before it and must carry a 口径变更 label.
 
 ### Highlight: `tech_boll_fade`
 
