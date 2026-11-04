@@ -715,7 +715,13 @@ class PaperExecutor:
         equity_usd = float(self.ledger.equity(self._marks())["equity_usd"])
         original_close = self.ledger.close_position
 
-        def _guarded_close(pid: str, *, price: float, reason: str) -> dict[str, Any]:
+        def _guarded_close(
+            pid: str,
+            *,
+            price: float,
+            reason: str,
+            meta_patch: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
             nonlocal equity_usd
             row = self.ledger.get_position(pid)
             if not isinstance(row, dict):
@@ -727,6 +733,7 @@ class PaperExecutor:
                 equity_usd=equity_usd,
                 reject_close=False,
                 closer=original_close,
+                meta_patch=meta_patch,
             )
             assert closed is not None
             if jump_meta.get("jump_clipped"):
@@ -767,6 +774,7 @@ class PaperExecutor:
         equity_usd: float,
         reject_close: bool,
         closer: Any | None = None,
+        meta_patch: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         """Close with absurd-jump PnL protection.
 
@@ -795,7 +803,14 @@ class PaperExecutor:
             "prospective_fill_price": float(fill_price),
         }
         if not reject:
-            closed = close_fn(pos["id"], price=float(fill_price), reason=reason)
+            kwargs: dict[str, Any] = {"price": float(fill_price), "reason": reason}
+            if meta_patch:
+                kwargs["meta_patch"] = dict(meta_patch)
+            try:
+                closed = close_fn(pos["id"], **kwargs)
+            except TypeError:
+                # Older ledger signature without meta_patch.
+                closed = close_fn(pos["id"], price=float(fill_price), reason=reason)
             return closed, meta
 
         if reject_close:
@@ -811,7 +826,12 @@ class PaperExecutor:
             entry,
             float(equity_usd),
         )
-        closed = close_fn(pos["id"], price=entry, reason=clip_reason)
+        try:
+            closed = close_fn(
+                pos["id"], price=entry, reason=clip_reason, meta_patch=meta_patch
+            )
+        except TypeError:
+            closed = close_fn(pos["id"], price=entry, reason=clip_reason)
         meta["jump_clipped"] = True
         meta["jump_reject_reason"] = why
         return closed, meta

@@ -51,6 +51,7 @@ from config import (  # noqa: E402
 from execution.exits import scan_exits  # noqa: E402
 from execution.shadow_c3 import refresh_open_peaks  # noqa: E402
 from execution.pricing import (  # noqa: E402
+    PAPER_FILL_CLAMP_VER,
     is_dead_pool_close,
     limit_exit_fill_price,
     liquidity_usd_from_raw,
@@ -234,7 +235,12 @@ class PaperLedger:
         return pid
 
     def close_position(
-        self, pid: str, *, price: float, reason: str
+        self,
+        pid: str,
+        *,
+        price: float,
+        reason: str,
+        meta_patch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = _utc()
         self.conn.execute("BEGIN IMMEDIATE")
@@ -247,14 +253,30 @@ class PaperLedger:
             qty = float(row["qty"])
             notional = qty * price
             pnl = notional - float(row["size_usd"])
-            cur = self.conn.execute(
-                """
-                UPDATE positions SET status='closed', exit_price=?, closed_at=?,
-                       exit_reason=?, pnl_usd=?
-                WHERE id=? AND status='open'
-                """,
-                (price, now, reason, pnl, pid),
-            )
+            if meta_patch:
+                try:
+                    parsed = json.loads(row["meta_json"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    parsed = {}
+                merged = parsed if isinstance(parsed, dict) else {}
+                merged.update(meta_patch)
+                cur = self.conn.execute(
+                    """
+                    UPDATE positions SET status='closed', exit_price=?, closed_at=?,
+                           exit_reason=?, pnl_usd=?, meta_json=?
+                    WHERE id=? AND status='open'
+                    """,
+                    (price, now, reason, pnl, json.dumps(merged), pid),
+                )
+            else:
+                cur = self.conn.execute(
+                    """
+                    UPDATE positions SET status='closed', exit_price=?, closed_at=?,
+                           exit_reason=?, pnl_usd=?
+                    WHERE id=? AND status='open'
+                    """,
+                    (price, now, reason, pnl, pid),
+                )
             if cur.rowcount != 1:
                 raise ValueError("position not open")
             self._add_cash(notional, now=now)
@@ -573,7 +595,22 @@ def tick(
                 slip=slip,
             )
 
-        closed = ledger.close_position(pos["id"], price=fill, reason=close_reason)
+        closed = ledger.close_position(
+            pos["id"],
+            price=fill,
+            reason=close_reason,
+            meta_patch={
+                "clamp_ver": PAPER_FILL_CLAMP_VER,
+                "mid_price": px,
+                "fill_price": fill,
+                "slippage": slip,
+                "tp_clamped": bool(tp_clamped),
+                "tp_limit_price": tp_limit_price,
+                "dead_pool_clipped": bool(dead_pool_clipped),
+                "close_liq_usd": float(liq) if liq is not None else None,
+                "close_liq_source": close_liq_source,
+            },
+        )
         closed["mid_price"] = px
         closed["fill_price"] = fill
         closed["slippage"] = slip

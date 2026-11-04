@@ -112,6 +112,9 @@ def _shift_iso(ts: str, seconds: int) -> str:
         return str(ts)
 
 
+ALERT_GRACE_S = 60
+
+
 def _liq_at_close(
     crawler: sqlite3.Connection | None,
     chain_id: str,
@@ -126,8 +129,14 @@ def _liq_at_close(
         return cache[key]
 
     val: float | None = None
-    lo = _shift_iso(closed_at, -60)
-    hi = _shift_iso(closed_at, 60)
+    # Look BACK only. The one tolerance is an alert that lands seconds after
+    # ``closed_at`` because the collector wrote it late: it reports the pool
+    # state at the rug instant, not a later state, so a small grace keeps the
+    # event from being missed. Any *sample* after ``closed_at`` is lookahead
+    # and is never used (v2 used a MIN over [close-120s, close+20min], which
+    # booked pools that only died later).
+    lo = _shift_iso(closed_at, -600)
+    hi = _shift_iso(closed_at, ALERT_GRACE_S)
     try:
         arow = crawler.execute(
             """
@@ -163,16 +172,16 @@ def _liq_at_close(
                     pass
 
     if val is None:
-        wlo = _shift_iso(closed_at, -120)
-        whi = _shift_iso(closed_at, 20 * 60)
+        # Last known liquidity at or before the close.
         row = crawler.execute(
             """
-            SELECT MIN(liquidity_usd) AS liq FROM pair_history
+            SELECT liquidity_usd AS liq FROM pair_history
             WHERE chain_id = ? AND pair_address = ?
-              AND recorded_at BETWEEN ? AND ?
+              AND recorded_at <= ?
               AND liquidity_usd IS NOT NULL
+            ORDER BY recorded_at DESC LIMIT 1
             """,
-            (key[0], pair, wlo, whi),
+            (key[0], pair, closed_at),
         ).fetchone()
         if row is not None and row["liq"] is not None:
             try:

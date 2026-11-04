@@ -219,6 +219,37 @@ class TpClampIntegrationTests(unittest.TestCase):
         expected_pnl = float(closed["qty"]) * limit - size
         self.assertAlmostEqual(float(closed["pnl_usd"]), expected_pnl, places=6)
 
+    def test_close_persists_clamp_ver_and_fill_audit(self) -> None:
+        """clamp_ver + audit fields must survive into the closed row's meta."""
+        opened = _buy(self.ex, 0.1, tp_pct=10.0)
+        self.assertTrue(opened["ok"], opened)
+        pid = opened["position_id"]
+        entry = float(self.ex.ledger.get_position(pid)["entry_price"])
+        self.prices.set_quote(entry * 2.0, liquidity=1_000_000.0)
+        self.ex.tick()
+        closed = self.ex.ledger.get_position(pid)
+        meta = json.loads(closed["meta_json"] or "{}")
+        self.assertEqual(meta.get("clamp_ver"), "v2")
+        self.assertTrue(meta.get("tp_clamped"))
+        self.assertAlmostEqual(float(meta["fill_price"]), entry * 1.10)
+        self.assertAlmostEqual(float(meta["mid_price"]), entry * 2.0)
+        self.assertIn("slippage", meta)
+
+    def test_close_meta_patch_keeps_original_keys(self) -> None:
+        """meta_patch merges; entry-side meta (strategy_id) is not dropped."""
+        opened = _buy(self.ex, 0.1, tp_pct=10.0)
+        self.assertTrue(opened["ok"], opened)
+        pid = opened["position_id"]
+        before = json.loads(self.ex.ledger.get_position(pid)["meta_json"] or "{}")
+        entry_px = float(self.ex.ledger.get_position(pid)["entry_price"])
+        self.prices.set_quote(entry_px * 2.0, liquidity=1_000_000.0)
+        self.ex.tick()
+        after = json.loads(self.ex.ledger.get_position(pid)["meta_json"] or "{}")
+        for key in before:
+            if key in ("peak_price",):
+                continue
+            self.assertIn(key, after, f"meta key {key} lost on close")
+
     def test_tp_mid_below_limit_no_clamp(self) -> None:
         opened = _buy(self.ex, 0.1, tp_pct=10.0)
         self.assertTrue(opened["ok"], opened)

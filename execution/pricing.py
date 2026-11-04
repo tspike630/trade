@@ -63,6 +63,12 @@ def sell_fill_price(mid: float, slip: float) -> float:
     return float(mid) * (1.0 - float(slip))
 
 
+# Version tag written onto every closed position so a fill's execution
+# convention is knowable after the fact. v1 = pre-clamp (no TP limit clamp,
+# close-time liq window not used); v2 = TP limit clamp + profit-side dead pool.
+PAPER_FILL_CLAMP_VER = "v2"
+
+
 def paper_tp_clamp_enabled() -> bool:
     """EXECUTION_PAPER_TP_CLAMP: default on. 0/false/no/off disables."""
     raw = os.environ.get(PAPER_TP_CLAMP_ENV)
