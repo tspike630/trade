@@ -664,6 +664,8 @@ class ExitAndTickTests(unittest.TestCase):
             root = Path(tmp)
             crawler = _PriceDB(root / "crawler.db")
             # unknown liquidity → 2% slip. mid 120 vs entry fill 100, tp 10%.
+            # Raw slip fill would be 120*0.98=117.6, but TP limit-sell clamps
+            # to entry*(1+tp_pct/100)=110 (EXECUTION_PAPER_TP_CLAMP default on).
             crawler.add_history(_iso(_now()), 120.0)
             crawler.close()
             led = PaperLedger(root / "paper.db")
@@ -685,7 +687,9 @@ class ExitAndTickTests(unittest.TestCase):
                 self.assertEqual(len(actions), 1)
                 self.assertEqual(actions[0]["reason"], "take_profit")
                 self.assertAlmostEqual(actions[0]["mid_price"], 120.0)
-                self.assertAlmostEqual(actions[0]["fill_price"], 120.0 * 0.98)
+                self.assertTrue(actions[0]["tp_clamped"])
+                self.assertAlmostEqual(actions[0]["fill_price"], 110.0)
+                self.assertAlmostEqual(actions[0]["tp_limit_price"], 110.0)
                 self.assertEqual(led.list_open(), [])
                 self.assertEqual(pid, actions[0]["id"])
             finally:

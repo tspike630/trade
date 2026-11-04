@@ -21,9 +21,11 @@ returns None when both are older than PAPER_PRICE_MAX_AGE_SEC (default 3600).
 Stale or missing → callers treat as no_price.
 
 Exits: ``tick`` calls ``execution.exits.scan_exits`` (same rules as backtest).
-The trigger price is the mid mark. The close fill is mid × (1 − slippage),
-matching PaperExecutor signal sells. TP/SL compare that mid to the entry fill
-(entry already includes buy slippage). Equity marks use mid, not the fill.
+The trigger price is the mid mark. The base close fill is mid × (1 − slippage),
+matching PaperExecutor signal sells. Take-profit fills clamp to the TP limit
+price; stop_loss does not. Low close-time liquidity flattens at entry
+(``dead_pool``). TP/SL compare mid to the entry fill (entry already includes
+buy slippage). Equity marks use mid, not the fill.
 """
 
 from __future__ import annotations
@@ -49,7 +51,10 @@ from config import (  # noqa: E402
 from execution.exits import scan_exits  # noqa: E402
 from execution.shadow_c3 import refresh_open_peaks  # noqa: E402
 from execution.pricing import (  # noqa: E402
+    limit_exit_fill_price,
     liquidity_usd_from_raw,
+    paper_close_min_liq_usd,
+    paper_tp_clamp_enabled,
     sell_fill_price,
     slippage_rate,
 )
@@ -437,14 +442,21 @@ def latest_price(
     return candidates[-1][1]
 
 
-def _close_fill(store: Any, chain_id: str, pair_address: str, mid: float) -> tuple[float, float]:
-    """Tick close fill. Same slippage curve as a signal sell."""
+def _close_fill(
+    store: Any, chain_id: str, pair_address: str, mid: float
+) -> tuple[float, float, float | None]:
+    """Tick close fill. Same slippage curve as a signal sell.
+
+    Returns ``(fill_price, slip, liquidity_usd)``. ``liquidity_usd`` may be
+    None when the pair raw quote is missing.
+    """
     raw = None
     get_raw = getattr(store, "get_pair_raw", None)
     if callable(get_raw):
         raw = get_raw(chain_id, pair_address)
-    slip = slippage_rate(liquidity_usd_from_raw(raw))
-    return sell_fill_price(mid, slip), slip
+    liq = liquidity_usd_from_raw(raw)
+    slip = slippage_rate(liq)
+    return sell_fill_price(mid, slip), slip, liq
 
 
 def _make_main_confirmer():
@@ -464,10 +476,16 @@ def tick(
 ) -> list[dict[str, Any]]:
     """Close on TP/SL/max_hold via execution.exits.scan_exits.
 
-    Trigger price is the mid mark. Fill price is mid × (1 − slip), same as
-    PaperExecutor signal sells. Does not write execution_log / order_events:
-    the entry receipt already owns decision_log_id (unique). The close is on
-    the paper position (exit_reason) and fills row.
+    Trigger price is the mid mark. Base fill is mid × (1 − slip), same as
+    PaperExecutor signal sells. Take-profit fills are then clamped to the TP
+    limit (``entry × (1 + tp_pct/100)``) so a limit sell cannot book above its
+    trigger; stop_loss / max_hold are not clamped. When close-time
+    ``liquidity_usd`` is below ``EXECUTION_PAPER_CLOSE_MIN_LIQ_USD`` (default
+    1000), the close flattens at entry (pnl≈0) with reason ``{reason}:dead_pool``.
+
+    Does not write execution_log / order_events: the entry receipt already
+    owns decision_log_id (unique). The close is on the paper position
+    (exit_reason) and fills row.
 
     Before the scan, each open position's ``meta_json.peak_price`` is raised
     to the current mid and never lowered. That bookkeeping does not change
@@ -507,11 +525,53 @@ def tick(
         px = price_lookup(pos)
         if px is None:
             continue
-        fill, slip = _close_fill(store, pos["chain_id"], pos["pair_address"], px)
-        closed = ledger.close_position(pos["id"], price=fill, reason=reason)
+        fill, slip, liq = _close_fill(store, pos["chain_id"], pos["pair_address"], px)
+        tp_clamped = False
+        tp_limit_price: float | None = None
+        dead_pool_clipped = False
+        close_reason = reason
+        entry = float(pos.get("entry_price") or 0.0)
+
+        min_liq = paper_close_min_liq_usd()
+        if (
+            liq is not None
+            and min_liq > 0
+            and float(liq) < float(min_liq)
+            and entry > 0
+        ):
+            # Dead pool: spike marks are not tradable. Flatten at entry.
+            fill = entry
+            dead_pool_clipped = True
+            close_reason = f"{reason}:dead_pool"
+            merge = getattr(ledger, "merge_open_meta", None)
+            if callable(merge):
+                try:
+                    merge(
+                        pos["id"],
+                        {
+                            "dead_pool_clipped": True,
+                            "close_liq_usd": float(liq),
+                        },
+                    )
+                except Exception:
+                    pass
+        elif reason == "take_profit" and paper_tp_clamp_enabled():
+            # Limit-sell semantics: clamp after slip, before jump guard.
+            fill, tp_clamped, tp_limit_price = limit_exit_fill_price(
+                entry_price=entry,
+                tp_pct=pos.get("tp_pct"),
+                mid=float(px),
+                slip=slip,
+            )
+
+        closed = ledger.close_position(pos["id"], price=fill, reason=close_reason)
         closed["mid_price"] = px
         closed["fill_price"] = fill
         closed["slippage"] = slip
+        closed["tp_clamped"] = bool(tp_clamped)
+        closed["tp_limit_price"] = tp_limit_price
+        closed["dead_pool_clipped"] = bool(dead_pool_clipped)
+        closed["close_liq_usd"] = float(liq) if liq is not None else None
         actions.append(closed)
     return actions
 

@@ -336,8 +336,8 @@ class PaperNotionalCapTests(unittest.TestCase):
 
 class PaperJumpRejectTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._prev = {k: os.environ.get(k) for k in (ENV, HARD_ENV, LIQ_ENV, JUMP_ENV)}
-        for k in (ENV, HARD_ENV, LIQ_ENV, JUMP_ENV):
+        self._prev = {k: os.environ.get(k) for k in (ENV, HARD_ENV, LIQ_ENV, JUMP_ENV, "EXECUTION_PAPER_TP_CLAMP", "EXECUTION_PAPER_CLOSE_MIN_LIQ_USD")}
+        for k in (ENV, HARD_ENV, LIQ_ENV, JUMP_ENV, "EXECUTION_PAPER_TP_CLAMP", "EXECUTION_PAPER_CLOSE_MIN_LIQ_USD"):
             os.environ.pop(k, None)
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
@@ -462,6 +462,11 @@ class PaperJumpRejectTests(unittest.TestCase):
         self.assertAlmostEqual(float(self.ex.ledger.get_cash()), cash_before)
 
     def test_tick_clips_absurd_jump_flat(self) -> None:
+        # Keep jump-guard coverage under pre-clamp fill semantics. With
+        # EXECUTION_PAPER_TP_CLAMP on (default), a 100× mid would clamp to the
+        # TP limit first and never reach jump-reject — that path is covered in
+        # test_tp_fill_clamp.py. Here we disable the clamp explicitly.
+        os.environ["EXECUTION_PAPER_TP_CLAMP"] = "0"
         opened = _buy(self.ex, 0.1)
         self.assertTrue(opened["ok"], opened)
         pid = opened["position_id"]
