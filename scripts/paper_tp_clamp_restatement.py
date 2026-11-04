@@ -3,7 +3,8 @@
 
 Does NOT write back into the paper DBs. Writes a markdown report.
 
-v2 rules (2026-11-04):
+v3 rules (2026-11-04): no forward-looking liquidity; alerts first, then last
+sample at/before closed_at; evidence tier recorded per fill.
   - TP clamp: take_profit exit > entry*(1+tp%/100) → fill at limit.
   - Dead pool: close-time liq < min_liq AND exit > entry (profit only) →
     flatten at entry. Loss-side low-liq keeps original pnl.
@@ -52,7 +53,9 @@ class TradeFix:
     new_pnl: float
     kind: str  # tp_clamp | dead_pool_profit | dead_pool_loss_kept
     close_liq: float | None = None
+    liq_source: str | None = None
     closed_at: str | None = None
+    tp_pnl: float = 0.0
 
 
 @dataclass
@@ -65,6 +68,10 @@ class BookSummary:
     n_tp: int = 0
     n_tp_overshoot: int = 0
     n_dead_profit: int = 0
+    n_dead_profit_alert: int = 0
+    n_dead_profit_sample: int = 0
+    dead_profit_alert_usd: float = 0.0
+    dead_profit_sample_usd: float = 0.0
     n_dead_loss_kept: int = 0
     start_cash: float = DEFAULT_START_CASH
     outlier: bool = False
@@ -120,15 +127,22 @@ def _liq_at_close(
     chain_id: str,
     pair: str,
     closed_at: str | None,
-    cache: dict[tuple[str, str, str], float | None] | None = None,
-) -> float | None:
+    cache: dict[tuple[str, str, str], tuple[float | None, str | None]] | None = None,
+) -> tuple[float | None, str | None]:
+    """Close-time liquidity and the evidence tier behind it.
+
+    Returns ``(liq, source)`` where source is ``"alert"`` (a
+    ``liquidity_drop`` alert at the rug instant), ``"sample"`` (last
+    ``pair_history`` sample at or before the close) or ``None`` (no evidence).
+    """
     if crawler is None or not closed_at or not pair:
-        return None
+        return None, None
     key = (str(chain_id or "solana"), pair.lower(), str(closed_at))
     if cache is not None and key in cache:
         return cache[key]
 
     val: float | None = None
+    source: str | None = None
     # Look BACK only. The one tolerance is an alert that lands seconds after
     # ``closed_at`` because the collector wrote it late: it reports the pool
     # state at the rug instant, not a later state, so a small grace keeps the
@@ -170,6 +184,8 @@ def _liq_at_close(
                     val = float(m.group(1))
                 except ValueError:
                     pass
+        if val is not None:
+            source = "alert"
 
     if val is None:
         # Last known liquidity at or before the close.
@@ -186,28 +202,13 @@ def _liq_at_close(
         if row is not None and row["liq"] is not None:
             try:
                 val = float(row["liq"])
-            except (TypeError, ValueError):
-                val = None
-
-    if val is None:
-        row = crawler.execute(
-            """
-            SELECT liquidity_usd FROM pair_history
-            WHERE chain_id = ? AND pair_address = ?
-              AND recorded_at <= ? AND liquidity_usd IS NOT NULL
-            ORDER BY recorded_at DESC LIMIT 1
-            """,
-            (key[0], pair, closed_at),
-        ).fetchone()
-        if row is not None:
-            try:
-                val = float(row["liquidity_usd"])
+                source = "sample"
             except (TypeError, ValueError):
                 val = None
 
     if cache is not None:
-        cache[key] = val
-    return val
+        cache[key] = (val, source)
+    return val, source
 
 
 def _is_tp_reason(reason: str | None) -> bool:
@@ -225,7 +226,7 @@ def restate_book(
     name = path.name
     summary = BookSummary(book=name, outlier=name in OUTLIER_BOOKS)
     con = _ro(path)
-    liq_cache: dict[tuple[str, str, str], float | None] = {}
+    liq_cache: dict[tuple[str, str, str], tuple[float | None, str | None]] = {}
     try:
         summary.start_cash = _start_cash(con)
         rows = con.execute(
@@ -253,7 +254,7 @@ def restate_book(
                 summary.n_tp += 1
             move_pct = ((exit_px / entry) - 1.0) * 100.0 if entry > 0 else 0.0
 
-            close_liq = _liq_at_close(
+            close_liq, close_liq_source = _liq_at_close(
                 crawler,
                 str(row["chain_id"] or "solana"),
                 str(row["pair_address"] or ""),
@@ -281,6 +282,7 @@ def restate_book(
                             new_pnl=tp_pnl,
                             kind="tp_clamp",
                             close_liq=close_liq,
+                            liq_source=close_liq_source,
                             closed_at=row["closed_at"],
                         )
                     )
@@ -299,6 +301,12 @@ def restate_book(
                 # Profit-side dead pool: wipe to ~0 (overrides TP clamp).
                 full_pnl = qty * entry - size  # ≈0
                 summary.n_dead_profit += 1
+                if close_liq_source == "alert":
+                    summary.n_dead_profit_alert += 1
+                    summary.dead_profit_alert_usd += tp_pnl - full_pnl
+                else:
+                    summary.n_dead_profit_sample += 1
+                    summary.dead_profit_sample_usd += tp_pnl - full_pnl
                 summary.dead_profit_trades.append(
                     TradeFix(
                         book=name,
@@ -312,7 +320,9 @@ def restate_book(
                         new_pnl=full_pnl,
                         kind="dead_pool_profit",
                         close_liq=close_liq,
+                        liq_source=close_liq_source,
                         closed_at=row["closed_at"],
+                        tp_pnl=tp_pnl,
                     )
                 )
                 # If this trade was also counted as TP overshoot, remove from
@@ -334,6 +344,7 @@ def restate_book(
                         new_pnl=orig_pnl,  # kept
                         kind="dead_pool_loss_kept",
                         close_liq=close_liq,
+                        liq_source=close_liq_source,
                         closed_at=row["closed_at"],
                     )
                 )
@@ -365,17 +376,37 @@ def render(summaries: list[BookSummary]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     lines: list[str] = []
-    lines.append("# Paper TP clamp + profit-side dead-pool restatement v2 (2026-11-04)")
+    lines.append("# Paper TP clamp + profit-side dead-pool restatement v3 (2026-11-04)")
     lines.append("")
     lines.append(f"Generated at {now} (UTC). **Read-only** — source `paper_eq_*.db` untouched.")
     lines.append("")
-    lines.append("## Rules (v2)")
+    lines.append("## Notation")
+    lines.append("")
+    lines.append("`positions.exit_price` is **already slipped** (`mid_raw*(1-slip)`), so the")
+    lines.append("shipped rule is `fill = min(exit_price, entry*(1+tp%/100))` — order A.")
+    lines.append("Multiplying `exit_price` by `0.99` again applies slippage twice (order B,")
+    lines.append("not the code). Any total below is a **snapshot at the timestamp above**;")
+    lines.append("live books keep closing, so re-running will not reproduce it exactly.")
+    lines.append("")
+    lines.append("## Rules (v3)")
     lines.append("")
     lines.append("1. **TP clamp**: `take_profit` with `exit > entry*(1+tp%/100)` → fill at limit.")
     lines.append("2. **Dead pool (profit only)**: close-time `liq < 1000` **and** `exit > entry` → flatten at entry (pnl≈0).")
     lines.append("3. **Dead pool loss kept**: `liq < 1000` but `exit <= entry` → **keep original loss** (do not beautify).")
     lines.append("4. `liq is None` → never dead-pool.")
     lines.append("5. OUTLIER books excluded from main totals.")
+    lines.append("6. **No forward-looking liquidity (v3 fix).** Close-time liquidity never uses")
+    lines.append("   a sample after `closed_at`. Evidence tier per fill:")
+    lines.append("   - `alert` — a `liquidity_drop` alert within `[-600s, +60s]` of the close")
+    lines.append("     (the +60s grace only covers the collector writing late; it reports the")
+    lines.append("     rug instant).")
+    lines.append("   - `sample` — last `pair_history` sample at or before `closed_at` is `< min_liq`.")
+    lines.append("   - none — no evidence, not judged a dead pool.")
+    lines.append("   v2 used a MIN over `[close-120s, close+20min]`, which banked pools that")
+    lines.append("   only died later; the `sample` tier is the corrected form of the same idea.")
+    lines.append("7. **SL is never clamped.** TP is a resting limit sell (fills at the limit);")
+    lines.append("   SL is a stop market and fills at the gap. Clamping SL would fake the left")
+    lines.append("   tail. Any 'symmetric execution' figure is an optimistic bound.")
     lines.append("")
 
     # Headline totals
@@ -389,6 +420,23 @@ def render(summaries: list[BookSummary]) -> str:
     lines.append(f"| 现网原值 | {_fmt_money(tot_on)} | — |")
     lines.append(f"| 只做 TP 夹价 | {_fmt_money(tot_tp)} | {_fmt_money(tot_tp - tot_on)} |")
     lines.append(f"| TP 夹价 + 修正后死池（仅浮盈） | {_fmt_money(tot_full)} | {_fmt_money(tot_full - tot_on)} |")
+    lines.append("")
+    n_alert = sum(s.n_dead_profit_alert for s in main)
+    n_sample = sum(s.n_dead_profit_sample for s in main)
+    dead_effect = tot_tp - tot_full
+    alert_effect = sum(s.dead_profit_alert_usd for s in main)
+    lines.append("### Dead-pool evidence split")
+    lines.append("")
+    lines.append(
+        f"Dead-pool effect is **${_fmt_money(dead_effect)}** in total "
+        f"({n_alert + n_sample} profit-side fills): **${_fmt_money(alert_effect)}** from "
+        f"{n_alert} `alert`-backed fills and "
+        f"**${_fmt_money(dead_effect - alert_effect)}** from {n_sample} `sample`-backed fills."
+    )
+    lines.append(
+        "The `alert` tier is the **confirmed floor**; the `sample` tier is the corrected "
+        "replacement for v2's forward-looking window, not an addition."
+    )
     lines.append("")
 
     # Main table
@@ -477,15 +525,16 @@ def render(summaries: list[BookSummary]) -> str:
     # B1) dead profit wiped
     lines.append("## B1) 死池浮盈被抵（修正后规则生效）")
     lines.append("")
-    lines.append("| book | position_id | pair | entry | exit | 移动% | close_liq | 原pnl | 夹后pnl |")
-    lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|")
+    lines.append("| book | position_id | pair | 证据档 | entry | exit | 移动% | close_liq | 原pnl | 夹后pnl |")
+    lines.append("|---|---|---|---|---|---:|---:|---:|---:|---:|")
     dprof = [t for s in main for t in s.dead_profit_trades]
     dprof.sort(key=lambda t: abs(t.orig_pnl), reverse=True)
     for t in dprof:
         lines.append(
-            "| {b} | `{pid}` | `{pair}` | {en:.8g} | {ex:.8g} | {mv:.2f} | {liq} | {op} | {np} |".format(
+            "| {b} | `{pid}` | `{pair}` | {src} | {en:.8g} | {ex:.8g} | {mv:.2f} | {liq} | {op} | {np} |".format(
                 b=t.book.replace("paper_eq_", "").replace(".db", ""),
                 pid=t.position_id[:8],
+                src=t.liq_source or "none",
                 pair=(t.pair[:12] + "…") if len(t.pair) > 12 else t.pair,
                 en=t.entry,
                 ex=t.exit,
@@ -496,10 +545,25 @@ def render(summaries: list[BookSummary]) -> str:
             )
         )
     if not dprof:
-        lines.append("| (none) |  |  |  |  |  |  |  |  |")
-    dead_wiped = sum(t.orig_pnl - t.new_pnl for t in dprof)
+        lines.append("| (none) |  |  |  |  |  |  |  |  |  |")
+    gross = sum(t.orig_pnl - t.new_pnl for t in dprof)
+    marginal = sum(t.tp_pnl - t.new_pnl for t in dprof)
+    m_alert = sum(t.tp_pnl - t.new_pnl for t in dprof if t.liq_source == "alert")
+    m_sample = marginal - m_alert
+    n_alert_b1 = sum(1 for t in dprof if t.liq_source == "alert")
     lines.append("")
-    lines.append(f"共 {len(dprof)} 笔；死池抵掉浮盈合计 ${_fmt_money(dead_wiped)}。")
+    lines.append(
+        f"共 {len(dprof)} 笔。**原值 → 最终**毛差 ${_fmt_money(gross)}，"
+        f"其中 TP 夹价先吃掉 ${_fmt_money(gross - marginal)}，"
+        f"**死池规则净效应 ${_fmt_money(marginal)}**（这才是与「只做 TP 夹价」那一档的差）。"
+    )
+    lines.append("")
+    lines.append(
+        f"死池净效应按证据档拆：`alert` {n_alert_b1} 笔 ${_fmt_money(m_alert)}、"
+        f"`sample` {len(dprof) - n_alert_b1} 笔 ${_fmt_money(m_sample)}。"
+        f"后者是 v2 前视窗口的修正替代、不是追加项；两档合计须等于 Headline 里的死池效应，"
+        f"否则说明还有第 `none` 档被算了进来。"
+    )
     lines.append("")
 
     # B2) dead loss kept
