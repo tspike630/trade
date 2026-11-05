@@ -1198,8 +1198,23 @@ class BinanceSpotAdapter:
                     exit_plan=plan,
                 )
             )
+        if self.client is None:
+            return self._finish(
+                _result(
+                    ok=False,
+                    dry_run=False,
+                    executed=0,
+                    submitted=False,
+                    error="mcp_gate_required",
+                    symbol=symbol,
+                    order=None,
+                    exchange_order_id=None,
+                    gates=gates,
+                    exit_plan=plan,
+                )
+            )
 
-        client = self.client if self.client is not None else BinanceSpotHttpClient()
+        client = self.client
         try:
             info = client.exchange_info(symbol)
         except Exception as exc:  # noqa: BLE001 — surface a redacted refusal, no retry

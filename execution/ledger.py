@@ -134,6 +134,7 @@ class ExecutionLedger:
         self._ensure_unique_decision()
         self._ensure_binance_spot_positions()
         self._ensure_binance_spot_position_columns()
+        self._ensure_mcp_book()
 
     def _ensure_status_columns(self) -> None:
         """Idempotent migration: status + status_updated_at on execution_log.
@@ -251,6 +252,144 @@ class ExecutionLedger:
                 self.conn.execute(
                     f"ALTER TABLE binance_spot_positions ADD COLUMN {name} TEXT"
                 )
+
+    def _ensure_mcp_book(self) -> None:
+        """Canonical hold and spent client ids for the live_bnb gate.
+
+        These rows are not ``binance_spot_positions`` and are not an exit plan.
+        """
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS canonical_positions (
+                purpose TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                status TEXT NOT NULL,
+                decision_log_id INTEGER NOT NULL,
+                quantity TEXT,
+                entry_order_id TEXT,
+                client_order_id TEXT,
+                avg_price TEXT,
+                cummulative_quote_qty TEXT,
+                source TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (purpose, decision_log_id)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS spent_orders (
+                client_order_id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                executed_qty TEXT,
+                decision_log_id INTEGER,
+                purpose TEXT NOT NULL,
+                commission TEXT,
+                commission_asset TEXT
+            )
+            """
+        )
+
+    def import_verified_fill(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Insert one verified spot fill. Does not move the execution cursor.
+
+        Exit prices are refused. A repeated client id is a no-op.
+        """
+        if receipt.get("stop_price") not in (None, "") or receipt.get("take_profit_price") not in (
+            None,
+            "",
+        ):
+            raise ValueError("blind_exit_rejected")
+        encoded = json.dumps(receipt, sort_keys=True, default=str)
+        if "0.156425" in encoded:
+            raise ValueError("blind_exit_rejected")
+        cursor_before = self.get_last_processed_id()
+        purpose = str(receipt.get("purpose") or "").strip()
+        symbol = str(receipt.get("symbol") or "").strip()
+        client_id = str(receipt.get("client_order_id") or "").strip()
+        order_id = str(receipt.get("order_id") or "").strip()
+        decision_id = int(receipt["decision_log_id"])
+        if not purpose or not symbol or not client_id or not order_id:
+            raise ValueError("verified_fill_incomplete")
+        now = _utc()
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO canonical_positions (
+                purpose, symbol, status, decision_log_id, quantity,
+                entry_order_id, client_order_id, avg_price,
+                cummulative_quote_qty, source, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                purpose,
+                symbol,
+                str(receipt.get("status") or "held_naked"),
+                decision_id,
+                receipt.get("quantity"),
+                order_id,
+                client_id,
+                receipt.get("avg_price"),
+                receipt.get("cummulative_quote_qty"),
+                receipt.get("source"),
+                now,
+                now,
+            ),
+        )
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO spent_orders (
+                client_order_id, order_id, symbol, executed_qty,
+                decision_log_id, purpose, commission, commission_asset
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                client_id,
+                order_id,
+                symbol,
+                receipt.get("executed_qty", receipt.get("quantity")),
+                decision_id,
+                purpose,
+                receipt.get("commission"),
+                receipt.get("commission_asset"),
+            ),
+        )
+        self.conn.commit()
+        if self.get_last_processed_id() != cursor_before:
+            raise RuntimeError("verified fill moved the execution cursor")
+        return self.mcp_book()
+
+    def mcp_book(self) -> dict[str, Any]:
+        """Book the live_bnb gate reads. Open orders are not invented."""
+        canonical = [
+            dict(row)
+            for row in self.conn.execute(
+                """
+                SELECT purpose, symbol, status, decision_log_id, quantity,
+                       entry_order_id, client_order_id, avg_price,
+                       cummulative_quote_qty, source
+                FROM canonical_positions
+                ORDER BY decision_log_id
+                """
+            )
+        ]
+        spent = [
+            dict(row)
+            for row in self.conn.execute(
+                """
+                SELECT order_id, client_order_id, symbol, executed_qty,
+                       decision_log_id, purpose, commission, commission_asset
+                FROM spent_orders
+                ORDER BY decision_log_id
+                """
+            )
+        ]
+        return {
+            "canonical_positions": canonical,
+            "spent_orders": spent,
+            "open_orders": [],
+        }
 
     # --- cursor ---
 

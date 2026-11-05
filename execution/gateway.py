@@ -27,7 +27,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from logging_setup import get_logger
 
@@ -42,6 +42,12 @@ from execution.executors.binance_spot import (
     PURPOSE_LIVE_BNB_BOLL_FADE,
     BinanceSpotAdapter,
     held_position_spec,
+    kill_switch_active,
+)
+from execution.live_bnb_dispatch import (
+    CatalogProbe,
+    dispatch_live_bnb,
+    parent_queue_view,
 )
 from execution.ledger import ExecutionLedger, _utc
 from execution.order_events import init_events
@@ -365,6 +371,8 @@ class ExecutionGateway:
         pm_enabled: bool | None = None,
         accept_purposes: frozenset[str] | set[str] | tuple[str, ...] | list[str] | None = None,
         binance_spot: BinanceSpotAdapter | None = None,
+        mcp_catalog: Iterable[str] | None = None,
+        mcp_transport: CatalogProbe | None = None,
     ) -> None:
         self.decision_db = resolve_decision_db(decision_db)
         self._owns_ledger = ledger is None
@@ -388,6 +396,9 @@ class ExecutionGateway:
                 str(p).strip() for p in accept_purposes if str(p).strip()
             )
         self._binance_spot = binance_spot
+        self._binance_injected = binance_spot is not None
+        self._mcp_catalog = tuple(mcp_catalog) if mcp_catalog else None
+        self._mcp_transport = mcp_transport
         # Order-event table lives on the execution ledger only. Flag off → no write.
         if EXECUTION_EVENTS_ENABLED:
             init_events(self.ledger.path)
@@ -1154,6 +1165,51 @@ class ExecutionGateway:
         if not ok:
             receipt_body["status"] = "validation_failed"
             receipt_body["note"] = "validation_failed; not executed"
+        elif (
+            sig.get("purpose") == PURPOSE_LIVE_BNB_BOLL_FADE
+            and mode != "dry_run"
+            and not self._binance_injected
+        ):
+            active, kill_name = kill_switch_active()
+            executor = BINANCE_SPOT_EXECUTOR
+            executed = 0
+            submitted_to_executor = False
+            if active:
+                exec_error = f"kill_switch:{kill_name}"
+                receipt_body["status"] = "live_refused"
+                receipt_body["note"] = "kill switch before the live_bnb gate"
+                receipt_body["error"] = exec_error
+            else:
+                transport = self._mcp_transport
+                if transport is None and self._mcp_catalog is not None:
+                    transport = CatalogProbe(self._mcp_catalog)
+                evaluation = dispatch_live_bnb(
+                    sig,
+                    self.ledger.mcp_book(),
+                    transport,
+                )
+                calls = parent_queue_view(evaluation)
+                exec_result = {
+                    "reason": evaluation.get("reason"),
+                    "idem": evaluation.get("idem"),
+                    "parent_calls": calls,
+                    "protection_tool_present": evaluation.get("protection_tool_present"),
+                    "handshake": evaluation.get("handshake"),
+                    "allow_buy": False,
+                    "allow_sell": False,
+                    "poll_naked_position": False,
+                    "auto_sell": False,
+                }
+                receipt_body["status"] = "gate_skip"
+                receipt_body["note"] = "live_bnb gate skip; no order"
+                receipt_body["gate_reason"] = evaluation.get("reason")
+                receipt_body["exec_result"] = exec_result
+                log.info(
+                    "live_bnb gate decision_log_id=%s action=%s reason=%s",
+                    sig.get("decision_log_id"),
+                    action,
+                    evaluation.get("reason"),
+                )
         elif sig.get("purpose") == PURPOSE_LIVE_BNB_BOLL_FADE:
             # CEX arm: not a paper fill, and not LiveExecutor. The adapter
             # itself keeps live newOrder behind the kill switch.

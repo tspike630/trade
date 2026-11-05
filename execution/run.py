@@ -38,6 +38,7 @@ from logging_setup import get_logger, setup_logging  # noqa: E402
 from execution.executors.binance_spot import (  # noqa: E402
     PURPOSE_LIVE_BNB_BOLL_FADE,
 )
+from execution.live_bnb_dispatch import live_bnb_paper_env_block
 from execution.gateway import ExecutionGateway, _env_bool  # noqa: E402
 from execution.ledger import resolve_ledger_path  # noqa: E402
 
@@ -309,6 +310,14 @@ def main(argv: list[str] | None = None) -> int:
             "Rules PM_TOKEN_DEDUP / PM_STRATEGY_MUTEX / PM_MAX_* default off."
         ),
     )
+    parser.add_argument(
+        "--mcp-catalog",
+        default=None,
+        help=(
+            "optional comma-separated MCP tool names from the parent. "
+            "Empty means fail-closed. This process does not call the tools."
+        ),
+    )
     args = parser.parse_args(argv)
 
     setup_logging()
@@ -336,6 +345,13 @@ def main(argv: list[str] | None = None) -> int:
     if peer_err:
         log.error("refusing to start: %s", peer_err)
         return 2
+    paper_env_err = live_bnb_paper_env_block(
+        paper_enabled=paper_enabled,
+        accept_live_bnb=accept_purposes == frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
+    )
+    if paper_env_err:
+        log.error("refusing to start: %s", paper_env_err)
+        return 2
 
     log.info(
         "execution start once=%s interval=%s ledger=%s since_id=%s paper_enabled=%s paper_db=%s paper_tick=%s pm_enabled=%s accept_purposes=%s",
@@ -362,6 +378,13 @@ def main(argv: list[str] | None = None) -> int:
         paper_db=args.paper_db if (paper_enabled or pm_enabled) else None,
         pm_enabled=pm_enabled,
         accept_purposes=accept_purposes,
+        mcp_catalog=[
+            part.strip()
+            for part in str(args.mcp_catalog).split(",")
+            if part.strip()
+        ]
+        if args.mcp_catalog
+        else None,
     ) as gw:
 
         def tick(since_id: int | None) -> dict:
