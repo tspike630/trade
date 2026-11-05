@@ -276,6 +276,7 @@ class EnginePurposeUniverseTests(unittest.TestCase):
         return _decision_rows(db)
 
     def test_live_purpose_emits_binance_symbol_only(self) -> None:
+        """auto, no CEX tables yet: the DEX∩listing bypass still stamps the symbol."""
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "d.db"
             _seed(db)

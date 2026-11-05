@@ -1,5 +1,7 @@
 # 决策 · Binance CEX 旁簿映射写绿（2026-11-05）
 
+**14:38 更新：** `live_bnb_boll_fade` 的主数据改为币安现货 K 线因子（`binance_indicators`），符号名单用采集层已落地的主宇宙，不再把 DEX 热池∩映射当主路径。DEX 映射留作 `LIVE_BNB_FACTOR_SOURCE=dex_map` 旁路。读法见 `docs/live_bnb_binance_klines.md` 与 `decision_cex_bnb_binance_native_2026-11-05.md`。纸面 `race_tech_boll_fade` 仍走下面不动过的 Solana 行。
+
 杨令（≈12:46–12:49 HKT）：链上 LiveExecutor 不作 `tech_boll_fade` 真盘出口；转币安 CEX。先由决策把 CEX 旁簿映射写绿，执行再自动下单。本文件只写决策侧。不下单、不碰密钥、不摘 `LIVE_TRADING_DISABLED`。
 
 ## 身份
