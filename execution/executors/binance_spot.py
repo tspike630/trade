@@ -13,13 +13,18 @@ This module does not call ``LiveExecutor`` and does not apply a per-order
 notional cap. Tests inject a client. The HTTP client is built only after the
 gates pass and only when no client was injected.
 
-A live buy does not attach a spot OCO or ``STOP_LOSS_LIMIT``. The entry
-receipt keeps ``protective_order=not_supported_not_sent``. After that buy
-fills, the execution loop calls ``exit_held_position``, which uses
-``protective_exit_reason`` and, when the mark hits the absolute stop or the
-decision-time take-profit, sells the whole floored base balance. Dry-run
-never arms a position and never submits. The same kill switch and
-``BINANCE_SPOT_LIVE_ENABLED`` gate block that sell.
+A live buy does not attach the OCO to the entry ``newOrder``. The entry
+receipt keeps ``protective_order=not_supported_not_sent``. After the fill,
+``maintain_held_position`` posts ``POST /api/v3/orderList/oco`` (take-profit
+``LIMIT_MAKER`` and stop ``STOP_LOSS_LIMIT``) sized from ``executedQty``.
+That list is the exchange-side cover if this process is down. The loop
+market sell is only the fallback after a positive OCO rejection or a
+terminal unfilled list. Dry-run never calls HTTP.
+
+``LIVE_TRADING_DISABLED`` blocks new buys and inbound sell signals. A
+ledger-tracked protective sell still goes out unless
+``BINANCE_SPOT_BLOCK_SELL_ON_KILL=1``. ``BINANCE_SPOT_LIVE_ENABLED`` must
+also be on. Neither flag is enabled by this module.
 """
 
 from __future__ import annotations
@@ -53,6 +58,8 @@ DEFAULT_BASE_URL = "https://api.binance.com"
 SPOT_PATH = "/api/v3/order"
 EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
 TICKER_PATH = "/api/v3/ticker/price"
+OCO_PATH = "/api/v3/orderList/oco"
+ORDER_LIST_PATH = "/api/v3/orderList"
 RECV_WINDOW_MS = "5000"
 LIVE_MODE = "live_stub"
 DRY_MODE = "dry_run"
@@ -276,8 +283,8 @@ def build_exit_plan(
     Absent on a legacy signal (no ``entry_reason`` and no prices) so an old
     dry-run still acks. Present prices are the decision-time ``boll_mid`` and
     the stop reference; a later mid does not rewrite them. The entry order
-    still does not rest an OCO. ``exit_held_position`` is what sells the
-    position after a fill.
+    itself still does not rest an OCO. ``maintain_held_position`` posts that
+    list after the fill, and ``exit_held_position`` is only the fallback.
     """
     stop_raw = extras.get("stop_price")
     tp_raw = extras.get("take_profit_price")
@@ -528,7 +535,14 @@ def held_position_spec(
     take_profit = _positive_decimal(plan.get("take_profit_price"))
     if stop is None or take_profit is None:
         return None
-    qty = _positive_decimal(result.get("filled_qty"))
+    raw_sellable = result.get("sellable_qty")
+    qty = (
+        _positive_decimal(raw_sellable)
+        if raw_sellable not in (None, "")
+        else None
+    )
+    if qty is None:
+        qty = _positive_decimal(result.get("filled_qty"))
     return {
         "decision_log_id": int(str(sig.get("decision_log_id")).strip()),
         "symbol": symbol,
@@ -698,6 +712,32 @@ class BinanceSpotHttpClient:
         status, body = self._opener(request, self.timeout)
         return _decode_ok(status, body)
 
+    def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"{self.base_url}{OCO_PATH}",
+            data=signed_query.encode("utf-8"),
+            method="POST",
+            headers={
+                "User-Agent": "trade-binance-spot",
+                "X-MBX-APIKEY": api_key,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        status, body = self._opener(request, self.timeout)
+        return _decode_ok(status, body)
+
+    def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"{self.base_url}{ORDER_LIST_PATH}?{signed_query}",
+            method="GET",
+            headers={
+                "User-Agent": "trade-binance-spot",
+                "X-MBX-APIKEY": api_key,
+            },
+        )
+        status, body = self._opener(request, self.timeout)
+        return _decode_ok(status, body)
+
 
 def _decode_ok(status: int, body: bytes) -> dict[str, Any]:
     if status >= 400:
@@ -800,6 +840,7 @@ def _result(
     intent: dict[str, Any] | None = None,
     exit_plan: dict[str, Any] | None = None,
     filled_qty: str | None = None,
+    sellable_qty: str | None = None,
 ) -> dict[str, Any]:
     return {
         "ok": ok,
@@ -815,7 +856,29 @@ def _result(
         "intent": intent,
         "exit_plan": exit_plan,
         "filled_qty": filled_qty,
+        "sellable_qty": sellable_qty,
     }
+
+
+from execution.executors.binance_spot_protect import (  # noqa: E402
+    PROTECTION_DUST,
+    PROTECTION_EXCHANGE,
+    PROTECTION_FALLBACK,
+    PROTECTION_PENDING,
+    block_sell_on_kill,
+    build_spot_oco,
+    classify_oco,
+    dust_archive_fields,
+    dust_detail,
+    entry_notional_floor_error,
+    entry_viability_error,
+    is_request_timeout,
+    oco_is_working,
+    oco_leg_ids,
+    protective_order_block,
+    sellable_base_qty,
+    tracked_exit,
+)
 
 
 class BinanceSpotAdapter:
@@ -851,6 +914,7 @@ class BinanceSpotAdapter:
             "kill_switch_active": active,
             "kill_switch": name,
             "live_enabled": _env_flag(ENABLE_ENV),
+            "block_sell_on_kill": block_sell_on_kill(),
         }
 
     def execute(self, sig: dict[str, Any]) -> dict[str, Any]:
@@ -939,6 +1003,23 @@ class BinanceSpotAdapter:
             )
         forced_dry = self.dry_run is True or mode == DRY_MODE
         if forced_dry:
+            if str(sig.get("action") or "").strip().lower() == "buy":
+                floor_error = entry_notional_floor_error(extras)
+                if floor_error:
+                    return self._finish(
+                        _result(
+                            ok=False,
+                            dry_run=True,
+                            executed=0,
+                            submitted=False,
+                            error=floor_error,
+                            symbol=symbol,
+                            order=None,
+                            exchange_order_id=None,
+                            gates=gates,
+                            exit_plan=plan,
+                        )
+                    )
             preview, preview_error = self._preview(sig, extras, symbol)
             side = _parse_side(sig.get("action"))
             order_type = _parse_order_type(
@@ -1028,6 +1109,24 @@ class BinanceSpotAdapter:
                 )
             )
 
+        if _parse_side(sig.get("action")) == "BUY":
+            floor_error = entry_notional_floor_error(extras)
+            if floor_error:
+                return self._finish(
+                    _result(
+                        ok=False,
+                        dry_run=False,
+                        executed=0,
+                        submitted=False,
+                        error=floor_error,
+                        symbol=symbol,
+                        order=dict(pairs),
+                        exchange_order_id=None,
+                        gates=gates,
+                        exit_plan=plan,
+                    )
+                )
+
         key, secret = self._credentials()
         if not key or not secret:
             return self._finish(
@@ -1078,6 +1177,23 @@ class BinanceSpotAdapter:
                     exit_plan=plan,
                 )
             )
+        if _parse_side(sig.get("action")) == "BUY":
+            viable_error = entry_viability_error(extras, info, symbol)
+            if viable_error:
+                return self._finish(
+                    _result(
+                        ok=False,
+                        dry_run=False,
+                        executed=0,
+                        submitted=False,
+                        error=viable_error,
+                        symbol=symbol,
+                        order=None,
+                        exchange_order_id=None,
+                        gates=gates,
+                        exit_plan=plan,
+                    )
+                )
 
         signed = sign_query(pairs, secret)
         try:
@@ -1151,6 +1267,7 @@ class BinanceSpotAdapter:
                 intent=intent,
                 exit_plan=plan,
                 filled_qty=filled_base_qty(placed),
+                sellable_qty=sellable_base_qty(placed, symbol) or filled_base_qty(placed),
             )
         )
 
@@ -1226,7 +1343,7 @@ class BinanceSpotAdapter:
     def refresh_filled_qty(self, position: dict[str, Any]) -> str | None:
         """Read the entry order's base fill. No request while the live gates are shut."""
         gates = self._gates()
-        if gates["kill_switch_active"] or not gates["live_enabled"]:
+        if not gates["live_enabled"]:
             return None
         symbol = position.get("symbol")
         order_id = position.get("entry_order_id")
@@ -1260,7 +1377,7 @@ class BinanceSpotAdapter:
     def mark_price(self, symbol: str) -> object | None:
         """Public last price. No client is built while the live gates are shut."""
         gates = self._gates()
-        if gates["kill_switch_active"] or not gates["live_enabled"]:
+        if not gates["live_enabled"]:
             return None
         if not is_spot_usdt_symbol(symbol):
             return None
@@ -1312,8 +1429,13 @@ class BinanceSpotAdapter:
             "gates": gates,
             "quantity": None,
             "exit_client_order_id": client_id,
-            "protection": HELD_EXIT_PROTECTION,
+            "protection": position.get("protection") or HELD_EXIT_PROTECTION,
+            "book": "unchanged",
         }
+        if not tracked_exit(position):
+            outcome["error"] = "untracked_exit"
+            outcome["book"] = "unchanged"
+            return self._log_exit(outcome)
         status = str(position.get("status") or "")
         if status == "qty_unconfirmed":
             outcome["error"] = "exit_qty_unconfirmed"
@@ -1336,11 +1458,10 @@ class BinanceSpotAdapter:
             unexpected_reason: never = reason
             outcome["error"] = f"invalid_exit_reason:{unexpected_reason}"
             return self._log_exit(outcome)
-        if gates["kill_switch_active"]:
-            outcome["error"] = f"kill_switch:{gates['kill_switch']}"
-            return self._log_exit(outcome)
-        if not gates["live_enabled"]:
-            outcome["error"] = "binance_spot_live_disabled"
+        blocked = protective_order_block(gates)
+        if blocked:
+            outcome["error"] = blocked
+            outcome["book"] = "blocked"
             return self._log_exit(outcome)
         if not isinstance(symbol, str) or not is_spot_usdt_symbol(symbol):
             outcome["error"] = "invalid_binance_symbol"
@@ -1368,7 +1489,22 @@ class BinanceSpotAdapter:
             return self._log_exit(outcome)
         sized, size_error = size_exit_quantity(info, symbol, qty, mark)
         if size_error or sized is None:
-            outcome["error"] = size_error or "exit_qty_invalid"
+            detail = dust_detail(size_error)
+            if detail is not None:
+                archived = dust_archive_fields(
+                    quantity=qty,
+                    mark=mark,
+                    stop=position.get("stop_price"),
+                    detail=detail,
+                )
+                outcome["error"] = "dust_untradable"
+                outcome["dust_detail"] = detail
+                outcome["residual_qty"] = archived["residual_qty"]
+                outcome["residual_quote"] = archived["residual_quote"]
+                outcome["book"] = "closed_dust"
+            else:
+                outcome["error"] = size_error or "exit_qty_invalid"
+                outcome["book"] = "error_only"
             return self._log_exit(outcome)
         pairs, qty_error = _order_pairs(
             symbol=symbol,
@@ -1405,7 +1541,539 @@ class BinanceSpotAdapter:
         outcome["submitted"] = True
         outcome["executed"] = 1
         outcome["exchange_order_id"] = order_id
+        outcome["book"] = "exit_submitted"
         return self._log_exit(outcome)
+
+    def maintain_held_position(
+        self,
+        position: dict[str, Any],
+        mark: object,
+        *,
+        persist: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+    ) -> dict[str, Any]:
+        """Requery or place the spot OCO, else fall back to the market exit.
+
+        ``persist`` runs before the OCO POST so a crash still has the client
+        id to requery. Exchange coverage is recorded only after a working
+        list is observed. A timeout does not market-sell.
+        """
+        row = dict(position)
+
+        def save(fields: dict[str, Any]) -> None:
+            if persist is None:
+                row.update(fields)
+                return
+            saved = persist(fields)
+            if isinstance(saved, dict):
+                row.clear()
+                row.update(saved)
+            else:
+                row.update(fields)
+
+        if not tracked_exit(row):
+            return self._coverage(
+                row,
+                book="unchanged",
+                error="untracked_exit",
+                submitted=False,
+            )
+        status = str(row.get("status") or "")
+        if status == "qty_unconfirmed":
+            return self._coverage(
+                row,
+                book="unchanged",
+                error="exit_qty_unconfirmed",
+                submitted=False,
+            )
+        if status in {"closed_dust", "exit_submitted", "oco_filled"}:
+            return self._coverage(
+                row,
+                book="unchanged",
+                error="position_not_open",
+                submitted=False,
+                ok=True,
+            )
+
+        protection = str(row.get("protection") or "")
+        if status in {"oco_unknown", "oco_working"} or protection in {
+            PROTECTION_PENDING,
+            PROTECTION_EXCHANGE,
+        }:
+            recon = self._reconcile_oco(row)
+            state = str(recon.get("state") or "")
+            if state == "working":
+                save(self._oco_working_fields(row, recon))
+                return self._coverage(
+                    row,
+                    book="oco_working",
+                    submitted=False,
+                    ok=True,
+                    protection=PROTECTION_EXCHANGE,
+                    error=None,
+                )
+            if state == "filled":
+                save(
+                    {
+                        "status": "oco_filled",
+                        "protection": PROTECTION_EXCHANGE,
+                        "exit_reason": recon.get("exit_reason"),
+                        "exit_order_id": recon.get("filled_order_id"),
+                        "oco_list_status": recon.get("list_status"),
+                        "oco_order_list_id": recon.get("order_list_id"),
+                        "oco_above_order_id": recon.get("above_order_id"),
+                        "oco_below_order_id": recon.get("below_order_id"),
+                        "last_error": None,
+                    }
+                )
+                return self._coverage(
+                    row,
+                    book="oco_filled",
+                    submitted=False,
+                    ok=True,
+                    protection=PROTECTION_EXCHANGE,
+                    error=None,
+                    reason=recon.get("exit_reason"),
+                )
+            if state == "requery_failed":
+                save({"last_error": recon.get("error") or "oco_requery_failed"})
+                return self._coverage(
+                    row,
+                    book="oco_unknown",
+                    submitted=False,
+                    error=recon.get("error") or "oco_requery_failed",
+                    protection=row.get("protection") or PROTECTION_PENDING,
+                )
+            if state == "absent" and status == "oco_working":
+                save({"last_error": "oco_requery_missing"})
+                return self._coverage(
+                    row,
+                    book="oco_working",
+                    submitted=False,
+                    error="oco_requery_missing",
+                    protection=PROTECTION_EXCHANGE,
+                )
+            if state == "absent" and status != "oco_unknown":
+                save({"last_error": "oco_requery_missing"})
+                return self._coverage(
+                    row,
+                    book="oco_unknown",
+                    submitted=False,
+                    error="oco_requery_missing",
+                    protection=PROTECTION_PENDING,
+                )
+            if state in {"unfilled", "partial"}:
+                remainder = recon.get("remainder_qty") or row.get("quantity")
+                detail = (
+                    "oco_partial_remainder" if state == "partial" else "oco_terminal_unfilled"
+                )
+                if state == "partial" and dust_detail("oco_qty_below_min") and self._remainder_is_dust(
+                    row, str(remainder), mark
+                ):
+                    fields = dust_archive_fields(
+                        quantity=str(remainder),
+                        mark=mark,
+                        stop=row.get("stop_price"),
+                        detail="oco_partial_remainder",
+                    )
+                    save(fields)
+                    return self._coverage(
+                        row,
+                        book="closed_dust",
+                        submitted=False,
+                        error="dust_untradable",
+                        protection=PROTECTION_DUST,
+                        reason="dust_abandon",
+                    )
+                save(
+                    {
+                        "status": "open",
+                        "protection": PROTECTION_FALLBACK,
+                        "quantity": str(remainder) if remainder is not None else row.get("quantity"),
+                        "oco_list_status": recon.get("list_status"),
+                        "last_error": detail,
+                    }
+                )
+            elif state == "absent":
+                # oco_unknown and the list is not on the book. Place below.
+                pass
+            elif state:
+                save({"last_error": recon.get("error") or "oco_requery_failed"})
+                return self._coverage(
+                    row,
+                    book="oco_unknown",
+                    submitted=False,
+                    error=recon.get("error") or "oco_requery_failed",
+                    protection=PROTECTION_PENDING,
+                )
+
+        if str(row.get("protection") or "") != PROTECTION_FALLBACK and str(row.get("status") or "") == "open":
+            placed = self._try_place_oco(row, mark, save)
+            if placed is not None:
+                return placed
+
+        outcome = self.exit_held_position(row, mark)
+        if outcome.get("book") == "closed_dust":
+            fields = dust_archive_fields(
+                quantity=str(outcome.get("residual_qty") or row.get("quantity") or ""),
+                mark=mark,
+                stop=row.get("stop_price"),
+                detail=str(outcome.get("dust_detail") or "exit_qty_below_min"),
+            )
+            save(fields)
+            outcome["protection"] = PROTECTION_DUST
+            outcome["reason"] = "dust_abandon"
+            return outcome
+        if outcome.get("book") == "error_only" or (
+            outcome.get("error") and outcome.get("book") == "unchanged"
+        ):
+            outcome["book"] = "error_only"
+        return outcome
+
+    def _try_place_oco(
+        self,
+        row: dict[str, Any],
+        mark: object,
+        save: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any] | None:
+        """Place the list, or return None so the loop fallback can run.
+
+        A returned dict is terminal for this tick (resting, unknown, blocked).
+        """
+        gates = self._gates()
+        client = self.client
+        if client is None or not callable(getattr(client, "new_oco", None)):
+            save(
+                {
+                    "status": "open",
+                    "protection": PROTECTION_FALLBACK,
+                    "last_error": "oco_client_unsupported",
+                }
+            )
+            return None
+        blocked = protective_order_block(gates)
+        if blocked:
+            return self._coverage(
+                row,
+                book="blocked",
+                submitted=False,
+                error=blocked,
+                protection=row.get("protection"),
+            )
+        info, info_error = self._load_symbol_info(row, gates)
+        if info_error or not isinstance(info, dict):
+            save(
+                {
+                    "status": "open",
+                    "protection": PROTECTION_FALLBACK,
+                    "last_error": info_error or "oco_missing_lot_filter",
+                }
+            )
+            return None
+        filters = _symbol_filters(info, str(row.get("symbol") or ""))
+        if not filters:
+            save(
+                {
+                    "status": "open",
+                    "protection": PROTECTION_FALLBACK,
+                    "last_error": "oco_missing_lot_filter",
+                }
+            )
+            return None
+        spec, spec_error = build_spot_oco(
+            symbol=str(row.get("symbol") or ""),
+            quantity=str(row.get("quantity") or ""),
+            stop_price=str(row.get("stop_price") or ""),
+            take_profit_price=str(row.get("take_profit_price") or ""),
+            decision_id=row.get("decision_log_id"),
+            filters=filters,
+            mark=mark,
+            timestamp_ms=int(self.clock_ms()),
+        )
+        if spec_error in {"oco_qty_below_min"} or dust_detail(spec_error):
+            fields = dust_archive_fields(
+                quantity=str(row.get("quantity") or ""),
+                mark=mark,
+                stop=row.get("stop_price"),
+                detail=spec_error or "oco_qty_below_min",
+            )
+            save(fields)
+            return self._coverage(
+                row,
+                book="closed_dust",
+                submitted=False,
+                error="dust_untradable",
+                protection=PROTECTION_DUST,
+                reason="dust_abandon",
+            )
+        if spec is None or spec_error:
+            save(
+                {
+                    "status": "open",
+                    "protection": PROTECTION_FALLBACK,
+                    "last_error": spec_error or "oco_rejected",
+                }
+            )
+            return None
+        key, secret = self._credentials()
+        if not key or not secret:
+            return self._coverage(
+                row,
+                book="blocked",
+                submitted=False,
+                error="missing_api_credentials",
+            )
+        save(
+            {
+                "status": "oco_unknown",
+                "protection": PROTECTION_PENDING,
+                "oco_list_client_id": spec["list_client_id"],
+                "oco_above_client_id": spec["above_client_id"],
+                "oco_below_client_id": spec["below_client_id"],
+                "quantity": spec["quantity"],
+                "residual_qty": spec.get("residual_qty"),
+                "residual_quote": None
+                if not spec.get("residual_qty")
+                else dust_archive_fields(
+                    quantity=str(spec["residual_qty"]),
+                    mark=mark,
+                    stop=row.get("stop_price"),
+                    detail="oco_lot_residual",
+                )["residual_quote"],
+                "last_error": None,
+            }
+        )
+        signed = sign_query(spec["pairs"], secret)
+        try:
+            placed = client.new_oco(signed, api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            found = self._reconcile_oco(row)
+            if found.get("state") == "working":
+                save(self._oco_working_fields(row, found))
+                return self._coverage(
+                    row,
+                    book="oco_working",
+                    submitted=True,
+                    ok=True,
+                    protection=PROTECTION_EXCHANGE,
+                    error=None,
+                )
+            if is_request_timeout(exc) or not isinstance(exc, BinanceRequestError):
+                save(
+                    {
+                        "status": "oco_unknown",
+                        "protection": PROTECTION_PENDING,
+                        "last_error": "oco_submit_timeout",
+                    }
+                )
+                return self._coverage(
+                    row,
+                    book="oco_unknown",
+                    submitted=False,
+                    error="oco_submit_timeout",
+                    protection=PROTECTION_PENDING,
+                )
+            save(
+                {
+                    "status": "open",
+                    "protection": PROTECTION_FALLBACK,
+                    "last_error": f"oco_rejected:{_public_error(exc, key, secret)}",
+                }
+            )
+            return None
+        if not isinstance(placed, dict) or placed.get("orderListId") is None:
+            save(
+                {
+                    "status": "open",
+                    "protection": PROTECTION_FALLBACK,
+                    "last_error": "oco_rejected:missing_order_list_id",
+                }
+            )
+            return None
+        classified = classify_oco(placed, held_qty=str(spec["quantity"]))
+        if classified.get("state") not in {"working", "partial_working", "filled"}:
+            save(
+                {
+                    "status": "open",
+                    "protection": PROTECTION_FALLBACK,
+                    "oco_order_list_id": classified.get("order_list_id"),
+                    "oco_list_status": classified.get("list_status"),
+                    "last_error": "oco_rejected:not_working",
+                }
+            )
+            return None
+        fields = self._oco_working_fields(row, classified)
+        fields["quantity"] = spec["quantity"]
+        if spec.get("residual_qty"):
+            fields["residual_qty"] = spec["residual_qty"]
+        save(fields)
+        return self._coverage(
+            row,
+            book="oco_working",
+            submitted=True,
+            ok=True,
+            protection=PROTECTION_EXCHANGE,
+            error=None,
+            order=dict(spec["pairs"]),
+            quantity=spec["quantity"],
+        )
+
+    def _reconcile_oco(self, row: dict[str, Any]) -> dict[str, Any]:
+        gates = self._gates()
+        if not gates.get("live_enabled"):
+            return {"state": "requery_failed", "error": "binance_spot_live_disabled"}
+        client = self.client
+        query = getattr(client, "get_order_list", None) if client is not None else None
+        if not callable(query):
+            return {"state": "requery_failed", "error": "oco_requery_unsupported"}
+        key, secret = self._credentials()
+        if not key or not secret:
+            return {"state": "requery_failed", "error": "missing_api_credentials"}
+        symbol = str(row.get("symbol") or "")
+        list_client = row.get("oco_list_client_id")
+        list_order = row.get("oco_order_list_id")
+        if list_order not in (None, ""):
+            ident = ("orderListId", str(list_order))
+        elif list_client not in (None, ""):
+            ident = ("origClientOrderId", str(list_client))
+        else:
+            return {"state": "absent", "error": "oco_requery_missing"}
+        pairs = [
+            ident,
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            payload = query(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            if isinstance(exc, BinanceRequestError) and exc.status in {400, 404}:
+                return {"state": "absent", "error": "oco_not_found"}
+            return {"state": "requery_failed", "error": _public_error(exc, key, secret)}
+        if not isinstance(payload, dict):
+            return {"state": "requery_failed", "error": "oco_requery_failed"}
+        if not payload.get("orderReports"):
+            legs = self._load_oco_legs(payload, symbol, key, secret)
+            if legs is None and not oco_is_working(payload):
+                return {"state": "requery_failed", "error": "oco_leg_requery_failed"}
+            if legs:
+                payload = dict(payload)
+                payload["orderReports"] = legs
+        classified = classify_oco(payload, held_qty=str(row.get("quantity") or ""))
+        classified["error"] = None
+        return classified
+
+    def _load_oco_legs(
+        self,
+        payload: dict[str, Any],
+        symbol: str,
+        key: str,
+        secret: str,
+    ) -> list[dict[str, Any]] | None:
+        client = self.client
+        lookup = getattr(client, "get_order", None) if client is not None else None
+        if not callable(lookup):
+            return None
+        above_id, below_id = oco_leg_ids(payload)
+        legs: list[dict[str, Any]] = []
+        for order_id in (above_id, below_id):
+            if not order_id:
+                continue
+            pairs = [
+                ("symbol", symbol),
+                ("orderId", order_id),
+                ("recvWindow", RECV_WINDOW_MS),
+                ("timestamp", str(int(self.clock_ms()))),
+            ]
+            try:
+                leg = lookup(sign_query(pairs, secret), api_key=key)
+            except Exception as exc:  # noqa: BLE001
+                if isinstance(exc, AssertionError):
+                    raise
+                return None
+            if not isinstance(leg, dict):
+                return None
+            legs.append(leg)
+        return legs or None
+
+    def _load_symbol_info(
+        self,
+        row: dict[str, Any],
+        gates: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        blocked = protective_order_block(gates)
+        if blocked:
+            return None, blocked
+        symbol = str(row.get("symbol") or "")
+        client = self.client if self.client is not None else BinanceSpotHttpClient()
+        try:
+            info = client.exchange_info(symbol)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            key, secret = self._credentials()
+            return None, _public_error(exc, key, secret)
+        if not isinstance(info, dict) or not symbol_status_trading(info, symbol):
+            return None, "symbol_not_trading"
+        return info, None
+
+    def _remainder_is_dust(self, row: dict[str, Any], quantity: str, mark: object) -> bool:
+        info, error = self._load_symbol_info(row, self._gates())
+        if error or not isinstance(info, dict):
+            return False
+        _sized, size_error = size_exit_quantity(info, str(row.get("symbol") or ""), quantity, mark)
+        return dust_detail(size_error) is not None
+
+    def _oco_working_fields(self, row: dict[str, Any], recon: dict[str, Any]) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "status": "oco_working",
+            "protection": PROTECTION_EXCHANGE,
+            "oco_list_status": recon.get("list_status") or "EXECUTING",
+            "last_error": None,
+        }
+        if recon.get("order_list_id"):
+            fields["oco_order_list_id"] = recon.get("order_list_id")
+        if recon.get("above_order_id"):
+            fields["oco_above_order_id"] = recon.get("above_order_id")
+        if recon.get("below_order_id"):
+            fields["oco_below_order_id"] = recon.get("below_order_id")
+        if row.get("oco_list_client_id"):
+            fields["oco_list_client_id"] = row.get("oco_list_client_id")
+        return fields
+
+    def _coverage(
+        self,
+        row: dict[str, Any],
+        *,
+        book: str,
+        submitted: bool,
+        error: str | None,
+        ok: bool = False,
+        protection: object = None,
+        reason: object = None,
+        order: dict[str, str] | None = None,
+        quantity: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "ok": ok,
+            "dry_run": False,
+            "executed": 0,
+            "submitted": submitted,
+            "error": error,
+            "reason": reason,
+            "decision_log_id": row.get("decision_log_id"),
+            "executor": EXECUTOR_NAME,
+            "symbol": row.get("symbol"),
+            "order": order,
+            "exchange_order_id": None,
+            "gates": self._gates(),
+            "quantity": quantity if quantity is not None else row.get("quantity"),
+            "protection": protection if protection is not None else row.get("protection"),
+            "book": book,
+            "coverage": protection if protection is not None else row.get("protection"),
+        }
 
     def _lookup_exit_order(
         self,

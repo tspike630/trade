@@ -1,0 +1,540 @@
+"""Reduce-only kill, spot OCO, and dust rules for ``live_bnb_boll_fade``.
+
+The entry order is still a normal spot order. After the exchange reports a
+base fill, protection is a resting ``POST /api/v3/orderList/oco`` sell:
+
+- above leg ``LIMIT_MAKER`` at the decision-time take-profit (tick-aligned)
+- below leg ``STOP_LOSS_LIMIT`` triggered at the absolute stop, limit one
+  tick below that stop so the stop can fill
+
+That OCO stays on Binance if this process is down. The loop is the fallback
+only when the exchange has positively rejected the list, or the list is
+terminal and unfilled. A timeout is not treated as rejection and does not
+market-sell over a list that may already be resting.
+
+``LIVE_TRADING_DISABLED`` blocks new buys and inbound sell signals. It does
+not block a ledger-tracked protective sell unless
+``BINANCE_SPOT_BLOCK_SELL_ON_KILL=1``. ``BINANCE_SPOT_LIVE_ENABLED`` still
+has to be on before any order or signed read. Dry-run never calls HTTP.
+"""
+
+from __future__ import annotations
+
+import os
+from decimal import ROUND_DOWN, Decimal
+from typing import Any
+
+from execution.executors.binance_spot import (
+    _decimal_text,
+    _filter_row,
+    _min_notional,
+    _positive_decimal,
+    _symbol_filters,
+    _to_decimal,
+    floor_base_qty,
+)
+
+BLOCK_SELL_ENV = "BINANCE_SPOT_BLOCK_SELL_ON_KILL"
+FEE_BPS_ENV = "BINANCE_SPOT_TAKER_FEE_BPS"
+ENTRY_MIN_NOTIONAL_USDT = Decimal("20")
+DEFAULT_TAKER_FEE_BPS = Decimal("10")
+OCO_PATH = "/api/v3/orderList/oco"
+ORDER_LIST_PATH = "/api/v3/orderList"
+
+PROTECTION_LOOP = "held_position_exit"
+PROTECTION_PENDING = "oco_pending"
+PROTECTION_EXCHANGE = "exchange_oco"
+PROTECTION_FALLBACK = "loop_fallback"
+PROTECTION_DUST = "dust_abandon"
+
+# listOrderStatus / listStatusType values that mean the list is still live.
+_OCO_WORKING = frozenset({"EXECUTING", "EXEC_STARTED"})
+_TERMINAL_LEG = frozenset({"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"})
+_DUST_DETAILS = frozenset({"exit_qty_below_min", "exit_below_min_notional", "oco_qty_below_min"})
+
+
+def block_sell_on_kill() -> bool:
+    raw = os.environ.get(BLOCK_SELL_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def taker_fee_rate() -> Decimal | None:
+    """Fraction of base assumed lost to the taker fee. Unset means 10 bps.
+
+    This is only a pre-trade viability haircut. It is not subtracted from an
+    order quantity and it is not a balance.
+    """
+    raw = os.environ.get(FEE_BPS_ENV)
+    if raw is None or not str(raw).strip():
+        bps = DEFAULT_TAKER_FEE_BPS
+    else:
+        text = str(raw).strip()
+        if not text.isdigit():
+            return None
+        bps = Decimal(text)
+    if bps < 0 or bps >= 10000:
+        return None
+    return bps / Decimal("10000")
+
+
+def protective_order_block(gates: dict[str, Any]) -> str | None:
+    """Why a ledger-tracked protective order must not be sent.
+
+    The kill switch alone is reduce-only: it does not return an error here.
+    ``BINANCE_SPOT_BLOCK_SELL_ON_KILL`` is the emergency halt for those sells.
+    The live-enable flag still gates every order.
+    """
+    if not gates.get("live_enabled"):
+        return "binance_spot_live_disabled"
+    if gates.get("kill_switch_active") and (
+        gates.get("block_sell_on_kill") or block_sell_on_kill()
+    ):
+        name = gates.get("kill_switch") or "LIVE_TRADING_DISABLED"
+        return f"kill_switch_block_sell:{name}"
+    return None
+
+
+def _client_piece(prefix: str, raw: object) -> str | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    text = str(raw).strip()
+    if not text.isdigit():
+        return None
+    client_id = f"{prefix}{text}"
+    if len(client_id) > 36:
+        return None
+    return client_id
+
+
+def oco_list_client_id(decision_id: object) -> str | None:
+    return _client_piece("bnbfade-ol-", decision_id)
+
+
+def oco_above_client_id(decision_id: object) -> str | None:
+    return _client_piece("bnbfade-tp-", decision_id)
+
+
+def oco_below_client_id(decision_id: object) -> str | None:
+    return _client_piece("bnbfade-sl-", decision_id)
+
+
+def reference_price(extras: dict[str, Any]) -> Decimal | None:
+    for key in ("price", "limit_price", "price_usd", "entry_price"):
+        number = _to_decimal(extras.get(key))
+        if number is not None:
+            return number
+    return None
+
+
+def planned_buy_notional(extras: dict[str, Any]) -> Decimal | None:
+    """Quote we plan to spend. A base qty is valued only with a signal price."""
+    quote = _to_decimal(extras.get("quote_order_qty", extras.get("quoteOrderQty")))
+    if quote is not None:
+        return quote
+    qty = _to_decimal(extras.get("quantity"))
+    price = reference_price(extras)
+    if qty is not None and price is not None:
+        return qty * price
+    return None
+
+
+def _has_order_size(extras: dict[str, Any]) -> bool:
+    for key in ("quote_order_qty", "quoteOrderQty", "quantity"):
+        if extras.get(key) not in (None, ""):
+            return True
+    return False
+
+
+def entry_notional_floor_error(extras: dict[str, Any]) -> str | None:
+    """20 USDT planned-entry floor. No exchange read. Not a daily cap.
+
+    A buy with no size is unchanged (the adapter already defers that). A buy
+    that names a size but cannot be valued, or is under 20 USDT, is refused.
+    """
+    if not _has_order_size(extras):
+        return None
+    notional = planned_buy_notional(extras)
+    if notional is None:
+        return "entry_notional_unknown"
+    if notional < ENTRY_MIN_NOTIONAL_USDT:
+        return "entry_notional_below_min"
+    return None
+
+
+def _limit_lot(filters: list[Any]) -> tuple[dict[str, Any] | None, str | None]:
+    lot = _filter_row(filters, "LOT_SIZE")
+    if lot is None:
+        return None, None
+    step = _to_decimal(lot.get("stepSize"))
+    if step is None:
+        return None, None
+    return lot, _decimal_text(step)
+
+
+def _tick_size(filters: list[Any]) -> str | None:
+    price_filter = _filter_row(filters, "PRICE_FILTER")
+    if price_filter is None:
+        return None
+    tick = _to_decimal(price_filter.get("tickSize"))
+    if tick is None:
+        return None
+    return _decimal_text(tick)
+
+
+def _align(price: Decimal, tick: Decimal, rounding: str) -> Decimal:
+    units = (price / tick).to_integral_value(rounding=rounding)
+    return units * tick
+
+
+def entry_viability_error(
+    extras: dict[str, Any],
+    info: dict[str, Any],
+    symbol: str,
+) -> str | None:
+    """Lot, minNotional, and a fee haircut. Does not change the order qty.
+
+    The haircut assumes the taker fee is taken in the base asset. That can
+    refuse a buy that would actually clear if the fee is paid in BNB. It
+    never rewrites ``quoteOrderQty`` or ``quantity`` from a wallet balance.
+    """
+    floor_error = entry_notional_floor_error(extras)
+    if floor_error:
+        return floor_error
+    filters = _symbol_filters(info, symbol)
+    if not filters:
+        return "entry_not_viable:missing_lot_filter"
+    notional = planned_buy_notional(extras)
+    if notional is None:
+        return "entry_notional_unknown"
+    min_notional = _min_notional(filters)
+    if min_notional is not None and notional < min_notional:
+        return "entry_not_viable:below_min_notional"
+    price = reference_price(extras)
+    if price is None:
+        # Quote size cleared the floors. Base lot is checked again on the fill.
+        return None
+    lot, step = _limit_lot(filters)
+    if lot is None or step is None:
+        return "entry_not_viable:missing_lot_filter"
+    fee = taker_fee_rate()
+    if fee is None:
+        return "entry_not_viable:bad_fee_bps"
+    quote = _to_decimal(extras.get("quote_order_qty", extras.get("quoteOrderQty")))
+    qty = _to_decimal(extras.get("quantity"))
+    if quote is not None:
+        gross = quote / price
+    elif qty is not None:
+        gross = qty
+    else:
+        return "entry_notional_unknown"
+    net = gross * (Decimal("1") - fee)
+    if net <= 0:
+        return "entry_not_viable:below_min_qty"
+    floored = floor_base_qty(_decimal_text(net), step)
+    if floored is None:
+        return "entry_not_viable:below_min_qty"
+    floored_n = _to_decimal(floored)
+    if floored_n is None:
+        return "entry_not_viable:below_min_qty"
+    min_qty = _to_decimal(lot.get("minQty"))
+    if min_qty is not None and floored_n < min_qty:
+        return "entry_not_viable:below_min_qty"
+    if min_notional is not None and floored_n * price < min_notional:
+        return "entry_not_viable:below_min_notional"
+    return None
+
+
+def sellable_base_qty(placed: dict[str, Any] | None, symbol: str) -> str | None:
+    """``executedQty`` minus base-asset commission shown on this fill.
+
+    Commission in any other asset is ignored. A missing ``fills`` array does
+    not invent a fee.
+    """
+    if not isinstance(placed, dict):
+        return None
+    executed = _to_decimal(placed.get("executedQty"))
+    if executed is None:
+        return None
+    base = symbol[: -len("USDT")] if symbol.endswith("USDT") else ""
+    fee = Decimal("0")
+    fills = placed.get("fills")
+    if isinstance(fills, list) and base:
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            asset = str(fill.get("commissionAsset") or "").upper()
+            if asset != base:
+                continue
+            part = _to_decimal(fill.get("commission"))
+            if part is not None:
+                fee += part
+    net = executed - fee
+    if net <= 0:
+        return None
+    return _decimal_text(net)
+
+
+def _quote_value(qty: str, mark: object, stop: object) -> tuple[str | None, str]:
+    qty_n = _to_decimal(qty)
+    if qty_n is None:
+        return None, "none"
+    mark_n = _to_decimal(mark)
+    if mark_n is not None:
+        return _decimal_text(qty_n * mark_n), "mark"
+    stop_n = _to_decimal(stop)
+    if stop_n is not None:
+        return _decimal_text(qty_n * stop_n), "stop_price"
+    return None, "none"
+
+
+def dust_archive_fields(
+    *,
+    quantity: str,
+    mark: object,
+    stop: object,
+    detail: str,
+) -> dict[str, Any]:
+    quote, source = _quote_value(quantity, mark, stop)
+    return {
+        "status": "closed_dust",
+        "protection": PROTECTION_DUST,
+        "exit_reason": "dust_abandon",
+        "residual_qty": quantity,
+        "residual_quote": quote,
+        "last_error": f"dust_untradable:{detail}:{source}",
+    }
+
+
+def build_spot_oco(
+    *,
+    symbol: str,
+    quantity: str,
+    stop_price: str,
+    take_profit_price: str,
+    decision_id: object,
+    filters: list[Any],
+    mark: object,
+    timestamp_ms: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Form body for ``POST /api/v3/orderList/oco``. No network.
+
+    Returns ``(spec, error)``. ``spec["pairs"]`` is the unsigned form.
+    """
+    list_id = oco_list_client_id(decision_id)
+    above_id = oco_above_client_id(decision_id)
+    below_id = oco_below_client_id(decision_id)
+    if list_id is None or above_id is None or below_id is None:
+        return None, "invalid_oco_client_id"
+    lot, step = _limit_lot(filters)
+    tick = _tick_size(filters)
+    if lot is None or step is None:
+        return None, "oco_missing_lot_filter"
+    if tick is None:
+        return None, "oco_missing_tick"
+    sized = floor_base_qty(quantity, step)
+    if sized is None:
+        return None, "oco_qty_below_min"
+    sized_n = _to_decimal(sized)
+    min_qty = _to_decimal(lot.get("minQty"))
+    if sized_n is None or (min_qty is not None and sized_n < min_qty):
+        return None, "oco_qty_below_min"
+    stop_n = _to_decimal(stop_price)
+    tp_n = _to_decimal(take_profit_price)
+    tick_n = _to_decimal(tick)
+    if stop_n is None or tp_n is None or tick_n is None or sized_n is None:
+        return None, "oco_prices_crossed"
+    above = _align(tp_n, tick_n, ROUND_DOWN)
+    below_stop = _align(stop_n, tick_n, ROUND_DOWN)
+    below_limit = below_stop - tick_n
+    min_price = None
+    price_filter = _filter_row(filters, "PRICE_FILTER")
+    if price_filter is not None:
+        min_price = _to_decimal(price_filter.get("minPrice"))
+    if below_limit <= 0 or (min_price is not None and below_limit < min_price):
+        below_limit = below_stop
+    if not (below_limit > 0 and below_stop > below_limit and above > below_stop):
+        # Equal stop and limit is still a valid stop-limit if the tick cannot
+        # step down. The take-profit must stay strictly above the trigger.
+        if not (above > below_stop > 0 and below_limit == below_stop):
+            return None, "oco_prices_crossed"
+    mark_n = _to_decimal(mark)
+    if mark_n is not None and not (below_stop < mark_n < above):
+        return None, "oco_price_restriction"
+    min_notional = _min_notional(filters)
+    if min_notional is not None:
+        value_px = mark_n if mark_n is not None else below_stop
+        if sized_n * value_px < min_notional:
+            return None, "oco_qty_below_min"
+    held = _to_decimal(quantity)
+    residual = None
+    if held is not None and held > sized_n:
+        residual = _decimal_text(held - sized_n)
+    pairs = [
+        ("symbol", symbol),
+        ("side", "SELL"),
+        ("quantity", sized),
+        ("listClientOrderId", list_id),
+        ("aboveType", "LIMIT_MAKER"),
+        ("aboveClientOrderId", above_id),
+        ("abovePrice", _decimal_text(above)),
+        ("belowType", "STOP_LOSS_LIMIT"),
+        ("belowClientOrderId", below_id),
+        ("belowPrice", _decimal_text(below_limit)),
+        ("belowStopPrice", _decimal_text(below_stop)),
+        ("belowTimeInForce", "GTC"),
+        ("newOrderRespType", "FULL"),
+        ("recvWindow", "5000"),
+        ("timestamp", str(int(timestamp_ms))),
+    ]
+    return {
+        "pairs": pairs,
+        "quantity": sized,
+        "residual_qty": residual,
+        "list_client_id": list_id,
+        "above_client_id": above_id,
+        "below_client_id": below_id,
+        "above_price": _decimal_text(above),
+        "below_stop_price": _decimal_text(below_stop),
+        "below_price": _decimal_text(below_limit),
+    }, None
+
+
+def _reports(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = payload.get("orderReports")
+    if isinstance(rows, list):
+        return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
+def _leg_by_type(payload: dict[str, Any], order_type: str) -> dict[str, Any] | None:
+    for row in _reports(payload):
+        if str(row.get("type") or "").upper() == order_type:
+            return row
+    return None
+
+
+def oco_is_working(payload: dict[str, Any]) -> bool:
+    status = str(payload.get("listOrderStatus") or "").upper()
+    if status == "EXECUTING":
+        return True
+    if status in {"ALL_DONE", "REJECT"}:
+        return False
+    kind = str(payload.get("listStatusType") or "").upper()
+    return kind in _OCO_WORKING
+
+
+def oco_leg_ids(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    """``(above_order_id, below_order_id)`` from reports, else the orders array."""
+    above = _leg_by_type(payload, "LIMIT_MAKER")
+    if above is None:
+        above = _leg_by_type(payload, "TAKE_PROFIT_LIMIT")
+    below = _leg_by_type(payload, "STOP_LOSS_LIMIT")
+    if below is None:
+        below = _leg_by_type(payload, "STOP_LOSS")
+    above_id = None if above is None else above.get("orderId")
+    below_id = None if below is None else below.get("orderId")
+    if above_id is None or below_id is None:
+        orders = payload.get("orders")
+        if isinstance(orders, list):
+            ids = [
+                str(item.get("orderId")).strip()
+                for item in orders
+                if isinstance(item, dict) and item.get("orderId") is not None
+            ]
+            if above_id is None and len(ids) >= 1:
+                above_id = ids[0]
+            if below_id is None and len(ids) >= 2:
+                below_id = ids[1]
+    return (
+        None if above_id is None else str(above_id).strip() or None,
+        None if below_id is None else str(below_id).strip() or None,
+    )
+
+
+def classify_oco(payload: dict[str, Any], *, held_qty: str) -> dict[str, Any]:
+    """Turn a list plus its leg reports into one book instruction.
+
+    ``working`` — exchange still has the list; do not market-sell.
+    ``filled`` — a leg filled; the list is done.
+    ``partial`` — list finished with a remainder still held.
+    ``unfilled`` — canceled, expired, or rejected with nothing executed.
+    """
+    list_status = str(payload.get("listOrderStatus") or "").upper()
+    list_id = payload.get("orderListId")
+    above_id, below_id = oco_leg_ids(payload)
+    base = {
+        "list_status": list_status or str(payload.get("listStatusType") or ""),
+        "order_list_id": None if list_id is None else str(list_id),
+        "above_order_id": above_id,
+        "below_order_id": below_id,
+    }
+    if oco_is_working(payload):
+        partial = False
+        for row in _reports(payload):
+            if str(row.get("status") or "").upper() == "PARTIALLY_FILLED":
+                partial = True
+        base["state"] = "partial_working" if partial else "working"
+        return base
+    executed = Decimal("0")
+    filled_reason: str | None = None
+    any_open = False
+    for row in _reports(payload):
+        status = str(row.get("status") or "").upper()
+        got = _to_decimal(row.get("executedQty")) or Decimal("0")
+        executed += got
+        if status == "FILLED" or (status == "PARTIALLY_FILLED" and got > 0):
+            leg = str(row.get("type") or "").upper()
+            if leg in {"LIMIT_MAKER", "TAKE_PROFIT_LIMIT", "TAKE_PROFIT"}:
+                filled_reason = "take_profit"
+            elif leg in {"STOP_LOSS_LIMIT", "STOP_LOSS"}:
+                filled_reason = "stop_loss"
+        if status not in _TERMINAL_LEG and status != "FILLED":
+            any_open = True
+    held = _to_decimal(held_qty) or Decimal("0")
+    base["executed_qty"] = _decimal_text(executed) if executed > 0 else "0"
+    if filled_reason and executed > 0 and not any_open:
+        if held > 0 and executed + Decimal("0.0000000000001") < held:
+            remainder = held - executed
+            base["state"] = "partial"
+            base["remainder_qty"] = _decimal_text(remainder)
+            base["exit_reason"] = filled_reason
+            return base
+        base["state"] = "filled"
+        base["exit_reason"] = filled_reason
+        return base
+    if list_status in {"ALL_DONE", "REJECT"} or (
+        _reports(payload) and not any_open and executed <= 0
+    ):
+        base["state"] = "unfilled"
+        return base
+    if not _reports(payload) and list_status in {"ALL_DONE", "REJECT"}:
+        base["state"] = "unfilled"
+        return base
+    base["state"] = "unknown"
+    return base
+
+
+def is_request_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    return "timeout" in type(exc).__name__.lower()
+
+
+def dust_detail(error: str | None) -> str | None:
+    if error in _DUST_DETAILS:
+        return error
+    return None
+
+
+def tracked_exit(position: dict[str, Any]) -> bool:
+    """True only for a ledger row, not an inbound decision signal."""
+    row_id = position.get("id")
+    if isinstance(row_id, bool) or row_id is None:
+        return False
+    if isinstance(row_id, int):
+        return row_id > 0
+    if isinstance(row_id, str) and row_id.strip().isdigit():
+        return int(row_id.strip()) > 0
+    return False

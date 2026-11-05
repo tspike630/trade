@@ -133,6 +133,7 @@ class ExecutionLedger:
         self._ensure_status_columns()
         self._ensure_unique_decision()
         self._ensure_binance_spot_positions()
+        self._ensure_binance_spot_position_columns()
 
     def _ensure_status_columns(self) -> None:
         """Idempotent migration: status + status_updated_at on execution_log.
@@ -207,6 +208,15 @@ class ExecutionLedger:
                 exit_reason TEXT,
                 exit_client_order_id TEXT,
                 last_error TEXT,
+                oco_list_client_id TEXT,
+                oco_order_list_id TEXT,
+                oco_list_status TEXT,
+                oco_above_order_id TEXT,
+                oco_below_order_id TEXT,
+                oco_above_client_id TEXT,
+                oco_below_client_id TEXT,
+                residual_qty TEXT,
+                residual_quote TEXT,
                 protection TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -217,6 +227,30 @@ class ExecutionLedger:
             "CREATE INDEX IF NOT EXISTS idx_bnb_spot_pos_status "
             "ON binance_spot_positions (status)"
         )
+
+    def _ensure_binance_spot_position_columns(self) -> None:
+        """Add OCO and dust columns on ledgers created before they existed."""
+        have = {
+            row[1]
+            for row in self.conn.execute(
+                "PRAGMA table_info(binance_spot_positions)"
+            ).fetchall()
+        }
+        for name in (
+            "oco_list_client_id",
+            "oco_order_list_id",
+            "oco_list_status",
+            "oco_above_order_id",
+            "oco_below_order_id",
+            "oco_above_client_id",
+            "oco_below_client_id",
+            "residual_qty",
+            "residual_quote",
+        ):
+            if name not in have:
+                self.conn.execute(
+                    f"ALTER TABLE binance_spot_positions ADD COLUMN {name} TEXT"
+                )
 
     # --- cursor ---
 
@@ -527,11 +561,59 @@ class ExecutionLedger:
         ).fetchone()
         return dict(row) if row else None
 
+    def binance_spot_position_by_id(self, position_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM binance_spot_positions WHERE id = ?",
+            (int(position_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    _BINANCE_SPOT_MUTABLE = (
+        "status",
+        "quantity",
+        "protection",
+        "exit_order_id",
+        "exit_reason",
+        "exit_client_order_id",
+        "last_error",
+        "oco_list_client_id",
+        "oco_order_list_id",
+        "oco_list_status",
+        "oco_above_order_id",
+        "oco_below_order_id",
+        "oco_above_client_id",
+        "oco_below_client_id",
+        "residual_qty",
+        "residual_quote",
+    )
+
+    def update_binance_spot_position(
+        self, position_id: int, fields: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Write a whitelisted subset of the held-position row."""
+        allowed = {
+            key: fields[key]
+            for key in self._BINANCE_SPOT_MUTABLE
+            if key in fields
+        }
+        if not allowed:
+            return self.binance_spot_position_by_id(position_id)
+        assignments = ", ".join(f"{key} = ?" for key in allowed)
+        values = [allowed[key] for key in allowed]
+        values.append(_utc())
+        values.append(int(position_id))
+        self.conn.execute(
+            f"UPDATE binance_spot_positions SET {assignments}, updated_at = ? WHERE id = ?",
+            values,
+        )
+        self.conn.commit()
+        return self.binance_spot_position_by_id(position_id)
+
     def list_binance_spot_positions_for_exit(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """
             SELECT * FROM binance_spot_positions
-            WHERE status IN ('open', 'qty_unconfirmed')
+            WHERE status IN ('open', 'qty_unconfirmed', 'oco_working', 'oco_unknown')
             ORDER BY id ASC
             """
         ).fetchall()
@@ -579,6 +661,7 @@ class ExecutionLedger:
                     exit_order_id = ?,
                     exit_reason = ?,
                     exit_client_order_id = ?,
+                    protection = COALESCE(?, protection),
                     last_error = NULL,
                     updated_at = ?
                 WHERE id = ? AND status = 'open'
@@ -588,6 +671,7 @@ class ExecutionLedger:
                     str(outcome.get("exchange_order_id")),
                     outcome.get("reason"),
                     outcome.get("exit_client_order_id"),
+                    outcome.get("protection"),
                     now,
                     int(position_id),
                 ),
