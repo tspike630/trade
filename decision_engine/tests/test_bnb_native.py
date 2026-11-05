@@ -47,6 +47,26 @@ def _hit_closes() -> list[float]:
     return [100.0] * 19 + [97.0]
 
 
+def _zone_hit_bars() -> list[tuple[int, float, float, float, float, float, float, int]]:
+    """``_hit_closes`` plus a last-bar wick and trade counts.
+
+    Close series is unchanged, so change_5m / boll_lower stay on the old
+    diagnostic. Low is set so alpha against SMA(20) is 0.20. Last-bar
+    trades are half the baseline, so trade_size_ratio is 2.
+    """
+    closes = _hit_closes()
+    mid = sum(closes[-20:]) / 20.0
+    price = closes[-1]
+    low = (price - 0.20 * mid) / 0.80
+    bars = _bars(closes)
+    out = []
+    for index, (ts, op, hi, _lo, close, vol, quote) in enumerate(bars):
+        bar_low = low if index == len(bars) - 1 else _lo
+        trades = 50 if index == len(bars) - 1 else 100
+        out.append((ts, op, hi, bar_low, close, vol, quote, trades))
+    return out
+
+
 def _bars(
     closes: list[float],
     *,
@@ -238,6 +258,9 @@ class NativeEmitTests(unittest.TestCase):
                     change_5m REAL,
                     volume_strength REAL,
                     boll_lower REAL,
+                    boll_mid REAL,
+                    kline_low REAL,
+                    trade_size_ratio REAL,
                     quote_volume_24h REAL,
                     updated_at TEXT
                 )
@@ -248,14 +271,16 @@ class NativeEmitTests(unittest.TestCase):
                 INSERT INTO binance_indicators (
                     symbol, base_asset, quote_asset, status, interval,
                     price_usd, change_5m, volume_strength, boll_lower,
+                    boll_mid, kline_low, trade_size_ratio,
                     quote_volume_24h, updated_at
-                ) VALUES (?, ?, 'USDT', ?, '5m', ?, ?, ?, ?, ?, '2026-11-05T06:00:00Z')
+                ) VALUES (?, ?, 'USDT', ?, '5m', ?, ?, ?, ?, ?, ?, ?, ?, '2026-11-05T06:00:00Z')
                 """,
                 [
-                    ("ZZQBOLLUSDT", "ZZQBOLL", "TRADING", 0.9, -3.0, 0.9, 1.0, 90_000),
-                    ("ZZQFLATUSDT", "ZZQFLAT", "TRADING", 0.9, -0.1, 0.9, 1.0, 90_000),
-                    ("ZZQTHINUSDT", "ZZQTHIN", "TRADING", 0.9, -3.0, 0.9, 1.0, 1_000),
-                    ("ZZQHALTUSDT", "ZZQHALT", "BREAK", 0.9, -3.0, 0.9, 1.0, 90_000),
+                    # alpha=(0.9-0.825)/(1.2-0.825)=0.20 and ratio 2 → entry zone
+                    ("ZZQBOLLUSDT", "ZZQBOLL", "TRADING", 0.9, -3.0, 0.9, 1.0, 1.2, 0.825, 2.0, 90_000),
+                    ("ZZQFLATUSDT", "ZZQFLAT", "TRADING", 0.9, -0.1, 0.9, 1.0, None, None, None, 90_000),
+                    ("ZZQTHINUSDT", "ZZQTHIN", "TRADING", 0.9, -3.0, 0.9, 1.0, None, None, None, 1_000),
+                    ("ZZQHALTUSDT", "ZZQHALT", "BREAK", 0.9, -3.0, 0.9, 1.0, None, None, None, 90_000),
                 ],
             )
             conn.execute(
@@ -290,7 +315,11 @@ class NativeEmitTests(unittest.TestCase):
             self.assertEqual(extras["quote_asset"], "USDT")
             self.assertEqual(extras["universe"], "binance_spot_usdt")
             self.assertEqual(extras["factor_source"], "binance_indicators")
-            self.assertEqual(extras["and_mode"], "tech_fade&boll_lower")
+            self.assertEqual(extras["and_mode"], "entry_zone")
+            self.assertEqual(extras["entry_reason"], "large_trade_market")
+            self.assertEqual(extras["order_type"], "MARKET")
+            self.assertAlmostEqual(extras["take_profit_price"], 1.2)
+            self.assertIn("stop_price", extras)
             self.assertNotIn("local_score", extras)
             self.assertNotIn("source_token_address", extras)
             self.assertNotIn("MintShouldNotEmit", row["token_address"])
@@ -306,15 +335,15 @@ class NativeEmitTests(unittest.TestCase):
                 CREATE TABLE binance_klines (
                     symbol TEXT, timeframe TEXT, ts INTEGER,
                     open REAL, high REAL, low REAL, close REAL,
-                    volume REAL, quote_volume REAL
+                    volume REAL, quote_volume REAL, trades INTEGER
                 )
                 """
             )
             conn.executemany(
-                "INSERT INTO binance_klines VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO binance_klines VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
-                    ("ZZQBOLLUSDT", "5m", ts, op, hi, lo, close, vol, quote)
-                    for ts, op, hi, lo, close, vol, quote in _bars(_hit_closes())
+                    ("ZZQBOLLUSDT", "5m", ts, op, hi, lo, close, vol, quote, trades)
+                    for ts, op, hi, lo, close, vol, quote, trades in _zone_hit_bars()
                 ],
             )
             conn.commit()
@@ -326,9 +355,15 @@ class NativeEmitTests(unittest.TestCase):
             self.assertEqual(extras["binance_symbol"], "ZZQBOLLUSDT")
             self.assertEqual(extras["factor_source"], "binance_klines")
             self.assertEqual(extras["kline_interval"], "5m")
+            self.assertEqual(extras["and_mode"], "entry_zone")
+            self.assertEqual(extras["entry_reason"], "large_trade_market")
+            self.assertEqual(extras["order_type"], "MARKET")
+            self.assertAlmostEqual(extras["take_profit_price"], extras["boll_mid"])
+            self.assertLess(extras["stop_price"], extras["price_usd"])
             self.assertLessEqual(extras["change_5m"], -2.0)
             self.assertGreaterEqual(extras["volume_strength"], 0.5)
             self.assertLess(extras["price_usd"], extras["boll_lower"])
+            self.assertEqual(extras["legacy_gate"], "diagnostic_only")
 
     def test_indicator_values_win_over_klines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -402,18 +437,19 @@ class NativeEmitTests(unittest.TestCase):
                 CREATE TABLE binance_klines (
                     symbol TEXT, interval TEXT, open_time_ms INTEGER,
                     open REAL, high REAL, low REAL, close REAL,
-                    volume REAL, quote_volume REAL, close_time_ms INTEGER
+                    volume REAL, quote_volume REAL, close_time_ms INTEGER,
+                    trades INTEGER
                 )
                 """
             )
             for symbol in ("ZZQBOLLUSDT", "ZZQNOPEUSDT"):
                 conn.executemany(
                     """
-                    INSERT INTO binance_klines VALUES (?, '5m', ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO binance_klines VALUES (?, '5m', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
-                        (symbol, ts, op, hi, lo, close, vol, quote, ts + 5 * 60 * 1000 - 1)
-                        for ts, op, hi, lo, close, vol, quote in _bars(_hit_closes())
+                        (symbol, ts, op, hi, lo, close, vol, quote, ts + 5 * 60 * 1000 - 1, trades)
+                        for ts, op, hi, lo, close, vol, quote, trades in _zone_hit_bars()
                     ],
                 )
             conn.commit()
@@ -550,6 +586,9 @@ class ScanWindowTests(unittest.TestCase):
                 change_5m REAL,
                 volume_strength REAL,
                 boll_lower REAL,
+                boll_mid REAL,
+                kline_low REAL,
+                trade_size_ratio REAL,
                 quote_volume_24h REAL
             )
             """
@@ -565,17 +604,25 @@ class ScanWindowTests(unittest.TestCase):
                 -10.0,
                 0.9,
                 1.0,
+                None,
+                None,
+                None,
                 liq,
             )
             for index in range(decoys)
         ]
-        rows.append(("KEEPUSDT", "KEEP", "USDT", "TRADING", 1.0, -3.0, 0.9, 2.0, liq))
+        # KEEP is the least negative change, so a short scan drops it.
+        # alpha=(1-0.75)/(2-0.75)=0.20, ratio 1.5 → the entry zone emits.
+        rows.append(
+            ("KEEPUSDT", "KEEP", "USDT", "TRADING", 1.0, -3.0, 0.9, 2.0, 2.0, 0.75, 1.5, liq)
+        )
         conn.executemany(
             """
             INSERT INTO binance_indicators (
                 symbol, base_asset, quote_asset, status,
-                price_usd, change_5m, volume_strength, boll_lower, quote_volume_24h
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                price_usd, change_5m, volume_strength, boll_lower,
+                boll_mid, kline_low, trade_size_ratio, quote_volume_24h
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

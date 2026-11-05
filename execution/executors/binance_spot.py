@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import time
@@ -207,6 +208,148 @@ def _parse_order_type(raw: object) -> _OrderType | None:
     return None
 
 
+def _finite_number(raw: object) -> float | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _format_positive(raw: object) -> str | None:
+    """Decimal text for an intent price. Floats are accepted; blank and <= 0 are not.
+
+    Exchange quantity stays on ``_positive_decimal`` (digit strings only).
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, str):
+        return _positive_decimal(raw.strip())
+    if isinstance(raw, int):
+        return _positive_decimal(raw)
+    if isinstance(raw, float):
+        if not math.isfinite(raw) or raw <= 0:
+            return None
+        text = format(raw, ".12f").rstrip("0").rstrip(".")
+        return text if _positive_decimal(text) else None
+    return None
+
+
+def _chosen_limit_raw(extras: dict[str, Any]) -> tuple[object, str | None]:
+    raw_price = extras.get("price")
+    raw_limit = extras.get("limit_price")
+    price_set = raw_price not in (None, "")
+    limit_set = raw_limit not in (None, "")
+    if price_set and limit_set:
+        if _format_positive(raw_price) != _format_positive(raw_limit):
+            return None, "ambiguous_limit_price"
+    if price_set:
+        return raw_price, None
+    if limit_set:
+        return raw_limit, None
+    return None, None
+
+
+def build_exit_plan(
+    sig: dict[str, Any],
+    extras: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Absolute stop and take-profit from the signal. No 5% / 10% fill-in.
+
+    Absent on a legacy signal (no ``entry_reason`` and no prices) so an old
+    dry-run still acks. Present prices are the decision-time ``boll_mid`` and
+    the stop reference; a later mid does not rewrite them. Protective orders
+    are not submitted: spot OCO / STOP_LOSS_LIMIT is not wired, and this
+    result says so instead of pretending the resting exit was sent.
+    """
+    stop_raw = extras.get("stop_price")
+    tp_raw = extras.get("take_profit_price")
+    reason = extras.get("entry_reason")
+    if all(value in (None, "") for value in (stop_raw, tp_raw, reason)):
+        return None, None
+    action = str(sig.get("action") or "").strip().lower()
+    if action != "buy":
+        return None, "exit_plan_buy_only"
+    stop = _format_positive(stop_raw)
+    take_profit = _format_positive(tp_raw)
+    if stop is None or take_profit is None:
+        return None, "missing_exit_prices"
+    order_type = _parse_order_type(extras.get("order_type", extras.get("binance_order_type")))
+    if order_type is None:
+        return None, "invalid_order_type"
+    if order_type == "LIMIT":
+        entry_raw, price_error = _chosen_limit_raw(extras)
+        if price_error:
+            return None, price_error
+        entry = _format_positive(entry_raw)
+        if entry is None:
+            return None, "missing_limit_price"
+    elif order_type == "MARKET":
+        entry = _format_positive(extras.get("price_usd"))
+        if entry is None:
+            entry = _format_positive(extras.get("entry_price"))
+        if entry is None:
+            return None, "missing_entry_price"
+    else:
+        unexpected_type: never = order_type
+        return None, f"invalid_order_type:{unexpected_type}"
+    stop_n = float(stop)
+    entry_n = float(entry)
+    tp_n = float(take_profit)
+    if stop_n >= entry_n:
+        return None, "stop_not_below_entry"
+    if tp_n <= entry_n:
+        return None, "take_profit_not_above_entry"
+    return {
+        "stop_price": stop,
+        "take_profit_price": take_profit,
+        "entry_price": entry,
+        "submitted": False,
+        "protective_order": "not_supported_not_sent",
+        "defaults_applied": False,
+        "price_source": "signal_absolute",
+    }, None
+
+
+def protective_exit_reason(exit_plan: dict[str, Any] | None, mark: object) -> str | None:
+    """Compare a mark to the absolute plan. Percent stops are not applied."""
+    if not isinstance(exit_plan, dict):
+        return None
+    stop = _finite_number(exit_plan.get("stop_price"))
+    take_profit = _finite_number(exit_plan.get("take_profit_price"))
+    price = _finite_number(mark)
+    if stop is None or take_profit is None or price is None:
+        return None
+    if price <= stop:
+        return "stop_loss"
+    if price >= take_profit:
+        return "take_profit"
+    return None
+
+
+def _entry_intent(
+    extras: dict[str, Any],
+    *,
+    side: str,
+    order_type: _OrderType,
+    order: dict[str, str] | None,
+) -> dict[str, Any]:
+    limit_raw, _error = _chosen_limit_raw(extras)
+    limit_text = _format_positive(limit_raw) if order_type == "LIMIT" else None
+    return {
+        "side": side,
+        "order_type": order_type,
+        "limit_price": limit_text,
+        "exchange_ready": order is not None,
+        "quantity_status": "exchange_ready" if order is not None else "deferred_size_pct",
+        "protective_order": "not_supported_not_sent",
+    }
+
+
 def _parse_side(action: object) -> _Side | None:
     text = str(action or "").strip().lower()
     if text == "buy":
@@ -330,10 +473,12 @@ def _order_pairs(
         extras.get("quote_order_qty", extras.get("quoteOrderQty"))
     )
     quantity = _positive_decimal(extras.get("quantity"))
-    price = _positive_decimal(extras.get("price"))
     raw_quote = extras.get("quote_order_qty", extras.get("quoteOrderQty"))
     raw_qty = extras.get("quantity")
-    raw_price = extras.get("price")
+    raw_price, price_error = _chosen_limit_raw(extras)
+    if price_error:
+        return None, price_error
+    price = _format_positive(raw_price)
     if raw_quote not in (None, "") and quote_qty is None:
         return None, "invalid_order_qty"
     if raw_qty not in (None, "") and quantity is None:
@@ -401,6 +546,8 @@ def _result(
     order: dict[str, str] | None,
     exchange_order_id: str | None,
     gates: dict[str, Any],
+    intent: dict[str, Any] | None = None,
+    exit_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "ok": ok,
@@ -413,6 +560,8 @@ def _result(
         "order": order,
         "exchange_order_id": exchange_order_id,
         "gates": gates,
+        "intent": intent,
+        "exit_plan": exit_plan,
     }
 
 
@@ -520,9 +669,33 @@ class BinanceSpotAdapter:
             )
 
         mode = str(sig.get("mode") or "").strip().lower()
+        plan, plan_error = build_exit_plan(sig, extras)
+        if plan_error:
+            return self._finish(
+                _result(
+                    ok=False,
+                    dry_run=mode == DRY_MODE or self.dry_run is True,
+                    executed=0,
+                    submitted=False,
+                    error=plan_error,
+                    symbol=symbol,
+                    order=None,
+                    exchange_order_id=None,
+                    gates=gates,
+                )
+            )
         forced_dry = self.dry_run is True or mode == DRY_MODE
         if forced_dry:
             preview, preview_error = self._preview(sig, extras, symbol)
+            side = _parse_side(sig.get("action"))
+            order_type = _parse_order_type(
+                extras.get("order_type", extras.get("binance_order_type"))
+            )
+            intent = None
+            if preview_error is None and side is not None and order_type is not None:
+                intent = _entry_intent(
+                    extras, side=side, order_type=order_type, order=preview
+                )
             return self._finish(
                 _result(
                     ok=preview_error is None,
@@ -534,6 +707,8 @@ class BinanceSpotAdapter:
                     order=preview,
                     exchange_order_id=None,
                     gates=gates,
+                    intent=intent,
+                    exit_plan=plan,
                 )
             )
 
@@ -549,6 +724,7 @@ class BinanceSpotAdapter:
                     order=None,
                     exchange_order_id=None,
                     gates=gates,
+                    exit_plan=plan,
                 )
             )
         if not gates["live_enabled"]:
@@ -563,6 +739,7 @@ class BinanceSpotAdapter:
                     order=None,
                     exchange_order_id=None,
                     gates=gates,
+                    exit_plan=plan,
                 )
             )
         if mode != LIVE_MODE:
@@ -577,6 +754,7 @@ class BinanceSpotAdapter:
                     order=None,
                     exchange_order_id=None,
                     gates=gates,
+                    exit_plan=plan,
                 )
             )
 
@@ -593,6 +771,7 @@ class BinanceSpotAdapter:
                     order=None,
                     exchange_order_id=None,
                     gates=gates,
+                    exit_plan=plan,
                 )
             )
 
@@ -609,6 +788,7 @@ class BinanceSpotAdapter:
                     order=dict(pairs),
                     exchange_order_id=None,
                     gates=gates,
+                    exit_plan=plan,
                 )
             )
 
@@ -627,6 +807,7 @@ class BinanceSpotAdapter:
                     order=dict(pairs),
                     exchange_order_id=None,
                     gates=gates,
+                    exit_plan=plan,
                 )
             )
         if not isinstance(info, dict) or not symbol_status_trading(info, symbol):
@@ -641,6 +822,7 @@ class BinanceSpotAdapter:
                     order=dict(pairs),
                     exchange_order_id=None,
                     gates=gates,
+                    exit_plan=plan,
                 )
             )
 
@@ -659,6 +841,7 @@ class BinanceSpotAdapter:
                     order=dict(pairs),
                     exchange_order_id=None,
                     gates=gates,
+                    exit_plan=plan,
                 )
             )
         if not isinstance(placed, dict):
@@ -673,6 +856,7 @@ class BinanceSpotAdapter:
                     order=dict(pairs),
                     exchange_order_id=None,
                     gates=gates,
+                    exit_plan=plan,
                 )
             )
         order_id = placed.get("orderId")
@@ -688,7 +872,17 @@ class BinanceSpotAdapter:
                     order=dict(pairs),
                     exchange_order_id=None,
                     gates=gates,
+                    exit_plan=plan,
                 )
+            )
+        side = _parse_side(sig.get("action"))
+        order_type = _parse_order_type(
+            extras.get("order_type", extras.get("binance_order_type"))
+        )
+        intent = None
+        if side is not None and order_type is not None:
+            intent = _entry_intent(
+                extras, side=side, order_type=order_type, order=dict(pairs)
             )
         return self._finish(
             _result(
@@ -701,6 +895,8 @@ class BinanceSpotAdapter:
                 order=dict(pairs),
                 exchange_order_id=str(order_id),
                 gates=gates,
+                intent=intent,
+                exit_plan=plan,
             )
         )
 
@@ -725,9 +921,18 @@ class BinanceSpotAdapter:
             return None, "invalid_order_type"
         raw_quote = extras.get("quote_order_qty", extras.get("quoteOrderQty"))
         raw_qty = extras.get("quantity")
-        raw_price = extras.get("price")
-        has_size = any(value not in (None, "") for value in (raw_quote, raw_qty, raw_price))
-        if not has_size:
+        limit_raw, price_error = _chosen_limit_raw(extras)
+        if price_error:
+            return None, price_error
+        has_qty = any(value not in (None, "") for value in (raw_quote, raw_qty))
+        if order_type == "LIMIT" and _format_positive(limit_raw) is None:
+            if limit_raw in (None, ""):
+                return None, "missing_limit_price"
+            return None, "invalid_limit_price"
+        if order_type == "LIMIT" and not has_qty:
+            # Price is an intent. Base size is still size_pct, not a fake quantity.
+            return None, None
+        if not has_qty:
             return None, None
         pairs, error = _order_pairs(
             symbol=symbol,

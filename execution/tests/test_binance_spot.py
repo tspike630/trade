@@ -26,7 +26,9 @@ from execution.executors.binance_spot import (  # noqa: E402
     PURPOSE_LIVE_BNB_BOLL_FADE,
     BinanceSpotAdapter,
     BinanceSpotHttpClient,
+    build_exit_plan,
     is_spot_usdt_symbol,
+    protective_exit_reason,
     sign_query,
     symbol_status_trading,
 )
@@ -651,6 +653,202 @@ class PeerGuardTests(unittest.TestCase):
                         paper_enabled=True,
                     )
                 )
+
+
+class DynamicExitPlanTests(unittest.TestCase):
+    """Absolute stop / take-profit / limit. No SL5 or TP10 stand-in. No live HTTP."""
+
+    def setUp(self) -> None:
+        self._net = mock.patch(
+            "execution.executors.binance_spot.urllib.request.urlopen",
+            side_effect=AssertionError("live binance HTTP is disabled in tests"),
+        )
+        self._net.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._net.stop()
+        self._tmp.cleanup()
+
+    def _adapter(self) -> BinanceSpotAdapter:
+        return BinanceSpotAdapter(
+            client=_FakeClient(),
+            kill_switch_path=self.root / "LIVE_TRADING_DISABLED",
+            api_key="test-key",
+            api_secret="test-secret",
+            clock_ms=lambda: 1_700_000_000_000,
+        )
+
+    def _zone_extras(self, **overrides: Any) -> dict[str, Any]:
+        extras = {
+            "binance_symbol": "BNBUSDT",
+            "market": "spot",
+            "order_type": "MARKET",
+            "price_usd": 102.0,
+            "stop_price": 99.0,
+            "take_profit_price": 110.0,
+            "entry_reason": "large_trade_market",
+            "entry_zone_min": 100.8,
+            "entry_zone_max": 104.0,
+            "alpha": 0.2,
+            "trade_size_ratio": 1.6,
+            "position_size_multiplier": 1.0,
+        }
+        extras.update(overrides)
+        return extras
+
+    def test_dry_run_keeps_absolute_stop_and_mid_take_profit(self) -> None:
+        kill = self.root / "LIVE_TRADING_DISABLED"
+        kill.write_text("off\n", encoding="utf-8")
+        adapter = self._adapter()
+        with mock.patch.dict(os.environ, _env(self.root, enabled="0", kill_exists=True)):
+            result = adapter.execute(
+                _sig(
+                    mode="dry_run",
+                    token_address="BNBUSDT",
+                    extras=self._zone_extras(),
+                )
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["dry_run"])
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["executed"], 0)
+        plan = result["exit_plan"]
+        self.assertEqual(plan["stop_price"], "99")
+        self.assertEqual(plan["take_profit_price"], "110")
+        self.assertEqual(plan["entry_price"], "102")
+        self.assertFalse(plan["submitted"])
+        self.assertFalse(plan["defaults_applied"])
+        self.assertEqual(plan["protective_order"], "not_supported_not_sent")
+        self.assertEqual(result["intent"]["order_type"], "MARKET")
+        self.assertIsNone(result["intent"]["limit_price"])
+        self.assertEqual(adapter.client.calls, [])
+        blob = json.dumps(result)
+        self.assertNotIn("tp_pct", blob)
+        self.assertNotIn("sl_pct", blob)
+        # 5% under 102 would be 96.9. The plan stops at 99, so 97 is still open.
+        # 98 is still above a 5% stop (102 * 0.95 = 96.9) and at/under this plan's 99.
+        self.assertIsNone(protective_exit_reason(plan, 100.5))
+        self.assertEqual(protective_exit_reason(plan, 98.0), "stop_loss")
+        self.assertEqual(protective_exit_reason(plan, 99.0), "stop_loss")
+        # 10% above 102 would be 112.2. Touching the decision mid exits first.
+        self.assertEqual(protective_exit_reason(plan, 110.0), "take_profit")
+        self.assertIsNone(protective_exit_reason(plan, 109.0))
+
+    def test_limit_intent_is_not_pretended_to_be_an_exchange_order(self) -> None:
+        adapter = self._adapter()
+        with mock.patch.dict(os.environ, _env(self.root, enabled="0", kill_exists=True)):
+            result = adapter.execute(
+                _sig(
+                    mode="dry_run",
+                    token_address="BNBUSDT",
+                    extras=self._zone_extras(
+                        order_type="LIMIT",
+                        price_usd=108.0,
+                        limit_price=102.0,
+                        entry_reason="neutral_limit",
+                        position_size_multiplier=0.5,
+                    ),
+                )
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertIsNone(result["order"])
+        self.assertEqual(result["intent"]["order_type"], "LIMIT")
+        self.assertEqual(result["intent"]["limit_price"], "102")
+        self.assertFalse(result["intent"]["exchange_ready"])
+        self.assertEqual(result["intent"]["quantity_status"], "deferred_size_pct")
+        self.assertEqual(result["intent"]["protective_order"], "not_supported_not_sent")
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["exit_plan"]["entry_price"], "102")
+        self.assertEqual(adapter.client.calls, [])
+
+    def test_stop_at_or_above_entry_is_rejected(self) -> None:
+        plan, error = build_exit_plan(
+            {"action": "buy"},
+            {
+                "order_type": "MARKET",
+                "price_usd": 100.0,
+                "stop_price": 100.0,
+                "take_profit_price": 110.0,
+                "entry_reason": "large_trade_market",
+            },
+        )
+        self.assertIsNone(plan)
+        self.assertEqual(error, "stop_not_below_entry")
+        adapter = self._adapter()
+        with mock.patch.dict(os.environ, _env(self.root, enabled="1", kill_exists=False)):
+            result = adapter.execute(
+                _sig(
+                    mode="live_stub",
+                    token_address="BNBUSDT",
+                    extras=self._zone_extras(stop_price=102.0),
+                )
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "stop_not_below_entry")
+        self.assertFalse(result["submitted"])
+        self.assertEqual(adapter.client.calls, [])
+
+    def test_live_submit_does_not_attach_a_protective_order(self) -> None:
+        client = _FakeClient(
+            info={"symbol": "BNBUSDT", "status": "TRADING", "quoteAsset": "USDT"}
+        )
+        adapter = BinanceSpotAdapter(
+            client=client,
+            kill_switch_path=self.root / "missing-switch",
+            api_key="test-key",
+            api_secret="test-secret",
+            clock_ms=lambda: 1_700_000_000_000,
+        )
+        extras = self._zone_extras(quote_order_qty="25")
+        with mock.patch.dict(os.environ, _env(self.root, enabled="1", kill_exists=False)):
+            result = adapter.execute(
+                _sig(mode="live_stub", token_address="BNBUSDT", extras=extras)
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["order"]["type"], "MARKET")
+        self.assertNotIn("stopPrice", result["order"])
+        self.assertNotIn("stop_price", result["order"])
+        self.assertFalse(result["exit_plan"]["submitted"])
+        self.assertEqual(result["exit_plan"]["protective_order"], "not_supported_not_sent")
+        kinds = [call[0] for call in client.calls]
+        self.assertEqual(kinds, ["exchange_info", "new_order"])
+        _kind, signed, _key = client.calls[1]
+        self.assertNotIn("stopPrice", signed)
+        self.assertNotIn("STOP_LOSS", signed)
+        self.assertNotIn("TAKE_PROFIT", signed)
+
+    def test_gateway_receipt_carries_the_plan(self) -> None:
+        paper = _RecordingPaper()
+        adapter = self._adapter()
+        env = _env(self.root, enabled="0", kill_exists=True)
+        with mock.patch.dict(os.environ, env):
+            with ExecutionGateway(
+                decision_db=self.root / "decision.db",
+                ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+                paper_enabled=True,
+                paper_db=self.root / "paper_eq_unused.db",
+                paper_executor=paper,
+                pm_enabled=False,
+                accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
+                binance_spot=adapter,
+            ) as gw:
+                result = gw.process_one(
+                    _decision_row(
+                        mode="dry_run",
+                        token_address="BNBUSDT",
+                        extras=self._zone_extras(),
+                    )
+                )
+        self.assertEqual(result["receipt"]["status"], "dry_run_acked")
+        plan = result["exec_result"]["exit_plan"]
+        self.assertEqual(plan["stop_price"], "99")
+        self.assertEqual(plan["take_profit_price"], "110")
+        self.assertFalse(plan["defaults_applied"])
+        self.assertEqual(paper.calls, [])
+        self.assertEqual(adapter.client.calls, [])
 
 
 if __name__ == "__main__":

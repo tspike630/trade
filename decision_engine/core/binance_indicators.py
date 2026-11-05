@@ -59,9 +59,25 @@ _READ_COLS = (
     "boll_lower",
     "quote_volume_24h",
     "sample_count",
+    "kline_close_time_ms",
     "tier",
     "tech_updated_at",
     "updated_at",
+)
+
+# Present only when a later indicator build or a test added them. #164's
+# avg_trade_size is not on main; reading it when the column exists avoids a
+# second definition. Missing columns are omitted from the SELECT.
+_OPTIONAL_COLS = (
+    "kline_low",
+    "low",
+    "trade_size_ratio",
+    "avg_trade_size",
+    "avg_trade_size_24h",
+    "bar_quote_volume",
+    "bar_trades",
+    "baseline_quote_volume",
+    "baseline_trades",
 )
 
 
@@ -135,7 +151,7 @@ def list_binance_hot_tokens(
     if not binance_indicators_ready(conn):
         return []
     present = _present_columns(conn)
-    cols = [name for name in _READ_COLS if name in present]
+    cols = [name for name in (*_READ_COLS, *_OPTIONAL_COLS) if name in present]
     if "symbol" not in cols:
         return []
     chosen = resolve_indicator_sort(
@@ -192,7 +208,7 @@ def _shape_row(raw: dict[str, Any]) -> dict[str, Any] | None:
         return None
     ccxt_symbol = f"{base}/{BINANCE_QUOTE}"
     quote_volume = raw.get("quote_volume_24h")
-    return {
+    shaped = {
         "chain_id": BINANCE_VENUE,
         "token_address": symbol,
         "symbol": base,
@@ -232,3 +248,7 @@ def _shape_row(raw: dict[str, Any]) -> dict[str, Any] | None:
         "source_chain_id": None,
         "source_token_address": None,
     }
+    for key in ("kline_close_time_ms", *_OPTIONAL_COLS):
+        if key in raw and raw.get(key) is not None:
+            shaped[key] = raw.get(key)
+    return shaped

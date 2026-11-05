@@ -276,10 +276,29 @@ class EnginePurposeUniverseTests(unittest.TestCase):
         return _decision_rows(db)
 
     def test_live_purpose_emits_binance_symbol_only(self) -> None:
-        """auto, no CEX tables yet: the DEX∩listing bypass still stamps the symbol."""
+        """auto, no indicator table: the DEX∩listing bypass still stamps the symbol.
+
+        Closed klines supply the entry-zone coordinates. Without them the
+        live purpose fails closed and does not fall back to the paper legs.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "d.db"
             _seed(db)
+            conn = sqlite3.connect(db)
+            # Coordinates live on the mapped DEX row. A binance_klines table
+            # would switch auto mode off dex_map and onto the kline factor path.
+            conn.execute("ALTER TABLE token_indicators ADD COLUMN boll_mid REAL")
+            conn.execute("ALTER TABLE token_indicators ADD COLUMN kline_low REAL")
+            conn.execute("ALTER TABLE token_indicators ADD COLUMN trade_size_ratio REAL")
+            conn.execute(
+                """
+                UPDATE token_indicators
+                SET boll_mid = 1.2, kline_low = 0.825, trade_size_ratio = 2.0
+                WHERE token_address = 'MintA'
+                """
+            )
+            conn.commit()
+            conn.close()
             rows = self._tick(db, PURPOSE_LIVE_BNB_BOLL_FADE)
             self.assertEqual(len(rows), 1)
             row = rows[0]
@@ -297,7 +316,14 @@ class EnginePurposeUniverseTests(unittest.TestCase):
             self.assertEqual(extras["universe"], CEX_UNIVERSE)
             self.assertEqual(extras["source_chain_id"], "solana")
             self.assertEqual(extras["source_token_address"], "MintA")
-            self.assertEqual(extras["and_mode"], "tech_fade&boll_lower")
+            self.assertEqual(extras["and_mode"], "entry_zone")
+            self.assertEqual(extras["entry_reason"], "large_trade_market")
+            self.assertEqual(extras["order_type"], "MARKET")
+            self.assertIn("stop_price", extras)
+            self.assertIn("take_profit_price", extras)
+            self.assertIn("entry_zone_min", extras)
+            self.assertIn("alpha", extras)
+            self.assertIn("trade_size_ratio", extras)
             self.assertNotIn("local_score", extras)
             self.assertNotIn("MintA", row["token_address"])
             self.assertNotIn("MintNope", row["token_address"])

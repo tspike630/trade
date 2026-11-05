@@ -564,12 +564,20 @@ def _volume_strength(points: Sequence[tuple[float, float]]) -> float | None:
     return current / mean_v
 
 
-def _boll_lower(closes: Sequence[float]) -> float | None:
-    """SMA(20) − 2 × population stdev. Same parameters as ``bbands(length=20, std=2)``."""
+def boll_mid_from_closes(closes: Sequence[float]) -> float | None:
+    """SMA(20) of close. Same window as ``_boll_lower`` / ``bbands(length=20)``."""
     if len(closes) < BOLL_LENGTH:
         return None
     window = list(closes[-BOLL_LENGTH:])
-    mid = sum(window) / BOLL_LENGTH
+    return sum(window) / BOLL_LENGTH
+
+
+def _boll_lower(closes: Sequence[float]) -> float | None:
+    """SMA(20) − 2 × population stdev. Same parameters as ``bbands(length=20, std=2)``."""
+    mid = boll_mid_from_closes(closes)
+    if mid is None:
+        return None
+    window = list(closes[-BOLL_LENGTH:])
     var = sum((px - mid) ** 2 for px in window) / BOLL_LENGTH
     return mid - BOLL_STD * math.sqrt(var)
 
