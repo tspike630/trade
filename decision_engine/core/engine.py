@@ -7,9 +7,16 @@ from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine.core.bnb_spot_map import (
+    default_listing_db_paths,
+    load_binance_spot_usdt_symbols,
+    load_token_bases,
+    map_hot_tokens_to_binance_spot,
+    stamp_bnb_spot_signals,
+)
 from decision_engine.core.data_adapter import IndicatorDataAdapter
 from decision_engine.core.risk_manager import RiskManager
-from decision_engine.core.signal_bus import SignalBus
+from decision_engine.core.signal_bus import PURPOSE_LIVE_BNB_BOLL_FADE, SignalBus
 from decision_engine.entry_ih_age import filter_buys_by_entry_ih_age
 from decision_engine.strategies.base_strategy import BaseStrategy
 
@@ -46,6 +53,9 @@ class DecisionEngine:
         self.tick_count += 1
         n_ind = self.adapter.count_indicators()
         hot = self.adapter.list_hot_tokens(limit=self.hot_limit)
+        bnb_spot = self.bus.purpose == PURPOSE_LIVE_BNB_BOLL_FADE
+        if bnb_spot:
+            hot = self._map_bnb_spot_universe(hot)
         log.info(
             "tick#%s indicators_total=%s hot_loaded=%s strategies=%s",
             self.tick_count,
@@ -66,6 +76,15 @@ class DecisionEngine:
                 candidates.extend(out)
             except Exception as exc:  # noqa: BLE001
                 log.exception("strategy %s failed: %s", strat.strategy_id, exc)
+
+        if bnb_spot:
+            before = len(candidates)
+            candidates = stamp_bnb_spot_signals(candidates, hot)
+            log.info(
+                "bnb_spot_stamp kept=%s dropped_unmapped=%s",
+                len(candidates),
+                before - len(candidates),
+            )
 
         entry_ih_rejected: dict[str, int] | None = None
         if self.entry_ih_min_hours is not None:
@@ -133,6 +152,38 @@ class DecisionEngine:
         if entry_ih_rejected is not None:
             payload["entry_ih_rejected"] = entry_ih_rejected
         return payload
+
+    def _map_bnb_spot_universe(self, hot: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Replace the scan set with listed Binance spot USDT names.
+
+        Failure or an empty listing set yields no rows. The original DEX
+        identities are not passed through on this purpose.
+        """
+        try:
+            listed = load_binance_spot_usdt_symbols(
+                self.adapter.conn,
+                extra_paths=default_listing_db_paths(self.adapter.db_path),
+            )
+            bases = load_token_bases(self.adapter.conn, hot)
+            mapped, stats = map_hot_tokens_to_binance_spot(
+                hot,
+                listed_symbols=listed,
+                symbol_by_token=bases,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("bnb_spot_map failed closed: %s", exc)
+            return []
+        log.info(
+            "bnb_spot_map listed=%s scanned=%s mapped=%s "
+            "skipped_no_symbol=%s skipped_unlisted=%s skipped_duplicate=%s",
+            len(listed),
+            stats["scanned"],
+            stats["mapped"],
+            stats["skipped_no_symbol"],
+            stats["skipped_unlisted"],
+            stats["skipped_duplicate"],
+        )
+        return mapped
 
     def _stamp_buy_liquidity(
         self,

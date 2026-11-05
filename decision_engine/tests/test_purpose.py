@@ -21,7 +21,9 @@ from decision_engine.core.engine import DecisionEngine
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import (
     DEFAULT_PURPOSE,
+    PURPOSE_LIVE_BNB_BOLL_FADE,
     PURPOSE_LIVE_CANDIDATE,
+    PURPOSE_RACE_TECH_BOLL_FADE,
     PURPOSE_SAMPLE,
     PURPOSES,
     SignalBus,
@@ -63,6 +65,19 @@ class PurposeEnumTests(unittest.TestCase):
         )
         self.assertEqual(PURPOSES, expected)
         self.assertEqual(DEFAULT_PURPOSE, PURPOSE_LIVE_CANDIDATE)
+        self.assertEqual(PURPOSE_LIVE_BNB_BOLL_FADE, "live_bnb_boll_fade")
+        self.assertIn(PURPOSE_LIVE_BNB_BOLL_FADE, PURPOSES)
+        self.assertIn(PURPOSE_RACE_TECH_BOLL_FADE, PURPOSES)
+        self.assertNotEqual(PURPOSE_LIVE_BNB_BOLL_FADE, PURPOSE_RACE_TECH_BOLL_FADE)
+        self.assertNotEqual(PURPOSE_LIVE_BNB_BOLL_FADE, PURPOSE_LIVE_CANDIDATE)
+        self.assertEqual(
+            resolve_run_purpose(
+                "live_bnb_boll_fade",
+                min_jev_strength=None,
+                live_min_strength=0.3,
+            ),
+            PURPOSE_LIVE_BNB_BOLL_FADE,
+        )
 
     def test_resident_loop_and_once_default_live_candidate(self) -> None:
         # Neither --once nor --loop passes a threshold; both share this default.
