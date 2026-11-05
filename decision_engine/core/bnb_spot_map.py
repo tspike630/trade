@@ -6,7 +6,12 @@ formula is not applied here. Rows that do not resolve to a listed spot
 fill id for that purpose.
 
 Listing membership is read from local SQLite only (``cex_listing_events``
-and the ccxt side tables). No exchange client and no API key.
+and the ccxt side tables). No exchange client and no API key. An empty or
+tiny Binance spot USDT set stays fail-closed.
+
+Base tickers are read from ``tokens.raw_json`` when that blob has one, then
+from ``pairs.raw_json`` ``baseToken.symbol`` (the live token blob often has
+only url/chainId/tokenAddress).
 """
 
 from __future__ import annotations
@@ -325,26 +330,222 @@ def default_listing_db_paths(indicator_db: Path) -> list[Path]:
     return out
 
 
-def _base_from_raw_json(raw: Any) -> str | None:
+def _parse_raw_object(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, dict):
-        parsed = raw
-    elif isinstance(raw, str) and raw.strip():
+        return raw
+    if isinstance(raw, str) and raw.strip():
         try:
             parsed = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return None
-        if not isinstance(parsed, dict):
-            return None
-    else:
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _base_from_raw_json(raw: Any) -> str | None:
+    parsed = _parse_raw_object(raw)
+    if parsed is None:
         return None
     return _base_from_mapping(parsed)
+
+
+def _base_from_pair_raw(raw: Any, token_address: str) -> str | None:
+    """Base from ``pairs.raw_json`` ``baseToken.symbol`` only.
+
+    ``quoteToken.symbol`` is never the base. When ``baseToken.address`` is
+    present it must be this token, so a pair stored on the other side is skipped.
+    """
+    parsed = _parse_raw_object(raw)
+    if parsed is None:
+        return None
+    base_token = parsed.get("baseToken")
+    if not isinstance(base_token, dict):
+        base_token = parsed.get("base_token")
+    if not isinstance(base_token, dict):
+        return None
+    address = base_token.get("address")
+    if isinstance(address, str) and address.strip() and address.strip() != token_address:
+        return None
+    symbol = base_token.get("symbol")
+    if not isinstance(symbol, str) or not symbol.strip():
+        return None
+    return normalize_spot_base(symbol)
+
+
+def _select_in_chunks(
+    conn: sqlite3.Connection,
+    *,
+    select_sql: str,
+    column: str,
+    keys: list[tuple[str, str]],
+) -> list[Any]:
+    """Run ``select_sql`` with ``{predicate}`` over ``(chain_id, column)`` chunks."""
+    if column not in {"pair_address", "token_address"}:
+        raise ValueError(f"unexpected pair lookup column: {column}")
+    out: list[Any] = []
+    chunk_size = 80
+    for start in range(0, len(keys), chunk_size):
+        chunk = keys[start : start + chunk_size]
+        predicate = " OR ".join(f"(chain_id = ? AND {column} = ?)" for _ in chunk)
+        params: list[str] = []
+        for left, right in chunk:
+            params.extend((left, right))
+        out.extend(conn.execute(select_sql.format(predicate=predicate), params).fetchall())
+    return out
+
+
+def _fill_bases_from_tokens(
+    conn: sqlite3.Connection,
+    keys: list[tuple[str, str]],
+    found: dict[tuple[str, str], str],
+) -> int:
+    try:
+        names = _table_names(conn)
+    except sqlite3.Error as exc:
+        log.warning("token symbol table scan failed: %s", exc)
+        return 0
+    if "tokens" not in names:
+        return 0
+    cols = _columns(conn, "tokens")
+    if not {"chain_id", "token_address", "raw_json"} <= cols:
+        return 0
+    added = 0
+    try:
+        fetched = _select_in_chunks(
+            conn,
+            select_sql=(
+                "SELECT chain_id, token_address, raw_json FROM tokens WHERE {predicate}"
+            ),
+            column="token_address",
+            keys=keys,
+        )
+    except sqlite3.Error as exc:
+        log.warning("token symbol lookup failed: %s", exc)
+        return 0
+    for chain_id, token_address, raw_json in fetched:
+        base = _base_from_raw_json(raw_json)
+        if base is None:
+            continue
+        found[(str(chain_id), str(token_address))] = base
+        added += 1
+    return added
+
+
+def _fill_bases_from_pairs(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    found: dict[tuple[str, str], str],
+) -> int:
+    """Fill bases still missing after ``tokens.raw_json``.
+
+    Prefer ``primary_pair_address``. Otherwise the first pair row for that
+    token whose ``baseToken`` is this token.
+    """
+    pending: list[dict[str, Any]] = []
+    seen_pending: set[tuple[str, str]] = set()
+    for row in rows:
+        chain = str(row.get("chain_id") or "")
+        token = str(row.get("token_address") or "")
+        key = (chain, token)
+        if not chain or not token or key in found or key in seen_pending:
+            continue
+        seen_pending.add(key)
+        pending.append(row)
+    if not pending:
+        return 0
+    try:
+        names = _table_names(conn)
+    except sqlite3.Error as exc:
+        log.warning("pair symbol table scan failed: %s", exc)
+        return 0
+    if "pairs" not in names:
+        return 0
+    cols = _columns(conn, "pairs")
+    if not {"chain_id", "pair_address", "raw_json"} <= cols:
+        return 0
+
+    pair_keys: list[tuple[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for row in pending:
+        pair = str(row.get("primary_pair_address") or "").strip()
+        chain = str(row.get("chain_id") or "")
+        if not pair:
+            continue
+        key = (chain, pair)
+        if key not in seen_pairs:
+            seen_pairs.add(key)
+            pair_keys.append(key)
+    raw_by_pair: dict[tuple[str, str], Any] = {}
+    if pair_keys:
+        try:
+            fetched = _select_in_chunks(
+                conn,
+                select_sql=(
+                    "SELECT chain_id, pair_address, raw_json FROM pairs WHERE {predicate}"
+                ),
+                column="pair_address",
+                keys=pair_keys,
+            )
+        except sqlite3.Error as exc:
+            log.warning("pair symbol lookup failed: %s", exc)
+            fetched = []
+        for chain_id, pair_address, raw_json in fetched:
+            raw_by_pair[(str(chain_id), str(pair_address))] = raw_json
+
+    added = 0
+    still: list[tuple[str, str]] = []
+    for row in pending:
+        chain = str(row.get("chain_id") or "")
+        token = str(row.get("token_address") or "")
+        pair = str(row.get("primary_pair_address") or "").strip()
+        base = _base_from_pair_raw(raw_by_pair.get((chain, pair)), token)
+        if base is not None:
+            found[(chain, token)] = base
+            added += 1
+        else:
+            still.append((chain, token))
+    if not still or "token_address" not in cols:
+        return added
+    try:
+        fetched = _select_in_chunks(
+            conn,
+            select_sql=(
+                "SELECT chain_id, token_address, raw_json FROM pairs "
+                "WHERE {predicate} ORDER BY pair_address"
+            ),
+            column="token_address",
+            keys=still,
+        )
+    except sqlite3.Error as exc:
+        log.warning("pair symbol token lookup failed: %s", exc)
+        return added
+    grouped: dict[tuple[str, str], list[Any]] = {}
+    for chain_id, token_address, raw_json in fetched:
+        grouped.setdefault((str(chain_id), str(token_address)), []).append(raw_json)
+    for chain, token in still:
+        if (chain, token) in found:
+            continue
+        for raw_json in grouped.get((chain, token), ()):
+            base = _base_from_pair_raw(raw_json, token)
+            if base is None:
+                continue
+            found[(chain, token)] = base
+            added += 1
+            break
+    return added
 
 
 def load_token_bases(
     conn: sqlite3.Connection,
     rows: list[dict[str, Any]],
 ) -> dict[tuple[str, str], str]:
-    """``(chain_id, token_address) → base`` from ``tokens.raw_json`` when present."""
+    """``(chain_id, token_address) → base``.
+
+    Order: ``tokens.raw_json`` when it has a ticker, else
+    ``pairs.raw_json`` ``baseToken.symbol`` for ``primary_pair_address``
+    (then any pair stored for that token).
+    """
     keys: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for row in rows:
@@ -358,33 +559,14 @@ def load_token_bases(
             keys.append(key)
     if not keys:
         return {}
-    try:
-        names = _table_names(conn)
-    except sqlite3.Error:
-        return {}
-    if "tokens" not in names:
-        return {}
-    cols = _columns(conn, "tokens")
-    if not {"chain_id", "token_address", "raw_json"} <= cols:
-        return {}
     found: dict[tuple[str, str], str] = {}
-    chunk_size = 80
-    for start in range(0, len(keys), chunk_size):
-        chunk = keys[start : start + chunk_size]
-        clause = " OR ".join("(chain_id = ? AND token_address = ?)" for _ in chunk)
-        params: list[str] = []
-        for chain, token in chunk:
-            params.extend((chain, token))
-        try:
-            fetched = conn.execute(
-                f"SELECT chain_id, token_address, raw_json FROM tokens WHERE {clause}",
-                params,
-            ).fetchall()
-        except sqlite3.Error as exc:
-            log.warning("token symbol lookup failed: %s", exc)
-            return found
-        for chain_id, token_address, raw_json in fetched:
-            base = _base_from_raw_json(raw_json)
-            if base is not None:
-                found[(str(chain_id), str(token_address))] = base
+    from_tokens = _fill_bases_from_tokens(conn, keys, found)
+    from_pairs = _fill_bases_from_pairs(conn, rows, found)
+    log.info(
+        "token_bases keys=%s from_tokens=%s from_pairs=%s unresolved=%s",
+        len(keys),
+        from_tokens,
+        from_pairs,
+        len(keys) - len(found),
+    )
     return found

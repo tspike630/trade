@@ -39,11 +39,21 @@ CEX 旁簿和纸面 Solana DEX **不是同一个分布**。看板必须分列：
 - 计价必须是 `USDT`
 - 旁路路径（文件存在才读）：指标库旁边的 `ccxt.db`，以及仓库根 / `crawler/` 下的 `ccxt.db` 与 `data/prior/db/prior.db`
 
-集合为空时，本 purpose 本拍发射 0 条。执行不要用 DEX 行补。
+集合为空或只有几行时，本 purpose 本拍对不上的名字发射 0 条。执行不要用 DEX 行补，也不要因为 `listed` 很小就把 mint 当成币安符号。
+
+运维必须在本地自己维持 **Binance 现货 USDT** 上市集合。空集合或只有 BTC/ETH 这几行是失败关闭，不是映射漏了。2026-11-05 实机 dry-run：`cex_listing_events` 里 Binance USDT 为 0 行；`ccxt_listings` 大多是 okx/kucoin，Binance USDT 只有少数几行（`BTCUSDT` / `ETHUSDT` 一类），日志是 `listed=4 mapped=0`。okx/kucoin 的行不算 Binance。补集合写到 `cex_listing_events`（`exchange=binance`，`quote=USDT`，符号里没有 `:`）或 `ccxt_listings`（`exchange=binance` 的现货 USDT）。本变更不请求交易所、不写密钥。
 
 ## 符号映射
 
-DEX 行上的 base 来自行内 `base_asset` / `base_symbol` / `base` / `symbol` / `token_symbol`，否则来自 `tokens.raw_json` 的 `symbol` 或 `baseToken.symbol`。
+DEX 行上的 base 按这个顺序取，取到为止：
+
+1. 行内 `base_asset` / `base_symbol` / `base` / `symbol` / `token_symbol`
+2. `tokens.raw_json` 的 `symbol` 或 `baseToken.symbol`
+3. 该行 `primary_pair_address` 对应的 `pairs.raw_json` → `baseToken.symbol`。主池没有符号时，再用同一 token 的其它 pair 行。`quoteToken.symbol` 不用。`baseToken.address` 若在且不等于该 token，跳过。
+
+现网 `tokens.raw_json` 只有 `url` / `chainId` / `tokenAddress`，没有 ticker。符号在 `pairs.raw_json`。`tokens.raw_json` 若已经有 ticker，以它为准，不用 pair 覆盖。
+
+符号补上之后，上市集合仍很小的话，日志会从 `skipped_no_symbol` 变成 `skipped_unlisted`。那是上市集合没补齐，仍然失败关闭。
 
 | 输入 | 结果 |
 |---|---|

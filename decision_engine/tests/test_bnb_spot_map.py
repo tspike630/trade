@@ -16,6 +16,7 @@ from decision_engine.core.bnb_spot_map import (
     CEX_UNIVERSE,
     classify_listed_symbol,
     load_binance_spot_usdt_symbols,
+    load_token_bases,
     map_hot_tokens_to_binance_spot,
     normalize_spot_base,
     stamp_bnb_spot_signals,
@@ -171,6 +172,183 @@ class SpotSymbolTests(unittest.TestCase):
         self.assertEqual(live.min_volume_strength, race.min_volume_strength)
 
 
+def _token_without_ticker(token: str) -> str:
+    """Live tokens.raw_json shape: route fields, no ticker."""
+    return json.dumps(
+        {
+            "url": f"https://dexscreener.com/solana/{token}",
+            "chainId": "solana",
+            "tokenAddress": token,
+        }
+    )
+
+
+def _pair_with_base(token: str, symbol: str, *, quote_symbol: str = "SOL") -> str:
+    floor = float(de_config.DECISION_MIN_LIQ_USD)
+    return json.dumps(
+        {
+            "liquidity": {"usd": floor},
+            "priceUsd": "0.9",
+            "baseToken": {"address": token, "symbol": symbol},
+            "quoteToken": {"address": "So11111111111111111111111111111111111111112", "symbol": quote_symbol},
+        }
+    )
+
+
+class PairRawSymbolTests(unittest.TestCase):
+    def test_pair_base_token_symbol_when_token_raw_has_no_ticker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "CREATE TABLE tokens (chain_id TEXT, token_address TEXT, raw_json TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO tokens VALUES (?, ?, ?)",
+                ("solana", "MintA", _token_without_ticker("MintA")),
+            )
+            conn.execute(
+                """
+                CREATE TABLE pairs (
+                    chain_id TEXT, pair_address TEXT, token_address TEXT, raw_json TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO pairs VALUES (?, ?, ?, ?)",
+                ("solana", "PairA", "MintA", _pair_with_base("MintA", "zzqboll")),
+            )
+            conn.execute(
+                "INSERT INTO pairs VALUES (?, ?, ?, ?)",
+                (
+                    "solana",
+                    "PairOther",
+                    "MintA",
+                    _pair_with_base("MintA", "ZZQOTHER"),
+                ),
+            )
+            conn.commit()
+            rows = [
+                {
+                    "chain_id": "solana",
+                    "token_address": "MintA",
+                    "primary_pair_address": "PairA",
+                }
+            ]
+            found = load_token_bases(conn, rows)
+            conn.close()
+        self.assertEqual(found, {("solana", "MintA"): "ZZQBOLL"})
+
+    def test_token_ticker_wins_over_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "CREATE TABLE tokens (chain_id TEXT, token_address TEXT, raw_json TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO tokens VALUES (?, ?, ?)",
+                ("solana", "MintA", json.dumps({"symbol": "ZZQKEEP"})),
+            )
+            conn.execute(
+                """
+                CREATE TABLE pairs (
+                    chain_id TEXT, pair_address TEXT, token_address TEXT, raw_json TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO pairs VALUES (?, ?, ?, ?)",
+                ("solana", "PairA", "MintA", _pair_with_base("MintA", "ZZQOTHER")),
+            )
+            conn.commit()
+            found = load_token_bases(
+                conn,
+                [
+                    {
+                        "chain_id": "solana",
+                        "token_address": "MintA",
+                        "primary_pair_address": "PairA",
+                    }
+                ],
+            )
+            conn.close()
+        self.assertEqual(found[("solana", "MintA")], "ZZQKEEP")
+
+    def test_quote_symbol_and_mismatched_base_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                CREATE TABLE pairs (
+                    chain_id TEXT, pair_address TEXT, token_address TEXT, raw_json TEXT
+                )
+                """
+            )
+            quote_only = json.dumps(
+                {
+                    "quoteToken": {"symbol": "SOL"},
+                    "baseToken": {"address": "SomeoneElse", "symbol": "ZZQOTHER"},
+                }
+            )
+            conn.execute(
+                "INSERT INTO pairs VALUES (?, ?, ?, ?)",
+                ("solana", "PairA", "MintA", quote_only),
+            )
+            conn.commit()
+            found = load_token_bases(
+                conn,
+                [
+                    {
+                        "chain_id": "solana",
+                        "token_address": "MintA",
+                        "primary_pair_address": "PairA",
+                    }
+                ],
+            )
+            conn.close()
+        self.assertEqual(found, {})
+
+    def test_falls_back_to_another_pair_when_primary_has_no_symbol(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                CREATE TABLE pairs (
+                    chain_id TEXT, pair_address TEXT, token_address TEXT, raw_json TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO pairs VALUES (?, ?, ?, ?)",
+                (
+                    "solana",
+                    "PairPrimary",
+                    "MintA",
+                    json.dumps({"priceUsd": "0.9", "quoteToken": {"symbol": "SOL"}}),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO pairs VALUES (?, ?, ?, ?)",
+                ("solana", "PairSibling", "MintA", _pair_with_base("MintA", "ZZQBOLL")),
+            )
+            conn.commit()
+            found = load_token_bases(
+                conn,
+                [
+                    {
+                        "chain_id": "solana",
+                        "token_address": "MintA",
+                        "primary_pair_address": "PairPrimary",
+                    }
+                ],
+            )
+            conn.close()
+        self.assertEqual(found, {("solana", "MintA"): "ZZQBOLL"})
+
+
 def _seed(db: Path) -> None:
     floor = float(de_config.DECISION_MIN_LIQ_USD)
     raw = json.dumps({"liquidity": {"usd": floor}, "priceUsd": "0.9"})
@@ -317,6 +495,80 @@ class EnginePurposeUniverseTests(unittest.TestCase):
                 self.assertEqual(row["strategy_id"], "tech_boll_fade_v1")
                 extras = json.loads(row["raw_json"])["extras"]
                 self.assertNotIn("binance_symbol", extras)
+
+    def test_live_purpose_uses_pair_base_when_token_raw_has_no_ticker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT, token_address TEXT, change_5m REAL,
+                    volume_strength REAL, boll_lower REAL, jev_strength REAL,
+                    tier TEXT, primary_pair_address TEXT, updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO token_indicators VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "solana",
+                    "MintA",
+                    -3.0,
+                    0.9,
+                    1.0,
+                    0.9,
+                    "hot",
+                    "PairA",
+                    "2026-11-05T00:00:00Z",
+                ),
+            )
+            conn.execute(
+                """
+                CREATE TABLE pairs (
+                    chain_id TEXT, pair_address TEXT, token_address TEXT,
+                    raw_json TEXT, updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO pairs VALUES (?, ?, ?, ?, ?)",
+                (
+                    "solana",
+                    "PairA",
+                    "MintA",
+                    _pair_with_base("MintA", "ZZQBOLL"),
+                    "2026-11-05T00:00:00Z",
+                ),
+            )
+            conn.execute(
+                "CREATE TABLE tokens (chain_id TEXT, token_address TEXT, raw_json TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO tokens VALUES (?, ?, ?)",
+                ("solana", "MintA", _token_without_ticker("MintA")),
+            )
+            conn.execute(
+                """
+                CREATE TABLE cex_listing_events (
+                    exchange TEXT, symbol TEXT, base TEXT, quote TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO cex_listing_events VALUES (?, ?, ?, ?)",
+                ("binance", "ZZQBOLL/USDT", "ZZQBOLL", "USDT"),
+            )
+            conn.commit()
+            conn.close()
+            rows = self._tick(db, PURPOSE_LIVE_BNB_BOLL_FADE)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["token_address"], "ZZQBOLLUSDT")
+            self.assertEqual(rows[0]["chain_id"], BINANCE_VENUE)
+            extras = json.loads(rows[0]["raw_json"])["extras"]
+            self.assertEqual(extras["binance_symbol"], "ZZQBOLLUSDT")
+            self.assertEqual(extras["source_token_address"], "MintA")
+            self.assertEqual(rows[0]["strategy_id"], "tech_boll_fade_v1")
 
 
 if __name__ == "__main__":
