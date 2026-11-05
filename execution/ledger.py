@@ -10,9 +10,11 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from execution.executors.binance_spot_gate import VERIFIED_FET_EXIT
 from execution.observe_schema import ensure_observe_schema
 from execution.order_events import record_event
 
@@ -279,6 +281,21 @@ class ExecutionLedger:
         )
         self.conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS canonical_position_exits (
+                decision_log_id INTEGER PRIMARY KEY,
+                sell_order_id TEXT NOT NULL,
+                avg_price TEXT NOT NULL,
+                proceeds TEXT NOT NULL,
+                gross_pnl TEXT NOT NULL,
+                fee_entry_bnb TEXT NOT NULL,
+                fee_exit_bnb TEXT NOT NULL,
+                fee_total_bnb TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS spent_orders (
                 client_order_id TEXT PRIMARY KEY,
                 order_id TEXT NOT NULL,
@@ -358,6 +375,94 @@ class ExecutionLedger:
         self.conn.commit()
         if self.get_last_processed_id() != cursor_before:
             raise RuntimeError("verified fill moved the execution cursor")
+        return self.mcp_book()
+
+    def close_canonical_exit(self, exit_row: dict[str, Any]) -> dict[str, Any]:
+        """Record the verified FET sell. Does not touch the execution log or cursor.
+
+        Decision 147831 only. The numbers are the operator's closed row:
+        sell 3736070415, average 0.1459, proceeds 20.44059, gross pnl -1.49907,
+        and the two BNB fees that sum to 0.00004528. A second call is a no-op.
+        """
+        cursor_before = self.get_last_processed_id()
+        log_before = self.count()
+        events_before = int(
+            self.conn.execute("SELECT COUNT(*) AS n FROM order_events").fetchone()["n"]
+        )
+        decision_id = int(exit_row["decision_log_id"])
+        if decision_id != int(VERIFIED_FET_EXIT["decision_log_id"]):
+            raise ValueError("exit_decision_mismatch")
+        for key in (
+            "sell_order_id",
+            "avg_price",
+            "proceeds",
+            "gross_pnl",
+            "fee_entry_bnb",
+            "fee_exit_bnb",
+            "fee_total_bnb",
+        ):
+            if str(exit_row.get(key)) != str(VERIFIED_FET_EXIT[key]):
+                raise ValueError(f"exit_field_mismatch:{key}")
+        row = self.conn.execute(
+            """
+            SELECT cummulative_quote_qty, client_order_id, status
+            FROM canonical_positions
+            WHERE decision_log_id = ? AND purpose = ?
+            """,
+            (decision_id, "live_bnb_boll_fade"),
+        ).fetchone()
+        if row is None:
+            raise ValueError("canonical_row_missing")
+        if str(row["client_order_id"]) != "bnbfade-147831":
+            raise ValueError("exit_client_mismatch")
+        proceeds = Decimal(str(VERIFIED_FET_EXIT["proceeds"]))
+        entry_quote = Decimal(str(row["cummulative_quote_qty"]))
+        pnl = proceeds - entry_quote
+        if pnl != Decimal(str(VERIFIED_FET_EXIT["gross_pnl"])):
+            raise ValueError("exit_pnl_mismatch")
+        fees = Decimal(str(VERIFIED_FET_EXIT["fee_entry_bnb"])) + Decimal(
+            str(VERIFIED_FET_EXIT["fee_exit_bnb"])
+        )
+        if fees != Decimal(str(VERIFIED_FET_EXIT["fee_total_bnb"])):
+            raise ValueError("exit_fee_mismatch")
+        now = _utc()
+        self.conn.execute(
+            """
+            UPDATE canonical_positions
+            SET status = 'closed', updated_at = ?
+            WHERE decision_log_id = ? AND purpose = ?
+            """,
+            (now, decision_id, "live_bnb_boll_fade"),
+        )
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO canonical_position_exits (
+                decision_log_id, sell_order_id, avg_price, proceeds, gross_pnl,
+                fee_entry_bnb, fee_exit_bnb, fee_total_bnb, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision_id,
+                VERIFIED_FET_EXIT["sell_order_id"],
+                VERIFIED_FET_EXIT["avg_price"],
+                VERIFIED_FET_EXIT["proceeds"],
+                VERIFIED_FET_EXIT["gross_pnl"],
+                VERIFIED_FET_EXIT["fee_entry_bnb"],
+                VERIFIED_FET_EXIT["fee_exit_bnb"],
+                VERIFIED_FET_EXIT["fee_total_bnb"],
+                now,
+            ),
+        )
+        self.conn.commit()
+        if self.get_last_processed_id() != cursor_before:
+            raise RuntimeError("canonical exit moved the execution cursor")
+        if self.count() != log_before:
+            raise RuntimeError("canonical exit wrote execution_log")
+        events_after = int(
+            self.conn.execute("SELECT COUNT(*) AS n FROM order_events").fetchone()["n"]
+        )
+        if events_after != events_before:
+            raise RuntimeError("canonical exit wrote order_events")
         return self.mcp_book()
 
     def mcp_book(self) -> dict[str, Any]:

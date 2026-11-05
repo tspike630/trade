@@ -871,6 +871,7 @@ def _result(
 
 
 from execution.executors.binance_spot_gate import (  # noqa: E402
+    REST_BOOK,
     account_book_block,
     buy_exposure_block,
     native_oco_verified,
@@ -973,6 +974,7 @@ class BinanceSpotAdapter:
         dry_run: bool | None = None,
         account_snapshot: dict[str, Any] | None = None,
         production_book: str | None = None,
+        rest_expected: dict[str, Any] | None = None,
     ) -> None:
         self.client = client
         self.kill_switch_path = kill_switch_path
@@ -982,6 +984,7 @@ class BinanceSpotAdapter:
         self.dry_run = dry_run
         self.account_snapshot = account_snapshot
         self.production_book = production_book
+        self.rest_expected = rest_expected
         self.buy_blocks: list[dict[str, Any]] = []
         self.canonical_rows: list[dict[str, Any]] = []
         self._size_plan: dict[str, Any] | None = None
@@ -1003,11 +1006,20 @@ class BinanceSpotAdapter:
         }
 
     def _account_block(self) -> str | None:
-        """Operator book name plus a snapshot uid. Env uid is not proof."""
+        """REST book uses the declared account type and USDT free balance.
+
+        ``BINANCE_SPOT_ACCOUNT_UID`` is not read. A missing uid on the spot
+        account payload does not become the MCP uid.
+        """
         book = self.production_book
         if book is None:
             book = os.environ.get("BINANCE_SPOT_PRODUCTION_BOOK", "").strip() or None
-        return account_book_block(self.account_snapshot, book)
+        expected = self.rest_expected
+        if expected is None and book == REST_BOOK:
+            usdt = os.environ.get("BINANCE_SPOT_REST_USDT_FREE", "").strip()
+            account_type = os.environ.get("BINANCE_SPOT_REST_ACCOUNT_TYPE", "SPOT").strip() or "SPOT"
+            expected = {"account_type": account_type, "usdt_free": usdt or None}
+        return account_book_block(self.account_snapshot, book, expected)
 
     def _live_buy_block(self, sig: dict[str, Any], plan: dict[str, Any] | None) -> str | None:
         """Reasons a live BUY must not be sent. None means the later checks still apply."""

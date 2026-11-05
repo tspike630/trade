@@ -227,8 +227,14 @@ class LiveBnbDispatchTests(unittest.TestCase):
             api_key="sentinelsecret-not-read",
             api_secret="sentinelsecret-not-read",
             clock_ms=lambda: 1_700_000_000_000,
-            account_snapshot={"uid": "9000000001", "canTrade": True},
+            account_snapshot={
+                "accountType": "SPOT",
+                "canTrade": True,
+                "permissions": ["SPOT"],
+                "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+            },
             production_book="rest_api_key",
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
         )
         with mock.patch.dict(os.environ, self.env, clear=False):
             result = adapter.execute(

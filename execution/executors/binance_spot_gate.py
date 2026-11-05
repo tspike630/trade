@@ -6,13 +6,16 @@ leg order ids ``>= 0``. ``spot.newOrder`` types ``MARKET``, ``STOP_LOSS``,
 ``STOP_LOSS_LIMIT``, ``TAKE_PROFIT``, and ``TAKE_PROFIT_LIMIT`` are not that
 list.
 
-The regular API-key book and MCP uid ``1289917075`` are different books.
-A signed ``GET /api/v3/account`` that only shows ``canTrade`` does not bind
-either one. This module never reports the arm live-ready.
+The regular REST key and MCP uid ``1289917075`` (an Agentic sub-account) are
+separate books until a spot account payload actually carries that uid. A
+uid-less ``GET /api/v3/account`` binds the REST book by account type,
+permissions, and the declared USDT free balance. It is not labeled with the
+MCP uid.
 """
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 PURPOSE_LIVE_BNB_BOLL_FADE = "live_bnb_boll_fade"
@@ -20,8 +23,18 @@ MCP_POSITION_UID = "1289917075"
 REST_BOOK = "rest_api_key"
 MCP_BOOK = "mcp:1289917075"
 
-# Production cursor after the manual FET fill and the rejected batch under it.
-# Startup reads strictly above this id. It is not an entry parameter.
+# Signed read-only endpoints. This module parses payloads; it does not call them.
+# Spot account: USER_DATA. The published example includes ``uid``; a payload
+# without that field is still the account of the signing key.
+SPOT_ACCOUNT_ENDPOINT = "GET /api/v3/account"
+# API-key permissions. No account uid.
+API_RESTRICTIONS_ENDPOINT = "GET /sapi/v1/account/apiRestrictions"
+# Master account only. ``subUserId`` names a child; it does not identify the
+# key that signed ``GET /api/v3/account``.
+SUB_ACCOUNT_LIST_ENDPOINT = "GET /sapi/v1/sub-account/list"
+
+# Cursor pinned by the PR171 gate test. Startup reads strictly above this id.
+# It is not an entry parameter and it is not a list of decision ids.
 REPLAY_FLOOR_DECISION_ID = 147840
 FROZEN_DECISION_ID = 147831
 FROZEN_CLIENT_ID = "bnbfade-147831"
@@ -42,23 +55,72 @@ _TERMINAL_POSITION = frozenset({"closed", "closed_dust", "oco_filled"})
 _ABOVE_LEG = frozenset({"LIMIT_MAKER", "TAKE_PROFIT_LIMIT"})
 _BELOW_LEG = frozenset({"STOP_LOSS_LIMIT"})
 
-# Standing facts this process cannot close. Not an environment attestation.
+# Environment facts this module does not attest. A bound REST snapshot is not
+# one of them. A ``closed`` canonical row is terminal and is not a blocker.
 EXTERNAL_BLOCKERS = (
-    "rest_account_uid_not_proven",
-    "mcp_uid_1289917075_is_a_separate_book",
     "mcp_connector_has_no_order_list_oco",
     "fixed_egress_does_not_represent_mcp_connector",
-    "canonical_fet_close_is_worker_owned",
-    "paper_off_fixed_egress_and_consumer_are_environment_checks",
+    "paper_off_and_consumer_are_environment_checks",
+    "live_flag_and_kill_switch_are_not_changed_here",
 )
+
+# Machine ledger reported by the operator. Not a file in this checkout.
+REPLAY_SCOPE = {
+    "cursor_floor": REPLAY_FLOOR_DECISION_ID,
+    "frozen_decision_id": FROZEN_DECISION_ID,
+    "frozen_client_id": FROZEN_CLIENT_ID,
+    "decisions_above_floor_in_repo": [],
+    "execution_log_rows_in_repo": None,
+    "order_events_rows_in_repo": None,
+    "operator_reported": {
+        "execution_log_rows": 20,
+        "order_events_rows": 40,
+        "cursor": REPLAY_FLOOR_DECISION_ID,
+        "canonical_decision": FROZEN_DECISION_ID,
+        "canonical_status": "closed",
+    },
+}
+
+# Sell that closed decision 147831. The entry fee is the imported fill's BNB fee.
+VERIFIED_FET_EXIT = {
+    "decision_log_id": FROZEN_DECISION_ID,
+    "sell_order_id": "3736070415",
+    "avg_price": "0.1459",
+    "proceeds": "20.44059",
+    "gross_pnl": "-1.49907",
+    "fee_entry_bnb": "0.00002310",
+    "fee_exit_bnb": "0.00002218",
+    "fee_total_bnb": "0.00004528",
+}
 
 
 def acceptance_report() -> dict[str, Any]:
-    """Always not live-ready. A unit-test snapshot does not clear the blockers."""
+    """Environment is not attested. REST binding does not need a uid."""
     return {
         "arm": PURPOSE_LIVE_BNB_BOLL_FADE,
         "live_ready": False,
+        "rest_book_bindable_without_uid": True,
         "blockers": list(EXTERNAL_BLOCKERS),
+        "replay": dict(REPLAY_SCOPE),
+    }
+
+
+def replay_scope() -> dict[str, Any]:
+    """What the replay floor covers, and what this checkout did not invent.
+
+    The PR171 gate test pins the cursor at 147840. This repository has no
+    production sqlite, so the operator's 20 ``execution_log`` rows and 40
+    ``order_events`` are not copied here. No decision id above 147840 is
+    stored in the repo, and none is added to a denylist.
+    """
+    return {
+        "cursor_floor": REPLAY_SCOPE["cursor_floor"],
+        "frozen_decision_id": REPLAY_SCOPE["frozen_decision_id"],
+        "frozen_client_id": REPLAY_SCOPE["frozen_client_id"],
+        "decisions_above_floor_in_repo": list(REPLAY_SCOPE["decisions_above_floor_in_repo"]),
+        "execution_log_rows_in_repo": REPLAY_SCOPE["execution_log_rows_in_repo"],
+        "order_events_rows_in_repo": REPLAY_SCOPE["order_events_rows_in_repo"],
+        "operator_reported": dict(REPLAY_SCOPE["operator_reported"]),
     }
 
 
@@ -168,30 +230,148 @@ def native_oco_verified(payload: object) -> tuple[dict[str, int] | None, str | N
     }, None
 
 
-def account_book_block(snapshot: object, book: object) -> str | None:
-    """Refuse a live BUY whose account book is unbound or mixed.
+def _decimal_text(raw: object) -> str | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        number = Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite():
+        return None
+    text = format(number, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
 
-    ``canTrade`` and a zero FET balance are not an identity. The MCP uid is
-    not implied by the regular API key. An env uid is not a snapshot.
+
+def _balance_free(snapshot: dict[str, Any], asset: str) -> str | None:
+    rows = snapshot.get("balances")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("asset") or "") != asset:
+            continue
+        return _decimal_text(row.get("free"))
+    return None
+
+
+def spot_account_uid(snapshot: object) -> str | None:
+    """Uid from ``GET /api/v3/account`` when the payload has one.
+
+    The published example includes ``uid``. The observed production payload
+    did not. Absence is not the MCP uid.
+    """
+    if not isinstance(snapshot, dict) or "uid" not in snapshot:
+        return None
+    parsed = _nonneg_id(snapshot.get("uid"))
+    if parsed is None:
+        return None
+    return str(parsed)
+
+
+def classify_sub_account_list(payload: object) -> dict[str, Any]:
+    """Read a master-account ``GET /sapi/v1/sub-account/list`` body. No network.
+
+    ``subUserId`` names a child of the master key. It does not prove that the
+    key which signed ``GET /api/v3/account`` is that child.
+    """
+    rows = payload.get("subAccounts") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return {
+            "endpoint": SUB_ACCOUNT_LIST_ENDPOINT,
+            "role": None,
+            "sub_user_ids": [],
+            "error": "not_a_sub_account_list",
+        }
+    ids: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        parsed = _nonneg_id(row.get("subUserId"))
+        if parsed is None:
+            continue
+        ids.append(str(parsed))
+    return {
+        "endpoint": SUB_ACCOUNT_LIST_ENDPOINT,
+        "role": "master",
+        "sub_user_ids": ids,
+        "lists_mcp_uid": MCP_POSITION_UID in ids,
+        "error": None,
+    }
+
+
+def bind_rest_book(
+    snapshot: object,
+    expected: object,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Bind an independent REST book without inventing a uid.
+
+    Required evidence from ``GET /api/v3/account``: ``accountType``,
+    ``canTrade``, ``permissions`` containing ``SPOT``, and a USDT ``free``
+    balance equal to the operator-declared anchor. ``uid`` is recorded when
+    present. If it equals the MCP uid, this key is that Agentic sub-account
+    and is not an independent REST book.
+    """
+    if not isinstance(snapshot, dict):
+        return None, "account_snapshot_required"
+    if not isinstance(expected, dict):
+        return None, "rest_balance_unbound"
+    account_type = str(snapshot.get("accountType") or "").strip()
+    expected_type = str(expected.get("account_type") or "SPOT").strip() or "SPOT"
+    if not account_type or account_type != expected_type:
+        return None, "rest_identity_incomplete"
+    if snapshot.get("canTrade") is not True:
+        return None, "account_cannot_trade"
+    permissions = snapshot.get("permissions")
+    if not isinstance(permissions, list) or "SPOT" not in permissions:
+        return None, "rest_identity_incomplete"
+    usdt = _balance_free(snapshot, "USDT")
+    expected_usdt = _decimal_text(expected.get("usdt_free"))
+    if usdt is None or expected_usdt is None:
+        return None, "rest_balance_unbound"
+    if usdt != expected_usdt:
+        return None, "rest_balance_mismatch"
+    uid = spot_account_uid(snapshot)
+    if uid == MCP_POSITION_UID:
+        return None, "account_book_mismatch"
+    return {
+        "book": REST_BOOK,
+        "endpoint": SPOT_ACCOUNT_ENDPOINT,
+        "account_type": account_type,
+        "can_trade": True,
+        "permissions": ["SPOT"],
+        "usdt_free": usdt,
+        "uid": uid,
+        "same_as_mcp_uid": False,
+    }, None
+
+
+def account_book_block(
+    snapshot: object,
+    book: object,
+    expected: object = None,
+) -> str | None:
+    """Refuse a live BUY whose selected book is unbound or mixed.
+
+    ``canTrade`` alone is not an identity. An env uid is not a snapshot.
+    Selecting the MCP book does not place a native OCO. Selecting the REST
+    book does not require uid ``1289917075``.
     """
     selected = str(book or "").strip()
     if not selected:
         return "account_book_unselected"
-    if not isinstance(snapshot, dict):
-        return "account_uid_unbound"
-    uid = _nonneg_id(snapshot.get("uid"))
-    if uid is None:
-        return "account_uid_unbound"
-    uid_text = str(uid)
     if selected == MCP_BOOK:
-        if uid_text != MCP_POSITION_UID:
+        uid = spot_account_uid(snapshot) if isinstance(snapshot, dict) else None
+        if uid is not None and uid != MCP_POSITION_UID:
             return "account_book_mismatch"
         return "mcp_has_no_native_oco"
-    if selected == REST_BOOK:
-        if uid_text == MCP_POSITION_UID:
-            return "account_book_mismatch"
-        return None
-    return "account_book_mismatch"
+    if selected != REST_BOOK:
+        return "account_book_mismatch"
+    _bound, error = bind_rest_book(snapshot, expected)
+    return error
 
 
 def _position_ids_verified(row: dict[str, Any]) -> bool:

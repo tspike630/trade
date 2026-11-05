@@ -40,18 +40,23 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     MCP_BOOK,
     MCP_POSITION_UID,
     REST_BOOK,
+    VERIFIED_FET_EXIT,
     acceptance_report,
     account_book_block,
+    bind_rest_book,
     buy_exposure_block,
+    classify_sub_account_list,
     native_oco_verified,
     replay_block,
+    replay_scope,
 )
 from execution.executors.binance_spot_protect import (  # noqa: E402
     ENTRY_MIN_NOTIONAL_USDT,
     build_spot_oco,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
-from execution.live_bnb_dispatch import dispatch_live_bnb  # noqa: E402
+from execution.ledger import ExecutionLedger  # noqa: E402
+from execution.live_bnb_dispatch import VERIFIED_FET_FILL, dispatch_live_bnb, import_verified_fet_fill  # noqa: E402
 
 _FILTERS = [
     {"filterType": "LOT_SIZE", "minQty": "0.01", "maxQty": "900000", "stepSize": "0.01"},
@@ -65,7 +70,17 @@ _INFO = {
     "isSpotTradingAllowed": True,
     "filters": _FILTERS,
 }
-_BOUND = {"uid": "9000000001", "canTrade": True, "balances": [{"asset": "FET", "free": "0"}]}
+# Fixture REST book. No uid. USDT free is not the MCP account's 437.63809903.
+_BOUND = {
+    "accountType": "SPOT",
+    "canTrade": True,
+    "permissions": ["SPOT"],
+    "balances": [
+        {"asset": "USDT", "free": "1000.00", "locked": "0"},
+        {"asset": "FET", "free": "0", "locked": "0"},
+    ],
+}
+_EXPECTED = {"account_type": "SPOT", "usdt_free": "1000"}
 
 
 def _working(*, list_id: object = 42, above: object = 11, below: object = 10) -> dict[str, Any]:
@@ -244,13 +259,16 @@ class ConsumerGateTests(unittest.TestCase):
             clock_ms=lambda: 1_700_000_000_000,
             account_snapshot=_BOUND,
             production_book=REST_BOOK,
+            rest_expected=_EXPECTED,
             **extra,
         )
 
     def test_verified_oco_allows_the_consumer_and_a_failure_blocks_the_next_buy(self) -> None:
         report = acceptance_report()
         self.assertFalse(report["live_ready"])
-        self.assertIn("rest_account_uid_not_proven", report["blockers"])
+        self.assertTrue(report["rest_book_bindable_without_uid"])
+        self.assertNotIn("rest_account_uid_not_proven", report["blockers"])
+        self.assertNotIn("canonical_fet_close_is_worker_owned", report["blockers"])
         self.assertIn("mcp_connector_has_no_order_list_oco", report["blockers"])
         client = _Client()
         adapter = self._adapter(client)
@@ -296,6 +314,7 @@ class ConsumerGateTests(unittest.TestCase):
             clock_ms=lambda: 1_700_000_000_000,
             account_snapshot=_BOUND,
             production_book=REST_BOOK,
+            rest_expected=_EXPECTED,
         )
         env = _env(self.root)
         env["LIVE_KILL_SWITCH_PATH"] = str(kill)
@@ -337,11 +356,17 @@ class ConsumerGateTests(unittest.TestCase):
     def test_accounts_stay_split_and_cantrade_is_not_a_uid(self) -> None:
         self.assertEqual(account_book_block(None, None), "account_book_unselected")
         self.assertEqual(
-            account_book_block({"canTrade": True, "balances": [{"asset": "FET", "free": "0"}]}, REST_BOOK),
-            "account_uid_unbound",
+            account_book_block(
+                {"canTrade": True, "balances": [{"asset": "FET", "free": "0"}]},
+                REST_BOOK,
+                _EXPECTED,
+            ),
+            "rest_identity_incomplete",
         )
+        mcp_shaped = dict(_BOUND)
+        mcp_shaped["uid"] = MCP_POSITION_UID
         self.assertEqual(
-            account_book_block({"uid": MCP_POSITION_UID, "canTrade": True}, REST_BOOK),
+            account_book_block(mcp_shaped, REST_BOOK, _EXPECTED),
             "account_book_mismatch",
         )
         self.assertEqual(
@@ -352,7 +377,22 @@ class ConsumerGateTests(unittest.TestCase):
             account_book_block({"uid": MCP_POSITION_UID}, MCP_BOOK),
             "mcp_has_no_native_oco",
         )
-        self.assertIsNone(account_book_block(_BOUND, REST_BOOK))
+        bound, error = bind_rest_book(_BOUND, _EXPECTED)
+        self.assertIsNone(error)
+        assert bound is not None
+        self.assertIsNone(bound["uid"])
+        self.assertFalse(bound["same_as_mcp_uid"])
+        self.assertEqual(bound["usdt_free"], "1000")
+        self.assertIsNone(account_book_block(_BOUND, REST_BOOK, _EXPECTED))
+        listed = classify_sub_account_list(
+            {"subAccounts": [{"subUserId": int(MCP_POSITION_UID), "email": "agentic"}]}
+        )
+        self.assertEqual(listed["role"], "master")
+        self.assertTrue(listed["lists_mcp_uid"])
+        self.assertEqual(
+            account_book_block(listed, REST_BOOK, _EXPECTED),
+            "rest_identity_incomplete",
+        )
         client = _Client()
         adapter = BinanceSpotAdapter(
             client=client,
@@ -360,14 +400,30 @@ class ConsumerGateTests(unittest.TestCase):
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
+            rest_expected=_EXPECTED,
         )
         env = _env(self.root)
         env["BINANCE_SPOT_ACCOUNT_UID"] = MCP_POSITION_UID
         env["BINANCE_SPOT_PRODUCTION_BOOK"] = REST_BOOK
+        env["BINANCE_SPOT_REST_USDT_FREE"] = "1000"
         with mock.patch.dict(os.environ, env):
             refused = adapter.execute(_buy())
-        self.assertEqual(refused["error"], "account_uid_unbound")
+        self.assertEqual(refused["error"], "account_snapshot_required")
         self.assertEqual(client.calls, [])
+        ready = BinanceSpotAdapter(
+            client=client,
+            kill_switch_path=self.root / "absent-kill",
+            api_key="test-key",
+            api_secret="test-secret",
+            clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot=_BOUND,
+            production_book=REST_BOOK,
+            rest_expected=_EXPECTED,
+        )
+        with mock.patch.dict(os.environ, env):
+            opened = ready.execute(_buy(147850))
+        self.assertTrue(opened["consumer_allowed"], opened)
+        self.assertIsNone(opened.get("account_uid"))
         self.assertEqual(replay_block(FROZEN_DECISION_ID, None), "historical_client_replay")
         self.assertEqual(replay_block(147999, FROZEN_CLIENT_ID), "historical_client_replay")
         self.assertEqual(
@@ -377,6 +433,26 @@ class ConsumerGateTests(unittest.TestCase):
             ),
             "naked_holds_new_buys",
         )
+        self.assertIsNone(
+            buy_exposure_block(
+                [],
+                [
+                    {
+                        "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                        "status": "closed",
+                        "symbol": "FETUSDT",
+                        "entry_order_id": "3735698106",
+                        "decision_log_id": FROZEN_DECISION_ID,
+                    }
+                ],
+            )
+        )
+        scope = replay_scope()
+        self.assertEqual(scope["decisions_above_floor_in_repo"], [])
+        self.assertIsNone(scope["execution_log_rows_in_repo"])
+        self.assertEqual(scope["operator_reported"]["execution_log_rows"], 20)
+        self.assertEqual(scope["operator_reported"]["cursor"], 147840)
+        self.assertEqual(scope["operator_reported"]["canonical_status"], "closed")
 
     def test_startup_does_not_replay_the_historical_cursor(self) -> None:
         db = self.root / "decision.db"
@@ -391,7 +467,8 @@ class ConsumerGateTests(unittest.TestCase):
             )
             """
         )
-        for decision_id in (FROZEN_DECISION_ID, 20, 147840, 147841):
+        # 147000 is a synthetic id below the floor, not execution_log row 20.
+        for decision_id in (FROZEN_DECISION_ID, 147000, 147840, 147841):
             conn.execute(
                 """
                 INSERT INTO decision_log
@@ -432,7 +509,7 @@ class ConsumerGateTests(unittest.TestCase):
         seen = [item["decision_log_id"] for item in stats.receipts]
         self.assertEqual(seen, [147841])
         self.assertNotIn(FROZEN_DECISION_ID, seen)
-        self.assertNotIn(20, seen)
+        self.assertNotIn(147000, seen)
         self.assertNotIn(147840, seen)
         self.assertEqual(frozen["error"], "historical_client_replay")
         self.assertFalse(any("bnbfade-147831" in call[1] for call in client.calls if len(call) > 1))
@@ -444,6 +521,33 @@ class ConsumerGateTests(unittest.TestCase):
         self.assertEqual(gated["reason"], "historical_client_replay")
         self.assertFalse(gated["oco_placed"])
         self.assertTrue(all(item.get("release") is False for item in gated["parent_queue"]))
+
+    def test_closed_fet_exit_does_not_move_the_log_or_block_a_new_buy(self) -> None:
+        ledger = ExecutionLedger(self.root / "execution_ledger_live_bnb_boll_fade.db")
+        ledger.set_last_processed_id(147840)
+        import_verified_fet_fill(ledger)
+        self.assertEqual(ledger.count(), 0)
+        book = ledger.close_canonical_exit(dict(VERIFIED_FET_EXIT))
+        again = ledger.close_canonical_exit(dict(VERIFIED_FET_EXIT))
+        self.assertEqual(ledger.get_last_processed_id(), 147840)
+        self.assertEqual(ledger.count(), 0)
+        self.assertEqual(
+            int(ledger.conn.execute("SELECT COUNT(*) AS n FROM order_events").fetchone()["n"]),
+            0,
+        )
+        self.assertEqual(book["canonical_positions"][0]["status"], "closed")
+        self.assertEqual(again["canonical_positions"][0]["status"], "closed")
+        self.assertEqual(
+            int(
+                ledger.conn.execute(
+                    "SELECT COUNT(*) AS n FROM canonical_position_exits"
+                ).fetchone()["n"]
+            ),
+            1,
+        )
+        self.assertIsNone(buy_exposure_block([], book["canonical_positions"]))
+        self.assertEqual(str(VERIFIED_FET_FILL["client_order_id"]), FROZEN_CLIENT_ID)
+        ledger.close()
 
 
 if __name__ == "__main__":
