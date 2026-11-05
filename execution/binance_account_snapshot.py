@@ -36,6 +36,7 @@ from execution.executors.binance_spot import (  # noqa: E402
 )
 from execution.executors.binance_spot import API_KEY_ENV, API_SECRET_ENV  # noqa: E402
 from execution.executors.binance_spot_gate import (  # noqa: E402
+    API_RESTRICTIONS_ENDPOINT,
     REST_BOOK,
     SPOT_ACCOUNT_ENDPOINT,
     bind_rest_book,
@@ -91,13 +92,23 @@ def _path_mode_error(path: Path) -> str | None:
     return "snapshot_path_inside_repo"
 
 
-def seal_snapshot(payload: dict[str, Any], *, secret: str, fetched_at_ms: int) -> dict[str, Any]:
-    body = {
+def seal_snapshot(
+    payload: dict[str, Any],
+    *,
+    secret: str,
+    fetched_at_ms: int,
+    restrictions: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Seal the account body. Restrictions are included when the GET returned them."""
+    body: dict[str, Any] = {
         "source": SNAPSHOT_SOURCE,
         "endpoint": SPOT_ACCOUNT_ENDPOINT,
         "fetched_at_ms": int(fetched_at_ms),
         "payload": payload,
     }
+    if restrictions is not None:
+        body["restrictions"] = restrictions
+        body["restrictions_endpoint"] = API_RESTRICTIONS_ENDPOINT
     sealed = dict(body)
     sealed["signature"] = snapshot_signature(body, secret)
     return sealed
@@ -164,7 +175,12 @@ def load_snapshot_file(
         "fetched_at_ms": parsed.get("fetched_at_ms"),
         "payload": parsed.get("payload"),
     }
+    if "restrictions" in parsed or "restrictions_endpoint" in parsed:
+        body["restrictions"] = parsed.get("restrictions")
+        body["restrictions_endpoint"] = parsed.get("restrictions_endpoint")
     if body["source"] != SNAPSHOT_SOURCE or body["endpoint"] != SPOT_ACCOUNT_ENDPOINT:
+        return None, "snapshot_untrusted_source"
+    if "restrictions_endpoint" in body and body["restrictions_endpoint"] != API_RESTRICTIONS_ENDPOINT:
         return None, "snapshot_untrusted_source"
     if not hmac.compare_digest(snapshot_signature(body, secret), signature):
         return None, "snapshot_unauthenticated"
@@ -176,10 +192,14 @@ def load_snapshot_file(
     payload = body["payload"]
     if not isinstance(payload, dict):
         return None, "snapshot_bad_json"
-    _bound, error = bind_rest_book(payload, expected)
+    view = dict(payload)
+    restrictions = body.get("restrictions")
+    if isinstance(restrictions, dict):
+        view["restrictions"] = restrictions
+    _bound, error = bind_rest_book(view, expected)
     if error:
         return None, error
-    return payload, None
+    return view, None
 
 
 def production_snapshot(
@@ -201,13 +221,17 @@ def production_snapshot(
         return None, age_error or "snapshot_max_age_invalid"
     usdt = os.environ.get("BINANCE_SPOT_REST_USDT_FREE", "").strip()
     account_type = os.environ.get("BINANCE_SPOT_REST_ACCOUNT_TYPE", "SPOT").strip() or "SPOT"
+    expected: dict[str, Any] = {"account_type": account_type, "usdt_free": usdt or None}
+    rest_uid = os.environ.get("BINANCE_SPOT_REST_UID", "").strip()
+    if rest_uid:
+        expected["uid"] = rest_uid
     clock = int(time.time() * 1000) if now_ms is None else int(now_ms)
     return load_snapshot_file(
         Path(path_raw),
         secret=secret,
         now_ms=clock,
         max_age_ms=max_age_ms,
-        expected={"account_type": account_type, "usdt_free": usdt or None},
+        expected=expected,
     )
 
 
@@ -221,6 +245,27 @@ def default_live_bnb_adapter() -> BinanceSpotAdapter:
         snapshot_error=error,
         allow_rest_http=error is None and payload is not None and book == REST_BOOK,
     )
+
+
+def fetch_api_restrictions(
+    client: BinanceSpotHttpClient,
+    *,
+    api_key: str,
+    api_secret: str,
+    now_ms: int,
+) -> dict[str, Any]:
+    """One signed restrictions read. The query is not an order."""
+    signed = sign_query(
+        [
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(now_ms))),
+        ],
+        api_secret,
+    )
+    payload = client.get_api_restrictions(signed, api_key=api_key)
+    if not isinstance(payload, dict):
+        raise ValueError("restrictions_payload_invalid")
+    return payload
 
 
 def fetch_account_payload(
@@ -251,7 +296,10 @@ def refresh_snapshot_file(
     client: BinanceSpotHttpClient | None = None,
     now_ms: int | None = None,
 ) -> str | None:
-    """GET the account and write the sealed file. Does not enable trading."""
+    """GET the account and the key restrictions, then write the file.
+
+    Does not place an order and does not change the kill file or the live flag.
+    """
     key = _env_secret(API_KEY_ENV)
     secret = _env_secret(API_SECRET_ENV)
     if not key or not secret:
@@ -262,7 +310,16 @@ def refresh_snapshot_file(
         payload = fetch_account_payload(http, api_key=key, api_secret=secret, now_ms=clock)
     except Exception:
         return "account_read_failed"
-    sealed = seal_snapshot(payload, secret=secret, fetched_at_ms=clock)
+    try:
+        restrictions = fetch_api_restrictions(http, api_key=key, api_secret=secret, now_ms=clock)
+    except Exception:
+        return "restrictions_read_failed"
+    sealed = seal_snapshot(
+        payload,
+        secret=secret,
+        fetched_at_ms=clock,
+        restrictions=restrictions,
+    )
     return write_snapshot_file(path, sealed)
 
 

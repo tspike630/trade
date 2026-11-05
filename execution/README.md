@@ -24,13 +24,20 @@ export BINANCE_API_SECRET=...
 python -m execution.binance_account_snapshot --output /secure/live-bnb-account.json
 ```
 
-The gateway and the watchdog read that file. They reject a missing file, bad JSON, a mode other than owner-only, a symlink, a path inside this repo, a bad HMAC, a snapshot older than `BINANCE_SPOT_ACCOUNT_SNAPSHOT_MAX_AGE_SEC` (default 3600), a USDT `free` balance that differs from `BINANCE_SPOT_REST_USDT_FREE`, or `uid` `1289917075` (the MCP Agentic sub-account). A payload without `uid` can still bind when `accountType` is `SPOT`, `canTrade` is true, and `permissions` contains `SPOT`.
+The command performs two read-only requests, `GET /api/v3/account` and `GET /sapi/v1/account/apiRestrictions`, and seals both in the same file. It does not call `POST /api/v3/order` or `POST /api/v3/orderList/oco`. The gateway and the watchdog only read the file. They do not call Binance on startup.
+
+Binding requires `accountType` `SPOT`, `canTrade` true, and `enableSpotAndMarginTrading` true. `enableReading` and `ipRestrict` must also be true. Legacy `permissions: ["SPOT"]` is still accepted. A modern account permission is an exact name: the groups `TRD_GRP_002` through `TRD_GRP_025` published in the spot enums, or another exact `TRD_GRP_` plus three digits such as `TRD_GRP_080`. A prefix, a truncated number, or extra characters is rejected. The group name does not replace the restrictions switch. `uid` `1275399777` is this REST account when the payload carries it. `uid` `1289917075` is the MCP Agentic sub-account and does not bind this book.
+
+USDT `free` in the snapshot must equal `BINANCE_SPOT_REST_USDT_FREE`. That free balance must also be at least 20 USDT, the existing minimum order. Below that, preflight and live buys stop with `funding_block`. `BINANCE_SPOT_BOOK_USDT` only sizes the 5% order. It is not a wallet, and neither the MCP balance nor an old book figure is used to fill the gap. When a deposit changes the free balance, run the snapshot command again and set `BINANCE_SPOT_REST_USDT_FREE` to the new free amount. That refresh does not remove `LIVE_TRADING_DISABLED` and does not start the consumer.
+
+The gateway and the watchdog reject a missing file, bad JSON, a mode other than owner-only, a symlink, a path inside this repo, a bad HMAC, a snapshot older than `BINANCE_SPOT_ACCOUNT_SNAPSHOT_MAX_AGE_SEC` (default 3600), a USDT mismatch, a missing or false spot-trading switch, or the MCP uid.
 
 Startup still needs paper off and does not by itself remove the kill file:
 
 ```bash
 export BINANCE_SPOT_PRODUCTION_BOOK=rest_api_key
 export BINANCE_SPOT_REST_USDT_FREE=<USDT free from that GET>
+export BINANCE_SPOT_REST_UID=1275399777
 export BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH=/secure/live-bnb-account.json
 export BINANCE_SPOT_BOOK_USDT=<operator sizing book>
 export BINANCE_SPOT_LIVE_ENABLED=1

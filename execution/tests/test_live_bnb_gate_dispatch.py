@@ -231,6 +231,11 @@ class LiveBnbDispatchTests(unittest.TestCase):
                 "accountType": "SPOT",
                 "canTrade": True,
                 "permissions": ["SPOT"],
+                "restrictions": {
+                    "enableSpotAndMarginTrading": True,
+                    "enableReading": True,
+                    "ipRestrict": True,
+                },
                 "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
             },
             production_book="rest_api_key",

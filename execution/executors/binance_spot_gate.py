@@ -6,15 +6,18 @@ leg order ids ``>= 0``. ``spot.newOrder`` types ``MARKET``, ``STOP_LOSS``,
 ``STOP_LOSS_LIMIT``, ``TAKE_PROFIT``, and ``TAKE_PROFIT_LIMIT`` are not that
 list.
 
-The regular REST key and MCP uid ``1289917075`` (an Agentic sub-account) are
-separate books until a spot account payload actually carries that uid. A
-uid-less ``GET /api/v3/account`` binds the REST book by account type,
-permissions, and the declared USDT free balance. It is not labeled with the
-MCP uid.
+The regular REST key and MCP uid ``1289917075`` (an Agentic sub-account) stay
+separate. Binding reads ``GET /api/v3/account`` and sealed
+``GET /sapi/v1/account/apiRestrictions``. Legacy ``permissions: ["SPOT"]``
+still counts. ``TRD_GRP_080`` is an exact group name, not a prefix, and it
+does not trade unless ``enableSpotAndMarginTrading`` is true. USDT free
+below the 20 USDT order floor is ``funding_block``. The MCP uid is never
+inferred.
 """
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -29,8 +32,13 @@ MCP_BOOK = "mcp:1289917075"
 # Spot account: USER_DATA. The published example includes ``uid``; a payload
 # without that field is still the account of the signing key.
 SPOT_ACCOUNT_ENDPOINT = "GET /api/v3/account"
-# API-key permissions. No account uid.
+# API-key permissions. This is the spot-trading capability, not a symbol group.
 API_RESTRICTIONS_ENDPOINT = "GET /sapi/v1/account/apiRestrictions"
+# Published in binance-spot-api-docs enums.md, "Account and Symbol Permissions".
+# TRD_GRP_080 is a later exact group name. It is not in that list, and a
+# prefix such as "TRD_GRP_" is not a permission.
+DOCUMENTED_TRD_GROUPS = frozenset(f"TRD_GRP_{index:03d}" for index in range(2, 26))
+_EXACT_TRD_GROUP = re.compile(r"TRD_GRP_[0-9]{3}\Z")
 # Master account only. ``subUserId`` names a child; it does not identify the
 # key that signed ``GET /api/v3/account``.
 SUB_ACCOUNT_LIST_ENDPOINT = "GET /sapi/v1/sub-account/list"
@@ -234,6 +242,13 @@ def _decimal_text(raw: object) -> str | None:
     return text or "0"
 
 
+def snapshot_usdt_free(snapshot: object) -> str | None:
+    """USDT free from an account payload. Missing means unknown, not zero."""
+    if not isinstance(snapshot, dict):
+        return None
+    return _balance_free(snapshot, "USDT")
+
+
 def _balance_free(snapshot: dict[str, Any], asset: str) -> str | None:
     rows = snapshot.get("balances")
     if not isinstance(rows, list):
@@ -292,17 +307,91 @@ def classify_sub_account_list(payload: object) -> dict[str, Any]:
     }
 
 
+def permission_kind(token: object) -> str:
+    """Classify one account permission token. A prefix is not a group.
+
+    ``SPOT`` is the legacy spot permission. ``TRD_GRP_002`` through
+    ``TRD_GRP_025`` are the groups published in the spot enums. Any other
+    token is a group only when it is exactly ``TRD_GRP_`` and three digits,
+    such as the live account's ``TRD_GRP_080``. ``TRD_GRP_``, ``TRD_GRP_08``,
+    and ``TRD_GRP_080extra`` are rejected.
+    """
+    if not isinstance(token, str) or token != token.strip():
+        return "rejected"
+    if token == "SPOT":
+        return "legacy_spot"
+    if token in {"MARGIN", "LEVERAGED"}:
+        return "other_documented"
+    if token in DOCUMENTED_TRD_GROUPS:
+        return "documented_group"
+    if _EXACT_TRD_GROUP.fullmatch(token):
+        return "exact_group"
+    return "rejected"
+
+
+def spot_permission_error(permissions: object) -> str | None:
+    """Spot permission form. The group name does not by itself allow trading."""
+    if not isinstance(permissions, list) or not permissions:
+        return "rest_permission_missing"
+    kinds = [permission_kind(item) for item in permissions]
+    if any(kind == "rejected" for kind in kinds):
+        return "rest_permission_rejected"
+    if not any(kind in {"legacy_spot", "documented_group", "exact_group"} for kind in kinds):
+        return "rest_permission_missing"
+    return None
+
+
+def restrictions_error(restrictions: object) -> str | None:
+    """Key capability from ``GET /sapi/v1/account/apiRestrictions``.
+
+    ``enableSpotAndMarginTrading`` is the spot-trading switch. ``enableReading``
+    and ``ipRestrict`` must also be true. A trading-group name cannot replace
+    a missing or false switch.
+    """
+    if not isinstance(restrictions, dict):
+        return "rest_capability_missing"
+    spot = restrictions.get("enableSpotAndMarginTrading")
+    if spot is None:
+        return "rest_capability_missing"
+    if spot is not True:
+        return "rest_capability_disabled"
+    if restrictions.get("enableReading") is not True:
+        return "rest_reading_disabled"
+    if restrictions.get("ipRestrict") is not True:
+        return "rest_ip_restrict_disabled"
+    return None
+
+
+def funding_block(free: object, minimum: object, planned: object = None) -> str | None:
+    """Refuse when the REST USDT free balance cannot fund the minimum order.
+
+    ``minimum`` is the existing 20 USDT floor. A planned quote above the free
+    balance is the same refusal. The operator book is not a balance.
+    """
+    free_text = _decimal_text(free)
+    minimum_text = _decimal_text(minimum)
+    if free_text is None or minimum_text is None:
+        return None
+    if Decimal(free_text) < Decimal(minimum_text):
+        return "funding_block"
+    planned_text = None if planned in (None, "") else _decimal_text(planned)
+    if planned_text is not None and Decimal(planned_text) > Decimal(free_text):
+        return "funding_block"
+    return None
+
+
 def bind_rest_book(
     snapshot: object,
     expected: object,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Bind an independent REST book without inventing a uid.
+    """Bind an independent REST book. The MCP uid is never inferred.
 
-    Required evidence from ``GET /api/v3/account``: ``accountType``,
-    ``canTrade``, ``permissions`` containing ``SPOT``, and a USDT ``free``
-    balance equal to the operator-declared anchor. ``uid`` is recorded when
-    present. If it equals the MCP uid, this key is that Agentic sub-account
-    and is not an independent REST book.
+    ``GET /api/v3/account`` supplies ``accountType``, ``canTrade``, the
+    permission list, and the USDT free balance. ``GET /sapi/v1/account/apiRestrictions``
+    supplies ``enableSpotAndMarginTrading``. Legacy ``permissions: ["SPOT"]``
+    remains valid only together with that switch. ``uid`` ``1275399777`` may
+    be recorded; ``uid`` ``1289917075`` is the MCP Agentic sub-account and
+    does not bind this book.
     """
     if not isinstance(snapshot, dict):
         return None, "account_snapshot_required"
@@ -314,9 +403,12 @@ def bind_rest_book(
         return None, "rest_identity_incomplete"
     if snapshot.get("canTrade") is not True:
         return None, "account_cannot_trade"
-    permissions = snapshot.get("permissions")
-    if not isinstance(permissions, list) or "SPOT" not in permissions:
-        return None, "rest_identity_incomplete"
+    permission_error = spot_permission_error(snapshot.get("permissions"))
+    if permission_error:
+        return None, permission_error
+    capability_error = restrictions_error(snapshot.get("restrictions"))
+    if capability_error:
+        return None, capability_error
     usdt = _balance_free(snapshot, "USDT")
     expected_usdt = _decimal_text(expected.get("usdt_free"))
     if usdt is None or expected_usdt is None:
@@ -326,12 +418,19 @@ def bind_rest_book(
     uid = spot_account_uid(snapshot)
     if uid == MCP_POSITION_UID:
         return None, "account_book_mismatch"
+    expected_uid = expected.get("uid")
+    if expected_uid not in (None, ""):
+        if uid is None or uid != str(expected_uid).strip():
+            return None, "rest_uid_mismatch"
+    permissions = [str(item) for item in snapshot.get("permissions") or []]
     return {
         "book": REST_BOOK,
         "endpoint": SPOT_ACCOUNT_ENDPOINT,
+        "restrictions_endpoint": API_RESTRICTIONS_ENDPOINT,
         "account_type": account_type,
         "can_trade": True,
-        "permissions": ["SPOT"],
+        "permissions": permissions,
+        "enable_spot_and_margin_trading": True,
         "usdt_free": usdt,
         "uid": uid,
         "same_as_mcp_uid": False,
