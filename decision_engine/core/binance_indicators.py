@@ -225,6 +225,7 @@ def _shape_row(raw: dict[str, Any]) -> dict[str, Any] | None:
         "primary_pair_address": ccxt_symbol,
         "binance_symbol": symbol,
         "ccxt_symbol": ccxt_symbol,
+        "factor_source": "binance_indicators",
         "venue": BINANCE_VENUE,
         "market": BINANCE_MARKET,
         "universe": CEX_UNIVERSE,

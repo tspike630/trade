@@ -13,6 +13,7 @@ from decision_engine.core.binance_indicators import (
     list_binance_hot_tokens,
     resolve_live_bnb_factor_source,
 )
+from decision_engine.core.bnb_native import limit_kline_scan, load_native_candidate_rows
 from decision_engine.core.bnb_spot_map import (
     default_listing_db_paths,
     load_binance_spot_usdt_symbols,
@@ -169,29 +170,69 @@ class DecisionEngine:
     def _load_live_bnb_hot(
         self, dex_hot: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], str]:
-        """Primary book is ``binance_indicators``. DEX∩listing map is the bypass.
+        """CEX factors for ``live_bnb_boll_fade``.
 
-        ``auto`` (default): use the side table once it exists, even if this
-        pass is empty. Fall back to the DEX map only when the table was never
-        created. ``binance`` never fills from DEX. ``dex_map`` keeps the old
-        intersection.
+        ``auto`` (default): ``binance_indicators`` once that table exists,
+        even if this pass is empty — klines are not recomputed on top of it.
+        If the table was never created, use ``binance_klines`` (in-process
+        factors) when those bars exist. DEX∩listing only when neither CEX
+        feed is available. ``binance`` never fills from DEX. ``dex_map``
+        keeps the old intersection.
         """
         source = resolve_live_bnb_factor_source(os.environ.get("LIVE_BNB_FACTOR_SOURCE"))
-        ready = binance_indicators_ready(self.adapter.conn)
-        if source == "dex_map" or (source == "auto" and not ready):
-            log.info(
-                "bnb_factor_source=dex_map requested=%s binance_indicators=%s",
-                source,
-                "yes" if ready else "no",
-            )
+        if source == "dex_map":
+            log.info("bnb_factor_source=dex_map requested=%s", source)
             return self._map_bnb_spot_universe(dex_hot), "dex_map"
-        rows = list_binance_hot_tokens(self.adapter.conn, limit=self.hot_limit)
+        if binance_indicators_ready(self.adapter.conn):
+            rows = list_binance_hot_tokens(self.adapter.conn, limit=self.hot_limit)
+            log.info(
+                "bnb_factor_source=binance_indicators requested=%s rows=%s",
+                source,
+                len(rows),
+            )
+            return rows, "binance_indicators"
+        kline_rows, snapshot_empty = self._load_kline_mvp()
+        if kline_rows or snapshot_empty:
+            log.info(
+                "bnb_factor_source=binance_klines requested=%s rows=%s snapshot_empty=%s",
+                source,
+                len(kline_rows),
+                int(snapshot_empty),
+            )
+            return kline_rows, "binance_klines"
+        if source == "binance":
+            log.info("bnb_factor_source=binance_indicators requested=%s rows=0", source)
+            return [], "binance_indicators"
         log.info(
-            "bnb_factor_source=binance_indicators requested=%s rows=%s",
+            "bnb_factor_source=dex_map requested=%s binance_indicators=no klines=no",
             source,
-            len(rows),
         )
-        return rows, "binance_indicators"
+        return self._map_bnb_spot_universe(dex_hot), "dex_map"
+
+    def _load_kline_mvp(self) -> tuple[list[dict[str, Any]], bool]:
+        """Factors from ``binance_klines``. Not used when ``binance_indicators`` exists.
+
+        The second value is true when a collection symbol snapshot was present
+        and produced no rows, so ``auto`` must not fill from the DEX map.
+        """
+        try:
+            rows, stats = load_native_candidate_rows(
+                self.adapter.conn,
+                self.adapter.db_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("binance_klines failed closed: %s", exc)
+            return [], False
+        if not rows:
+            log.info(
+                "binance_klines empty listed=%s kline_symbols=%s fetched=%s primary=%s",
+                stats.get("listed"),
+                stats.get("kline_symbols"),
+                stats.get("fetched"),
+                stats.get("primary_snapshot"),
+            )
+            return [], bool(stats.get("primary_snapshot"))
+        return limit_kline_scan(rows, self.hot_limit), False
 
     def _map_bnb_spot_universe(self, hot: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Replace the scan set with listed Binance spot USDT names.

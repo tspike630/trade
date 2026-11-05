@@ -1,11 +1,12 @@
 """Optional DEX hot-token ∩ Binance listing map for ``live_bnb_boll_fade``.
 
-The primary book for that purpose is ``binance_indicators`` (spot klines).
-This module remains the bypass when ``LIVE_BNB_FACTOR_SOURCE=dex_map``, or
-when ``auto`` and the side table has not been created yet. It does not
-recompute tech_boll factors; mapped rows keep the DEX fields they arrived
-with. Rows that do not resolve to a listed spot ``BASEUSDT`` market are
-dropped so a Solana mint is never written as the fill id.
+The primary book is ``binance_indicators``. ``binance_klines`` is only the
+in-process fallback when that table has not been created. This module is
+the bypass for ``LIVE_BNB_FACTOR_SOURCE=dex_map``, or for ``auto`` when
+neither CEX feed is available. It does not recompute tech_boll factors;
+mapped rows keep the DEX fields they arrived with. Rows that do not
+resolve to a listed spot ``BASEUSDT`` market are dropped so a Solana mint
+is never written as the fill id.
 
 Listing membership is read from local SQLite only (``cex_listing_events``
 and the ccxt side tables). No exchange client and no API key.
@@ -43,6 +44,8 @@ _STAMP_KEYS = (
     "quote_asset",
     "base_asset",
     "universe",
+    "factor_source",
+    "kline_interval",
     "source_chain_id",
     "source_token_address",
 )
@@ -222,7 +225,8 @@ def stamp_bnb_spot_signals(
         if meta is None or str(sig.get("chain_id") or "") != BINANCE_VENUE:
             continue
         for key in _STAMP_KEYS:
-            sig[key] = meta.get(key)
+            if meta.get(key) is not None:
+                sig[key] = meta.get(key)
         sig["pair_address"] = meta.get("ccxt_symbol")
         kept.append(sig)
     return kept
