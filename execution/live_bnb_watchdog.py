@@ -35,8 +35,16 @@ from execution.executors.binance_spot import (  # noqa: E402
     kill_switch_active,
 )
 from execution.binance_account_snapshot import production_snapshot  # noqa: E402
-from execution.executors.binance_spot_gate import REST_BOOK  # noqa: E402
-from execution.executors.binance_spot_protect import BOOK_ENV, book_usdt  # noqa: E402
+from execution.executors.binance_spot_gate import (  # noqa: E402
+    REST_BOOK,
+    funding_block,
+    snapshot_usdt_free,
+)
+from execution.executors.binance_spot_protect import (  # noqa: E402
+    BOOK_ENV,
+    ENTRY_MIN_NOTIONAL_USDT,
+    book_usdt,
+)
 
 RESTART_DELAY_SEC = 3.0
 LEDGER_NAME = "execution_ledger_live_bnb_boll_fade.db"
@@ -74,9 +82,11 @@ def preflight() -> dict[str, Any]:
     if book != REST_BOOK:
         reasons.append("production_book_unselected")
     else:
-        _payload, snap_error = production_snapshot()
+        payload, snap_error = production_snapshot()
         if snap_error:
             reasons.append(snap_error)
+        elif funding_block(snapshot_usdt_free(payload), ENTRY_MIN_NOTIONAL_USDT):
+            reasons.append("funding_block")
     ok = not reasons
     report: dict[str, Any] = {
         "ok": ok,

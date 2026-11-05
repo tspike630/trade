@@ -75,6 +75,11 @@ _BOUND = {
     "accountType": "SPOT",
     "canTrade": True,
     "permissions": ["SPOT"],
+    "restrictions": {
+        "enableSpotAndMarginTrading": True,
+        "enableReading": True,
+        "ipRestrict": True,
+    },
     "balances": [
         {"asset": "USDT", "free": "1000.00", "locked": "0"},
         {"asset": "FET", "free": "0", "locked": "0"},

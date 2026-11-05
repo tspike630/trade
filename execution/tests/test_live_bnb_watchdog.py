@@ -27,6 +27,14 @@ from execution.live_bnb_watchdog import (  # noqa: E402
     supervise,
 )
 
+_RESTRICTIONS = {
+    "enableSpotAndMarginTrading": True,
+    "enableReading": True,
+    "ipRestrict": True,
+    "enableMargin": False,
+    "enableFutures": False,
+    "enableWithdrawals": False,
+}
 _ACCOUNT = {
     "accountType": "SPOT",
     "canTrade": True,
@@ -116,7 +124,9 @@ class WatchdogTests(unittest.TestCase):
         ready["BINANCE_SPOT_PRODUCTION_BOOK"] = "rest_api_key"
         ready["BINANCE_SPOT_REST_USDT_FREE"] = "250.50"
         snap = self.root / "account.json"
-        sealed = seal_snapshot(_ACCOUNT, secret=SECRET, fetched_at_ms=1_700_000_000_000)
+        sealed = seal_snapshot(
+            _ACCOUNT, secret=SECRET, fetched_at_ms=1_700_000_000_000, restrictions=_RESTRICTIONS
+        )
         self.assertIsNone(write_snapshot_file(snap, sealed))
         ready["BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH"] = str(snap)
         with mock.patch.dict(os.environ, ready, clear=False), mock.patch(
@@ -134,6 +144,36 @@ class WatchdogTests(unittest.TestCase):
         self.assertNotIn("--paper-enabled", report["argv"])
         self.assertEqual(report["purpose"], "live_bnb_boll_fade")
 
+    def test_zero_usdt_is_funding_block_and_does_not_spawn(self) -> None:
+        self.kill.unlink()
+        broke = dict(self.env)
+        broke["BINANCE_SPOT_LIVE_ENABLED"] = "1"
+        broke["BINANCE_SPOT_BOOK_USDT"] = "439.13716903"
+        broke["BINANCE_API_KEY"] = "test-key"
+        broke["BINANCE_API_SECRET"] = SECRET
+        broke["BINANCE_SPOT_PRODUCTION_BOOK"] = "rest_api_key"
+        broke["BINANCE_SPOT_REST_USDT_FREE"] = "0"
+        empty = dict(_ACCOUNT)
+        empty["balances"] = [{"asset": "USDT", "free": "0", "locked": "0"}]
+        snap = self.root / "empty.json"
+        sealed = seal_snapshot(
+            empty, secret=SECRET, fetched_at_ms=1_700_000_000_000, restrictions=_RESTRICTIONS
+        )
+        self.assertIsNone(write_snapshot_file(snap, sealed))
+        broke["BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH"] = str(snap)
+        with mock.patch.dict(os.environ, broke, clear=False), mock.patch(
+            "execution.binance_account_snapshot.time.time",
+            return_value=1_700_000_000,
+        ), mock.patch(
+            "execution.executors.binance_spot.urllib.request.urlopen",
+            side_effect=AssertionError("funding preflight must not call Binance"),
+        ):
+            report = preflight()
+        self.assertFalse(report["would_start"])
+        self.assertEqual(report["reasons"], ["funding_block"])
+        self.assertIsNone(report["argv"])
+        self.assertNotIn("437.63809903", json.dumps(report))
+
     def test_supervise_restarts_within_three_seconds_and_one_lock(self) -> None:
         self.kill.unlink()
         ready = dict(self.env)
@@ -144,7 +184,9 @@ class WatchdogTests(unittest.TestCase):
         ready["BINANCE_SPOT_PRODUCTION_BOOK"] = "rest_api_key"
         ready["BINANCE_SPOT_REST_USDT_FREE"] = "250.50"
         snap = self.root / "account.json"
-        sealed = seal_snapshot(_ACCOUNT, secret=SECRET, fetched_at_ms=1_700_000_000_000)
+        sealed = seal_snapshot(
+            _ACCOUNT, secret=SECRET, fetched_at_ms=1_700_000_000_000, restrictions=_RESTRICTIONS
+        )
         self.assertIsNone(write_snapshot_file(snap, sealed))
         ready["BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH"] = str(snap)
         seen: list[list[str]] = []

@@ -54,6 +54,7 @@ API_KEY_ENV = ("BINANCE_API_KEY", "LIVE_EXCHANGE_API_KEY")
 API_SECRET_ENV = ("BINANCE_API_SECRET", "LIVE_EXCHANGE_API_SECRET")
 DEFAULT_BASE_URL = "https://api.binance.com"
 ACCOUNT_PATH = "/api/v3/account"
+API_RESTRICTIONS_PATH = "/sapi/v1/account/apiRestrictions"
 SPOT_PATH = "/api/v3/order"
 EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
 TICKER_PATH = "/api/v3/ticker/price"
@@ -687,6 +688,19 @@ class BinanceSpotHttpClient:
         status, body = self._opener(request, self.timeout)
         return _decode_ok(status, body)
 
+    def get_api_restrictions(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        """Signed read of ``GET /sapi/v1/account/apiRestrictions``. Not an order."""
+        request = urllib.request.Request(
+            f"{self.base_url}{API_RESTRICTIONS_PATH}?{signed_query}",
+            method="GET",
+            headers={
+                "User-Agent": "trade-binance-spot",
+                "X-MBX-APIKEY": api_key,
+            },
+        )
+        status, body = self._opener(request, self.timeout)
+        return _decode_ok(status, body)
+
     def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{self.base_url}{SPOT_PATH}",
@@ -888,8 +902,10 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     REST_BOOK,
     account_book_block,
     buy_exposure_block,
+    funding_block,
     native_oco_verified,
     replay_block,
+    snapshot_usdt_free,
 )
 from execution.executors.binance_spot_protect import (  # noqa: E402
     PROTECTION_DUST,
@@ -1039,6 +1055,9 @@ class BinanceSpotAdapter:
             usdt = os.environ.get("BINANCE_SPOT_REST_USDT_FREE", "").strip()
             account_type = os.environ.get("BINANCE_SPOT_REST_ACCOUNT_TYPE", "SPOT").strip() or "SPOT"
             expected = {"account_type": account_type, "usdt_free": usdt or None}
+            rest_uid = os.environ.get("BINANCE_SPOT_REST_UID", "").strip()
+            if rest_uid:
+                expected["uid"] = rest_uid
         return account_book_block(self.account_snapshot, book, expected)
 
     def _live_buy_block(self, sig: dict[str, Any], plan: dict[str, Any] | None) -> str | None:
@@ -1054,7 +1073,21 @@ class BinanceSpotAdapter:
         decision = str(sig.get("decision_log_id") or "").strip()
         if not decision.isdigit():
             return "invalid_oco_client_id"
-        return buy_exposure_block(self.buy_blocks, self.canonical_rows)
+        held = buy_exposure_block(self.buy_blocks, self.canonical_rows)
+        if held:
+            return held
+        planned = None
+        if isinstance(self._size_plan, dict):
+            planned = self._size_plan.get("quote_usdt")
+        if planned in (None, ""):
+            planned = sig.get("extras", {}).get("quote_order_qty") if isinstance(sig.get("extras"), dict) else None
+            if planned in (None, "") and isinstance(sig.get("extras"), dict):
+                planned = sig["extras"].get("quoteOrderQty")
+        return funding_block(
+            snapshot_usdt_free(self.account_snapshot),
+            ENTRY_MIN_NOTIONAL_USDT,
+            planned,
+        )
 
     def _buy_with_native_oco(
         self,

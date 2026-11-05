@@ -26,12 +26,30 @@ from execution.binance_account_snapshot import (  # noqa: E402
     seal_snapshot,
     write_snapshot_file,
 )
-from execution.executors.binance_spot_gate import MCP_POSITION_UID  # noqa: E402
+from execution.executors.binance_spot_gate import (  # noqa: E402
+    MCP_POSITION_UID,
+    bind_rest_book,
+    funding_block,
+    permission_kind,
+)
+from execution.executors.binance_spot_protect import ENTRY_MIN_NOTIONAL_USDT  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
 from execution.live_bnb_watchdog import preflight  # noqa: E402
 
 SECRET = "snapshot-secret-not-a-key"
 NOW_MS = 1_700_000_000_000
+_RESTRICTIONS = {
+    "enableSpotAndMarginTrading": True,
+    "enableReading": True,
+    "ipRestrict": True,
+    "enableMargin": False,
+    "enableFutures": False,
+    "enableWithdrawals": False,
+    "enableInternalTransfer": True,
+    "enableVanillaOptions": False,
+    "permitsUniversalTransfer": True,
+    "createTime": 1793901903000,
+}
 _ACCOUNT = {
     "accountType": "SPOT",
     "canTrade": True,
@@ -39,7 +57,8 @@ _ACCOUNT = {
     "canDeposit": True,
     "brokered": False,
     "updateTime": 1_700_000_000_000,
-    "permissions": ["SPOT"],
+    "permissions": ["TRD_GRP_080"],
+    "uid": 1275399777,
     "balances": [
         {"asset": "USDT", "free": "250.50", "locked": "0.00"},
         {"asset": "FET", "free": "0.00000000", "locked": "0.00000000"},
@@ -68,7 +87,12 @@ def _expected() -> dict[str, str]:
 
 def _install(root: Path, payload: dict[str, Any] | None = None) -> Path:
     path = root / "account.json"
-    sealed = seal_snapshot(payload or _ACCOUNT, secret=SECRET, fetched_at_ms=NOW_MS)
+    sealed = seal_snapshot(
+        payload or _ACCOUNT,
+        secret=SECRET,
+        fetched_at_ms=NOW_MS,
+        restrictions=_RESTRICTIONS,
+    )
     error = write_snapshot_file(path, sealed)
     if error:
         raise AssertionError(error)
@@ -118,8 +142,10 @@ class SnapshotFileTests(unittest.TestCase):
         )
         self.assertIsNone(error)
         assert payload is not None
-        self.assertNotIn("uid", payload)
-        self.assertEqual(payload["accountType"], "SPOT")
+        self.assertEqual(payload["uid"], 1275399777)
+        self.assertNotEqual(str(payload["uid"]), MCP_POSITION_UID)
+        self.assertEqual(payload["permissions"], ["TRD_GRP_080"])
+        self.assertIs(payload["restrictions"]["enableSpotAndMarginTrading"], True)
         broken = json.loads(text)
         broken["payload"]["balances"][0]["free"] = "1"
         path.write_text(json.dumps(broken), encoding="utf-8")
@@ -187,7 +213,9 @@ class SnapshotFileTests(unittest.TestCase):
         claimed = dict(_ACCOUNT)
         claimed["uid"] = int(MCP_POSITION_UID)
         mcp = self.root / "mcp.json"
-        sealed = seal_snapshot(claimed, secret=SECRET, fetched_at_ms=NOW_MS)
+        sealed = seal_snapshot(
+            claimed, secret=SECRET, fetched_at_ms=NOW_MS, restrictions=_RESTRICTIONS
+        )
         self.assertIsNone(write_snapshot_file(mcp, sealed))
         self.assertEqual(
             load_snapshot_file(
@@ -205,11 +233,14 @@ class SnapshotFileTests(unittest.TestCase):
         def urlopen(request: urllib.request.Request, timeout: float) -> _Response:
             del timeout
             seen.append(request.full_url)
-            if request.get_method() != "GET" or not request.full_url.split("?", 1)[0].endswith(
-                "/api/v3/account"
-            ):
+            path = request.full_url.split("?", 1)[0]
+            if request.get_method() != "GET" or "/order" in path:
                 raise AssertionError(request.full_url)
-            return _Response(200, json.dumps(_ACCOUNT).encode("utf-8"))
+            if path.endswith("/api/v3/account"):
+                return _Response(200, json.dumps(_ACCOUNT).encode("utf-8"))
+            if path.endswith("/sapi/v1/account/apiRestrictions"):
+                return _Response(200, json.dumps(_RESTRICTIONS).encode("utf-8"))
+            raise AssertionError(request.full_url)
 
         env = _env(self.root, None)
         env["BINANCE_SPOT_LIVE_ENABLED"] = "0"
@@ -221,7 +252,7 @@ class SnapshotFileTests(unittest.TestCase):
             code = main(["--output", str(out)])
             self.assertEqual(os.environ.get("BINANCE_SPOT_LIVE_ENABLED"), "0")
         self.assertEqual(code, 0, seen)
-        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(seen), 2)
         self.assertEqual(kill.read_text(encoding="utf-8"), "keep\n")
         text = out.read_text(encoding="utf-8")
         self.assertNotIn(SECRET, text)
@@ -229,7 +260,66 @@ class SnapshotFileTests(unittest.TestCase):
             out, secret=SECRET, now_ms=NOW_MS, max_age_ms=3600_000, expected=_expected()
         )
         self.assertIsNone(error)
-        self.assertEqual(payload, _ACCOUNT)
+        assert payload is not None
+        self.assertEqual(payload["uid"], 1275399777)
+        self.assertEqual(payload["restrictions"]["enableSpotAndMarginTrading"], True)
+        self.assertEqual(payload["restrictions"]["ipRestrict"], True)
+
+    def test_permission_shapes_and_zero_usdt_do_not_fund(self) -> None:
+        self.assertEqual(permission_kind("TRD_GRP_080"), "exact_group")
+        self.assertEqual(permission_kind("TRD_GRP_004"), "documented_group")
+        self.assertEqual(permission_kind("SPOT"), "legacy_spot")
+        for bad in ("TRD_GRP_", "TRD_GRP_08", "TRD_GRP_080extra", "TRD_GRP_ABC", "SPOT "):
+            self.assertEqual(permission_kind(bad), "rejected", bad)
+        expected = {"account_type": "SPOT", "usdt_free": "0"}
+        account = {
+            "accountType": "SPOT",
+            "canTrade": True,
+            "permissions": ["TRD_GRP_080"],
+            "uid": 1275399777,
+            "balances": [{"asset": "USDT", "free": "0", "locked": "0"}],
+            "restrictions": _RESTRICTIONS,
+        }
+        bound, error = bind_rest_book(account, expected)
+        self.assertIsNone(error)
+        assert bound is not None
+        self.assertEqual(bound["uid"], "1275399777")
+        self.assertFalse(bound["same_as_mcp_uid"])
+        self.assertNotEqual(bound["uid"], MCP_POSITION_UID)
+        self.assertEqual(
+            funding_block(bound["usdt_free"], ENTRY_MIN_NOTIONAL_USDT),
+            "funding_block",
+        )
+        self.assertEqual(ENTRY_MIN_NOTIONAL_USDT, 20)
+        empty = dict(account)
+        empty["permissions"] = []
+        self.assertEqual(bind_rest_book(empty, expected)[1], "rest_permission_missing")
+        junk = dict(account)
+        junk["permissions"] = ["TRD_GRP_080extra"]
+        self.assertEqual(bind_rest_book(junk, expected)[1], "rest_permission_rejected")
+        disabled = dict(account)
+        disabled["restrictions"] = dict(_RESTRICTIONS)
+        disabled["restrictions"]["enableSpotAndMarginTrading"] = False
+        self.assertEqual(bind_rest_book(disabled, expected)[1], "rest_capability_disabled")
+        missing = dict(account)
+        missing.pop("restrictions")
+        self.assertEqual(bind_rest_book(missing, expected)[1], "rest_capability_missing")
+        legacy = dict(account)
+        legacy["permissions"] = ["SPOT"]
+        legacy.pop("uid")
+        self.assertIsNone(bind_rest_book(legacy, expected)[1])
+        funded = dict(account)
+        funded["balances"] = [{"asset": "USDT", "free": "20", "locked": "0"}]
+        funded_bound, funded_error = bind_rest_book(
+            funded, {"account_type": "SPOT", "usdt_free": "20"}
+        )
+        self.assertIsNone(funded_error)
+        assert funded_bound is not None
+        self.assertIsNone(funding_block(funded_bound["usdt_free"], ENTRY_MIN_NOTIONAL_USDT, "20"))
+        self.assertEqual(
+            funding_block(funded_bound["usdt_free"], ENTRY_MIN_NOTIONAL_USDT, "50"),
+            "funding_block",
+        )
 
 
 class ProductionAssemblyTests(unittest.TestCase):
