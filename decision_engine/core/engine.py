@@ -8,6 +8,7 @@ from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine import config as de_config
 from decision_engine.core.binance_indicators import (
     binance_indicators_ready,
     list_binance_hot_tokens,
@@ -30,6 +31,22 @@ from decision_engine.strategies.base_strategy import BaseStrategy
 log = get_logger("decision_engine.engine")
 
 
+def scan_limit_for_purpose(purpose: str, explicit: int | None = None) -> int:
+    """How many names one tick may load.
+
+    A scan window, not an entry gate. Strategy thresholds stay put.
+    ``live_bnb_boll_fade`` defaults to at least ``LIVE_BNB_SCAN_LIMIT`` so a
+    broad dump does not drop spot names ranked past the global hot limit
+    (universe about 518). Other purposes keep ``HOT_TOKEN_LIMIT``.
+    An explicit limit, including ``--limit``, is kept as given.
+    """
+    if explicit is not None:
+        return int(explicit)
+    if purpose == PURPOSE_LIVE_BNB_BOLL_FADE:
+        return max(int(de_config.HOT_TOKEN_LIMIT), int(de_config.LIVE_BNB_SCAN_LIMIT))
+    return int(de_config.HOT_TOKEN_LIMIT)
+
+
 class DecisionEngine:
     def __init__(
         self,
@@ -38,7 +55,7 @@ class DecisionEngine:
         strategies: list[BaseStrategy],
         *,
         risk: RiskManager | None = None,
-        hot_limit: int = 50,
+        hot_limit: int | None = None,
         token_cooldown: Any = None,
         entry_ih_min_hours: float | None = None,
     ):
@@ -46,7 +63,7 @@ class DecisionEngine:
         self.bus = bus
         self.strategies = strategies
         self.risk = risk or RiskManager()
-        self.hot_limit = hot_limit
+        self.hot_limit = scan_limit_for_purpose(bus.purpose, hot_limit)
         self.token_cooldown = token_cooldown
         self.entry_ih_min_hours = (
             None if entry_ih_min_hours is None else float(entry_ih_min_hours)

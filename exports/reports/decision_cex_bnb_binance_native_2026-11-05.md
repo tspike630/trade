@@ -18,7 +18,7 @@
 
 `binance_indicators`：`symbol`，`status`，`interval`，`price_usd`，`change_5m`，`volume_strength`，`boll_lower`，`quote_volume_24h`，`tech_updated_at`，`updated_at`。
 
-`liquidity_usd` 不另开门槛：读的时候把 `quote_volume_24h` 填进现有的 `DECISION_MIN_LIQ_USD` 地板。`BINANCE_INDICATORS_FRESH_SEC` 默认 3600。扫描窗口 `DECISION_HOT_TOKEN_LIMIT`，默认按 `change_5m` 升序，不是入场条件。
+`liquidity_usd` 不另开门槛：读的时候把 `quote_volume_24h` 填进现有的 `DECISION_MIN_LIQ_USD` 地板。`BINANCE_INDICATORS_FRESH_SEC` 默认 3600。扫描窗口按 `change_5m` 升序，不是入场条件。其它 purpose 仍是 `DECISION_HOT_TOKEN_LIMIT`。`live_bnb_boll_fade` 不传 `--limit` 时至少 600（`LIVE_BNB_SCAN_LIMIT`），盖住约 518 个名字。显式 `--limit` 仍按传入值截断。
 
 `binance_klines`：`symbol`，`interval='5m'`，`open_time_ms`，`open/high/low/close`，`volume`，`quote_volume`，`close_time_ms`。
 
@@ -27,7 +27,7 @@ K 线现算（仅指标表不存在时）对齐纸面参数，不改阈值：
 | 字段 | 算法 |
 |---|---|
 | `change_5m` | `change_pct`，300 秒，5m 收盘对齐就是相邻两根 |
-| `volume_strength` | 最近 1 小时量 / 过去 24 小时这些读数的均值 |
+| `volume_strength` | 最近 1 小时 quote volume（USDT）/ 过去 24 小时这些读数的均值。某根缺 quote 才用 base volume |
 | `boll_lower` | SMA(20) − 2 × 总体标准差（`ddof=0`），即 `bbands(length=20, std=2)` |
 | `price_usd` | 最后一根已收盘 5m 的收盘价 |
 

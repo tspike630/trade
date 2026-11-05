@@ -11,9 +11,11 @@ import unittest
 from pathlib import Path
 
 import decision_engine  # noqa: F401 — crawler/ on path for logging_setup
+from decision_engine import config as de_config
 from decision_engine.core.bnb_native import (
     _boll_lower,
     _change_5m,
+    _trailing_hour_volume,
     _volume_strength,
     factors_from_klines,
     load_native_candidate_rows,
@@ -25,8 +27,10 @@ from decision_engine.core.engine import DecisionEngine
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_FADE,
+    PURPOSE_LIVE_CANDIDATE,
     SignalBus,
 )
+from decision_engine.run import main as run_main
 from decision_engine.strategies import get_strategy
 
 _ENV_KEYS = (
@@ -78,6 +82,41 @@ class FactorMathTests(unittest.TestCase):
         self.assertAlmostEqual(_volume_strength(points) or 0.0, 1.0)
         points[-1] = (9.0, 6.0)
         self.assertAlmostEqual(_volume_strength(points) or 0.0, 6.0 / 11.4)
+
+    def test_trailing_hour_prefers_quote_volume(self) -> None:
+        bars = _bars([100.0] * 12, volume=2.0, quote=9.0)
+        self.assertAlmostEqual(_trailing_hour_volume(bars, 11), 12 * 9.0)
+        zero_quote = [(*row[:5], 4.0, 0.0) for row in bars]
+        self.assertAlmostEqual(_trailing_hour_volume(zero_quote, 11), 0.0)
+
+    def test_trailing_hour_falls_back_to_base_when_quote_is_missing(self) -> None:
+        bars = _bars([100.0] * 12, volume=3.0, quote=50.0)
+        missing = [(*row[:6], None) for row in bars]
+        self.assertAlmostEqual(_trailing_hour_volume(missing, 11), 12 * 3.0)
+        mixed = list(missing)
+        mixed[-1] = (*bars[-1][:5], 3.0, 50.0)
+        self.assertAlmostEqual(_trailing_hour_volume(mixed, 11), 11 * 3.0 + 50.0)
+
+    def test_kline_volume_strength_follows_quote_not_base(self) -> None:
+        closes = [100.0] * 24
+        quotes = [10.0] * 23 + [400.0]
+        quote_bars = []
+        fallback_bars = []
+        for index, row in enumerate(_bars(closes, volume=1.0, quote=10.0)):
+            quote_bars.append((*row[:5], 1.0, quotes[index]))
+            fallback_bars.append((*row[:5], quotes[index], None))
+        now = quote_bars[-1][0] + 5 * 60 * 1000
+        from_quote = factors_from_klines(quote_bars, now_ms=now)
+        from_base = factors_from_klines(fallback_bars, now_ms=now)
+        flat_base = factors_from_klines(_bars(closes, volume=1.0, quote=1.0), now_ms=now)
+        self.assertIsNotNone(from_quote)
+        self.assertIsNotNone(from_base)
+        self.assertIsNotNone(flat_base)
+        assert from_quote is not None and from_base is not None and flat_base is not None
+        self.assertAlmostEqual(from_quote["volume_strength"], from_base["volume_strength"])
+        self.assertNotAlmostEqual(
+            from_quote["volume_strength"], flat_base["volume_strength"]
+        )
 
     def test_forming_bar_is_dropped(self) -> None:
         closed = _bars([100.0] * 20)
@@ -493,6 +532,185 @@ class NativeEmitTests(unittest.TestCase):
             rows, payload = self._tick(db)
             self.assertEqual(payload["bnb_factor_source"], "dex_map")
             self.assertNotIn("ONLYCEXUSDT", {row["token_address"] for row in rows})
+
+
+class ScanWindowTests(unittest.TestCase):
+    """live_bnb_boll_fade scan window, not an entry gate."""
+
+    def _seed_ranked_dump(self, db: Path, *, decoys: int = 60) -> None:
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """
+            CREATE TABLE binance_indicators (
+                symbol TEXT PRIMARY KEY,
+                base_asset TEXT,
+                quote_asset TEXT,
+                status TEXT,
+                price_usd REAL,
+                change_5m REAL,
+                volume_strength REAL,
+                boll_lower REAL,
+                quote_volume_24h REAL
+            )
+            """
+        )
+        liq = float(de_config.DECISION_MIN_LIQ_USD) + 10_000.0
+        rows = [
+            (
+                f"D{index:03d}USDT",
+                f"D{index:03d}",
+                "USDT",
+                "TRADING",
+                5.0,
+                -10.0,
+                0.9,
+                1.0,
+                liq,
+            )
+            for index in range(decoys)
+        ]
+        rows.append(("KEEPUSDT", "KEEP", "USDT", "TRADING", 1.0, -3.0, 0.9, 2.0, liq))
+        conn.executemany(
+            """
+            INSERT INTO binance_indicators (
+                symbol, base_asset, quote_asset, status,
+                price_usd, change_5m, volume_strength, boll_lower, quote_volume_24h
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+
+    def _tick(self, db: Path, *, hot_limit: int | None) -> tuple[list[sqlite3.Row], dict, int]:
+        adapter = IndicatorDataAdapter(db)
+        bus = SignalBus(db, purpose=PURPOSE_LIVE_BNB_BOLL_FADE)
+        try:
+            kwargs = {}
+            if hot_limit is not None:
+                kwargs["hot_limit"] = hot_limit
+            engine = DecisionEngine(
+                adapter,
+                bus,
+                [get_strategy("tech_boll_fade_v1")],
+                risk=RiskManager(cooldown_sec=0),
+                **kwargs,
+            )
+            payload = engine.tick()
+            limit = engine.hot_limit
+        finally:
+            bus.close()
+            adapter.close()
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = list(conn.execute("SELECT token_address FROM decision_log"))
+        finally:
+            conn.close()
+        return rows, payload, limit
+
+    def test_default_scan_keeps_a_break_ranked_past_fifty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            self._seed_ranked_dump(db)
+            rows, payload, limit = self._tick(db, hot_limit=None)
+            self.assertGreaterEqual(limit, 600)
+            self.assertEqual(payload["bnb_factor_source"], "binance_indicators")
+            self.assertGreaterEqual(payload["hot_loaded"], 61)
+            self.assertEqual([row["token_address"] for row in rows], ["KEEPUSDT"])
+
+    def test_explicit_limit_still_truncates_the_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            self._seed_ranked_dump(db)
+            rows, payload, limit = self._tick(db, hot_limit=20)
+            self.assertEqual(limit, 20)
+            self.assertEqual(payload["hot_loaded"], 20)
+            self.assertEqual(rows, [])
+
+    def test_other_purpose_keeps_the_global_hot_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            sqlite3.connect(db).close()
+            adapter = IndicatorDataAdapter(db)
+            bus = SignalBus(db, purpose=PURPOSE_LIVE_CANDIDATE)
+            try:
+                engine = DecisionEngine(
+                    adapter,
+                    bus,
+                    [get_strategy("tech_boll_fade_v1")],
+                    risk=RiskManager(cooldown_sec=0),
+                )
+                self.assertEqual(engine.hot_limit, de_config.HOT_TOKEN_LIMIT)
+                self.assertLess(engine.hot_limit, 600)
+            finally:
+                bus.close()
+                adapter.close()
+
+    def _capture_cli_limit(self, argv: list[str]) -> int:
+        captured: dict[str, int] = {}
+
+        def spy(engine, adapter, bus, strategies, **kwargs):
+            del engine, adapter, strategies
+            captured["hot_limit"] = int(kwargs["hot_limit"])
+            raise RuntimeError("stop-before-tick")
+
+        original = DecisionEngine.__init__
+        DecisionEngine.__init__ = spy  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(RuntimeError):
+                run_main(argv)
+        finally:
+            DecisionEngine.__init__ = original  # type: ignore[method-assign]
+        return captured["hot_limit"]
+
+    def test_cli_live_bnb_defaults_to_the_wide_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            sqlite3.connect(db).close()
+            limit = self._capture_cli_limit(
+                [
+                    "--strategy",
+                    "tech_boll_fade_v1",
+                    "--purpose",
+                    PURPOSE_LIVE_BNB_BOLL_FADE,
+                    "--once",
+                    "--db",
+                    str(db),
+                ]
+            )
+            self.assertGreaterEqual(limit, 600)
+
+    def test_cli_other_purpose_and_explicit_limit_stay_put(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            sqlite3.connect(db).close()
+            other = self._capture_cli_limit(
+                [
+                    "--strategy",
+                    "tech_boll_fade_v1",
+                    "--purpose",
+                    PURPOSE_LIVE_CANDIDATE,
+                    "--once",
+                    "--db",
+                    str(db),
+                ]
+            )
+            explicit = self._capture_cli_limit(
+                [
+                    "--strategy",
+                    "tech_boll_fade_v1",
+                    "--purpose",
+                    PURPOSE_LIVE_BNB_BOLL_FADE,
+                    "--once",
+                    "--limit",
+                    "20",
+                    "--db",
+                    str(db),
+                ]
+            )
+            self.assertEqual(other, de_config.HOT_TOKEN_LIMIT)
+            self.assertEqual(explicit, 20)
 
 
 if __name__ == "__main__":

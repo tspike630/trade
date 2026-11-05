@@ -47,6 +47,11 @@ if not Path(DB_PATH).is_absolute():
 
 TICK_INTERVAL_SEC = int(os.environ.get("DECISION_TICK_INTERVAL_SEC", "60"))
 HOT_TOKEN_LIMIT = int(os.environ.get("DECISION_HOT_TOKEN_LIMIT", "50"))
+# Scan window for purpose live_bnb_boll_fade only. Not an entry gate.
+# The spot USDT universe is about 518 names. ORDER BY change_5m ASC with the
+# global HOT_TOKEN_LIMIT drops valid break-lower names ranked past 50.
+# Other purposes keep HOT_TOKEN_LIMIT. An explicit --limit still wins.
+LIVE_BNB_SCAN_LIMIT = 600
 DEFAULT_STRATEGY = os.environ.get("DECISION_DEFAULT_STRATEGY", "jev_strength_v1")
 
 # Reader-side hot freshness. Indicators own the writes; this layer only drops stale rows.
