@@ -38,7 +38,7 @@ from logging_setup import get_logger, setup_logging  # noqa: E402
 
 from decision_engine import config as de_config  # noqa: E402
 from decision_engine.core.data_adapter import IndicatorDataAdapter  # noqa: E402
-from decision_engine.core.engine import DecisionEngine  # noqa: E402
+from decision_engine.core.engine import DecisionEngine, scan_limit_for_purpose  # noqa: E402
 from decision_engine.core.risk_manager import RiskManager  # noqa: E402
 from decision_engine.core.token_cooldown import DEFAULT_TOKEN_COOLDOWN_MIN, TokenCooldown  # noqa: E402
 from decision_engine.core.signal_bus import (  # noqa: E402
@@ -354,7 +354,12 @@ def main(argv: list[str] | None = None) -> int:
         "--limit",
         type=int,
         default=None,
-        help=f"hot token limit (default {de_config.HOT_TOKEN_LIMIT})",
+        help=(
+            "hot-token scan window, not an entry gate "
+            f"(default {de_config.HOT_TOKEN_LIMIT}; "
+            "purpose live_bnb_boll_fade defaults to at least "
+            f"{de_config.LIVE_BNB_SCAN_LIMIT})"
+        ),
     )
     parser.add_argument(
         "--min-jev-strength",
@@ -427,7 +432,6 @@ def main(argv: list[str] | None = None) -> int:
     interval = (
         args.interval if args.interval is not None else float(de_config.TICK_INTERVAL_SEC)
     )
-    hot_limit = args.limit if args.limit is not None else de_config.HOT_TOKEN_LIMIT
     dry_run = bool(args.dry_run)
 
     if not dry_run:
@@ -494,6 +498,12 @@ def main(argv: list[str] | None = None) -> int:
             purpose,
             out_db,
         )
+    hot_limit = scan_limit_for_purpose(purpose, args.limit)
+    log.info(
+        "scan_window hot_limit=%s purpose=%s (scan window, not an entry gate)",
+        hot_limit,
+        purpose,
+    )
     risk = ShadowCohortRisk() if args.shadow_liq_cohorts else RiskManager()
     if isinstance(risk, ShadowCohortRisk):
         risk.read_db = db_path

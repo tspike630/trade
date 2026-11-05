@@ -57,6 +57,8 @@ PYTHONPATH=crawler python -m indicators.binance_spot --db crawler/dexscreener.db
 | `binance` | 只读 CEX 表。表空或过期 → 本拍 0 条，不用 DEX 补 |
 | `dex_map` | 旧映射旁路。纸面对照不走这条 |
 
-新鲜度：`BINANCE_INDICATORS_FRESH_SEC`（默认 3600）。扫描顺序默认 `change_5m` 升序（跌得多的先进入 `DECISION_HOT_TOKEN_LIMIT`），可用 `BINANCE_INDICATORS_SORT=volume_strength` 或 `quote_volume_24h`。这是窗口顺序，不是入场条件。
+新鲜度：`BINANCE_INDICATORS_FRESH_SEC`（默认 3600）。扫描顺序默认 `change_5m` 升序，可用 `BINANCE_INDICATORS_SORT=volume_strength` 或 `quote_volume_24h`。
+
+这是扫描窗口，不是入场门。`min_change_5m` / `volume_strength` / BOLL / TP / SL / hold 仍是纸面 `tech_boll_fade_v1`。其它 purpose 继续用 `DECISION_HOT_TOKEN_LIMIT`（默认 50）。`live_bnb_boll_fade` 不传 `--limit` 时窗口至少 `LIVE_BNB_SCAN_LIMIT`（600），盖住约 518 个 TRADING `*USDT`，避免跌幅排在 51 名之后的破下轨被 `ORDER BY change_5m ASC` 裁掉。显式 `--limit` 仍按传入值截断。K 线后备的 1 小时量优先用 quote volume（USDT），与指标任务一致；某根缺 quote 才退回 base volume。
 
 `race_tech_boll_fade` 仍读 Solana `token_indicators`，不看这两张表。
