@@ -14,6 +14,7 @@ import decision_engine  # noqa: F401 — crawler/ on path for logging_setup
 from decision_engine.core.bnb_native import (
     _boll_lower,
     _change_5m,
+    _trailing_hour_volume,
     _volume_strength,
     factors_from_klines,
     load_native_candidate_rows,
@@ -78,6 +79,41 @@ class FactorMathTests(unittest.TestCase):
         self.assertAlmostEqual(_volume_strength(points) or 0.0, 1.0)
         points[-1] = (9.0, 6.0)
         self.assertAlmostEqual(_volume_strength(points) or 0.0, 6.0 / 11.4)
+
+    def test_trailing_hour_prefers_quote_volume(self) -> None:
+        bars = _bars([100.0] * 12, volume=2.0, quote=9.0)
+        self.assertAlmostEqual(_trailing_hour_volume(bars, 11), 12 * 9.0)
+        zero_quote = [(*row[:5], 4.0, 0.0) for row in bars]
+        self.assertAlmostEqual(_trailing_hour_volume(zero_quote, 11), 0.0)
+
+    def test_trailing_hour_falls_back_to_base_when_quote_is_missing(self) -> None:
+        bars = _bars([100.0] * 12, volume=3.0, quote=50.0)
+        missing = [(*row[:6], None) for row in bars]
+        self.assertAlmostEqual(_trailing_hour_volume(missing, 11), 12 * 3.0)
+        mixed = list(missing)
+        mixed[-1] = (*bars[-1][:5], 3.0, 50.0)
+        self.assertAlmostEqual(_trailing_hour_volume(mixed, 11), 11 * 3.0 + 50.0)
+
+    def test_kline_volume_strength_follows_quote_not_base(self) -> None:
+        closes = [100.0] * 24
+        quotes = [10.0] * 23 + [400.0]
+        quote_bars = []
+        fallback_bars = []
+        for index, row in enumerate(_bars(closes, volume=1.0, quote=10.0)):
+            quote_bars.append((*row[:5], 1.0, quotes[index]))
+            fallback_bars.append((*row[:5], quotes[index], None))
+        now = quote_bars[-1][0] + 5 * 60 * 1000
+        from_quote = factors_from_klines(quote_bars, now_ms=now)
+        from_base = factors_from_klines(fallback_bars, now_ms=now)
+        flat_base = factors_from_klines(_bars(closes, volume=1.0, quote=1.0), now_ms=now)
+        self.assertIsNotNone(from_quote)
+        self.assertIsNotNone(from_base)
+        self.assertIsNotNone(flat_base)
+        assert from_quote is not None and from_base is not None and flat_base is not None
+        self.assertAlmostEqual(from_quote["volume_strength"], from_base["volume_strength"])
+        self.assertNotAlmostEqual(
+            from_quote["volume_strength"], flat_base["volume_strength"]
+        )
 
     def test_forming_bar_is_dropped(self) -> None:
         closed = _bars([100.0] * 20)

@@ -545,7 +545,9 @@ def _change_5m(closes: Sequence[tuple[float, float]]) -> float | None:
 def _volume_strength(points: Sequence[tuple[float, float]]) -> float | None:
     """``current / mean`` over the trailing 24h. Matches ``volume_strength``.
 
-    Each point is ``(close_epoch_sec, trailing_1h_base_volume)``.
+    Each point is ``(close_epoch_sec, trailing_1h_quote_volume)``. The quote
+    figure is USDT notional from ``_trailing_hour_volume``. A bar with no
+    quote volume contributes base-asset volume instead.
     """
     if not points:
         return None
@@ -573,6 +575,13 @@ def _boll_lower(closes: Sequence[float]) -> float | None:
 
 
 def _trailing_hour_volume(bars: Sequence[Candle], index: int) -> float:
+    """Trailing 1h volume ending at ``bars[index]``.
+
+    Prefer quote volume (USDT, candle index 6), the same unit
+    ``indicators.binance_spot.price_series_from_klines`` sums into
+    ``volume_h1``. Fall back to base-asset volume (index 5) only when that
+    bar's quote volume is missing. A present zero stays zero.
+    """
     close_ms = int(bars[index][0]) + KLINE_MS
     start = close_ms - HOUR_SEC * 1000
     total = 0.0
@@ -581,7 +590,12 @@ def _trailing_hour_volume(bars: Sequence[Candle], index: int) -> float:
         bar_close = int(bars[j][0]) + KLINE_MS
         if bar_close <= start:
             break
-        total += float(bars[j][5])
+        quote = bars[j][6]
+        if quote is not None:
+            total += float(quote)
+        else:
+            # No quote notional on this bar; base-asset volume is the fallback.
+            total += float(bars[j][5])
         j -= 1
     return total
 
