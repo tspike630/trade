@@ -186,6 +186,51 @@ def compute_pandas_ta(
     return out
 
 
+def boll_band_series(
+    closes: list[float],
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    """Causal BOLL(20, 2σ) at every bar: ``(lower, mid, upper)``.
+
+    Same ``pandas_ta`` call as :func:`compute_pandas_ta`. Bar ``i`` uses only
+    closes up through ``i``. A short or failed series is all ``None`` and
+    does not raise. The last lower/mid match ``compute_pandas_ta`` on the
+    same closes.
+    """
+    n = len(closes)
+    empty = ([None] * n, [None] * n, [None] * n)
+    if n < 2:
+        return empty
+    try:
+        bb = ta.bbands(pd.Series(closes, dtype="float64"), length=20, std=2.0)
+    except Exception:  # noqa: BLE001 — same swallow as compute_pandas_ta
+        return empty
+    if bb is None or getattr(bb, "empty", True):
+        return empty
+    bbl = bbm = bbu = None
+    for column in bb.columns:
+        name = str(column).upper()
+        if name.startswith("BBL"):
+            bbl = column
+        elif name.startswith("BBM"):
+            bbm = column
+        elif name.startswith("BBU"):
+            bbu = column
+    columns = list(bb.columns)
+    if bbl is None and len(columns) >= 1:
+        bbl = columns[0]
+    if bbm is None and len(columns) >= 2:
+        bbm = columns[1]
+    if bbu is None and len(columns) >= 3:
+        bbu = columns[2]
+
+    def _series(column: Any) -> list[float | None]:
+        if column is None:
+            return [None] * n
+        return [_finite_or_none(value) for value in _align(bb[column], n)]
+
+    return _series(bbl), _series(bbm), _series(bbu)
+
+
 # Aliases matching tutorial naming (boll_up / boll_low)
 def compute_technical_last(closes: list[float]) -> dict[str, float | None]:
     """Same as compute_pandas_ta; also exposes boll_up/boll_low aliases."""

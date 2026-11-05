@@ -62,3 +62,9 @@ PYTHONPATH=crawler python -m indicators.binance_spot --db crawler/dexscreener.db
 这是扫描窗口，不是入场门。`min_change_5m` / `volume_strength` / BOLL / TP / SL / hold 仍是纸面 `tech_boll_fade_v1`。其它 purpose 继续用 `DECISION_HOT_TOKEN_LIMIT`（默认 50）。`live_bnb_boll_fade` 不传 `--limit` 时窗口至少 `LIVE_BNB_SCAN_LIMIT`（600），盖住约 518 个 TRADING `*USDT`，避免跌幅排在 51 名之后的破下轨被 `ORDER BY change_5m ASC` 裁掉。显式 `--limit` 仍按传入值截断。K 线后备的 1 小时量优先用 quote volume（USDT），与指标任务一致；某根缺 quote 才退回 base volume。
 
 `race_tech_boll_fade` 仍读 Solana `token_indicators`，不看这两张表。
+
+## α 入场区列（本任务只写列）
+
+`binance_indicators` 上另有一组列：收盘针的 L/M/S、缓冲后的 `rr_to_mid`、三档 `entry_signal`，以及只供消融的 `action_complete` / `breakout_fired`。口径在 `docs/entry_zone_alpha_crowding_2026-11-05.md`。
+
+本文件对应的代码不把这些列放进 `list_binance_hot_tokens`，不改跌 2 / 量能 0.5 / 下轨，不改纸面 `tech_boll_fade` 的 TP/SL，不碰杀开关。杨已解除这条配方的冻结，接线是决策引擎自己的 PR。canonical 止损列是 `stop_price_zone = L − 0.1×S`。`natural_stop_price`（针低 − 10 bps）不是口径。
