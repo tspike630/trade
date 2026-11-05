@@ -134,6 +134,10 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
         "order": public_order,
         "exchange_order_id": result.get("exchange_order_id"),
         "gates": result.get("gates") if isinstance(result.get("gates"), dict) else {},
+        "intent": result.get("intent") if isinstance(result.get("intent"), dict) else None,
+        "exit_plan": (
+            result.get("exit_plan") if isinstance(result.get("exit_plan"), dict) else None
+        ),
     }
 
 

@@ -15,6 +15,7 @@ from decision_engine.core.binance_indicators import (
     resolve_live_bnb_factor_source,
 )
 from decision_engine.core.bnb_native import limit_kline_scan, load_native_candidate_rows
+from decision_engine.core.live_bnb_entry_coords import attach_live_entry_coordinates
 from decision_engine.core.bnb_spot_map import (
     default_listing_db_paths,
     load_binance_spot_usdt_symbols,
@@ -81,6 +82,11 @@ class DecisionEngine:
         bnb_source: str | None = None
         if bnb_spot:
             hot, bnb_source = self._load_live_bnb_hot(hot)
+            hot = attach_live_entry_coordinates(
+                self.adapter.conn,
+                hot,
+                now_ms=int(time.time() * 1000),
+            )
         log.info(
             "tick#%s indicators_total=%s hot_loaded=%s bnb_factor_source=%s strategies=%s",
             self.tick_count,
@@ -94,6 +100,7 @@ class DecisionEngine:
             "indicators_total": n_ind,
             "tick": self.tick_count,
             "adapter": self.adapter,
+            "purpose": self.bus.purpose,
         }
         candidates: list[dict[str, Any]] = []
         for strat in self.strategies:

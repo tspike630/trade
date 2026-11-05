@@ -21,7 +21,10 @@ from decision_engine.core.signal_bus import (
 )
 from decision_engine.strategies import get_strategy
 from decision_engine.tests.test_bnb_spot_map import BINANCE_VENUE, _decision_rows, _seed
-from indicators.binance_spot import ensure_schema
+
+_SCHEMA = (
+    Path(__file__).resolve().parents[2] / "crawler" / "models" / "binance_indicator_tables.sql"
+)
 
 
 def _iso(dt: datetime) -> str:
@@ -42,19 +45,23 @@ def _insert_cex(db: Path) -> None:
     now = _iso(datetime.now(timezone.utc))
     stale = _iso(datetime.now(timezone.utc) - timedelta(hours=6))
     conn = sqlite3.connect(db)
-    ensure_schema(conn)
+    conn.executescript(_SCHEMA.read_text(encoding="utf-8"))
+    conn.execute("ALTER TABLE binance_indicators ADD COLUMN kline_low REAL")
+    conn.execute("ALTER TABLE binance_indicators ADD COLUMN trade_size_ratio REAL")
     conn.executemany(
         """
         INSERT INTO binance_indicators (
             symbol, base_asset, quote_asset, status, interval,
-            price_usd, change_5m, volume_strength, boll_lower,
+            price_usd, change_5m, volume_strength, boll_lower, boll_mid,
+            kline_low, trade_size_ratio,
             quote_volume_24h, tier, tech_updated_at, updated_at
-        ) VALUES (?, ?, 'USDT', 'TRADING', '5m', ?, ?, ?, ?, ?, 'hot', ?, ?)
+        ) VALUES (?, ?, 'USDT', 'TRADING', '5m', ?, ?, ?, ?, ?, ?, ?, ?, 'hot', ?, ?)
         """,
         [
-            ("ONLYCEXUSDT", "ONLYCEX", 0.8, -4.0, 0.9, 1.0, 90_000.0, now, now),
-            ("THINUSDT", "THIN", 0.4, -6.0, 0.9, 1.0, 1_000.0, now, now),
-            ("STALEUSDT", "STALE", 0.4, -6.0, 0.9, 1.0, 90_000.0, stale, stale),
+            # alpha=(0.8-0.75)/(1-0.75)=0.20, ratio 1.5 → large_trade market
+            ("ONLYCEXUSDT", "ONLYCEX", 0.8, -4.0, 0.9, 1.0, 1.0, 0.75, 1.5, 90_000.0, now, now),
+            ("THINUSDT", "THIN", 0.4, -6.0, 0.9, 1.0, None, None, None, 1_000.0, now, now),
+            ("STALEUSDT", "STALE", 0.4, -6.0, 0.9, 1.0, None, None, None, 90_000.0, stale, stale),
         ],
     )
     conn.commit()
@@ -135,7 +142,9 @@ class LiveBnbCexFactorTests(unittest.TestCase):
                     os.environ["LIVE_BNB_FACTOR_SOURCE"] = old
             self.assertEqual(payload["bnb_factor_source"], "dex_map")
             tokens = {row["token_address"] for row in rows}
-            self.assertIn("ZZQBOLLUSDT", tokens)
+            # Mapped DEX names have no closed-bar coordinates here, so the
+            # entry zone fails closed instead of using the old -2% / lower-band legs.
+            self.assertEqual(tokens, set())
             self.assertNotIn("ONLYCEXUSDT", tokens)
 
     def test_binance_source_does_not_fill_from_dex_when_table_missing(self) -> None:

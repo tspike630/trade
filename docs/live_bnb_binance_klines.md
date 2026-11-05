@@ -25,7 +25,7 @@
 
 ## 写到哪
 
-公开 REST `GET /api/v3/klines`（不需要密钥）。因子沿用纸面同一套函数：`change_pct`、`volume_strength`、`compute_pandas_ta` 的 BOLL(20, 2σ)，收盘价当 close。`volume_h1` 样本是该根 K 线往前 1 小时的 quote volume 合计，比值公式没改。阈值仍是 5 分钟跌 2、量能 0.5、价格在下轨下。
+公开 REST `GET /api/v3/klines`（不需要密钥）。因子沿用纸面同一套函数：`change_pct`、`volume_strength`、`compute_pandas_ta` 的 BOLL(20, 2σ)，收盘价当 close。`volume_h1` 样本是该根 K 线往前 1 小时的 quote volume 合计，比值公式没改。纸面 `race_tech_boll_fade` 的阈值仍是 5 分钟跌 2、量能 0.5、价格在下轨下。`live_bnb_boll_fade` 的入场已换成 Entry Zone，见 `docs/live_bnb_entry_zone_2026-11-05.md`。跌 2 / 破下轨只留在该臂 extras 里做诊断，不再挡新区间。
 
 只写这两张表，和 Solana `token_indicators` / `pair_history` 分开：
 
@@ -59,6 +59,6 @@ PYTHONPATH=crawler python -m indicators.binance_spot --db crawler/dexscreener.db
 
 新鲜度：`BINANCE_INDICATORS_FRESH_SEC`（默认 3600）。扫描顺序默认 `change_5m` 升序，可用 `BINANCE_INDICATORS_SORT=volume_strength` 或 `quote_volume_24h`。
 
-这是扫描窗口，不是入场门。`min_change_5m` / `volume_strength` / BOLL / TP / SL / hold 仍是纸面 `tech_boll_fade_v1`。其它 purpose 继续用 `DECISION_HOT_TOKEN_LIMIT`（默认 50）。`live_bnb_boll_fade` 不传 `--limit` 时窗口至少 `LIVE_BNB_SCAN_LIMIT`（600），盖住约 518 个 TRADING `*USDT`，避免跌幅排在 51 名之后的破下轨被 `ORDER BY change_5m ASC` 裁掉。显式 `--limit` 仍按传入值截断。K 线后备的 1 小时量优先用 quote volume（USDT），与指标任务一致；某根缺 quote 才退回 base volume。
+这是扫描窗口，不是入场门。纸面 `race_tech_boll_fade` 的 `min_change_5m` / `volume_strength` / 破下轨 / TP10 / SL5 / hold 不动。`live_bnb_boll_fade` 用 Entry Zone 的绝对止损和 `boll_mid` 止盈，不套纸面 SL5/TP10。其它 purpose 继续用 `DECISION_HOT_TOKEN_LIMIT`（默认 50）。`live_bnb_boll_fade` 不传 `--limit` 时窗口至少 `LIVE_BNB_SCAN_LIMIT`（600），盖住约 518 个 TRADING `*USDT`，避免跌幅排在 51 名之后的破下轨被 `ORDER BY change_5m ASC` 裁掉。显式 `--limit` 仍按传入值截断。K 线后备的 1 小时量优先用 quote volume（USDT），与指标任务一致；某根缺 quote 才退回 base volume。
 
 `race_tech_boll_fade` 仍读 Solana `token_indicators`，不看这两张表。

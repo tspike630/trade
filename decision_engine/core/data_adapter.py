@@ -46,6 +46,10 @@ _INDICATOR_COLS = (
     "boll_mid",
     "boll_upper",
     "boll_lower",
+    # Live entry-zone coordinates. Absent on the Solana table, so the paper
+    # scan does not see them. Present only when a row already carries them.
+    "kline_low",
+    "trade_size_ratio",
 )
 
 _BOLL_COLS = ("boll_upper", "boll_mid", "boll_lower")
