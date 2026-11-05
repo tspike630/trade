@@ -62,44 +62,16 @@ def import_verified_fet_fill(ledger: ExecutionLedger) -> dict[str, Any]:
     return ledger.import_verified_fill(dict(VERIFIED_FET_FILL))
 
 
-def _has_canonical_fet(book: dict[str, Any]) -> bool:
-    rows = book.get("canonical_positions")
-    if not isinstance(rows, list):
-        return False
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if (
-            str(row.get("purpose") or "") == PURPOSE_LIVE_BNB_BOLL_FADE
-            and str(row.get("symbol") or "") == "FETUSDT"
-            and str(row.get("status") or "") == "held_naked"
-        ):
-            return True
-    return False
-
-
 def dispatch_live_bnb(
     signal: dict[str, Any],
     book: dict[str, Any],
     transport: CatalogProbe | None = None,
 ) -> dict[str, Any]:
-    """Gate one signal. An empty canonical book is not a permission to buy."""
-    if str(signal.get("purpose") or "").strip() != PURPOSE_LIVE_BNB_BOLL_FADE:
-        broker = LiveMCPBroker(transport=transport)
-        return broker.evaluate(signal, book)
-    if not _has_canonical_fet(book):
-        broker = LiveMCPBroker(transport=transport)
-        blocked = broker.evaluate(signal, book)
-        blocked["reason"] = "canonical_fet_missing"
-        blocked["allow_buy"] = False
-        blocked["allow_sell"] = False
-        for item in blocked.get("parent_queue") or []:
-            if isinstance(item, dict):
-                item["release"] = False
-                item["invoke"] = False
-        blocked["idem"] = dict(blocked.get("idem") or {})
-        blocked["idem"]["idem_decision"] = "canonical_fet_missing"
-        return blocked
+    """Gate one signal. An empty book is not permission to buy.
+
+    The manual FET row is not required. A ``held_naked`` row still blocks a
+    new buy. This function does not write the worker's close of that fill.
+    """
     broker = LiveMCPBroker(transport=transport)
     return broker.evaluate(signal, book)
 

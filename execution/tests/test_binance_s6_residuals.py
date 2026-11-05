@@ -214,6 +214,8 @@ class ResidualS6Tests(unittest.TestCase):
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot={"uid": "9000000001", "canTrade": True},
+            production_book="rest_api_key",
         )
 
     def tearDown(self) -> None:
@@ -264,8 +266,8 @@ class ResidualS6Tests(unittest.TestCase):
                 inbound = gw.process_one(sell)
         self.assertEqual(bought["executed"], 0)
         self.assertTrue(str(bought["error"]).startswith("kill_switch:"))
-        self.assertTrue(str(inbound["error"]).startswith("kill_switch:"))
-        self.assertNotIn("protective", str(inbound["error"]))
+        self.assertEqual(inbound["error"], "inbound_sell_not_protective")
+        self.assertFalse(str(inbound["error"]).startswith("kill_switch:"))
         self.assertEqual(self.client.calls, [])
         position = {
             "id": 1,
@@ -413,19 +415,20 @@ class ResidualS6Tests(unittest.TestCase):
         env = _env(self.root, enabled="1")
         with mock.patch.dict(os.environ, env):
             with self._gateway() as gw:
-                gw.process_one(_row())
+                opened = gw.process_one(_row())
                 # Inside the band: rejection is recorded and no market sell is forced.
                 quiet = tick_live_bnb_exits(
                     gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "100"}
                 )
                 row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertEqual(quiet[0]["protection"], "loop_fallback", quiet[0])
+        self.assertFalse(quiet[0]["submitted"], quiet[0])
         self.assertNotEqual(quiet[0]["protection"], "exchange_oco")
         self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
         assert row is not None
-        self.assertEqual(row["status"], "open")
-        self.assertEqual(row["protection"], "loop_fallback")
-        self.assertTrue(str(row["last_error"]).startswith("oco_rejected:"), row["last_error"])
+        self.assertEqual(row["status"], "oco_failed")
+        self.assertNotEqual(row["protection"], "exchange_oco")
+        self.assertTrue(str(opened["error"]).startswith("oco_rejected:"), opened["error"])
+        self.assertEqual(opened["executed"], 0)
 
     def test_exchange_fill_and_expiry_are_reconciled(self) -> None:
         env = _env(self.root, enabled="1")
@@ -534,9 +537,9 @@ class ResidualS6Tests(unittest.TestCase):
                     gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "100"}
                 )
                 woke_row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertEqual(woke[0]["protection"], "loop_fallback", woke[0])
+        self.assertEqual(woke[0]["book"], "oco_failed", woke[0])
         assert woke_row is not None
-        self.assertEqual(woke_row["status"], "open")
+        self.assertEqual(woke_row["status"], "oco_failed")
         self.assertEqual(woke_row["last_error"], "oco_terminal_unfilled")
         self.assertNotEqual(woke_row["protection"], "exchange_oco")
         self.assertFalse(any(call[0] == "new_order" for call in self.client.calls))
@@ -584,7 +587,7 @@ class ResidualS6Tests(unittest.TestCase):
                     {"quantity": "0.004", "status": "open", "protection": "loop_fallback"},
                 )
                 dusted = tick_live_bnb_exits(
-                    gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "98"}
+                    gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "100"}
                 )
                 again = tick_live_bnb_exits(
                     gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "50"}
@@ -599,7 +602,7 @@ class ResidualS6Tests(unittest.TestCase):
         self.assertEqual(dust_row["exit_reason"], "dust_abandon")
         self.assertEqual(dust_row["protection"], "dust_abandon")
         self.assertEqual(dust_row["residual_qty"], "0.004")
-        self.assertEqual(dust_row["residual_quote"], "0.392")
+        self.assertEqual(dust_row["residual_quote"], "0.4")
         self.assertNotEqual(dust_row["status"], "exit_submitted")
         self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
 

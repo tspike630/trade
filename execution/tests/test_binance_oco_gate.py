@@ -1,0 +1,450 @@
+"""Dry/mock gates for native spot OCO. No live HTTP and no secrets.
+
+    python -m unittest execution.tests.test_binance_oco_gate
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+import urllib.request
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+from unittest import mock
+from urllib.parse import parse_qs
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "crawler"))
+
+from execution.executors.binance_mcp_broker import (  # noqa: E402
+    DEFAULT_QUOTE_REDUCE_CAP,
+    LiveMCPBroker,
+)
+from execution.executors.binance_spot import (  # noqa: E402
+    PURPOSE_LIVE_BNB_BOLL_FADE,
+    BinanceRequestError,
+    BinanceSpotAdapter,
+    BinanceSpotHttpClient,
+    OCO_PATH,
+    sign_query,
+)
+from execution.executors.binance_spot_gate import (  # noqa: E402
+    FROZEN_CLIENT_ID,
+    FROZEN_DECISION_ID,
+    MCP_BOOK,
+    MCP_POSITION_UID,
+    REST_BOOK,
+    acceptance_report,
+    account_book_block,
+    buy_exposure_block,
+    native_oco_verified,
+    replay_block,
+)
+from execution.executors.binance_spot_protect import (  # noqa: E402
+    ENTRY_MIN_NOTIONAL_USDT,
+    build_spot_oco,
+)
+from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.live_bnb_dispatch import dispatch_live_bnb  # noqa: E402
+
+_FILTERS = [
+    {"filterType": "LOT_SIZE", "minQty": "0.01", "maxQty": "900000", "stepSize": "0.01"},
+    {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000", "tickSize": "0.01"},
+    {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": True},
+]
+_INFO = {
+    "symbol": "BNBUSDT",
+    "status": "TRADING",
+    "quoteAsset": "USDT",
+    "isSpotTradingAllowed": True,
+    "filters": _FILTERS,
+}
+_BOUND = {"uid": "9000000001", "canTrade": True, "balances": [{"asset": "FET", "free": "0"}]}
+
+
+def _working(*, list_id: object = 42, above: object = 11, below: object = 10) -> dict[str, Any]:
+    return {
+        "orderListId": list_id,
+        "listOrderStatus": "EXECUTING",
+        "listStatusType": "EXEC_STARTED",
+        "orderReports": [
+            {"orderId": above, "type": "LIMIT_MAKER", "status": "NEW", "executedQty": "0"},
+            {
+                "orderId": below,
+                "type": "STOP_LOSS_LIMIT",
+                "status": "NEW",
+                "stopPrice": "99",
+                "executedQty": "0",
+            },
+        ],
+    }
+
+
+class _Client:
+    def __init__(self, oco: dict[str, Any] | Exception | None = None) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.oco: dict[str, Any] | Exception = _working() if oco is None else oco
+
+    def exchange_info(self, symbol: str) -> dict[str, Any]:
+        self.calls.append(("exchange_info", symbol))
+        return _INFO
+
+    def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("new_order", signed_query, api_key))
+        if "side=SELL" in signed_query:
+            return {"orderId": "77", "status": "FILLED", "executedQty": "1.23"}
+        return {"orderId": "99", "status": "FILLED", "executedQty": "1.239", "symbol": "BNBUSDT"}
+
+    def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("new_oco", signed_query, api_key))
+        if isinstance(self.oco, Exception):
+            raise self.oco
+        return self.oco
+
+    def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("get_order_list", signed_query, api_key))
+        if isinstance(self.oco, Exception):
+            raise self.oco
+        return self.oco
+
+
+def _buy(decision_id: int = 147841) -> dict[str, Any]:
+    return {
+        "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        "action": "buy",
+        "mode": "live_stub",
+        "decision_log_id": decision_id,
+        "token_address": "BNBUSDT",
+        "extras": {
+            "binance_symbol": "BNBUSDT",
+            "order_type": "MARKET",
+            "quote_order_qty": "25",
+            "price_usd": "102",
+            "stop_price": "99",
+            "take_profit_price": "110",
+            "entry_reason": "large_trade_market",
+        },
+    }
+
+
+def _env(root: Path) -> dict[str, str]:
+    return {
+        "BINANCE_SPOT_LIVE_ENABLED": "1",
+        "LIVE_KILL_SWITCH_PATH": str(root / "absent-kill"),
+        "BINANCE_API_KEY": "",
+        "BINANCE_API_SECRET": "",
+        "BINANCE_SPOT_ACCOUNT_UID": "",
+        "BINANCE_SPOT_PRODUCTION_BOOK": "",
+    }
+
+
+class NativeOcoReceiptTests(unittest.TestCase):
+    def test_signed_oco_posts_both_legs_and_accepts_order_list_id_zero(self) -> None:
+        self.assertEqual(ENTRY_MIN_NOTIONAL_USDT, Decimal("20"))
+        self.assertEqual(DEFAULT_QUOTE_REDUCE_CAP, Decimal("0.05"))
+        spec, error = build_spot_oco(
+            symbol="BNBUSDT",
+            quantity="1.239",
+            stop_price="99",
+            take_profit_price="110",
+            decision_id=147841,
+            filters=_FILTERS,
+            mark="102",
+            timestamp_ms=1_700_000_000_000,
+        )
+        self.assertIsNone(error)
+        assert spec is not None
+        signed = sign_query(spec["pairs"], "test-secret")
+        form = parse_qs(signed)
+        self.assertEqual(form["symbol"], ["BNBUSDT"])
+        self.assertEqual(form["side"], ["SELL"])
+        self.assertEqual(form["quantity"], ["1.23"])
+        self.assertEqual(form["aboveType"], ["LIMIT_MAKER"])
+        self.assertEqual(form["abovePrice"], ["110"])
+        self.assertEqual(form["aboveClientOrderId"], ["bnbfade-tp-147841"])
+        self.assertEqual(form["belowType"], ["STOP_LOSS_LIMIT"])
+        self.assertEqual(form["belowStopPrice"], ["99"])
+        self.assertEqual(form["belowPrice"], ["98.99"])
+        self.assertEqual(form["belowTimeInForce"], ["GTC"])
+        self.assertEqual(form["belowClientOrderId"], ["bnbfade-sl-147841"])
+        self.assertEqual(form["listClientOrderId"], ["bnbfade-ol-147841"])
+        self.assertEqual(form["newOrderRespType"], ["FULL"])
+        self.assertIn("signature", form)
+        self.assertNotIn("test-secret", signed)
+        seen: dict[str, Any] = {}
+
+        def opener(request: urllib.request.Request, timeout: float) -> tuple[int, bytes]:
+            seen["url"] = request.full_url
+            seen["method"] = request.get_method()
+            seen["body"] = request.data
+            return 200, json.dumps(_working(list_id=0, above=8, below=9)).encode("utf-8")
+
+        with mock.patch(
+            "execution.executors.binance_spot.urllib.request.urlopen",
+            side_effect=AssertionError("live binance HTTP is disabled"),
+        ):
+            http = BinanceSpotHttpClient(base_url="https://api.binance.test", opener=opener)
+            payload = http.new_oco(signed, api_key="test-key")
+        self.assertEqual(seen["method"], "POST")
+        self.assertTrue(str(seen["url"]).endswith(OCO_PATH))
+        self.assertNotIn("api.binance.com", str(seen["url"]))
+        self.assertEqual(seen["body"], signed.encode("utf-8"))
+        verified, verify_error = native_oco_verified(payload)
+        self.assertIsNone(verify_error)
+        assert verified is not None
+        self.assertEqual(verified["order_list_id"], 0)
+        self.assertEqual(verified["above_order_id"], 8)
+        self.assertEqual(verified["below_order_id"], 9)
+
+    def test_single_leg_and_bad_list_id_are_not_protection(self) -> None:
+        for order_type in ("MARKET", "STOP_LOSS", "STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"):
+            verified, reason = native_oco_verified(
+                {"symbol": "BNBUSDT", "side": "SELL", "type": order_type, "orderId": 5, "status": "NEW"}
+            )
+            self.assertIsNone(verified)
+            self.assertEqual(reason, "mcp_order_not_oco")
+        verified, reason = native_oco_verified(_working(list_id=-1))
+        self.assertIsNone(verified)
+        self.assertEqual(reason, "native_oco_unverified")
+        verified, reason = native_oco_verified(_working(above=11, below=11))
+        self.assertIsNone(verified)
+        self.assertEqual(reason, "native_oco_unverified")
+        broker = LiveMCPBroker()
+        broker._catalog = frozenset({"spot.newOrder"})  # catalog read, no invoke
+        self.assertFalse(broker.availability("protection_tool"))
+        self.assertFalse(broker.availability("oco"))
+
+
+class ConsumerGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._net = mock.patch(
+            "execution.executors.binance_spot.urllib.request.urlopen",
+            side_effect=AssertionError("live binance HTTP is disabled"),
+        )
+        self._net.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._net.stop()
+        self._tmp.cleanup()
+
+    def _adapter(self, client: _Client, **extra: Any) -> BinanceSpotAdapter:
+        return BinanceSpotAdapter(
+            client=client,
+            kill_switch_path=self.root / "absent-kill",
+            api_key="test-key",
+            api_secret="test-secret",
+            clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot=_BOUND,
+            production_book=REST_BOOK,
+            **extra,
+        )
+
+    def test_verified_oco_allows_the_consumer_and_a_failure_blocks_the_next_buy(self) -> None:
+        report = acceptance_report()
+        self.assertFalse(report["live_ready"])
+        self.assertIn("rest_account_uid_not_proven", report["blockers"])
+        self.assertIn("mcp_connector_has_no_order_list_oco", report["blockers"])
+        client = _Client()
+        adapter = self._adapter(client)
+        with mock.patch.dict(os.environ, _env(self.root)):
+            covered = adapter.execute(_buy())
+        self.assertTrue(covered["consumer_allowed"], covered)
+        self.assertEqual(covered["executed"], 1)
+        self.assertEqual(covered["arm_position"]["status"], "oco_working")
+        self.assertEqual(covered["oco_fields"]["oco_order_list_id"], "42")
+        self.assertEqual(covered["oco_fields"]["oco_above_order_id"], "11")
+        self.assertEqual(covered["oco_fields"]["oco_below_order_id"], "10")
+        oco = parse_qs(next(call[1] for call in client.calls if call[0] == "new_oco"))
+        self.assertEqual(oco["belowType"], ["STOP_LOSS_LIMIT"])
+        self.assertEqual(oco["aboveType"], ["LIMIT_MAKER"])
+        self.assertEqual(len([call for call in client.calls if call[0] == "new_order"]), 1)
+
+        failed_client = _Client(BinanceRequestError(400))
+        failed = self._adapter(failed_client)
+        with mock.patch.dict(os.environ, _env(self.root)):
+            naked = failed.execute(_buy(147842))
+        self.assertFalse(naked["consumer_allowed"])
+        self.assertEqual(naked["executed"], 0)
+        self.assertEqual(naked["arm_position"]["status"], "oco_failed")
+        self.assertTrue(str(naked["error"]).startswith("oco_rejected:"))
+        failed.buy_blocks = [naked["arm_position"]]
+        with mock.patch.dict(os.environ, _env(self.root)):
+            again = failed.execute(_buy(147843))
+        self.assertEqual(again["error"], "oco_failed_blocks_buy")
+        self.assertEqual(
+            [call[0] for call in failed_client.calls if call[0] == "new_order"],
+            ["new_order"],
+        )
+
+    def test_kill_blocks_only_the_new_buy(self) -> None:
+        kill = self.root / "LIVE_TRADING_DISABLED"
+        kill.write_text("off\n", encoding="utf-8")
+        client = _Client()
+        adapter = BinanceSpotAdapter(
+            client=client,
+            kill_switch_path=kill,
+            api_key="test-key",
+            api_secret="test-secret",
+            clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot=_BOUND,
+            production_book=REST_BOOK,
+        )
+        env = _env(self.root)
+        env["LIVE_KILL_SWITCH_PATH"] = str(kill)
+        with mock.patch.dict(os.environ, env):
+            blocked = adapter.execute(_buy())
+            sold = adapter.exit_held_position(
+                {
+                    "id": 1,
+                    "decision_log_id": 147841,
+                    "symbol": "BNBUSDT",
+                    "status": "open",
+                    "quantity": "1.239",
+                    "stop_price": "99",
+                    "take_profit_price": "110",
+                },
+                "98",
+            )
+        self.assertTrue(str(blocked["error"]).startswith("kill_switch:"))
+        self.assertEqual(blocked["executed"], 0)
+        self.assertTrue(sold["submitted"], sold)
+        self.assertEqual(parse_qs(client.calls[-1][1])["side"], ["SELL"])
+        env["BINANCE_SPOT_BLOCK_SELL_ON_KILL"] = "1"
+        with mock.patch.dict(os.environ, env):
+            halted = adapter.exit_held_position(
+                {
+                    "id": 1,
+                    "decision_log_id": 147841,
+                    "symbol": "BNBUSDT",
+                    "status": "open",
+                    "quantity": "1.239",
+                    "stop_price": "99",
+                    "take_profit_price": "110",
+                },
+                "98",
+            )
+        self.assertTrue(str(halted["error"]).startswith("kill_switch_block_sell:"))
+        self.assertFalse(halted["submitted"])
+
+    def test_accounts_stay_split_and_cantrade_is_not_a_uid(self) -> None:
+        self.assertEqual(account_book_block(None, None), "account_book_unselected")
+        self.assertEqual(
+            account_book_block({"canTrade": True, "balances": [{"asset": "FET", "free": "0"}]}, REST_BOOK),
+            "account_uid_unbound",
+        )
+        self.assertEqual(
+            account_book_block({"uid": MCP_POSITION_UID, "canTrade": True}, REST_BOOK),
+            "account_book_mismatch",
+        )
+        self.assertEqual(
+            account_book_block({"uid": "9000000001"}, MCP_BOOK),
+            "account_book_mismatch",
+        )
+        self.assertEqual(
+            account_book_block({"uid": MCP_POSITION_UID}, MCP_BOOK),
+            "mcp_has_no_native_oco",
+        )
+        self.assertIsNone(account_book_block(_BOUND, REST_BOOK))
+        client = _Client()
+        adapter = BinanceSpotAdapter(
+            client=client,
+            kill_switch_path=self.root / "absent-kill",
+            api_key="test-key",
+            api_secret="test-secret",
+            clock_ms=lambda: 1_700_000_000_000,
+        )
+        env = _env(self.root)
+        env["BINANCE_SPOT_ACCOUNT_UID"] = MCP_POSITION_UID
+        env["BINANCE_SPOT_PRODUCTION_BOOK"] = REST_BOOK
+        with mock.patch.dict(os.environ, env):
+            refused = adapter.execute(_buy())
+        self.assertEqual(refused["error"], "account_uid_unbound")
+        self.assertEqual(client.calls, [])
+        self.assertEqual(replay_block(FROZEN_DECISION_ID, None), "historical_client_replay")
+        self.assertEqual(replay_block(147999, FROZEN_CLIENT_ID), "historical_client_replay")
+        self.assertEqual(
+            buy_exposure_block(
+                [],
+                [{"purpose": PURPOSE_LIVE_BNB_BOLL_FADE, "status": "held_naked", "symbol": "FETUSDT"}],
+            ),
+            "naked_holds_new_buys",
+        )
+
+    def test_startup_does_not_replay_the_historical_cursor(self) -> None:
+        db = self.root / "decision.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """
+            CREATE TABLE decision_log (
+                id INTEGER PRIMARY KEY,
+                ts TEXT, strategy_id TEXT, action TEXT, chain_id TEXT,
+                token_address TEXT, size_pct REAL, reason TEXT, risk_passed INTEGER,
+                mode TEXT, raw_json TEXT, purpose TEXT
+            )
+            """
+        )
+        for decision_id in (FROZEN_DECISION_ID, 20, 147840, 147841):
+            conn.execute(
+                """
+                INSERT INTO decision_log
+                    (id, ts, strategy_id, action, chain_id, token_address, size_pct,
+                     reason, risk_passed, mode, purpose, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_id,
+                    "2026-11-05T00:00:00Z",
+                    "tech_boll_fade_v1",
+                    "buy",
+                    "binance",
+                    "BNBUSDT",
+                    0.05,
+                    "old",
+                    1,
+                    "live_stub",
+                    PURPOSE_LIVE_BNB_BOLL_FADE,
+                    json.dumps({"purpose": PURPOSE_LIVE_BNB_BOLL_FADE, "pair_address": "BNB/USDT"}),
+                ),
+            )
+        conn.commit()
+        conn.close()
+        client = _Client()
+        adapter = self._adapter(client)
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with ExecutionGateway(
+                decision_db=db,
+                ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+                paper_enabled=False,
+                pm_enabled=False,
+                accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
+                binance_spot=adapter,
+            ) as gw:
+                stats = gw.process_pending(since_id=0)
+                frozen = adapter.execute(_buy(FROZEN_DECISION_ID))
+        seen = [item["decision_log_id"] for item in stats.receipts]
+        self.assertEqual(seen, [147841])
+        self.assertNotIn(FROZEN_DECISION_ID, seen)
+        self.assertNotIn(20, seen)
+        self.assertNotIn(147840, seen)
+        self.assertEqual(frozen["error"], "historical_client_replay")
+        self.assertFalse(any("bnbfade-147831" in call[1] for call in client.calls if len(call) > 1))
+        gated = dispatch_live_bnb(
+            _buy(FROZEN_DECISION_ID),
+            {"canonical_positions": [], "spent_orders": [], "open_orders": []},
+            None,
+        )
+        self.assertEqual(gated["reason"], "historical_client_replay")
+        self.assertFalse(gated["oco_placed"])
+        self.assertTrue(all(item.get("release") is False for item in gated["parent_queue"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

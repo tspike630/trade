@@ -752,7 +752,20 @@ class ExecutionLedger:
         rows = self.conn.execute(
             """
             SELECT * FROM binance_spot_positions
-            WHERE status IN ('open', 'qty_unconfirmed', 'oco_working', 'oco_unknown')
+            WHERE status IN (
+                'open', 'qty_unconfirmed', 'oco_working', 'oco_unknown', 'oco_failed'
+            )
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_binance_spot_buy_blocks(self) -> list[dict[str, Any]]:
+        """Non-terminal spot rows. A new BUY must not stack on these."""
+        rows = self.conn.execute(
+            """
+            SELECT * FROM binance_spot_positions
+            WHERE status NOT IN ('closed', 'closed_dust', 'oco_filled')
             ORDER BY id ASC
             """
         ).fetchall()
