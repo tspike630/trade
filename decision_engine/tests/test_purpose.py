@@ -22,6 +22,7 @@ from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import (
     DEFAULT_PURPOSE,
     PURPOSE_LIVE_CANDIDATE,
+    PURPOSE_LIVE_TECH_BOLL_FADE,
     PURPOSE_SAMPLE,
     PURPOSES,
     SignalBus,
@@ -63,6 +64,8 @@ class PurposeEnumTests(unittest.TestCase):
         )
         self.assertEqual(PURPOSES, expected)
         self.assertEqual(DEFAULT_PURPOSE, PURPOSE_LIVE_CANDIDATE)
+        self.assertEqual(PURPOSE_LIVE_TECH_BOLL_FADE, "live_tech_boll_fade")
+        self.assertIn(PURPOSE_LIVE_TECH_BOLL_FADE, PURPOSES)
 
     def test_resident_loop_and_once_default_live_candidate(self) -> None:
         # Neither --once nor --loop passes a threshold; both share this default.
