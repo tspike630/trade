@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -136,6 +137,14 @@ class SizeChainTests(unittest.TestCase):
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot={
+                "accountType": "SPOT",
+                "canTrade": True,
+                "permissions": ["SPOT"],
+                "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+            },
+            production_book="rest_api_key",
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
         )
         self.signal = _signal()
         self.assertNotIn("quote_order_qty", self.signal)
@@ -152,6 +161,10 @@ class SizeChainTests(unittest.TestCase):
         db = self.root / "dexscreener.db"
         with SignalBus(db, dry_run=False, purpose=PURPOSE_LIVE_BNB_BOLL_FADE) as bus:
             bus.publish(self.signal)
+        wrote = sqlite3.connect(db)
+        wrote.execute("UPDATE decision_log SET id = 147841")
+        wrote.commit()
+        wrote.close()
         gw = ExecutionGateway(
             decision_db=db,
             ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
@@ -199,7 +212,7 @@ class SizeChainTests(unittest.TestCase):
                 self.assertEqual(oco["abovePrice"], ["110"])
                 self.assertEqual(oco["belowStopPrice"], ["99"])
                 self.assertEqual(oco["quantity"], ["1.23"])
-                held = gw.ledger.binance_spot_position_by_decision(1)
+                held = gw.ledger.binance_spot_position_by_decision(147841)
                 assert held is not None
                 self.assertEqual(held["residual_qty"], "0.009")
                 self.assertEqual(held["status"], "oco_working")
@@ -219,21 +232,19 @@ class SizeChainTests(unittest.TestCase):
         with mock.patch.dict(os.environ, _env(self.root, "1000")):
             gw, receipt = self._publish_and_run("1000")
             try:
-                self.assertEqual(receipt["executed"], 1, receipt)
+                self.assertEqual(receipt["executed"], 0, receipt)
+                self.assertFalse(receipt["exec_result"]["consumer_allowed"])
                 stopped = tick_live_bnb_exits(
                     gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "98"}
                 )
             finally:
                 gw.__exit__(None, None, None)
-        self.assertEqual(stopped[0]["reason"], "stop_loss", stopped[0])
-        self.assertTrue(stopped[0]["submitted"], stopped[0])
-        self.assertEqual(stopped[0]["protection"], "loop_fallback")
+        self.assertFalse(stopped[0]["submitted"], stopped[0])
+        self.assertEqual(stopped[0]["position_status"], "oco_failed")
         self.assertNotEqual(stopped[0]["protection"], "exchange_oco")
-        sell = parse_qs(
-            next(c[1] for c in self.client.calls if c[0] == "new_order" and "side=SELL" in c[1])
+        self.assertFalse(
+            any(c[0] == "new_order" and "side=SELL" in c[1] for c in self.client.calls)
         )
-        self.assertEqual(sell["quantity"], ["1.23"])
-        self.assertEqual(sell["type"], ["MARKET"])
 
 
 if __name__ == "__main__":

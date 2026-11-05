@@ -51,8 +51,30 @@ _INFO = {
             "stepSize": "0.001",
         },
         {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": True},
+        {
+            "filterType": "PRICE_FILTER",
+            "minPrice": "0.01",
+            "maxPrice": "1000000",
+            "tickSize": "0.01",
+        },
     ],
 }
+
+
+def _working_oco() -> dict[str, Any]:
+    return {
+        "orderListId": 42,
+        "listOrderStatus": "EXECUTING",
+        "listStatusType": "EXEC_STARTED",
+        "orders": [
+            {"orderId": 11},
+            {"orderId": 10},
+        ],
+        "orderReports": [
+            {"orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "executedQty": "0"},
+            {"orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "executedQty": "0"},
+        ],
+    }
 
 
 class _Client:
@@ -78,6 +100,14 @@ class _Client:
                 "executedQty": "1.239",
             }
         return {"orderId": "77", "status": "FILLED"}
+
+    def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("new_oco", signed_query, api_key))
+        return _working_oco()
+
+    def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("get_order_list", signed_query, api_key))
+        return _working_oco()
 
     def ticker_price(self, symbol: str) -> dict[str, Any]:
         raise AssertionError(f"ticker must not be fetched when a mark was given ({symbol})")
@@ -169,6 +199,14 @@ class ProtectiveExitTests(unittest.TestCase):
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot={
+                "accountType": "SPOT",
+                "canTrade": True,
+                "permissions": ["SPOT"],
+                "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+            },
+            production_book="rest_api_key",
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
         )
 
     def tearDown(self) -> None:
@@ -214,40 +252,24 @@ class ProtectiveExitTests(unittest.TestCase):
             with self._gateway() as gw:
                 opened = gw.process_one(_decision_row())
                 held = opened["receipt"]["held_position"]
-                self.assertEqual(held["status"], "open")
-                self.assertEqual(held["quantity"], "1.239")
-                self.assertEqual(held["protection"], "held_position_exit")
+                self.assertEqual(held["status"], "oco_working")
+                self.assertEqual(held["protection"], "exchange_oco")
                 self.assertEqual(held["stop_price"], "99")
                 self.assertEqual(held["take_profit_price"], "110")
+                self.assertEqual(opened["executed"], 1)
                 buy = _signed_form(self.client.calls[1][1])
                 self.assertEqual(buy["side"], ["BUY"])
                 self.assertNotIn("stopPrice", buy)
                 self.assertNotIn("STOP_LOSS", self.client.calls[1][1])
-                with mock.patch(
-                    "execution.executors.binance_spot.protective_exit_reason",
-                    wraps=protective_exit_reason,
-                ) as spy:
-                    # 98 is above a 5% stop from 102 (96.9) and at/under the plan stop.
-                    exits = tick_live_bnb_exits(
-                        gw,
-                        frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
-                        {"BNBUSDT": "98"},
-                    )
-                self.assertGreaterEqual(spy.call_count, 1)
-                self.assertEqual(exits[0]["reason"], "stop_loss")
-                self.assertTrue(exits[0]["submitted"], exits[0])
-                self.assertEqual(exits[0]["quantity"], "1.23")
-                self.assertEqual(exits[0]["position_status"], "exit_submitted")
-                sells = _sell_forms(self.client)
-                self.assertEqual(len(sells), 1)
-                self.assertEqual(sells[0]["type"], ["MARKET"])
-                self.assertEqual(sells[0]["quantity"], ["1.23"])
-                self.assertEqual(sells[0]["symbol"], ["BNBUSDT"])
-                self.assertEqual(sells[0]["newClientOrderId"], ["bnbfade-x-11"])
-                self.assertNotIn("quoteOrderQty", sells[0])
-                signed = next(
-                    call[1] for call in self.client.calls if call[0] == "new_order" and "side=SELL" in call[1]
+                exits = tick_live_bnb_exits(
+                    gw,
+                    frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
+                    {"BNBUSDT": "98"},
                 )
+                self.assertEqual(exits[0]["position_status"], "oco_working")
+                self.assertFalse(exits[0]["submitted"])
+                self.assertEqual(_sell_forms(self.client), [])
+                signed = next(call[1] for call in self.client.calls if call[0] == "new_oco")
                 body, signature = signed.rsplit("&signature=", 1)
                 expected = hmac.new(
                     b"test-secret", body.encode("utf-8"), hashlib.sha256
@@ -255,20 +277,25 @@ class ProtectiveExitTests(unittest.TestCase):
                 self.assertEqual(signature, expected)
                 self.assertNotIn("test-secret", signed)
                 self.assertNotIn("test-key", signed)
+                oco = _signed_form(signed)
+                self.assertEqual(oco["aboveType"], ["LIMIT_MAKER"])
+                self.assertEqual(oco["belowType"], ["STOP_LOSS_LIMIT"])
+                self.assertEqual(oco["side"], ["SELL"])
                 again = tick_live_bnb_exits(
                     gw,
                     frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
                     {"BNBUSDT": "50"},
                 )
-                self.assertEqual(again, [])
-                self.assertEqual(len(_sell_forms(self.client)), 1)
+                self.assertEqual(again[0]["position_status"], "oco_working")
+                self.assertEqual(_sell_forms(self.client), [])
                 row = gw.ledger.binance_spot_position_by_decision(11)
         self.assertIsNotNone(row)
         assert row is not None
-        self.assertEqual(row["status"], "exit_submitted")
-        self.assertEqual(row["exit_reason"], "stop_loss")
-        self.assertEqual(row["quantity"], "1.23")
-        self.assertEqual(row["exit_order_id"], "77")
+        self.assertEqual(row["status"], "oco_working")
+        self.assertEqual(row["protection"], "exchange_oco")
+        self.assertEqual(row["oco_order_list_id"], "42")
+        self.assertEqual(row["oco_above_order_id"], "11")
+        self.assertEqual(row["oco_below_order_id"], "10")
 
     def test_take_profit_uses_the_decision_mid_not_a_percent(self) -> None:
         env = _env(self.root, enabled="1")
@@ -281,17 +308,16 @@ class ProtectiveExitTests(unittest.TestCase):
                     frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
                     {"BNBUSDT": "109"},
                 )
-                self.assertEqual(quiet[0]["reason"], None)
                 self.assertFalse(quiet[0]["submitted"])
-                self.assertEqual(quiet[0]["position_status"], "open")
+                self.assertEqual(quiet[0]["position_status"], "oco_working")
                 hit = tick_live_bnb_exits(
                     gw,
                     frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
                     {"BNBUSDT": "110"},
                 )
-        self.assertEqual(hit[0]["reason"], "take_profit")
-        self.assertTrue(hit[0]["submitted"])
-        self.assertEqual(_sell_forms(self.client)[-1]["quantity"], ["1.23"])
+        self.assertEqual(hit[0]["position_status"], "oco_working")
+        self.assertFalse(hit[0]["submitted"])
+        self.assertEqual(_sell_forms(self.client), [])
 
     def test_kill_switch_still_allows_the_ledger_protective_sell(self) -> None:
         kill = self.root / "LIVE_TRADING_DISABLED"
@@ -385,7 +411,7 @@ class ProtectiveExitTests(unittest.TestCase):
                 sized = tick_live_bnb_exits(
                     gw,
                     frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
-                    {"BNBUSDT": "98"},
+                    {"BNBUSDT": "100"},
                 )
         dust_exit = next(item for item in sized if item["decision_log_id"] == 21)
         self.assertEqual(dust_exit["error"], "dust_untradable")
@@ -417,6 +443,7 @@ class ProtectiveExitTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             with self._gateway() as gw:
                 opened = gw.process_one(_decision_row())
+                self.assertEqual(opened["executed"], 0)
                 self.assertEqual(opened["receipt"]["held_position"]["status"], "qty_unconfirmed")
                 exits = tick_live_bnb_exits(
                     gw,
@@ -424,43 +451,34 @@ class ProtectiveExitTests(unittest.TestCase):
                     {"BNBUSDT": "98"},
                 )
                 row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertEqual(exits[0]["reason"], "stop_loss")
-        self.assertTrue(exits[0]["submitted"], exits[0])
-        self.assertEqual(exits[0]["quantity"], "1.23")
-        self.assertEqual(exits[0]["position_status"], "exit_submitted")
+        self.assertEqual(exits[0]["position_status"], "oco_failed")
+        self.assertEqual(exits[0]["error"], "oco_price_restriction")
+        self.assertFalse(exits[0]["submitted"])
+        self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
         assert row is not None
-        self.assertEqual(row["status"], "exit_submitted")
-        kinds = [call[0] for call in self.client.calls]
-        self.assertEqual(kinds, ["exchange_info", "new_order", "get_order", "exchange_info", "new_order"])
-        self.assertIn("orderId=99", self.client.calls[2][1])
-        self.assertEqual(len(_sell_forms(self.client)), 1)
+        self.assertEqual(row["status"], "oco_failed")
+        self.assertIn("orderId=99", next(call[1] for call in self.client.calls if call[0] == "get_order"))
+        self.assertEqual(_sell_forms(self.client), [])
 
     def test_http_failure_keeps_the_position_open_and_retries_one_client_id(self) -> None:
         self.client = _Client(fail_sells=1)
         self.adapter.client = self.client
         env = _env(self.root, enabled="1")
+        position = {
+            "id": 1,
+            "decision_log_id": 11,
+            "symbol": "BNBUSDT",
+            "status": "open",
+            "quantity": "1.239",
+            "stop_price": "99",
+            "take_profit_price": "110",
+        }
         with mock.patch.dict(os.environ, env):
-            with self._gateway() as gw:
-                gw.process_one(_decision_row())
-                failed = tick_live_bnb_exits(
-                    gw,
-                    frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
-                    {"BNBUSDT": "98"},
-                )
-                self.assertFalse(failed[0]["submitted"])
-                self.assertEqual(failed[0]["error"], "binance_http_error:500")
-                self.assertEqual(failed[0]["position_status"], "open")
-                row = gw.ledger.binance_spot_position_by_decision(11)
-                assert row is not None
-                self.assertEqual(row["status"], "open")
-                self.assertEqual(row["last_error"], "binance_http_error:500")
-                retried = tick_live_bnb_exits(
-                    gw,
-                    frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
-                    {"BNBUSDT": "98"},
-                )
-                self.assertTrue(retried[0]["submitted"], retried[0])
-                self.assertEqual(retried[0]["position_status"], "exit_submitted")
+            failed = self.adapter.exit_held_position(position, "98")
+            retried = self.adapter.exit_held_position(position, "98")
+        self.assertFalse(failed["submitted"])
+        self.assertEqual(failed["error"], "binance_http_error:500")
+        self.assertTrue(retried["submitted"], retried)
         sells = _sell_forms(self.client)
         self.assertEqual(len(sells), 2)
         self.assertEqual(sells[0]["newClientOrderId"], ["bnbfade-x-11"])

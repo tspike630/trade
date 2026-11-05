@@ -200,7 +200,7 @@ class LiveBnbDispatchTests(unittest.TestCase):
                         ),
                     }
                 )
-        self.assertEqual(missing["receipt"]["gate_reason"], "canonical_fet_missing")
+        self.assertEqual(missing["receipt"]["gate_reason"], "protection_tool_absent")
         self.assertEqual(missing["executed"], 0)
         self.assertEqual(missing["exec_result"]["parent_calls"], [])
         self.assertEqual(other["executed"], 0)
@@ -227,6 +227,14 @@ class LiveBnbDispatchTests(unittest.TestCase):
             api_key="sentinelsecret-not-read",
             api_secret="sentinelsecret-not-read",
             clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot={
+                "accountType": "SPOT",
+                "canTrade": True,
+                "permissions": ["SPOT"],
+                "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+            },
+            production_book="rest_api_key",
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
         )
         with mock.patch.dict(os.environ, self.env, clear=False):
             result = adapter.execute(
@@ -239,6 +247,10 @@ class LiveBnbDispatchTests(unittest.TestCase):
                         "binance_symbol": "FETUSDT",
                         "quote_order_qty": "25",
                         "order_type": "MARKET",
+                        "price_usd": "0.16",
+                        "stop_price": "0.14",
+                        "take_profit_price": "0.20",
+                        "entry_reason": "large_trade_market",
                     },
                 }
             )

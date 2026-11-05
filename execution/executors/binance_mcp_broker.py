@@ -26,6 +26,7 @@ from execution.executors.binance_spot import (
     _to_decimal,
     floor_base_qty,
 )
+from execution.executors.binance_spot_gate import replay_block
 
 GateExpr = Literal[
     "original_api_key",
@@ -69,6 +70,7 @@ _BLOCK_REASONS = frozenset(
         "naked_holds_new_buys",
         "protection_tool_absent",
         "buy_unreleased",
+        "historical_client_replay",
     }
 )
 
@@ -233,6 +235,8 @@ def reconcile_block(
         return None
     if client_order_id and client_order_id in _spent_clients(book):
         return "spent_client_order"
+    if replay_block(None, client_order_id):
+        return "historical_client_replay"
     if _naked_rows(book):
         return "naked_holds_new_buys"
     return None

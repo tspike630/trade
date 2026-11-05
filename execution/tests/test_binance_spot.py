@@ -296,27 +296,12 @@ class AdapterTests(unittest.TestCase):
         adapter = self._adapter(client, kill_exists=False)
         with mock.patch.dict(os.environ, _env(self.root, enabled="1", kill_exists=False)):
             result = adapter.execute(_sig(mode="live_stub"))
-        self.assertTrue(result["ok"], result)
-        self.assertFalse(result["dry_run"])
-        self.assertEqual(result["executed"], 1)
-        self.assertTrue(result["submitted"])
-        self.assertEqual(result["exchange_order_id"], "55")
-        self.assertEqual(client.calls[0][0], "exchange_info")
-        kind, signed, api_key = client.calls[1]
-        self.assertEqual(kind, "new_order")
-        self.assertEqual(api_key, "test-key")
-        query, _, signature = signed.rpartition("&signature=")
-        expected = hmac.new(
-            b"test-secret",
-            query.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        self.assertEqual(signature, expected)
-        self.assertIn("symbol=BTCUSDT", query)
-        self.assertIn("side=BUY", query)
-        self.assertIn("type=MARKET", query)
-        self.assertIn("quoteOrderQty=25", query)
-        self.assertNotIn("test-secret", signed)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["executed"], 0)
+        self.assertFalse(result["submitted"])
+        self.assertFalse(result["consumer_allowed"])
+        self.assertEqual(result["error"], "missing_exit_prices")
+        self.assertEqual(client.calls, [])
         self.assertNotIn("test-secret", json.dumps(result))
 
     def test_limit_sell_and_not_trading(self) -> None:
@@ -545,12 +530,10 @@ class GatewayHookTests(unittest.TestCase):
                 live = gw.process_one(
                     _decision_row(mode="live_stub", decision_log_id=8)
                 )
-        self.assertEqual(live["executed"], 1, live)
+        self.assertEqual(live["executed"], 0, live)
         self.assertEqual(live["executor"], BINANCE_SPOT_EXECUTOR)
-        self.assertEqual(live["receipt"]["status"], "binance_spot_submitted")
-        self.assertEqual(live["exec_result"]["exchange_order_id"], "99")
-        self.assertEqual(live_client.calls[0][0], "exchange_info")
-        self.assertEqual(live_client.calls[1][0], "new_order")
+        self.assertEqual(live["error"], "missing_exit_prices")
+        self.assertEqual(live_client.calls, [])
         self.assertEqual(paper.calls, [])
 
     def test_paper_peer_and_frozen_onchain_purpose_stay_off_the_adapter(self) -> None:
@@ -842,19 +825,13 @@ class DynamicExitPlanTests(unittest.TestCase):
             result = adapter.execute(
                 _sig(mode="live_stub", token_address="BNBUSDT", extras=extras)
             )
-        self.assertTrue(result["ok"], result)
-        self.assertTrue(result["submitted"])
-        self.assertEqual(result["order"]["type"], "MARKET")
-        self.assertNotIn("stopPrice", result["order"])
-        self.assertNotIn("stop_price", result["order"])
-        self.assertFalse(result["exit_plan"]["submitted"])
-        self.assertEqual(result["exit_plan"]["protective_order"], "not_supported_not_sent")
-        kinds = [call[0] for call in client.calls]
-        self.assertEqual(kinds, ["exchange_info", "new_order"])
-        _kind, signed, _key = client.calls[1]
-        self.assertNotIn("stopPrice", signed)
-        self.assertNotIn("STOP_LOSS", signed)
-        self.assertNotIn("TAKE_PROFIT", signed)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["executed"], 0)
+        self.assertFalse(result["consumer_allowed"])
+        self.assertEqual(result["error"], "account_book_unselected")
+        self.assertEqual(client.calls, [])
+        self.assertNotIn("STOP_LOSS", json.dumps(result))
+        self.assertNotIn("TAKE_PROFIT", json.dumps(result))
 
     def test_gateway_receipt_carries_the_plan(self) -> None:
         paper = _RecordingPaper()

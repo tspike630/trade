@@ -13,8 +13,8 @@ CLI for execution management Step A/B/C.
   #     --accept-purpose race_rsi_bounce
   # Binance spot arm (still refuses live newOrder while LIVE_TRADING_DISABLED
   # is present or BINANCE_SPOT_LIVE_ENABLED is off). Not a paper peer.
-  # The same loop sells a filled long when its absolute stop or take-profit
-  # is touched. Dry-run does not arm that position.
+  # The same loop rests or reconciles a native OCO. It does not market-sell
+  # from a watched mark. Dry-run does not arm that position.
   #   python -m execution.run --loop \
   #     --ledger execution_ledger_live_bnb_boll_fade.db \
   #     --accept-purpose live_bnb_boll_fade

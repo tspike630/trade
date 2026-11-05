@@ -14,9 +14,10 @@ default off. Never calls LiveExecutor. Main decision DB is read-only.
 
 Purpose ``live_bnb_boll_fade`` (only when that purpose is on this process's
 allowlist) is handed to ``BinanceSpotAdapter`` instead of PaperExecutor.
-The adapter refuses a live spot ``newOrder`` while the kill-switch file is
-present or ``BINANCE_SPOT_LIVE_ENABLED`` is off. ``mode=dry_run`` never
-submits. No other purpose can reach that adapter.
+The adapter refuses a live BUY while the kill-switch file is present or
+``BINANCE_SPOT_LIVE_ENABLED`` is off. A completed BUY requires a verified
+native OCO. ``mode=dry_run`` never submits. No other purpose can reach
+that adapter.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from execution.config import (
     EXECUTION_MAX_OPEN,
     EXECUTION_RISK_ENABLED,
 )
+from execution.executors.binance_spot_gate import consumer_read_cursor
 from execution.executors.binance_spot import (
     EXECUTOR_NAME as BINANCE_SPOT_EXECUTOR,
     PURPOSE_LIVE_BNB_BOLL_FADE,
@@ -157,6 +159,13 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
         ),
         "size_plan": (
             result.get("size_plan") if isinstance(result.get("size_plan"), dict) else None
+        ),
+        "consumer_allowed": result.get("consumer_allowed") is True,
+        "arm_position": (
+            result.get("arm_position") if isinstance(result.get("arm_position"), dict) else None
+        ),
+        "oco_fields": (
+            result.get("oco_fields") if isinstance(result.get("oco_fields"), dict) else None
         ),
     }
 
@@ -1079,6 +1088,39 @@ class ExecutionGateway:
             "receipt": receipt_body,
         }
 
+    def _arm_binance_position(
+        self,
+        sig: dict[str, Any],
+        exec_result: dict[str, Any],
+        receipt_body: dict[str, Any],
+    ) -> None:
+        held = held_position_spec(sig, exec_result)
+        if held is None:
+            return
+        try:
+            armed = self.ledger.arm_binance_spot_position(held)
+            oco_fields = exec_result.get("oco_fields")
+            if isinstance(oco_fields, dict) and oco_fields and armed.get("id") is not None:
+                updated = self.ledger.update_binance_spot_position(int(armed["id"]), oco_fields)
+                if isinstance(updated, dict):
+                    armed = updated
+        except Exception:  # noqa: BLE001 — a sent order must still leave a receipt
+            log.exception(
+                "binance spot position arm failed decision_log_id=%s",
+                sig.get("decision_log_id"),
+            )
+            receipt_body["held_position_error"] = "arm_failed"
+            return
+        receipt_body["held_position"] = {
+            "status": armed.get("status"),
+            "quantity": armed.get("quantity"),
+            "symbol": armed.get("symbol"),
+            "protection": armed.get("protection"),
+            "stop_price": armed.get("stop_price"),
+            "take_profit_price": armed.get("take_profit_price"),
+        }
+        exec_result["held_position"] = receipt_body["held_position"]
+
     def process_one(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         sig: dict[str, Any] | None = None
         try:
@@ -1174,10 +1216,10 @@ class ExecutionGateway:
             executor = BINANCE_SPOT_EXECUTOR
             executed = 0
             submitted_to_executor = False
-            if active:
+            if active and action != "sell":
                 exec_error = f"kill_switch:{kill_name}"
                 receipt_body["status"] = "live_refused"
-                receipt_body["note"] = "kill switch before the live_bnb gate"
+                receipt_body["note"] = "kill switch blocks a new buy"
                 receipt_body["error"] = exec_error
             else:
                 transport = self._mcp_transport
@@ -1215,6 +1257,11 @@ class ExecutionGateway:
             # itself keeps live newOrder behind the kill switch.
             adapter = self._binance_spot or BinanceSpotAdapter()
             self._binance_spot = adapter
+            if action == "buy" and mode != "dry_run":
+                adapter.buy_blocks = self.ledger.list_binance_spot_buy_blocks()
+                book = self.ledger.mcp_book()
+                canonical = book.get("canonical_positions")
+                adapter.canonical_rows = canonical if isinstance(canonical, list) else []
             exec_result = _binance_public_result(adapter.execute(sig))
             executor = BINANCE_SPOT_EXECUTOR
             submitted_to_executor = bool(exec_result.get("submitted"))
@@ -1232,31 +1279,18 @@ class ExecutionGateway:
                     receipt_body["status"] = "dry_run_rejected"
                     receipt_body["note"] = "binance spot dry-run rejected; newOrder not called"
                     receipt_body["error"] = exec_error
-            elif exec_result.get("ok") and int(exec_result.get("executed") or 0) == 1:
+            elif (
+                exec_result.get("consumer_allowed") is True
+                and exec_result.get("ok")
+                and int(exec_result.get("executed") or 0) == 1
+            ):
                 executed = 1
                 receipt_body["status"] = "binance_spot_submitted"
-                receipt_body["note"] = "binance spot newOrder accepted by client"
-                held = held_position_spec(sig, exec_result)
-                if held is not None:
-                    try:
-                        armed = self.ledger.arm_binance_spot_position(held)
-                    except Exception:  # noqa: BLE001 — fill already happened
-                        log.exception(
-                            "binance spot position arm failed decision_log_id=%s",
-                            sig.get("decision_log_id"),
-                        )
-                        receipt_body["held_position_error"] = "arm_failed"
-                    else:
-                        receipt_body["held_position"] = {
-                            "status": armed.get("status"),
-                            "quantity": armed.get("quantity"),
-                            "symbol": armed.get("symbol"),
-                            "protection": armed.get("protection"),
-                            "stop_price": armed.get("stop_price"),
-                            "take_profit_price": armed.get("take_profit_price"),
-                        }
-                        exec_result["held_position"] = receipt_body["held_position"]
+                receipt_body["note"] = "binance spot buy covered by a verified native OCO"
+                self._arm_binance_position(sig, exec_result, receipt_body)
             else:
+                if exec_result.get("arm_position"):
+                    self._arm_binance_position(sig, exec_result, receipt_body)
                 executed = 0
                 exec_error = str(exec_result.get("error") or "binance_spot_refused")
                 receipt_body["status"] = "live_refused"
@@ -1358,10 +1392,11 @@ class ExecutionGateway:
         ``since_id`` only changes which rows this call reads. The persisted
         cursor moves forward with MAX and is not rewound when since_id is lower.
         """
-        cursor = (
-            int(since_id)
-            if since_id is not None
-            else self.ledger.get_last_processed_id()
+        persisted = self.ledger.get_last_processed_id()
+        cursor = consumer_read_cursor(
+            persisted=persisted,
+            since_id=since_id,
+            live_arm=self.accept_purposes == frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
         )
         rows = self.fetch_pending(cursor, limit=limit)
         stats = ProcessStats()
@@ -1441,10 +1476,8 @@ class ExecutionGateway:
                     if isinstance(saved_qty, dict) and saved_qty.get("status") == "open":
                         row = saved_qty
             symbol = str(row.get("symbol") or "")
-            if marks is not None:
-                mark = marks.get(symbol) if symbol in marks else None
-            elif row.get("status") in {"open", "oco_working", "oco_unknown"}:
-                mark = adapter.mark_price(symbol)
+            if marks is not None and symbol in marks:
+                mark = marks.get(symbol)
             else:
                 mark = None
             position_id = int(row["id"])

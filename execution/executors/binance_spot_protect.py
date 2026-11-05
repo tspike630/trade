@@ -7,15 +7,13 @@ base fill, protection is a resting ``POST /api/v3/orderList/oco`` sell:
 - below leg ``STOP_LOSS_LIMIT`` triggered at the absolute stop, limit one
   tick below that stop so the stop can fill
 
-That OCO stays on Binance if this process is down. The loop is the fallback
-only when the exchange has positively rejected the list, or the list is
-terminal and unfilled. A timeout is not treated as rejection and does not
-market-sell over a list that may already be resting.
+That OCO stays on Binance if this process is down. A timeout is not treated
+as rejection. This process does not watch a mark and market-sell in its place.
 
-``LIVE_TRADING_DISABLED`` blocks new buys and inbound sell signals. It does
-not block a ledger-tracked protective sell unless
-``BINANCE_SPOT_BLOCK_SELL_ON_KILL=1``. ``BINANCE_SPOT_LIVE_ENABLED`` still
-has to be on before any order or signed read. Dry-run never calls HTTP.
+``LIVE_TRADING_DISABLED`` blocks a new buy only. It does not block a
+ledger-tracked protective sell unless ``BINANCE_SPOT_BLOCK_SELL_ON_KILL=1``.
+``BINANCE_SPOT_LIVE_ENABLED`` still has to be on before any order or signed
+read. Dry-run never calls HTTP.
 """
 
 from __future__ import annotations
