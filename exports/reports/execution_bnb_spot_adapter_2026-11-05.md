@@ -66,7 +66,9 @@ OCO 请求是 `POST /api/v3/orderList/oco`：`side=SELL`，`quantity` 为成交 
 
 `LIVE_TRADING_DISABLED` 挡住新的买入，也挡住决策流里自己送进来的卖出。账本跟踪的保护卖出（OCO 或 fallback 市价）在杀开关打开时仍可发。`BINANCE_SPOT_BLOCK_SELL_ON_KILL=1` 连这些保护卖出也停。`BINANCE_SPOT_LIVE_ENABLED` 默认关，关着时不发单、不签请求。干跑不发 HTTP。
 
-计划买入名义（`quote_order_qty`，或数量乘信号价）低于 20 USDT 拒绝。这是 viability 地板，不是每日软顶，也不改订单数量。再对照符号的 `LOT_SIZE` / `minNotional`，并用默认 10 bps（`BINANCE_SPOT_TAKER_FEE_BPS`）估计扣费后的 base 还够不够最小下单量。估不出来就不改数量。
+计划买入名义低于 20 USDT 拒绝。这是 viability 地板，不是每日软顶，也不改订单数量。策略只给 `size_pct` 时，名义是 `size_pct * BINANCE_SPOT_BOOK_USDT`（操作者设的账面，不是钱包余额）。没设账面就 `missing_book_usdt`，不猜一笔数量。显式 `quote_order_qty` / `quantity` 优先。再对照符号的 `LOT_SIZE` / `minNotional`，并用默认 10 bps（`BINANCE_SPOT_TAKER_FEE_BPS`）估计扣费后的 base 还够不够最小下单量。估不出来就不改数量。
+
+生产看门狗是 `scripts/live_bnb_execution_watchdog.sh`。它只拉起这一条臂的 `execution.run --loop`，单实例，子进程退出后最多 3 秒再拉。杀开关还在、`BINANCE_SPOT_LIVE_ENABLED` 不是开、没有密钥、或没有账面，它拒绝启动，并且不改这些开关、不删文件、不把密钥写进命令行。`scripts/live_bnb_watchdog_dry.sh` 只会做同一套预检，不能进入 supervise。
 
 取整灰尘和整笔都低于步长或最小名义的，返回 `dust_untradable`，归档为 `closed_dust` / `exit_reason=dust_abandon`。不在这里做 BNB 小额转换。本仓库不装 systemd，也不做进程看门狗。
 

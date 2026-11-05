@@ -873,12 +873,47 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     entry_notional_floor_error,
     entry_viability_error,
     is_request_timeout,
+    ENTRY_MIN_NOTIONAL_USDT,
+    resolve_entry_size,
     oco_is_working,
     oco_leg_ids,
     protective_order_block,
     sellable_base_qty,
     tracked_exit,
 )
+
+
+def _floor_limit_quantity(
+    info: dict[str, Any],
+    symbol: str,
+    extras: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Floor a size_pct limit buy onto LOT_SIZE. Does not read a balance."""
+    filters = _symbol_filters(info, symbol)
+    if not filters:
+        return None, "entry_not_viable:missing_lot_filter"
+    lot = _filter_row(filters, "LOT_SIZE")
+    step = None if lot is None else _to_decimal(lot.get("stepSize"))
+    if lot is None or step is None:
+        return None, "entry_not_viable:missing_lot_filter"
+    floored = floor_base_qty(extras.get("quantity"), _decimal_text(step))
+    if floored is None:
+        return None, "entry_not_viable:below_min_qty"
+    floored_n = _to_decimal(floored)
+    min_qty = _to_decimal(lot.get("minQty"))
+    if floored_n is None or (min_qty is not None and floored_n < min_qty):
+        return None, "entry_not_viable:below_min_qty"
+    price = _to_decimal(extras.get("limit_price"))
+    if price is None:
+        price = _to_decimal(extras.get("price"))
+    min_notional = _min_notional(filters)
+    if floored_n is not None and price is not None:
+        notion = floored_n * price
+        if notion < ENTRY_MIN_NOTIONAL_USDT:
+            return None, "entry_notional_below_min"
+        if min_notional is not None and notion < min_notional:
+            return None, "entry_not_viable:below_min_notional"
+    return floored, None
 
 
 class BinanceSpotAdapter:
@@ -900,6 +935,7 @@ class BinanceSpotAdapter:
         self.api_secret = api_secret
         self.clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self.dry_run = dry_run
+        self._size_plan: dict[str, Any] | None = None
 
     def _credentials(self) -> tuple[str, str]:
         key = (self.api_key if self.api_key is not None else _env_secret(API_KEY_ENV)).strip()
@@ -918,6 +954,7 @@ class BinanceSpotAdapter:
         }
 
     def execute(self, sig: dict[str, Any]) -> dict[str, Any]:
+        self._size_plan = None
         gates = self._gates()
         purpose = str(sig.get("purpose") or "").strip()
         if purpose != PURPOSE_LIVE_BNB_BOLL_FADE:
@@ -938,6 +975,7 @@ class BinanceSpotAdapter:
         extras = sig.get("extras")
         if not isinstance(extras, dict):
             extras = {}
+        mode = str(sig.get("mode") or "").strip().lower()
         raw_symbol = extras.get("binance_symbol")
         if raw_symbol is None or (isinstance(raw_symbol, str) and not raw_symbol.strip()):
             return self._finish(
@@ -985,7 +1023,6 @@ class BinanceSpotAdapter:
                 )
             )
 
-        mode = str(sig.get("mode") or "").strip().lower()
         plan, plan_error = build_exit_plan(sig, extras)
         if plan_error:
             return self._finish(
@@ -1002,6 +1039,24 @@ class BinanceSpotAdapter:
                 )
             )
         forced_dry = self.dry_run is True or mode == DRY_MODE
+        extras, size_error, self._size_plan = resolve_entry_size(
+            sig, extras, require_book=not forced_dry
+        )
+        if size_error:
+            return self._finish(
+                _result(
+                    ok=False,
+                    dry_run=forced_dry,
+                    executed=0,
+                    submitted=False,
+                    error=size_error,
+                    symbol=symbol,
+                    order=None,
+                    exchange_order_id=None,
+                    gates=gates,
+                    exit_plan=plan,
+                )
+            )
         if forced_dry:
             if str(sig.get("action") or "").strip().lower() == "buy":
                 floor_error = entry_notional_floor_error(extras)
@@ -1194,6 +1249,43 @@ class BinanceSpotAdapter:
                         exit_plan=plan,
                     )
                 )
+            if isinstance(self._size_plan, dict) and self._size_plan.get("needs_lot_floor"):
+                floored, floor_err = _floor_limit_quantity(info, symbol, extras)
+                if floor_err or floored is None:
+                    return self._finish(
+                        _result(
+                            ok=False,
+                            dry_run=False,
+                            executed=0,
+                            submitted=False,
+                            error=floor_err or "entry_not_viable:below_min_qty",
+                            symbol=symbol,
+                            order=None,
+                            exchange_order_id=None,
+                            gates=gates,
+                            exit_plan=plan,
+                        )
+                    )
+                extras = dict(extras)
+                extras["quantity"] = floored
+                self._size_plan = dict(self._size_plan)
+                self._size_plan["quantity"] = floored
+                pairs, qty_error = self._preview_pairs(sig, extras, symbol)
+                if qty_error or pairs is None:
+                    return self._finish(
+                        _result(
+                            ok=False,
+                            dry_run=False,
+                            executed=0,
+                            submitted=False,
+                            error=qty_error or "missing_order_qty",
+                            symbol=symbol,
+                            order=None,
+                            exchange_order_id=None,
+                            gates=gates,
+                            exit_plan=plan,
+                        )
+                    )
 
         signed = sign_query(pairs, secret)
         try:
@@ -2115,6 +2207,13 @@ class BinanceSpotAdapter:
         return outcome
 
     def _finish(self, result: dict[str, Any]) -> dict[str, Any]:
+        plan = getattr(self, "_size_plan", None)
+        if isinstance(plan, dict):
+            result["size_plan"] = {
+                key: value
+                for key, value in plan.items()
+                if key != "needs_lot_floor"
+            }
         log.info(
             "binance_spot symbol=%s dry_run=%s ok=%s submitted=%s error=%s",
             result.get("symbol"),

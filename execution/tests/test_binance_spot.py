@@ -135,6 +135,7 @@ def _env(root: Path, *, enabled: str, kill_exists: bool) -> dict[str, str]:
         "LIVE_EXCHANGE_API_KEY": "",
         "LIVE_EXCHANGE_API_SECRET": "",
         "BINANCE_SPOT_API_BASE": "https://api.binance.test",
+        "BINANCE_SPOT_BOOK_USDT": "",
     }
 
 
@@ -249,7 +250,7 @@ class AdapterTests(unittest.TestCase):
                     extras={"binance_symbol": "BTCUSDT", "market": "spot"},
                 )
             )
-        self.assertEqual(result["error"], "missing_order_qty")
+        self.assertEqual(result["error"], "missing_book_usdt")
         self.assertEqual(result["executed"], 0)
         self.assertEqual(client.calls, [])
 
