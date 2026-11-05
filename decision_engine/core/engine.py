@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine.core.binance_indicators import (
+    binance_indicators_ready,
+    list_binance_hot_tokens,
+    resolve_live_bnb_factor_source,
+)
 from decision_engine.core.bnb_spot_map import (
     default_listing_db_paths,
     load_binance_spot_usdt_symbols,
@@ -54,13 +60,15 @@ class DecisionEngine:
         n_ind = self.adapter.count_indicators()
         hot = self.adapter.list_hot_tokens(limit=self.hot_limit)
         bnb_spot = self.bus.purpose == PURPOSE_LIVE_BNB_BOLL_FADE
+        bnb_source: str | None = None
         if bnb_spot:
-            hot = self._map_bnb_spot_universe(hot)
+            hot, bnb_source = self._load_live_bnb_hot(hot)
         log.info(
-            "tick#%s indicators_total=%s hot_loaded=%s strategies=%s",
+            "tick#%s indicators_total=%s hot_loaded=%s bnb_factor_source=%s strategies=%s",
             self.tick_count,
             n_ind,
             len(hot),
+            bnb_source or "-",
             [s.strategy_id for s in self.strategies],
         )
         data = {
@@ -108,6 +116,7 @@ class DecisionEngine:
                 candidates=0,
                 emitted=0,
                 entry_ih_rejected=entry_ih_rejected,
+                bnb_factor_source=bnb_source,
             )
 
         # Shared buy choke point: every strategy's candidates pass through
@@ -131,6 +140,7 @@ class DecisionEngine:
             candidates=len(candidates),
             emitted=len(emitted),
             entry_ih_rejected=entry_ih_rejected,
+            bnb_factor_source=bnb_source,
         )
 
     def _tick_payload(
@@ -141,6 +151,7 @@ class DecisionEngine:
         candidates: int,
         emitted: int,
         entry_ih_rejected: dict[str, int] | None,
+        bnb_factor_source: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "tick": self.tick_count,
@@ -151,7 +162,36 @@ class DecisionEngine:
         }
         if entry_ih_rejected is not None:
             payload["entry_ih_rejected"] = entry_ih_rejected
+        if bnb_factor_source is not None:
+            payload["bnb_factor_source"] = bnb_factor_source
         return payload
+
+    def _load_live_bnb_hot(
+        self, dex_hot: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Primary book is ``binance_indicators``. DEX∩listing map is the bypass.
+
+        ``auto`` (default): use the side table once it exists, even if this
+        pass is empty. Fall back to the DEX map only when the table was never
+        created. ``binance`` never fills from DEX. ``dex_map`` keeps the old
+        intersection.
+        """
+        source = resolve_live_bnb_factor_source(os.environ.get("LIVE_BNB_FACTOR_SOURCE"))
+        ready = binance_indicators_ready(self.adapter.conn)
+        if source == "dex_map" or (source == "auto" and not ready):
+            log.info(
+                "bnb_factor_source=dex_map requested=%s binance_indicators=%s",
+                source,
+                "yes" if ready else "no",
+            )
+            return self._map_bnb_spot_universe(dex_hot), "dex_map"
+        rows = list_binance_hot_tokens(self.adapter.conn, limit=self.hot_limit)
+        log.info(
+            "bnb_factor_source=binance_indicators requested=%s rows=%s",
+            source,
+            len(rows),
+        )
+        return rows, "binance_indicators"
 
     def _map_bnb_spot_universe(self, hot: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Replace the scan set with listed Binance spot USDT names.

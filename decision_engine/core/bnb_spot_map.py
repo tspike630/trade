@@ -1,9 +1,11 @@
-"""Map overlapping DEX hot-token bases onto Binance spot USDT symbols.
+"""Optional DEX hot-token ∩ Binance listing map for ``live_bnb_boll_fade``.
 
-Used only when the run purpose is ``live_bnb_boll_fade``. The boll-fade
-formula is not applied here. Rows that do not resolve to a listed spot
-``BASEUSDT`` market are dropped so a Solana mint is never written as the
-fill id for that purpose.
+The primary book for that purpose is ``binance_indicators`` (spot klines).
+This module remains the bypass when ``LIVE_BNB_FACTOR_SOURCE=dex_map``, or
+when ``auto`` and the side table has not been created yet. It does not
+recompute tech_boll factors; mapped rows keep the DEX fields they arrived
+with. Rows that do not resolve to a listed spot ``BASEUSDT`` market are
+dropped so a Solana mint is never written as the fill id.
 
 Listing membership is read from local SQLite only (``cex_listing_events``
 and the ccxt side tables). No exchange client and no API key.
