@@ -53,6 +53,21 @@ python -m execution.run --loop \
 
 ## 持仓保护（仍不打开实盘）
 
-入场 `newOrder` 不附带 OCO / STOP_LOSS_LIMIT，回执仍是 `protective_order=not_supported_not_sent`。上面这个循环在处理新决策之后，会对本账本里已成交的多单调用 `protective_exit_reason`。入场回执没有 base `executedQty` 时先记成未确认，下一拍在闸打开的情况下用入场 `orderId` 再读一次；读到数量才允许卖。标记价触及绝对止损，或触及下单时记下的止盈（决策当时的 `boll_mid`），就按该符号的 LOT_SIZE / MARKET_LOT_SIZE 向下取整，市价卖出全部 base 数量。取整后低于最小数量或最小名义，不发单，仓位保持 open。卖单被拒或 HTTP 失败也不改成已平，下一拍用同一个 `bnbfade-x-<decision_log_id>` 再试，避免换号打出第二笔。干跑不记仓。杀开关文件还在，或 `BINANCE_SPOT_LIVE_ENABLED` 不是开，保护卖单同样不发。进程停着的时候，交易所上没有休息着的保护单。
+入场 `newOrder` 不附带 OCO，回执仍是 `protective_order=not_supported_not_sent`。两种覆盖不要写成同一件事：
+
+| `protection` | 意思 |
+|---|---|
+| `exchange_oco` | 交易所上有一张执行中的 OCO。进程停了，这张单还在。循环不再市价卖。 |
+| `oco_pending` | 已经打算下 OCO，或 POST 超时，还没确认列表。这个状态不是覆盖。先按 `origClientOrderId=<listClientOrderId>` 查 `GET /api/v3/orderList`，不在同一拍市价再卖。 |
+| `loop_fallback` | OCO 明确被拒，或列表结束且没有成交。循环才用绝对止损 / 决策当时的止盈做市价卖。 |
+| `dust_abandon` | 状态 `closed_dust`。剩余数量卖不掉，留下 `residual_qty` / `residual_quote`。不是 `exit_submitted`，也不再每拍重试。 |
+
+OCO 请求是 `POST /api/v3/orderList/oco`：`side=SELL`，`quantity` 为成交 base 按 `LOT_SIZE` 向下取整，`aboveType=LIMIT_MAKER`，`abovePrice` 为决策止盈，`belowType=STOP_LOSS_LIMIT`，`belowStopPrice` 为绝对止损，`belowPrice` 再低一个 tick，`belowTimeInForce=GTC`。数量不按未出现在成交回报里的手续费去改；只有 `fills` 写明佣金资产就是这个 base 时才从 `executedQty` 里减掉。
+
+`LIVE_TRADING_DISABLED` 挡住新的买入，也挡住决策流里自己送进来的卖出。账本跟踪的保护卖出（OCO 或 fallback 市价）在杀开关打开时仍可发。`BINANCE_SPOT_BLOCK_SELL_ON_KILL=1` 连这些保护卖出也停。`BINANCE_SPOT_LIVE_ENABLED` 默认关，关着时不发单、不签请求。干跑不发 HTTP。
+
+计划买入名义（`quote_order_qty`，或数量乘信号价）低于 20 USDT 拒绝。这是 viability 地板，不是每日软顶，也不改订单数量。再对照符号的 `LOT_SIZE` / `minNotional`，并用默认 10 bps（`BINANCE_SPOT_TAKER_FEE_BPS`）估计扣费后的 base 还够不够最小下单量。估不出来就不改数量。
+
+取整灰尘和整笔都低于步长或最小名义的，返回 `dust_untradable`，归档为 `closed_dust` / `exit_reason=dust_abandon`。不在这里做 BNB 小额转换。本仓库不装 systemd，也不做进程看门狗。
 
 有疑问：把 `LIVE_TRADING_DISABLED` 放回去，并取消 `BINANCE_SPOT_LIVE_ENABLED`。

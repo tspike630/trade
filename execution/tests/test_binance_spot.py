@@ -44,6 +44,21 @@ _TRADING = {
     "status": "TRADING",
     "quoteAsset": "USDT",
     "isSpotTradingAllowed": True,
+    "filters": [
+        {
+            "filterType": "LOT_SIZE",
+            "minQty": "0.00001",
+            "maxQty": "9000",
+            "stepSize": "0.00001",
+        },
+        {
+            "filterType": "PRICE_FILTER",
+            "minPrice": "0.01",
+            "maxPrice": "1000000",
+            "tickSize": "0.01",
+        },
+        {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": True},
+    ],
 }
 
 
@@ -792,7 +807,27 @@ class DynamicExitPlanTests(unittest.TestCase):
 
     def test_live_submit_does_not_attach_a_protective_order(self) -> None:
         client = _FakeClient(
-            info={"symbol": "BNBUSDT", "status": "TRADING", "quoteAsset": "USDT"}
+            info={
+                "symbol": "BNBUSDT",
+                "status": "TRADING",
+                "quoteAsset": "USDT",
+                "isSpotTradingAllowed": True,
+                "filters": [
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.00001",
+                        "maxQty": "9000",
+                        "stepSize": "0.00001",
+                    },
+                    {
+                        "filterType": "PRICE_FILTER",
+                        "minPrice": "0.01",
+                        "maxPrice": "1000000",
+                        "tickSize": "0.01",
+                    },
+                    {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": True},
+                ],
+            }
         )
         adapter = BinanceSpotAdapter(
             client=client,

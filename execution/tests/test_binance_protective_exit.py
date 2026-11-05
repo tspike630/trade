@@ -293,11 +293,12 @@ class ProtectiveExitTests(unittest.TestCase):
         self.assertTrue(hit[0]["submitted"])
         self.assertEqual(_sell_forms(self.client)[-1]["quantity"], ["1.23"])
 
-    def test_kill_switch_blocks_the_protective_sell(self) -> None:
+    def test_kill_switch_still_allows_the_ledger_protective_sell(self) -> None:
         kill = self.root / "LIVE_TRADING_DISABLED"
         kill.write_text("keep live off\n", encoding="utf-8")
         env = _env(self.root, enabled="1")
         position = {
+            "id": 1,
             "decision_log_id": 11,
             "symbol": "BNBUSDT",
             "status": "open",
@@ -305,26 +306,18 @@ class ProtectiveExitTests(unittest.TestCase):
             "stop_price": "99",
             "take_profit_price": "110",
         }
-        def _boom_get(signed_query: str, *, api_key: str) -> dict[str, Any]:
-            raise AssertionError(f"kill switch must not query orders {signed_query} {api_key}")
-
-        self.client.get_order = _boom_get  # type: ignore[method-assign]
         with mock.patch.dict(os.environ, env):
-            self.assertIsNone(
-                self.adapter.refresh_filled_qty(
-                    {**position, "status": "qty_unconfirmed", "entry_order_id": "99"}
-                )
-            )
-            blocked = self.adapter.exit_held_position(position, "98")
-        self.assertEqual(blocked["reason"], "stop_loss")
-        self.assertFalse(blocked["submitted"])
-        self.assertTrue(str(blocked["error"]).startswith("kill_switch:"))
-        self.assertEqual(self.client.calls, [])
-        self.assertNotIn("test-secret", json.dumps(blocked))
+            sold = self.adapter.exit_held_position(position, "98")
+        self.assertEqual(sold["reason"], "stop_loss")
+        self.assertTrue(sold["submitted"], sold)
+        self.assertEqual(sold["quantity"], "1.23")
+        self.assertEqual(_sell_forms(self.client)[0]["side"], ["SELL"])
+        self.assertNotIn("test-secret", json.dumps(sold))
 
     def test_live_flag_off_blocks_the_protective_sell(self) -> None:
         env = _env(self.root, enabled="0")
         position = {
+            "id": 1,
             "decision_log_id": 11,
             "symbol": "BNBUSDT",
             "status": "open",
@@ -367,6 +360,7 @@ class ProtectiveExitTests(unittest.TestCase):
                     "quantity": "0.004",
                     "stop_price": "99",
                     "take_profit_price": "110",
+                    "protection": "loop_fallback",
                 }
                 gw.ledger.arm_binance_spot_position(
                     {
@@ -394,9 +388,10 @@ class ProtectiveExitTests(unittest.TestCase):
                     {"BNBUSDT": "98"},
                 )
         dust_exit = next(item for item in sized if item["decision_log_id"] == 21)
-        self.assertEqual(dust_exit["error"], "exit_qty_below_min")
+        self.assertEqual(dust_exit["error"], "dust_untradable")
         self.assertFalse(dust_exit["submitted"])
-        self.assertEqual(dust_exit["position_status"], "open")
+        self.assertEqual(dust_exit["position_status"], "closed_dust")
+        self.assertEqual(dust_exit["protection"], "dust_abandon")
         self.assertEqual(_sell_forms(self.client), [])
         self.assertEqual(floor_base_qty("1.239", "0.01"), "1.23")
         self.assertNotEqual(floor_base_qty("1.239", "0.01"), "1.24")
@@ -487,6 +482,7 @@ class ProtectiveExitTests(unittest.TestCase):
         self.client.info = naked
         env = _env(self.root, enabled="1")
         position = {
+            "id": 1,
             "decision_log_id": 11,
             "symbol": "BNBUSDT",
             "status": "open",

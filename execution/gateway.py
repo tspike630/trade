@@ -144,6 +144,11 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
             if isinstance(result.get("filled_qty"), str)
             else None
         ),
+        "sellable_qty": (
+            result.get("sellable_qty")
+            if isinstance(result.get("sellable_qty"), str)
+            else None
+        ),
     }
 
 
@@ -1379,14 +1384,27 @@ class ExecutionGateway:
             symbol = str(row.get("symbol") or "")
             if marks is not None:
                 mark = marks.get(symbol) if symbol in marks else None
-            elif row.get("status") == "open":
+            elif row.get("status") in {"open", "oco_working", "oco_unknown"}:
                 mark = adapter.mark_price(symbol)
             else:
                 mark = None
-            outcome = adapter.exit_held_position(dict(row), mark)
-            saved = self.ledger.apply_binance_spot_exit(int(row["id"]), outcome)
+            position_id = int(row["id"])
+
+            def persist(fields: dict[str, Any], held_id: int = position_id) -> dict[str, Any] | None:
+                return self.ledger.update_binance_spot_position(held_id, fields)
+
+            outcome = adapter.maintain_held_position(dict(row), mark, persist=persist)
+            book = str(outcome.get("book") or "")
+            if book == "exit_submitted" or (
+                book == "error_only" and outcome.get("error")
+            ):
+                saved = self.ledger.apply_binance_spot_exit(position_id, outcome)
+            else:
+                saved = self.ledger.binance_spot_position_by_id(position_id)
             if isinstance(saved, dict):
                 outcome = dict(outcome)
                 outcome["position_status"] = saved.get("status")
+                outcome["protection"] = saved.get("protection")
+                outcome["coverage"] = saved.get("protection")
             outcomes.append(outcome)
         return outcomes
