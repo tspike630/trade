@@ -16,4 +16,4 @@
 
 父进程集成就是读 `parent_calls(evaluate(...))`。返回的行要由父进程自己去调 MCP。这里没有服务，没有后台任务。
 
-`BinanceSpotAdapter` 仍是那条未验证的原始路由，本变更不改它，也不把它换成轮询卖出。
+`BinanceSpotAdapter` 仍是那条未验证的原始路由。`execution.run` 在没有注入适配器时，把非 dry-run 的 `live_bnb_boll_fade` 先看杀开关，再交给这道门。空的 `canonical_positions` 不是可以买的状态。147831 的 FET 成交是手工 MCP 单，不写退出价，导入时不移动执行游标。实盘进程要显式 `--no-paper-enabled`，并且 `PAPER_DB_PATH`、`EXECUTION_PAPER_DB`、`EXECUTION_PAPER_ENABLED` 都是空的，避免 dotenv 把纸面账本填回来。
