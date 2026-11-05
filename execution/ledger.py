@@ -132,6 +132,7 @@ class ExecutionLedger:
         ensure_observe_schema(self.conn)
         self._ensure_status_columns()
         self._ensure_unique_decision()
+        self._ensure_binance_spot_positions()
 
     def _ensure_status_columns(self) -> None:
         """Idempotent migration: status + status_updated_at on execution_log.
@@ -181,6 +182,40 @@ class ExecutionLedger:
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_exec_log_decision "
             "ON execution_log (decision_log_id)"
+        )
+
+    def _ensure_binance_spot_positions(self) -> None:
+        """Held Binance spot longs for the live_bnb protective-exit loop.
+
+        One row per decision. ``quantity`` is the exchange base fill, never a
+        quote conversion. Status ``open`` can be sold; ``qty_unconfirmed``
+        cannot; ``exit_submitted`` must not be sold again.
+        """
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS binance_spot_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_log_id INTEGER NOT NULL UNIQUE,
+                symbol TEXT NOT NULL,
+                status TEXT NOT NULL,
+                quantity TEXT,
+                stop_price TEXT NOT NULL,
+                take_profit_price TEXT NOT NULL,
+                entry_price TEXT,
+                entry_order_id TEXT,
+                exit_order_id TEXT,
+                exit_reason TEXT,
+                exit_client_order_id TEXT,
+                last_error TEXT,
+                protection TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bnb_spot_pos_status "
+            "ON binance_spot_positions (status)"
         )
 
     # --- cursor ---
@@ -450,3 +485,125 @@ class ExecutionLedger:
             (int(limit),),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def arm_binance_spot_position(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Insert a held long once. A replay returns the existing row unchanged."""
+        decision_id = int(spec["decision_log_id"])
+        now = _utc()
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO binance_spot_positions (
+                decision_log_id, symbol, status, quantity, stop_price,
+                take_profit_price, entry_price, entry_order_id, protection,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision_id,
+                str(spec["symbol"]),
+                str(spec["status"]),
+                spec.get("quantity"),
+                str(spec["stop_price"]),
+                str(spec["take_profit_price"]),
+                spec.get("entry_price"),
+                spec.get("entry_order_id"),
+                str(spec["protection"]),
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        row = self.binance_spot_position_by_decision(decision_id)
+        if row is None:
+            raise RuntimeError(f"binance spot position missing for {decision_id}")
+        return row
+
+    def binance_spot_position_by_decision(
+        self, decision_log_id: int
+    ) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM binance_spot_positions WHERE decision_log_id = ?",
+            (int(decision_log_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_binance_spot_positions_for_exit(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM binance_spot_positions
+            WHERE status IN ('open', 'qty_unconfirmed')
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def confirm_binance_spot_qty(
+        self, position_id: int, quantity: str
+    ) -> dict[str, Any] | None:
+        """Promote ``qty_unconfirmed`` once the entry order reports a base fill."""
+        now = _utc()
+        self.conn.execute(
+            """
+            UPDATE binance_spot_positions
+            SET quantity = ?, status = 'open', last_error = NULL, updated_at = ?
+            WHERE id = ? AND status = 'qty_unconfirmed'
+            """,
+            (str(quantity), now, int(position_id)),
+        )
+        self.conn.commit()
+        saved = self.conn.execute(
+            "SELECT * FROM binance_spot_positions WHERE id = ?",
+            (int(position_id),),
+        ).fetchone()
+        return dict(saved) if saved else None
+
+    def apply_binance_spot_exit(
+        self, position_id: int, outcome: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Record a sell only after the exchange accepted it. Failures stay open."""
+        current = self.conn.execute(
+            "SELECT * FROM binance_spot_positions WHERE id = ?",
+            (int(position_id),),
+        ).fetchone()
+        if current is None:
+            return None
+        row = dict(current)
+        now = _utc()
+        submitted = bool(outcome.get("submitted")) and bool(outcome.get("exchange_order_id"))
+        if submitted and row["status"] == "open":
+            self.conn.execute(
+                """
+                UPDATE binance_spot_positions SET
+                    status = 'exit_submitted',
+                    quantity = COALESCE(?, quantity),
+                    exit_order_id = ?,
+                    exit_reason = ?,
+                    exit_client_order_id = ?,
+                    last_error = NULL,
+                    updated_at = ?
+                WHERE id = ? AND status = 'open'
+                """,
+                (
+                    outcome.get("quantity"),
+                    str(outcome.get("exchange_order_id")),
+                    outcome.get("reason"),
+                    outcome.get("exit_client_order_id"),
+                    now,
+                    int(position_id),
+                ),
+            )
+        elif outcome.get("error") and row["status"] in {"open", "qty_unconfirmed"}:
+            self.conn.execute(
+                """
+                UPDATE binance_spot_positions
+                SET last_error = ?, updated_at = ?
+                WHERE id = ? AND status IN ('open', 'qty_unconfirmed')
+                """,
+                (str(outcome.get("error")), now, int(position_id)),
+            )
+        self.conn.commit()
+        saved = self.conn.execute(
+            "SELECT * FROM binance_spot_positions WHERE id = ?",
+            (int(position_id),),
+        ).fetchone()
+        return dict(saved) if saved else None

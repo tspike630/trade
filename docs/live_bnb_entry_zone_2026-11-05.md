@@ -12,7 +12,7 @@
 
 只在 `S > 0` 且 alpha 有限时继续。`P >= M` 记 `price_above_mid`。`P` 低于该档地板记 `price_below_floor`（大单地板是 alpha 0.08）。止损 `>=` 入场价记 `stop_not_below_price`，赔率不算。比较带 1e-9 的浮点容差，不把区间放宽。
 
-止损参考 `L - 0.1*S`。止盈是决策当时的 `M`（绝对价）。没有另扣手续费，也没有把 1.5 / 2.5 改掉。执行 adapter 收下这个绝对价；之后 boll_mid 变了，不改这笔止盈。现货 OCO / STOP_LOSS_LIMIT 没接，dry-run 写 `protective_order=not_supported_not_sent`，不把没发出的保护单说成已挂。
+止损参考 `L - 0.1*S`。止盈是决策当时的 `M`（绝对价）。没有另扣手续费，也没有把 1.5 / 2.5 改掉。执行 adapter 收下这个绝对价；之后 boll_mid 变了，不改这笔止盈。入场单仍然不挂 OCO / STOP_LOSS_LIMIT，dry-run 和 live 入场回执都写 `protective_order=not_supported_not_sent`。live 成交且回了 base `executedQty` 之后，仓位记在这条臂自己的账本里。没带回数量就先记未确认，下一拍闸开着再读入场单。执行循环每拍用 `protective_exit_reason` 对绝对止损和决策当时的止盈：触价就按 LOT_SIZE 向下取整，市价卖掉全部持仓。干跑不记仓、不发单。杀开关还在或 `BINANCE_SPOT_LIVE_ENABLED` 关着时，触价也只拒单。进程不在跑时，交易所上没有挂着的保护单。
 
 旧的跌 2、量能、破下轨写在 `legacy_*`，`legacy_gate=diagnostic_only`。
 

@@ -11,7 +11,7 @@ receipts into an **independent** `execution_ledger.db`.
 
 **Never** calls `LiveExecutor` / `live_trade`. Failures are not retried (`{ok:false,error:...}` → `executed=0` + error on receipt).
 
-Purpose `live_bnb_boll_fade` is the only Binance spot arm. It does not use PaperExecutor. Live `POST /api/v3/order` stays off while `LIVE_TRADING_DISABLED` is present or `BINANCE_SPOT_LIVE_ENABLED` is off. `mode=dry_run` never submits. Enable steps are manual: [`exports/reports/execution_bnb_spot_adapter_2026-11-05.md`](../exports/reports/execution_bnb_spot_adapter_2026-11-05.md).
+Purpose `live_bnb_boll_fade` is the only Binance spot arm. It does not use PaperExecutor. Live `POST /api/v3/order` stays off while `LIVE_TRADING_DISABLED` is present or `BINANCE_SPOT_LIVE_ENABLED` is off. `mode=dry_run` never submits. A live fill that carries absolute `stop_price` / `take_profit_price` and exchange `executedQty` is stored on that arm's ledger. Each loop tick calls `protective_exit_reason` and, when the mark hits the stop or the decision-time take-profit, sells the full base quantity floored to the symbol lot step. The entry order still does not rest an OCO (`protective_order=not_supported_not_sent`). The same kill switch and `BINANCE_SPOT_LIVE_ENABLED` block that sell. Enable steps are manual: [`exports/reports/execution_bnb_spot_adapter_2026-11-05.md`](../exports/reports/execution_bnb_spot_adapter_2026-11-05.md).
 
 ## What it does
 

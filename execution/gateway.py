@@ -41,6 +41,7 @@ from execution.executors.binance_spot import (
     EXECUTOR_NAME as BINANCE_SPOT_EXECUTOR,
     PURPOSE_LIVE_BNB_BOLL_FADE,
     BinanceSpotAdapter,
+    held_position_spec,
 )
 from execution.ledger import ExecutionLedger, _utc
 from execution.order_events import init_events
@@ -137,6 +138,11 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
         "intent": result.get("intent") if isinstance(result.get("intent"), dict) else None,
         "exit_plan": (
             result.get("exit_plan") if isinstance(result.get("exit_plan"), dict) else None
+        ),
+        "filled_qty": (
+            result.get("filled_qty")
+            if isinstance(result.get("filled_qty"), str)
+            else None
         ),
     }
 
@@ -1166,6 +1172,26 @@ class ExecutionGateway:
                 executed = 1
                 receipt_body["status"] = "binance_spot_submitted"
                 receipt_body["note"] = "binance spot newOrder accepted by client"
+                held = held_position_spec(sig, exec_result)
+                if held is not None:
+                    try:
+                        armed = self.ledger.arm_binance_spot_position(held)
+                    except Exception:  # noqa: BLE001 — fill already happened
+                        log.exception(
+                            "binance spot position arm failed decision_log_id=%s",
+                            sig.get("decision_log_id"),
+                        )
+                        receipt_body["held_position_error"] = "arm_failed"
+                    else:
+                        receipt_body["held_position"] = {
+                            "status": armed.get("status"),
+                            "quantity": armed.get("quantity"),
+                            "symbol": armed.get("symbol"),
+                            "protection": armed.get("protection"),
+                            "stop_price": armed.get("stop_price"),
+                            "take_profit_price": armed.get("take_profit_price"),
+                        }
+                        exec_result["held_position"] = receipt_body["held_position"]
             else:
                 executed = 0
                 exec_error = str(exec_result.get("error") or "binance_spot_refused")
@@ -1324,3 +1350,43 @@ class ExecutionGateway:
                 stats.executed_fail += 1
             stats.receipts.append(result)
         return stats
+
+    def tick_binance_protective_exits(
+        self,
+        marks: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Full-position sells for open ``live_bnb_boll_fade`` spot longs.
+
+        Other purposes are not scanned. No mark fetch and no order when the
+        book has nothing open. Callers that pass ``marks`` own the prices;
+        a missing symbol is not filled in with a network read.
+        """
+        if self.accept_purposes != frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}):
+            return []
+        positions = self.ledger.list_binance_spot_positions_for_exit()
+        if not positions:
+            return []
+        adapter = self._binance_spot or BinanceSpotAdapter()
+        self._binance_spot = adapter
+        outcomes: list[dict[str, Any]] = []
+        for row in positions:
+            if row.get("status") == "qty_unconfirmed":
+                qty = adapter.refresh_filled_qty(dict(row))
+                if qty:
+                    saved_qty = self.ledger.confirm_binance_spot_qty(int(row["id"]), qty)
+                    if isinstance(saved_qty, dict) and saved_qty.get("status") == "open":
+                        row = saved_qty
+            symbol = str(row.get("symbol") or "")
+            if marks is not None:
+                mark = marks.get(symbol) if symbol in marks else None
+            elif row.get("status") == "open":
+                mark = adapter.mark_price(symbol)
+            else:
+                mark = None
+            outcome = adapter.exit_held_position(dict(row), mark)
+            saved = self.ledger.apply_binance_spot_exit(int(row["id"]), outcome)
+            if isinstance(saved, dict):
+                outcome = dict(outcome)
+                outcome["position_status"] = saved.get("status")
+            outcomes.append(outcome)
+        return outcomes

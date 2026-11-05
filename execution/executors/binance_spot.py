@@ -12,6 +12,14 @@ Live ``POST /api/v3/order`` stays off unless every gate below is open:
 This module does not call ``LiveExecutor`` and does not apply a per-order
 notional cap. Tests inject a client. The HTTP client is built only after the
 gates pass and only when no client was injected.
+
+A live buy does not attach a spot OCO or ``STOP_LOSS_LIMIT``. The entry
+receipt keeps ``protective_order=not_supported_not_sent``. After that buy
+fills, the execution loop calls ``exit_held_position``, which uses
+``protective_exit_reason`` and, when the mark hits the absolute stop or the
+decision-time take-profit, sells the whole floored base balance. Dry-run
+never arms a position and never submits. The same kill switch and
+``BINANCE_SPOT_LIVE_ENABLED`` gate block that sell.
 """
 
 from __future__ import annotations
@@ -26,6 +34,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -43,9 +52,13 @@ API_SECRET_ENV = ("BINANCE_API_SECRET", "LIVE_EXCHANGE_API_SECRET")
 DEFAULT_BASE_URL = "https://api.binance.com"
 SPOT_PATH = "/api/v3/order"
 EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
+TICKER_PATH = "/api/v3/ticker/price"
 RECV_WINDOW_MS = "5000"
 LIVE_MODE = "live_stub"
 DRY_MODE = "dry_run"
+HELD_EXIT_PROTECTION = "held_position_exit"
+_EXIT_FAIL_STATUS = frozenset({"REJECTED", "EXPIRED", "CANCELED", "CANCELLED"})
+_ExitReason = Literal["stop_loss", "take_profit"]
 
 # Same base shape as decision_engine.core.bnb_spot_map, but the order id must
 # already be the concatenated BASEUSDT form. Slash / colon names are rejected.
@@ -262,9 +275,9 @@ def build_exit_plan(
 
     Absent on a legacy signal (no ``entry_reason`` and no prices) so an old
     dry-run still acks. Present prices are the decision-time ``boll_mid`` and
-    the stop reference; a later mid does not rewrite them. Protective orders
-    are not submitted: spot OCO / STOP_LOSS_LIMIT is not wired, and this
-    result says so instead of pretending the resting exit was sent.
+    the stop reference; a later mid does not rewrite them. The entry order
+    still does not rest an OCO. ``exit_held_position`` is what sells the
+    position after a fill.
     """
     stop_raw = extras.get("stop_price")
     tp_raw = extras.get("take_profit_price")
@@ -315,7 +328,9 @@ def build_exit_plan(
     }, None
 
 
-def protective_exit_reason(exit_plan: dict[str, Any] | None, mark: object) -> str | None:
+def protective_exit_reason(
+    exit_plan: dict[str, Any] | None, mark: object
+) -> _ExitReason | None:
     """Compare a mark to the absolute plan. Percent stops are not applied."""
     if not isinstance(exit_plan, dict):
         return None
@@ -329,6 +344,216 @@ def protective_exit_reason(exit_plan: dict[str, Any] | None, mark: object) -> st
     if price >= take_profit:
         return "take_profit"
     return None
+
+
+def filled_base_qty(placed: dict[str, Any] | None) -> str | None:
+    """Base qty the exchange says filled. Quote notional is not converted."""
+    if not isinstance(placed, dict):
+        return None
+    return _positive_decimal(placed.get("executedQty"))
+
+
+def exit_client_order_id(raw: object) -> str | None:
+    """Stable id so a retried full-position sell cannot double-fill."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    text = str(raw).strip()
+    if not text.isdigit():
+        return None
+    client_id = f"bnbfade-x-{text}"
+    if len(client_id) > 36:
+        return None
+    return client_id
+
+
+def _to_decimal(raw: object) -> Decimal | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, Decimal):
+        number = raw
+    elif isinstance(raw, int):
+        number = Decimal(raw)
+    elif isinstance(raw, float):
+        if not math.isfinite(raw) or raw <= 0:
+            return None
+        number = Decimal(str(raw))
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not _DECIMAL.fullmatch(text):
+            return None
+        number = Decimal(text)
+    else:
+        return None
+    if not number.is_finite() or number <= 0:
+        return None
+    return number
+
+
+def _decimal_text(number: Decimal) -> str:
+    text = format(number, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def floor_base_qty(quantity: object, step: object) -> str | None:
+    """Floor ``quantity`` to ``step``. Never rounds up and never exceeds it."""
+    qty = _to_decimal(quantity)
+    step_n = _to_decimal(step)
+    if qty is None or step_n is None:
+        return None
+    units = (qty / step_n).to_integral_value(rounding=ROUND_DOWN)
+    floored = units * step_n
+    if floored <= 0 or floored > qty:
+        return None
+    return _decimal_text(floored)
+
+
+def _symbol_row(payload: dict[str, Any], symbol: str) -> dict[str, Any] | None:
+    listed = payload.get("symbols")
+    if isinstance(listed, list):
+        for item in listed:
+            if isinstance(item, dict) and str(item.get("symbol") or "").upper() == symbol:
+                return item
+        return None
+    listed_symbol = str(payload.get("symbol") or "").upper()
+    if listed_symbol and listed_symbol != symbol:
+        return None
+    return payload
+
+
+def _filter_row(filters: list[Any], name: str) -> dict[str, Any] | None:
+    for item in filters:
+        if isinstance(item, dict) and str(item.get("filterType") or "") == name:
+            return item
+    return None
+
+
+def _symbol_filters(payload: dict[str, Any], symbol: str) -> list[Any] | None:
+    row = _symbol_row(payload, symbol)
+    if row is None:
+        return None
+    filters = row.get("filters")
+    if not isinstance(filters, list):
+        return None
+    return filters
+
+
+def _market_lot(filters: list[Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Prefer a positive MARKET_LOT_SIZE step, else LOT_SIZE."""
+    market = _filter_row(filters, "MARKET_LOT_SIZE")
+    lot = _filter_row(filters, "LOT_SIZE")
+    market_step = None if market is None else _to_decimal(market.get("stepSize"))
+    if market is not None and market_step is not None:
+        return market, _decimal_text(market_step)
+    lot_step = None if lot is None else _to_decimal(lot.get("stepSize"))
+    if lot is not None and lot_step is not None:
+        return lot, _decimal_text(lot_step)
+    return None, None
+
+
+def _min_notional(filters: list[Any]) -> Decimal | None:
+    for name in ("NOTIONAL", "MIN_NOTIONAL"):
+        row = _filter_row(filters, name)
+        if row is None:
+            continue
+        if name == "NOTIONAL" and row.get("applyMinToMarket") is False:
+            continue
+        floor = _to_decimal(row.get("minNotional"))
+        if floor is not None:
+            return floor
+    return None
+
+
+def size_exit_quantity(
+    payload: dict[str, Any],
+    symbol: str,
+    quantity: str,
+    mark: object,
+) -> tuple[str | None, str | None]:
+    """Full-position sell size. Dust below the step or min is not sent."""
+    filters = _symbol_filters(payload, symbol)
+    if filters is None:
+        return None, "missing_lot_filter"
+    lot, step = _market_lot(filters)
+    if lot is None or step is None:
+        return None, "missing_lot_filter"
+    floored = floor_base_qty(quantity, step)
+    if floored is None:
+        return None, "exit_qty_below_min"
+    floored_n = _to_decimal(floored)
+    if floored_n is None:
+        return None, "exit_qty_below_min"
+    min_qty = _to_decimal(lot.get("minQty"))
+    if min_qty is not None and floored_n < min_qty:
+        return None, "exit_qty_below_min"
+    max_qty = _to_decimal(lot.get("maxQty"))
+    if max_qty is not None and floored_n > max_qty:
+        return None, "exit_qty_above_max"
+    mark_n = _to_decimal(mark)
+    notional_floor = _min_notional(filters)
+    if notional_floor is not None:
+        if mark_n is None:
+            return None, "mark_unavailable"
+        if floored_n * mark_n < notional_floor:
+            return None, "exit_below_min_notional"
+    return floored, None
+
+
+def held_position_spec(
+    sig: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Ledger row for a live buy that already has absolute stop and take-profit.
+
+    Dry-run and unfilled acks return None. Base size comes only from
+    ``filled_qty`` (exchange ``executedQty``). Missing size is recorded as
+    ``qty_unconfirmed`` and is not sellable.
+    """
+    if result.get("dry_run") or not result.get("submitted"):
+        return None
+    if int(result.get("executed") or 0) != 1:
+        return None
+    if str(sig.get("action") or "").strip().lower() != "buy":
+        return None
+    plan = result.get("exit_plan")
+    if not isinstance(plan, dict):
+        return None
+    symbol = result.get("symbol")
+    if not isinstance(symbol, str) or not is_spot_usdt_symbol(symbol):
+        return None
+    decision_id = exit_client_order_id(sig.get("decision_log_id"))
+    if decision_id is None:
+        return None
+    stop = _positive_decimal(plan.get("stop_price"))
+    take_profit = _positive_decimal(plan.get("take_profit_price"))
+    if stop is None or take_profit is None:
+        return None
+    qty = _positive_decimal(result.get("filled_qty"))
+    return {
+        "decision_log_id": int(str(sig.get("decision_log_id")).strip()),
+        "symbol": symbol,
+        "quantity": qty,
+        "stop_price": stop,
+        "take_profit_price": take_profit,
+        "entry_price": _positive_decimal(plan.get("entry_price")),
+        "entry_order_id": (
+            None
+            if result.get("exchange_order_id") is None
+            else str(result.get("exchange_order_id"))
+        ),
+        "status": "open" if qty else "qty_unconfirmed",
+        "protection": HELD_EXIT_PROTECTION,
+    }
+
+
+def _exit_order_accepted(placed: dict[str, Any]) -> str | None:
+    status = str(placed.get("status") or "").upper()
+    if status in _EXIT_FAIL_STATUS:
+        return None
+    order_id = placed.get("orderId")
+    if order_id is None or not str(order_id).strip():
+        return None
+    return str(order_id).strip()
 
 
 def _entry_intent(
@@ -447,6 +672,32 @@ class BinanceSpotHttpClient:
         status, body = self._opener(request, self.timeout)
         return _decode_ok(status, body)
 
+    def ticker_price(self, symbol: str) -> dict[str, Any]:
+        query = urllib.parse.urlencode(
+            (("symbol", symbol),),
+            quote_via=urllib.parse.quote,
+            safe="",
+        )
+        request = urllib.request.Request(
+            f"{self.base_url}{TICKER_PATH}?{query}",
+            method="GET",
+            headers={"User-Agent": "trade-binance-spot"},
+        )
+        status, body = self._opener(request, self.timeout)
+        return _decode_ok(status, body)
+
+    def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"{self.base_url}{SPOT_PATH}?{signed_query}",
+            method="GET",
+            headers={
+                "User-Agent": "trade-binance-spot",
+                "X-MBX-APIKEY": api_key,
+            },
+        )
+        status, body = self._opener(request, self.timeout)
+        return _decode_ok(status, body)
+
 
 def _decode_ok(status: int, body: bytes) -> dict[str, Any]:
     if status >= 400:
@@ -548,6 +799,7 @@ def _result(
     gates: dict[str, Any],
     intent: dict[str, Any] | None = None,
     exit_plan: dict[str, Any] | None = None,
+    filled_qty: str | None = None,
 ) -> dict[str, Any]:
     return {
         "ok": ok,
@@ -562,6 +814,7 @@ def _result(
         "gates": gates,
         "intent": intent,
         "exit_plan": exit_plan,
+        "filled_qty": filled_qty,
     }
 
 
@@ -897,6 +1150,7 @@ class BinanceSpotAdapter:
                 gates=gates,
                 intent=intent,
                 exit_plan=plan,
+                filled_qty=filled_base_qty(placed),
             )
         )
 
@@ -968,6 +1222,229 @@ class BinanceSpotAdapter:
             client_id=_client_order_id(sig),
             timestamp_ms=int(self.clock_ms()),
         )
+
+    def refresh_filled_qty(self, position: dict[str, Any]) -> str | None:
+        """Read the entry order's base fill. No request while the live gates are shut."""
+        gates = self._gates()
+        if gates["kill_switch_active"] or not gates["live_enabled"]:
+            return None
+        symbol = position.get("symbol")
+        order_id = position.get("entry_order_id")
+        if not isinstance(symbol, str) or not is_spot_usdt_symbol(symbol):
+            return None
+        if order_id is None or not str(order_id).strip():
+            return None
+        key, secret = self._credentials()
+        if not key or not secret:
+            return None
+        client = self.client if self.client is not None else BinanceSpotHttpClient()
+        lookup = getattr(client, "get_order", None)
+        if not callable(lookup):
+            return None
+        pairs = [
+            ("symbol", symbol),
+            ("orderId", str(order_id).strip()),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            placed = lookup(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001 — a missed read must not submit
+            if isinstance(exc, AssertionError):
+                raise
+            return None
+        if not isinstance(placed, dict):
+            return None
+        return filled_base_qty(placed)
+
+    def mark_price(self, symbol: str) -> object | None:
+        """Public last price. No client is built while the live gates are shut."""
+        gates = self._gates()
+        if gates["kill_switch_active"] or not gates["live_enabled"]:
+            return None
+        if not is_spot_usdt_symbol(symbol):
+            return None
+        client = self.client if self.client is not None else BinanceSpotHttpClient()
+        ticker = getattr(client, "ticker_price", None)
+        if not callable(ticker):
+            return None
+        try:
+            payload = ticker(symbol)
+        except Exception as exc:  # noqa: BLE001 — a missing mark must not submit
+            if isinstance(exc, AssertionError):
+                raise
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload.get("price")
+
+    def exit_held_position(
+        self,
+        position: dict[str, Any],
+        mark: object,
+    ) -> dict[str, Any]:
+        """Sell the whole held base qty when the absolute plan is touched.
+
+        ``protective_exit_reason`` is the only trigger. Percent stops are not
+        applied. A refusal leaves the caller to keep the row open.
+        """
+        gates = self._gates()
+        symbol = position.get("symbol")
+        shown = symbol if isinstance(symbol, str) else None
+        plan = {
+            "stop_price": position.get("stop_price"),
+            "take_profit_price": position.get("take_profit_price"),
+        }
+        reason = protective_exit_reason(plan, mark)
+        client_id = exit_client_order_id(position.get("decision_log_id"))
+        outcome: dict[str, Any] = {
+            "ok": False,
+            "dry_run": False,
+            "executed": 0,
+            "submitted": False,
+            "error": None,
+            "reason": reason,
+            "decision_log_id": position.get("decision_log_id"),
+            "executor": EXECUTOR_NAME,
+            "symbol": shown,
+            "order": None,
+            "exchange_order_id": None,
+            "gates": gates,
+            "quantity": None,
+            "exit_client_order_id": client_id,
+            "protection": HELD_EXIT_PROTECTION,
+        }
+        status = str(position.get("status") or "")
+        if status == "qty_unconfirmed":
+            outcome["error"] = "exit_qty_unconfirmed"
+            return self._log_exit(outcome)
+        if status != "open":
+            outcome["error"] = "position_not_open"
+            outcome["ok"] = status in {"exit_submitted", "closed"}
+            return self._log_exit(outcome)
+        if reason is None:
+            if _finite_number(mark) is None:
+                outcome["error"] = "mark_unavailable"
+            else:
+                outcome["ok"] = True
+            return self._log_exit(outcome)
+        if reason == "stop_loss":
+            pass
+        elif reason == "take_profit":
+            pass
+        else:
+            unexpected_reason: never = reason
+            outcome["error"] = f"invalid_exit_reason:{unexpected_reason}"
+            return self._log_exit(outcome)
+        if gates["kill_switch_active"]:
+            outcome["error"] = f"kill_switch:{gates['kill_switch']}"
+            return self._log_exit(outcome)
+        if not gates["live_enabled"]:
+            outcome["error"] = "binance_spot_live_disabled"
+            return self._log_exit(outcome)
+        if not isinstance(symbol, str) or not is_spot_usdt_symbol(symbol):
+            outcome["error"] = "invalid_binance_symbol"
+            return self._log_exit(outcome)
+        qty = _positive_decimal(position.get("quantity"))
+        if qty is None:
+            outcome["error"] = "exit_qty_unconfirmed"
+            return self._log_exit(outcome)
+        if client_id is None:
+            outcome["error"] = "invalid_exit_client_id"
+            return self._log_exit(outcome)
+        key, secret = self._credentials()
+        if not key or not secret:
+            outcome["error"] = "missing_api_credentials"
+            return self._log_exit(outcome)
+
+        client = self.client if self.client is not None else BinanceSpotHttpClient()
+        try:
+            info = client.exchange_info(symbol)
+        except Exception as exc:  # noqa: BLE001
+            outcome["error"] = _public_error(exc, key, secret)
+            return self._log_exit(outcome)
+        if not isinstance(info, dict) or not symbol_status_trading(info, symbol):
+            outcome["error"] = "symbol_not_trading"
+            return self._log_exit(outcome)
+        sized, size_error = size_exit_quantity(info, symbol, qty, mark)
+        if size_error or sized is None:
+            outcome["error"] = size_error or "exit_qty_invalid"
+            return self._log_exit(outcome)
+        pairs, qty_error = _order_pairs(
+            symbol=symbol,
+            side="SELL",
+            order_type="MARKET",
+            extras={"quantity": sized},
+            client_id=client_id,
+            timestamp_ms=int(self.clock_ms()),
+        )
+        if qty_error or pairs is None:
+            outcome["error"] = qty_error or "missing_order_qty"
+            return self._log_exit(outcome)
+        outcome["order"] = dict(pairs)
+        outcome["quantity"] = sized
+        signed = sign_query(pairs, secret)
+        try:
+            placed = client.new_order(signed, api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            recovered = self._lookup_exit_order(
+                client, symbol, client_id, key, secret
+            )
+            if recovered is None:
+                outcome["error"] = _public_error(exc, key, secret)
+                return self._log_exit(outcome)
+            placed = recovered
+        if not isinstance(placed, dict):
+            outcome["error"] = "binance_order_rejected"
+            return self._log_exit(outcome)
+        order_id = _exit_order_accepted(placed)
+        if order_id is None:
+            outcome["error"] = "binance_order_rejected"
+            return self._log_exit(outcome)
+        outcome["ok"] = True
+        outcome["submitted"] = True
+        outcome["executed"] = 1
+        outcome["exchange_order_id"] = order_id
+        return self._log_exit(outcome)
+
+    def _lookup_exit_order(
+        self,
+        client: Any,
+        symbol: str,
+        client_id: str,
+        key: str,
+        secret: str,
+    ) -> dict[str, Any] | None:
+        """After a failed POST, adopt the order if this client id already exists."""
+        lookup = getattr(client, "get_order", None)
+        if not callable(lookup):
+            return None
+        pairs = [
+            ("symbol", symbol),
+            ("origClientOrderId", client_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            placed = lookup(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001 — lookup failure leaves the sell unconfirmed
+            if isinstance(exc, AssertionError):
+                raise
+            return None
+        if not isinstance(placed, dict) or _exit_order_accepted(placed) is None:
+            return None
+        return placed
+
+    def _log_exit(self, outcome: dict[str, Any]) -> dict[str, Any]:
+        log.info(
+            "binance_spot_exit symbol=%s reason=%s submitted=%s error=%s qty=%s",
+            outcome.get("symbol"),
+            outcome.get("reason"),
+            outcome.get("submitted"),
+            outcome.get("error"),
+            outcome.get("quantity"),
+        )
+        return outcome
 
     def _finish(self, result: dict[str, Any]) -> dict[str, Any]:
         log.info(
