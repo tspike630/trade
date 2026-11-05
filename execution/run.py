@@ -11,6 +11,11 @@ CLI for execution management Step A/B/C.
   #     --paper-db paper_eq_rsi_bounce.db \
   #     --ledger execution_ledger_race_rsi_bounce.db \
   #     --accept-purpose race_rsi_bounce
+  # Binance spot arm (still refuses live newOrder while LIVE_TRADING_DISABLED
+  # is present or BINANCE_SPOT_LIVE_ENABLED is off). Not a paper peer:
+  #   python -m execution.run --loop \
+  #     --ledger execution_ledger_live_bnb_boll_fade.db \
+  #     --accept-purpose live_bnb_boll_fade
 """
 
 from __future__ import annotations
@@ -28,6 +33,9 @@ if str(_ROOT) not in sys.path:
 
 from logging_setup import get_logger, setup_logging  # noqa: E402
 
+from execution.executors.binance_spot import (  # noqa: E402
+    PURPOSE_LIVE_BNB_BOLL_FADE,
+)
 from execution.gateway import ExecutionGateway, _env_bool  # noqa: E402
 from execution.ledger import resolve_ledger_path  # noqa: E402
 
@@ -92,6 +100,32 @@ def _peer_isolation_guard(
         return None
     if not accept_purposes:
         return "EXECUTION_ACCEPT_PURPOSE / --accept-purpose resolved empty"
+    if PURPOSE_LIVE_BNB_BOLL_FADE in accept_purposes:
+        if accept_purposes != frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}):
+            return (
+                "live_bnb_boll_fade must be the only --accept-purpose "
+                "on this process"
+            )
+        main_ledger = _default_main_ledger_path()
+        if ledger_path.resolve() == main_ledger:
+            return (
+                "live_bnb_boll_fade requires an isolated --ledger "
+                f"(not shared {main_ledger.name})"
+            )
+        if paper_enabled:
+            return (
+                "live_bnb_boll_fade does not use the paper book; "
+                "omit --paper-enabled"
+            )
+        paper_name = ""
+        if paper_db and str(paper_db).strip():
+            paper_name = Path(str(paper_db)).name
+        if paper_name in {"paper_trading.db", "paper_eq_tech_boll_fade.db"}:
+            return (
+                "live_bnb_boll_fade must not target "
+                "paper_trading.db or paper_eq_tech_boll_fade.db"
+            )
+        return None
     main_ledger = _default_main_ledger_path()
     if ledger_path.resolve() == main_ledger:
         return (

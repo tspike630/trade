@@ -11,6 +11,12 @@ rejected with executed=0 and the cursor still advances. Peer runners may pass
 to allow a single alternate purpose such as ``race_*`` or ``shadow_entry_ih_ge1h``
 for that process only; other purposes stay rejected. Paper / PM / risk stay
 default off. Never calls LiveExecutor. Main decision DB is read-only.
+
+Purpose ``live_bnb_boll_fade`` (only when that purpose is on this process's
+allowlist) is handed to ``BinanceSpotAdapter`` instead of PaperExecutor.
+The adapter refuses a live spot ``newOrder`` while the kill-switch file is
+present or ``BINANCE_SPOT_LIVE_ENABLED`` is off. ``mode=dry_run`` never
+submits. No other purpose can reach that adapter.
 """
 
 from __future__ import annotations
@@ -30,6 +36,11 @@ from execution.config import (
     EXECUTION_EVENTS_ENABLED,
     EXECUTION_MAX_OPEN,
     EXECUTION_RISK_ENABLED,
+)
+from execution.executors.binance_spot import (
+    EXECUTOR_NAME as BINANCE_SPOT_EXECUTOR,
+    PURPOSE_LIVE_BNB_BOLL_FADE,
+    BinanceSpotAdapter,
 )
 from execution.ledger import ExecutionLedger, _utc
 from execution.order_events import init_events
@@ -94,6 +105,36 @@ def _risk_rejected_event_detail(risk_reasons: list[dict[str, Any]]) -> dict[str,
             payload["detail"] = extra
             break
     return payload
+
+
+_BINANCE_ORDER_SECRET_KEYS = frozenset(
+    {"signature", "api_key", "api_secret", "secret"}
+)
+
+
+def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Ledger copy of a spot-adapter result. Secrets never land in the receipt."""
+    order = result.get("order")
+    if isinstance(order, dict):
+        public_order = {
+            key: value
+            for key, value in order.items()
+            if key not in _BINANCE_ORDER_SECRET_KEYS
+        }
+    else:
+        public_order = None
+    return {
+        "ok": bool(result.get("ok")),
+        "dry_run": bool(result.get("dry_run")),
+        "executed": int(result.get("executed") or 0),
+        "submitted": bool(result.get("submitted")),
+        "error": result.get("error"),
+        "executor": result.get("executor"),
+        "symbol": result.get("symbol"),
+        "order": public_order,
+        "exchange_order_id": result.get("exchange_order_id"),
+        "gates": result.get("gates") if isinstance(result.get("gates"), dict) else {},
+    }
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -305,6 +346,7 @@ class ExecutionGateway:
         position_manager: Any | None = None,
         pm_enabled: bool | None = None,
         accept_purposes: frozenset[str] | set[str] | tuple[str, ...] | list[str] | None = None,
+        binance_spot: BinanceSpotAdapter | None = None,
     ) -> None:
         self.decision_db = resolve_decision_db(decision_db)
         self._owns_ledger = ledger is None
@@ -327,6 +369,7 @@ class ExecutionGateway:
             self.accept_purposes = frozenset(
                 str(p).strip() for p in accept_purposes if str(p).strip()
             )
+        self._binance_spot = binance_spot
         # Order-event table lives on the execution ledger only. Flag off → no write.
         if EXECUTION_EVENTS_ENABLED:
             init_events(self.ledger.path)
@@ -1018,6 +1061,7 @@ class ExecutionGateway:
                 return self._reject_purpose(sig, reason)
             if (
                 str(sig.get("action") or "").strip().lower() == "buy"
+                and sig.get("purpose") != PURPOSE_LIVE_BNB_BOLL_FADE
                 and paper_open_paused()
             ):
                 return self._reject_purpose(sig, PAPER_OPEN_PAUSED_REASON)
@@ -1092,6 +1136,38 @@ class ExecutionGateway:
         if not ok:
             receipt_body["status"] = "validation_failed"
             receipt_body["note"] = "validation_failed; not executed"
+        elif sig.get("purpose") == PURPOSE_LIVE_BNB_BOLL_FADE:
+            # CEX arm: not a paper fill, and not LiveExecutor. The adapter
+            # itself keeps live newOrder behind the kill switch.
+            adapter = self._binance_spot or BinanceSpotAdapter()
+            self._binance_spot = adapter
+            exec_result = _binance_public_result(adapter.execute(sig))
+            executor = BINANCE_SPOT_EXECUTOR
+            submitted_to_executor = bool(exec_result.get("submitted"))
+            receipt_body["step"] = "binance_spot"
+            receipt_body["exec_result"] = exec_result
+            if exec_result.get("dry_run"):
+                executed = 0
+                if exec_result.get("ok"):
+                    receipt_body["status"] = "dry_run_acked"
+                    receipt_body["note"] = (
+                        "binance spot dry-run; newOrder not called"
+                    )
+                else:
+                    exec_error = str(exec_result.get("error") or "binance_spot_refused")
+                    receipt_body["status"] = "dry_run_rejected"
+                    receipt_body["note"] = "binance spot dry-run rejected; newOrder not called"
+                    receipt_body["error"] = exec_error
+            elif exec_result.get("ok") and int(exec_result.get("executed") or 0) == 1:
+                executed = 1
+                receipt_body["status"] = "binance_spot_submitted"
+                receipt_body["note"] = "binance spot newOrder accepted by client"
+            else:
+                executed = 0
+                exec_error = str(exec_result.get("error") or "binance_spot_refused")
+                receipt_body["status"] = "live_refused"
+                receipt_body["note"] = "binance spot live fill refused; no retry"
+                receipt_body["error"] = exec_error
         else:
             # Step C: PM gate after validation, before executor (buy only)
             pm = self._get_pm()
@@ -1237,7 +1313,7 @@ class ExecutionGateway:
             ):
                 stats.pm_rejected += 1
             elif (
-                result.get("executor") == PAPER_EXECUTOR
+                result.get("executor") in (PAPER_EXECUTOR, BINANCE_SPOT_EXECUTOR)
                 and result.get("validation_ok")
                 and result.get("error")
             ):
