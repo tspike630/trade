@@ -38,7 +38,8 @@ from execution.config import (
     EXECUTION_MAX_OPEN,
     EXECUTION_RISK_ENABLED,
 )
-from execution.executors.binance_spot_gate import consumer_read_cursor
+from execution.binance_account_snapshot import default_live_bnb_adapter
+from execution.executors.binance_spot_gate import REST_BOOK, consumer_read_cursor
 from execution.executors.binance_spot import (
     EXECUTOR_NAME as BINANCE_SPOT_EXECUTOR,
     PURPOSE_LIVE_BNB_BOLL_FADE,
@@ -1211,6 +1212,7 @@ class ExecutionGateway:
             sig.get("purpose") == PURPOSE_LIVE_BNB_BOLL_FADE
             and mode != "dry_run"
             and not self._binance_injected
+            and os.environ.get("BINANCE_SPOT_PRODUCTION_BOOK", "").strip() != REST_BOOK
         ):
             active, kill_name = kill_switch_active()
             executor = BINANCE_SPOT_EXECUTOR
@@ -1255,7 +1257,7 @@ class ExecutionGateway:
         elif sig.get("purpose") == PURPOSE_LIVE_BNB_BOLL_FADE:
             # CEX arm: not a paper fill, and not LiveExecutor. The adapter
             # itself keeps live newOrder behind the kill switch.
-            adapter = self._binance_spot or BinanceSpotAdapter()
+            adapter = self._binance_spot or default_live_bnb_adapter()
             self._binance_spot = adapter
             if action == "buy" and mode != "dry_run":
                 adapter.buy_blocks = self.ledger.list_binance_spot_buy_blocks()
@@ -1465,7 +1467,7 @@ class ExecutionGateway:
         positions = self.ledger.list_binance_spot_positions_for_exit()
         if not positions:
             return []
-        adapter = self._binance_spot or BinanceSpotAdapter()
+        adapter = self._binance_spot or default_live_bnb_adapter()
         self._binance_spot = adapter
         outcomes: list[dict[str, Any]] = []
         for row in positions:

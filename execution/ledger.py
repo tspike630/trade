@@ -14,8 +14,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from execution.executors.binance_spot_gate import VERIFIED_FET_EXIT
 from execution.observe_schema import ensure_observe_schema
+from execution.verified_fet import VERIFIED_FET_EXIT
 from execution.order_events import record_event
 
 log = logging.getLogger("execution.ledger")

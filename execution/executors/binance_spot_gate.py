@@ -18,6 +18,8 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from execution.verified_fet import VERIFIED_FET_EXIT
+
 PURPOSE_LIVE_BNB_BOLL_FADE = "live_bnb_boll_fade"
 MCP_POSITION_UID = "1289917075"
 REST_BOOK = "rest_api_key"
@@ -80,19 +82,6 @@ REPLAY_SCOPE = {
         "canonical_status": "closed",
     },
 }
-
-# Sell that closed decision 147831. The entry fee is the imported fill's BNB fee.
-VERIFIED_FET_EXIT = {
-    "decision_log_id": FROZEN_DECISION_ID,
-    "sell_order_id": "3736070415",
-    "avg_price": "0.1459",
-    "proceeds": "20.44059",
-    "gross_pnl": "-1.49907",
-    "fee_entry_bnb": "0.00002310",
-    "fee_exit_bnb": "0.00002218",
-    "fee_total_bnb": "0.00004528",
-}
-
 
 def acceptance_report() -> dict[str, Any]:
     """Environment is not attested. REST binding does not need a uid."""
