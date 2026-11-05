@@ -2,6 +2,9 @@
 -- READ the landed universe (exports/binance_spot_universe.db / the JSON report).
 -- WRITE only the tables in this file.
 -- Never INSERT/UPDATE/DELETE token_indicators, indicator_history, or pair_history.
+-- Crowding shadow columns (taker_buy_quote_volume, avg_trade_size,
+-- trades_spike_ratio, taker_buy_quote_ratio) are observation only.
+-- Existing databases gain them via ALTER in ensure_schema. Do not rebuild.
 
 CREATE TABLE IF NOT EXISTS binance_klines (
     symbol TEXT NOT NULL,
@@ -15,6 +18,7 @@ CREATE TABLE IF NOT EXISTS binance_klines (
     quote_volume REAL,
     close_time_ms INTEGER NOT NULL,
     trades INTEGER,
+    taker_buy_quote_volume REAL,
     PRIMARY KEY (symbol, interval, open_time_ms)
 );
 
@@ -47,7 +51,10 @@ CREATE TABLE IF NOT EXISTS binance_indicators (
     kline_close_time_ms INTEGER,
     tier TEXT,
     tech_updated_at TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    avg_trade_size REAL,
+    trades_spike_ratio REAL,
+    taker_buy_quote_ratio REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_binance_indicators_tech
