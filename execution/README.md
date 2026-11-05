@@ -11,7 +11,40 @@ receipts into an **independent** `execution_ledger.db`.
 
 **Never** calls `LiveExecutor` / `live_trade`. Failures are not retried (`{ok:false,error:...}` → `executed=0` + error on receipt).
 
-Purpose `live_bnb_boll_fade` is the only Binance spot arm. It does not use PaperExecutor. `mode=dry_run` never submits. A live fill with absolute `stop_price` / `take_profit_price` is stored on that arm's ledger. After `executedQty` is known, the loop posts a spot OCO (`POST /api/v3/orderList/oco`): `LIMIT_MAKER` at the decision-time take-profit and `STOP_LOSS_LIMIT` at the absolute stop. `protection=exchange_oco` means that list is resting on the exchange, including while this process is down. `protection=loop_fallback` means the OCO was rejected or finished unfilled, and the loop may market-sell when `protective_exit_reason` fires. The entry `newOrder` still does not carry the OCO (`protective_order=not_supported_not_sent`). `LIVE_TRADING_DISABLED` blocks new buys and inbound sell signals; it does not block the ledger protective sell unless `BINANCE_SPOT_BLOCK_SELL_ON_KILL=1`. `BINANCE_SPOT_LIVE_ENABLED` stays off unless set in the process environment. A strategy buy that only carries `size_pct` is sized as `size_pct * BINANCE_SPOT_BOOK_USDT` (an operator book, not a wallet). Unset book is `missing_book_usdt`. Explicit `quote_order_qty` / `quantity` wins. Planned entry notional under 20 USDT is refused (a viability floor, not a cap). The production supervisor is `scripts/live_bnb_execution_watchdog.sh` (one instance, restart within 3s). It does not change the kill file, the live flag, or keys, and it does not start until those gates are already open and a key and book are present. `scripts/live_bnb_watchdog_dry.sh` only prints that preflight. Untradable remainder is `closed_dust` / `dust_abandon`, not a clean flat. Enable steps are manual: [`exports/reports/execution_bnb_spot_adapter_2026-11-05.md`](../exports/reports/execution_bnb_spot_adapter_2026-11-05.md).
+Purpose `live_bnb_boll_fade` is the only Binance spot arm. It does not use PaperExecutor. `mode=dry_run` never submits. A live BUY is consumed only after a verified native OCO (`POST /api/v3/orderList/oco`, `orderListId >= 0` and both leg order ids). The loop does not market-sell from a watched mark. `LIVE_TRADING_DISABLED` blocks a new buy only. A ledger protective sell still goes out unless `BINANCE_SPOT_BLOCK_SELL_ON_KILL=1`. `BINANCE_SPOT_LIVE_ENABLED` stays off unless set in the process environment. A strategy buy that only carries `size_pct` is sized as `size_pct * BINANCE_SPOT_BOOK_USDT` (an operator book, not a wallet). Unset book is `missing_book_usdt`. Explicit `quote_order_qty` / `quantity` wins. Planned entry notional under 20 USDT is refused (a viability floor, not a cap). The 5% size and the 20 USDT floor are unchanged. The production supervisor is `scripts/live_bnb_execution_watchdog.sh` (one instance, restart within 3s). It does not change the kill file, the live flag, or keys. `scripts/live_bnb_watchdog_dry.sh` only prints that preflight.
+
+### REST account snapshot
+
+Refreshing this file is not opening the gate. The command only signs `GET /api/v3/account` and writes a mode `0600` JSON file outside the repo. It does not place an order and does not change `LIVE_TRADING_DISABLED` or `BINANCE_SPOT_LIVE_ENABLED`.
+
+```bash
+# key and secret stay in the process environment. Do not put them on the command line.
+export BINANCE_API_KEY=...
+export BINANCE_API_SECRET=...
+python -m execution.binance_account_snapshot --output /secure/live-bnb-account.json
+```
+
+The gateway and the watchdog read that file. They reject a missing file, bad JSON, a mode other than owner-only, a symlink, a path inside this repo, a bad HMAC, a snapshot older than `BINANCE_SPOT_ACCOUNT_SNAPSHOT_MAX_AGE_SEC` (default 3600), a USDT `free` balance that differs from `BINANCE_SPOT_REST_USDT_FREE`, or `uid` `1289917075` (the MCP Agentic sub-account). A payload without `uid` can still bind when `accountType` is `SPOT`, `canTrade` is true, and `permissions` contains `SPOT`.
+
+Startup still needs paper off and does not by itself remove the kill file:
+
+```bash
+export BINANCE_SPOT_PRODUCTION_BOOK=rest_api_key
+export BINANCE_SPOT_REST_USDT_FREE=<USDT free from that GET>
+export BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH=/secure/live-bnb-account.json
+export BINANCE_SPOT_BOOK_USDT=<operator sizing book>
+export BINANCE_SPOT_LIVE_ENABLED=1
+export EXECUTION_PAPER_ENABLED=
+export PAPER_DB_PATH=
+export EXECUTION_PAPER_DB=
+# LIVE_TRADING_DISABLED must already be absent. This command does not remove it.
+python -m execution.run --loop \
+  --ledger execution_ledger_live_bnb_boll_fade.db \
+  --accept-purpose live_bnb_boll_fade \
+  --no-paper-enabled
+```
+
+`BINANCE_SPOT_BOOK_USDT` sizes the 5% order. `BINANCE_SPOT_REST_USDT_FREE` is the wallet balance the snapshot must match. They are not the same field. `live_ready` stays false in code: paper-off, the fixed egress, and the running consumer are environment checks.
 
 ## What it does
 

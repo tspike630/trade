@@ -16,12 +16,23 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "crawler"))
 
+from execution.binance_account_snapshot import (  # noqa: E402
+    seal_snapshot,
+    write_snapshot_file,
+)
 from execution.live_bnb_watchdog import (  # noqa: E402
     RESTART_DELAY_SEC,
     child_argv,
     preflight,
     supervise,
 )
+
+_ACCOUNT = {
+    "accountType": "SPOT",
+    "canTrade": True,
+    "permissions": ["SPOT"],
+    "balances": [{"asset": "USDT", "free": "250.50", "locked": "0"}],
+}
 
 SECRET = "super-secret-value"
 
@@ -73,6 +84,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("binance_spot_live_disabled", report["reasons"])
         self.assertIn("missing_api_credentials", report["reasons"])
         self.assertIn("missing_book_usdt", report["reasons"])
+        self.assertIn("production_book_unselected", report["reasons"])
         self.assertIsNone(report["argv"])
         self.assertEqual(self.kill.read_bytes(), before)
         self.assertNotIn(SECRET, json.dumps(report))
@@ -87,7 +99,10 @@ class WatchdogTests(unittest.TestCase):
         with mock.patch.dict(os.environ, opened, clear=False):
             report = preflight()
         self.assertFalse(report["would_start"])
-        self.assertEqual(report["reasons"], ["missing_api_credentials"])
+        self.assertEqual(
+            report["reasons"],
+            ["missing_api_credentials", "production_book_unselected"],
+        )
         self.assertNotIn(SECRET, json.dumps(report))
         self.assertFalse(self.kill.exists())
 
@@ -98,7 +113,19 @@ class WatchdogTests(unittest.TestCase):
         ready["BINANCE_SPOT_BOOK_USDT"] = "1000"
         ready["BINANCE_API_KEY"] = "test-key"
         ready["BINANCE_API_SECRET"] = SECRET
-        with mock.patch.dict(os.environ, ready, clear=False):
+        ready["BINANCE_SPOT_PRODUCTION_BOOK"] = "rest_api_key"
+        ready["BINANCE_SPOT_REST_USDT_FREE"] = "250.50"
+        snap = self.root / "account.json"
+        sealed = seal_snapshot(_ACCOUNT, secret=SECRET, fetched_at_ms=1_700_000_000_000)
+        self.assertIsNone(write_snapshot_file(snap, sealed))
+        ready["BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH"] = str(snap)
+        with mock.patch.dict(os.environ, ready, clear=False), mock.patch(
+            "execution.executors.binance_spot.urllib.request.urlopen",
+            side_effect=AssertionError("watchdog must not call Binance"),
+        ), mock.patch(
+            "execution.binance_account_snapshot.time.time",
+            return_value=1_700_000_000,
+        ):
             report = preflight()
             code = __import__("execution.live_bnb_watchdog", fromlist=["main"]).main(["--dry-run"])
         self.assertTrue(report["would_start"], report)
@@ -114,6 +141,12 @@ class WatchdogTests(unittest.TestCase):
         ready["BINANCE_SPOT_BOOK_USDT"] = "1000"
         ready["BINANCE_API_KEY"] = "test-key"
         ready["BINANCE_API_SECRET"] = SECRET
+        ready["BINANCE_SPOT_PRODUCTION_BOOK"] = "rest_api_key"
+        ready["BINANCE_SPOT_REST_USDT_FREE"] = "250.50"
+        snap = self.root / "account.json"
+        sealed = seal_snapshot(_ACCOUNT, secret=SECRET, fetched_at_ms=1_700_000_000_000)
+        self.assertIsNone(write_snapshot_file(snap, sealed))
+        ready["BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH"] = str(snap)
         seen: list[list[str]] = []
         delays: list[float] = []
 
@@ -124,7 +157,10 @@ class WatchdogTests(unittest.TestCase):
         def sleeper(seconds: float) -> None:
             delays.append(seconds)
 
-        with mock.patch.dict(os.environ, ready, clear=False):
+        with mock.patch.dict(os.environ, ready, clear=False), mock.patch(
+            "execution.binance_account_snapshot.time.time",
+            return_value=1_700_000_000,
+        ):
             code = supervise(
                 runner=runner,
                 sleeper=sleeper,
@@ -150,7 +186,10 @@ class WatchdogTests(unittest.TestCase):
         held = (self.root / "one.lock").open("a", encoding="utf-8")
         fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            with mock.patch.dict(os.environ, ready, clear=False):
+            with mock.patch.dict(os.environ, ready, clear=False), mock.patch(
+                "execution.binance_account_snapshot.time.time",
+                return_value=1_700_000_000,
+            ):
                 busy = supervise(
                     runner=runner,
                     sleeper=sleeper,

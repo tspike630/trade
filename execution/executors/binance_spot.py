@@ -53,6 +53,7 @@ DEFAULT_KILL_SWITCH_NAME = "LIVE_TRADING_DISABLED"
 API_KEY_ENV = ("BINANCE_API_KEY", "LIVE_EXCHANGE_API_KEY")
 API_SECRET_ENV = ("BINANCE_API_SECRET", "LIVE_EXCHANGE_API_SECRET")
 DEFAULT_BASE_URL = "https://api.binance.com"
+ACCOUNT_PATH = "/api/v3/account"
 SPOT_PATH = "/api/v3/order"
 EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
 TICKER_PATH = "/api/v3/ticker/price"
@@ -673,6 +674,19 @@ class BinanceSpotHttpClient:
         status, body = self._opener(request, self.timeout)
         return _decode_ok(status, body)
 
+    def get_account(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        """Signed read of ``GET /api/v3/account``. Does not place an order."""
+        request = urllib.request.Request(
+            f"{self.base_url}{ACCOUNT_PATH}?{signed_query}",
+            method="GET",
+            headers={
+                "User-Agent": "trade-binance-spot",
+                "X-MBX-APIKEY": api_key,
+            },
+        )
+        status, body = self._opener(request, self.timeout)
+        return _decode_ok(status, body)
+
     def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{self.base_url}{SPOT_PATH}",
@@ -975,6 +989,8 @@ class BinanceSpotAdapter:
         account_snapshot: dict[str, Any] | None = None,
         production_book: str | None = None,
         rest_expected: dict[str, Any] | None = None,
+        snapshot_error: str | None = None,
+        allow_rest_http: bool = False,
     ) -> None:
         self.client = client
         self.kill_switch_path = kill_switch_path
@@ -985,6 +1001,8 @@ class BinanceSpotAdapter:
         self.account_snapshot = account_snapshot
         self.production_book = production_book
         self.rest_expected = rest_expected
+        self.snapshot_error = snapshot_error
+        self.allow_rest_http = bool(allow_rest_http)
         self.buy_blocks: list[dict[str, Any]] = []
         self.canonical_rows: list[dict[str, Any]] = []
         self._size_plan: dict[str, Any] | None = None
@@ -1011,6 +1029,8 @@ class BinanceSpotAdapter:
         ``BINANCE_SPOT_ACCOUNT_UID`` is not read. A missing uid on the spot
         account payload does not become the MCP uid.
         """
+        if self.snapshot_error:
+            return self.snapshot_error
         book = self.production_book
         if book is None:
             book = os.environ.get("BINANCE_SPOT_PRODUCTION_BOOK", "").strip() or None
@@ -1459,21 +1479,23 @@ class BinanceSpotAdapter:
                 )
             )
         if self.client is None:
-            return self._finish(
-                _result(
-                    ok=False,
-                    dry_run=False,
-                    executed=0,
-                    submitted=False,
-                    error="mcp_gate_required",
-                    symbol=symbol,
-                    order=None,
-                    exchange_order_id=None,
-                    gates=gates,
-                    exit_plan=plan,
-                    consumer_allowed=False,
+            if not self.allow_rest_http:
+                return self._finish(
+                    _result(
+                        ok=False,
+                        dry_run=False,
+                        executed=0,
+                        submitted=False,
+                        error="mcp_gate_required",
+                        symbol=symbol,
+                        order=None,
+                        exchange_order_id=None,
+                        gates=gates,
+                        exit_plan=plan,
+                        consumer_allowed=False,
+                    )
                 )
-            )
+            self.client = BinanceSpotHttpClient()
         if side_now == "BUY" and not callable(getattr(self.client, "new_oco", None)):
             return self._finish(
                 _result(

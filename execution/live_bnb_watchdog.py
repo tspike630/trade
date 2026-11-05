@@ -34,6 +34,8 @@ from execution.executors.binance_spot import (  # noqa: E402
     _env_secret,
     kill_switch_active,
 )
+from execution.binance_account_snapshot import production_snapshot  # noqa: E402
+from execution.executors.binance_spot_gate import REST_BOOK  # noqa: E402
 from execution.executors.binance_spot_protect import BOOK_ENV, book_usdt  # noqa: E402
 
 RESTART_DELAY_SEC = 3.0
@@ -68,6 +70,13 @@ def preflight() -> dict[str, Any]:
         reasons.append("missing_api_credentials")
     if book_usdt() is None:
         reasons.append("missing_book_usdt")
+    book = os.environ.get("BINANCE_SPOT_PRODUCTION_BOOK", "").strip()
+    if book != REST_BOOK:
+        reasons.append("production_book_unselected")
+    else:
+        _payload, snap_error = production_snapshot()
+        if snap_error:
+            reasons.append(snap_error)
     ok = not reasons
     report: dict[str, Any] = {
         "ok": ok,
