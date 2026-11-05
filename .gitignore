@@ -10,6 +10,7 @@ logs/
 backups/
 exports/reports/*
 !exports/reports/decision_cex_bnb_boll_fade_map_2026-11-05.md
+!exports/reports/execution_bnb_spot_adapter_2026-11-05.md
 proxies.txt
 LIVE_TRADING_DISABLED
 *.log
