@@ -12,6 +12,8 @@ from history import pair_history_column_sql
 from logging_setup import get_logger
 from store import norm_address, norm_chain
 
+from indicators.local_score import LOCAL_SCORE_INPUTS, compute_local_score
+
 log = get_logger("indicators.base")
 
 # How long this connection waits for a SQLite lock. Matches Store
@@ -70,6 +72,8 @@ TOKEN_INDICATOR_COLS = [
     "sentiment_updated_at",
     "spike_ratio",
     "spike",
+    "local_score",
+    "local_score_updated_at",
     "composite_score",
     "composite_updated_at",
     "tier",
@@ -107,6 +111,7 @@ _HISTORY_FILL_IF_ABSENT = (
     "sentiment_polarity",
     "spike_ratio",
     "spike",
+    "local_score",
     "composite_score",
     "tier",
     "primary_pair_address",
@@ -144,6 +149,9 @@ _MIGRATE_TOKEN_INDICATORS = [
     # JEV freshness (2026-10-21): age at compute time + verbatim stance
     ("jev_age_min", "REAL"),
     ("jev_stance_raw", "TEXT"),
+    # Local旁路 rank score. Legacy jev_* columns stay nullable.
+    ("local_score", "REAL"),
+    ("local_score_updated_at", "TEXT"),
 ]
 _MIGRATE_INDICATOR_HISTORY = [
     ("rsi_14", "REAL"),
@@ -163,6 +171,7 @@ _MIGRATE_INDICATOR_HISTORY = [
     ("jev_stance_raw", "TEXT"),
     ("change_7d", "REAL"),
     ("volume_7d_avg", "REAL"),
+    ("local_score", "REAL"),
 ]
 
 def utc_now_iso() -> str:
@@ -465,6 +474,50 @@ class IndicatorStore:
         ).fetchone()
         return row["pair_address"] if row else None
 
+    def latest_liquidity_usd(self, chain_id: str, token_address: str) -> float | None:
+        """Latest ``pair_history.liquidity_usd`` of the primary pair.
+
+        Same ranking as ``pick_primary_pair`` (latest snapshot per pair, then
+        the highest liquidity). No HTTP. Missing table, column, or value → None.
+        """
+        chain_id = norm_chain(chain_id)
+        token_address = norm_address(token_address)
+        cols = self._table_columns("pair_history")
+        if "liquidity_usd" not in cols or "pair_address" not in cols:
+            return None
+        if "recorded_at" not in cols:
+            return None
+        order = "recorded_at DESC"
+        if "id" in cols:
+            order = "recorded_at DESC, id DESC"
+        try:
+            found = self._conn.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT liquidity_usd,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY pair_address
+                               ORDER BY {order}
+                           ) AS rn
+                    FROM pair_history
+                    WHERE chain_id = ? AND token_address = ?
+                )
+                SELECT liquidity_usd
+                FROM ranked
+                WHERE rn = 1
+                ORDER BY
+                    CASE WHEN liquidity_usd IS NULL THEN 1 ELSE 0 END,
+                    liquidity_usd DESC
+                LIMIT 1
+                """,
+                (chain_id, token_address),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if found is None:
+            return None
+        return found["liquidity_usd"]
+
     def load_pair_history(
         self,
         chain_id: str,
@@ -544,18 +597,36 @@ class IndicatorStore:
         ``touch_updated_at=False`` leaves the shared updated_at clock alone.
         ``tech_updated_at`` is written only when the caller puts it in ``row``
         (technical passes that do not recompute RSI/MACD/BOLL omit it).
+
+        A payload that includes ``volume_strength``, ``change_5m``,
+        ``spike_ratio``, or ``spike`` refreshes ``local_score`` from the
+        merged row plus the latest pair liquidity. Funding writes that only
+        touch ``jev_*`` leave the local score alone.
         """
         chain_id = norm_chain(row["chain_id"])
         token_address = norm_address(row["token_address"])
         updated_at = row.get("updated_at") or utc_now_iso()
-        cols = [c for c in TOKEN_INDICATOR_COLS if c in row]
+        payload = dict(row)
+        if LOCAL_SCORE_INPUTS.intersection(payload):
+            prev_row = (
+                self.get_token_indicators(chain_id, token_address, use_cache=False)
+                or {}
+            )
+            merged = dict(prev_row)
+            merged.update(payload)
+            payload["local_score"] = compute_local_score(
+                merged,
+                liquidity_usd=self.latest_liquidity_usd(chain_id, token_address),
+            )
+            payload["local_score_updated_at"] = payload.get("updated_at") or utc_now_iso()
+        cols = [c for c in TOKEN_INDICATOR_COLS if c in payload]
         if cols:
             placeholders = ", ".join("?" for _ in cols)
             insert_cols = ", ".join(cols)
             assignments = ", ".join(f"{c}=excluded.{c}" for c in cols)
             if touch_updated_at:
                 assignments = f"{assignments}, updated_at=excluded.updated_at"
-            values = [row.get(c) for c in cols]
+            values = [payload.get(c) for c in cols]
             self._conn.execute(
                 f"""
                 INSERT INTO token_indicators (
@@ -589,7 +660,7 @@ class IndicatorStore:
                 prev = existing
         merged = {
             **prev,
-            **{c: row.get(c) for c in cols},
+            **{c: payload.get(c) for c in cols},
             "chain_id": chain_id,
             "token_address": token_address,
         }
@@ -629,12 +700,13 @@ class IndicatorStore:
                 sentiment_heat_score, sentiment_polarity,
                 spike_ratio, spike,
                 composite_score,
+                local_score,
                 tier, primary_pair_address
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?
+                ?, ?, ?
             )
             """,
             (
@@ -668,6 +740,7 @@ class IndicatorStore:
                 payload.get("spike_ratio"),
                 payload.get("spike"),
                 payload.get("composite_score"),
+                payload.get("local_score"),
                 payload.get("tier"),
                 payload.get("primary_pair_address"),
             ),
@@ -714,21 +787,22 @@ class IndicatorStore:
         return d
 
 
-    # Allowed ORDER BY columns for public top-N API (whitelist only)
-    TOP_SORT_COLUMNS = ("change_5m", "jev_strength", "volume_strength")
+    # Allowed ORDER BY columns for public top-N API (whitelist only).
+    # local_score is the default. jev_strength is legacy and not a sort key.
+    TOP_SORT_COLUMNS = ("local_score", "volume_strength", "change_5m")
 
     def list_top_token_indicators(
         self,
         *,
         chain: str | None = None,
-        sort: str = "change_5m",
+        sort: str = "local_score",
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """
         Top-N rows from token_indicators.
         sort must be in TOP_SORT_COLUMNS; NULLs sorted last; DESC by default.
         """
-        sort_col = (sort or "change_5m").strip()
+        sort_col = (sort or "local_score").strip()
         if sort_col not in self.TOP_SORT_COLUMNS:
             raise ValueError(
                 f"invalid sort={sort_col!r}; allowed={list(self.TOP_SORT_COLUMNS)}"

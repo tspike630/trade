@@ -56,7 +56,7 @@ python -m api_server   # 只读 API + admin
 
 ### 4. API
 
-- `GET /indicators/top?chain=&sort=&limit=` — sort ∈ `change_5m|jev_strength|volume_strength`
+- `GET /indicators/top?chain=&sort=&limit=` — sort ∈ `local_score|volume_strength|change_5m`
 - `GET /indicators/{chain}/{token_address}`
 - 鉴权：与其它数据路由相同（`API_SECRET` → `X-API-Key`；`/health` 开放）
 - 响应块：`technical` / `funding` / `sentiment` / `composite` + meta
@@ -83,7 +83,7 @@ python -m api_server   # 只读 API + admin
 
 | 工具 | 用法 |
 |------|------|
-| `./top.sh jev\|change5m\|volume [chain] [limit]` | 调 `/indicators/top` |
+| `./top.sh local\|change5m\|volume [chain] [limit]` | 调 `/indicators/top` |
 | `python scripts/grok_dd_report.py … --telegram` | 可选推 admin 频道 |
 | Admin `/` → Indicators Top | 前端 `fetch` |
 
@@ -194,12 +194,12 @@ python -m indicators.run --once
 python -m indicators.run --full          # 显式全量，无视 INDICATORS_ENABLED=0
 
 # Top
-./top.sh jev
+./top.sh local
 ./top.sh change5m solana 20
 
 # API（密钥勿回显到日志）
 curl -sS -H "X-API-Key: $API_SECRET" \
-  "http://127.0.0.1:8080/indicators/top?chain=solana&sort=jev_strength&limit=5"
+  "http://127.0.0.1:8080/indicators/top?chain=solana&sort=local_score&limit=5"
 
 # 冒烟
 python demo_indicators_p0.py

@@ -72,7 +72,7 @@ python -m indicators.run --once          # 或 --full
 python demo_indicators_p0.py             # API 冒烟（需 api_server + API_SECRET）
 nohup python -m indicators.run --loop --interval 300 >> logs/indicators.log 2>&1 &
 nohup python -m sources.jev --loop --interval 900 >> logs/jev.log 2>&1 &
-# 可选 Top：./top.sh jev|change5m|volume
+# 可选 Top：./top.sh local|change5m|volume
 ```
 
 验收：`pgrep -af 'indicators.run|sources.jev'`；`token_indicators` 有新鲜 `updated_at`；权重仍为 0。

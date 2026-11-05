@@ -15,7 +15,12 @@ from unittest import mock
 
 from decision_engine import config as de_config
 from decision_engine.backtest.replay import HistoryReplay, merge_bar_rows
-from decision_engine.core.data_adapter import _INDICATOR_COLS, IndicatorDataAdapter
+from decision_engine.core.data_adapter import (
+    HOT_RANK_COLUMNS,
+    IndicatorDataAdapter,
+    _INDICATOR_COLS,
+    local_hot_rank_key,
+)
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import SignalBus
 from decision_engine.factors.buy.boll_breakout import BollBreakoutBuyFactor
@@ -138,8 +143,12 @@ class BollColumnTests(unittest.TestCase):
         self.assertNotIn("boll_low", _INDICATOR_COLS)
         self.assertIn("change_7d", _INDICATOR_COLS)
         self.assertIn("volume_7d_avg", _INDICATOR_COLS)
+        self.assertIn("local_score", _INDICATOR_COLS)
+        self.assertEqual(HOT_RANK_COLUMNS[0], "local_score")
+        self.assertNotIn("jev_strength", HOT_RANK_COLUMNS)
         self.assertIn("change_7d", HistoryReplay._IND_COLS)
         self.assertIn("volume_7d_avg", HistoryReplay._IND_COLS)
+        self.assertIn("local_score", HistoryReplay._IND_COLS)
 
     def test_factor_reads_boll_upper(self) -> None:
         factor = BollBreakoutBuyFactor()
@@ -281,15 +290,48 @@ class HotFreshnessTests(unittest.TestCase):
                 """
                 CREATE TABLE token_indicators (
                     chain_id TEXT, token_address TEXT, tier TEXT,
-                    jev_strength REAL, updated_at TEXT
+                    jev_strength REAL, local_score REAL, volume_strength REAL,
+                    change_5m REAL, updated_at TEXT
                 )
                 """
             )
+            # b wins on local_score even though a has the higher jev_strength.
+            # c/d/e have NULL local_score and fall through volume, then change.
             conn.execute(
-                "INSERT INTO token_indicators VALUES ('solana', 'a', 'hot', 0.2, '2026-01-01T00:00:00Z')"
+                """
+                INSERT INTO token_indicators VALUES
+                    ('solana', 'a', 'hot', 0.9, 0.1, 9.0, 9.0, '2026-01-01T00:00:00Z')
+                """
             )
             conn.execute(
-                "INSERT INTO token_indicators VALUES ('solana', 'b', 'hot', 0.5, '2026-01-01T00:00:00Z')"
+                """
+                INSERT INTO token_indicators VALUES
+                    ('solana', 'b', 'hot', 0.1, 0.8, 0.1, 0.1, '2026-01-01T00:00:00Z')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators VALUES
+                    ('solana', 'c', 'hot', 1.0, NULL, 5.0, 1.0, '2026-01-01T00:00:00Z')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators VALUES
+                    ('solana', 'd', 'hot', 1.0, NULL, NULL, 50.0, '2026-01-02T00:00:00Z')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators VALUES
+                    ('solana', 'e', 'hot', 9.0, NULL, NULL, NULL, '2026-01-01T00:00:00Z')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO token_indicators VALUES
+                    ('solana', 'f', 'hot', 9.0, -0.4, 0.0, -20.0, '2026-01-03T00:00:00Z')
+                """
             )
             conn.commit()
             conn.close()
@@ -301,9 +343,64 @@ class HotFreshnessTests(unittest.TestCase):
                 logging.getLogger("dexscreener.decision_engine.data_adapter").removeHandler(
                     handler
                 )
-            self.assertEqual([r["token_address"] for r in rows], ["b", "a"])
+            self.assertEqual(
+                [r["token_address"] for r in rows],
+                ["b", "a", "f", "c", "d", "e"],
+            )
             self.assertTrue(any("freshness columns missing" in m for m in messages), messages)
             self.assertTrue(any("skipped_stale=0" in m for m in messages), messages)
+            self.assertFalse(any("jev_strength" in m for m in messages), messages)
+
+    def test_no_hot_tier_falls_back_to_local_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ind.db"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                """
+                CREATE TABLE token_indicators (
+                    chain_id TEXT, token_address TEXT, tier TEXT,
+                    jev_strength REAL, local_score REAL, volume_strength REAL,
+                    change_5m REAL, updated_at TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO token_indicators VALUES (?, ?, 'warm', ?, ?, ?, ?, ?)
+                """,
+                [
+                    ("solana", "hi_jev", 0.99, None, 0.2, 1.0, "2026-01-01T00:00:00Z"),
+                    ("solana", "hi_local", 0.01, 0.4, 0.2, 1.0, "2026-01-01T00:00:00Z"),
+                    ("solana", "hi_vol", 0.5, None, 3.0, -5.0, "2026-01-01T00:00:00Z"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            handler, messages = self._capture()
+            try:
+                with IndicatorDataAdapter(path) as adapter:
+                    rows = adapter.list_hot_tokens(limit=10)
+            finally:
+                logging.getLogger("dexscreener.decision_engine.data_adapter").removeHandler(
+                    handler
+                )
+            self.assertEqual(
+                [r["token_address"] for r in rows],
+                ["hi_local", "hi_vol", "hi_jev"],
+            )
+            self.assertTrue(any("by local_score,volume_strength,change_5m" in m for m in messages))
+
+    def test_rank_key_puts_null_local_score_last(self) -> None:
+        rows = [
+            {"local_score": None, "volume_strength": 9.0, "change_5m": 9.0, "jev_strength": 1.0},
+            {"local_score": -0.2, "volume_strength": 0.0, "change_5m": -50.0, "jev_strength": 0.0},
+            {"local_score": 0.2, "volume_strength": 0.0, "change_5m": 0.0, "jev_strength": 0.0},
+        ]
+        ranked = sorted(rows, key=local_hot_rank_key)
+        self.assertEqual(
+            [r["local_score"] for r in ranked],
+            [0.2, -0.2, None],
+        )
 
 
 class CooldownTests(unittest.TestCase):

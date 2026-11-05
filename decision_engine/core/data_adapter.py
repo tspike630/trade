@@ -30,6 +30,8 @@ _INDICATOR_COLS = (
     "volume_7d_avg",
     "volatility_24h",
     "volume_strength",
+    "local_score",
+    "local_score_updated_at",
     "jev_raw_score",
     "jev_score",
     "jev_signal",
@@ -59,6 +61,49 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 def _iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Hot/top rank. jev_strength is legacy and must not decide order.
+# NULL local_score falls through to volume_strength, then change_5m.
+HOT_RANK_COLUMNS = ("local_score", "volume_strength", "change_5m")
+
+
+def _nulls_last_desc_key(value: Any) -> tuple[int, float]:
+    number = _safe_float(value)
+    if number is None:
+        return (1, 0.0)
+    return (0, -number)
+
+
+def local_hot_rank_key(row: dict[str, Any]) -> tuple[int | float, ...]:
+    """Sort key: local_score, then volume_strength, then change_5m. NULLS LAST."""
+    parts: list[int | float] = []
+    for col in HOT_RANK_COLUMNS:
+        missing, signed = _nulls_last_desc_key(row.get(col))
+        parts.append(missing)
+        parts.append(signed)
+    return tuple(parts)
+
+
+def hot_rank_order_sql(columns: set[str], *, qualifier: str = "") -> str:
+    """ORDER BY clause for hot/top reads. Skips columns the table does not have."""
+    prefix = f"{qualifier}." if qualifier else ""
+    parts: list[str] = []
+    for col in HOT_RANK_COLUMNS:
+        if col not in columns:
+            continue
+        expr = f"{prefix}{col}"
+        parts.append(f"CASE WHEN {expr} IS NULL THEN 1 ELSE 0 END, {expr} DESC")
+    if "updated_at" in columns:
+        parts.append(f"{prefix}updated_at DESC")
+    else:
+        parts.append(f"{prefix}rowid DESC")
+    return ", ".join(parts)
+
+
+def hot_rank_label(columns: set[str]) -> str:
+    present = [col for col in HOT_RANK_COLUMNS if col in columns]
+    return ",".join(present) if present else "updated_at"
 
 
 def _safe_float(value: Any) -> float | None:
@@ -264,7 +309,9 @@ class IndicatorDataAdapter:
 
     def list_hot_tokens(self, limit: int = 50) -> list[dict[str, Any]]:
         """
-        Prefer tier='hot' ordered by jev_strength DESC NULLS LAST.
+        Prefer tier='hot' ordered by local_score DESC NULLS LAST, then
+        volume_strength, then change_5m. jev_strength is not a sort key.
+        Columns the table does not have are skipped.
 
         tier alone is not trusted: a token that left the hot window can stay
         tier='hot' after funding/sentiment refresh the shared updated_at.
@@ -272,7 +319,7 @@ class IndicatorDataAdapter:
         When tech_updated_at exists, also require that technical pass to be fresh.
         Missing columns degrade to the filters that are available.
         If every hot row is stale, return empty — do not fall back onto them.
-        If there is no hot tier at all, fall back to top jev_strength globally.
+        If there is no hot tier at all, fall back to the same local rank globally.
         """
         if not self._table_exists("token_indicators"):
             log.warning("token_indicators table missing")
@@ -328,12 +375,12 @@ class IndicatorDataAdapter:
                 "yes" if has_tech else "no",
             )
 
-        order_updated = "ti.updated_at" if "updated_at" in ind_present else "ti.rowid"
+        order_by = hot_rank_order_sql(ind_present, qualifier="ti")
         sql_hot = f"""
             SELECT {select_list}
             FROM token_indicators ti{join_sql}
             WHERE {' AND '.join(where)}
-            ORDER BY COALESCE(ti.jev_strength, -1) DESC, {order_updated} DESC
+            ORDER BY {order_by}
             LIMIT ?
         """
         rows = self.conn.execute(sql_hot, (*params, limit)).fetchall()
@@ -364,14 +411,15 @@ class IndicatorDataAdapter:
         sql_any = f"""
             SELECT {", ".join(col_names)}
             FROM token_indicators
-            ORDER BY COALESCE(jev_strength, -1) DESC, updated_at DESC
+            ORDER BY {hot_rank_order_sql(ind_present)}
             LIMIT ?
         """
         rows = self.conn.execute(sql_any, (limit,)).fetchall()
         log.info(
-            "list_hot_tokens: no hot tier; fallback top-%s by jev_strength (%s rows) "
+            "list_hot_tokens: no hot tier; fallback top-%s by %s (%s rows) "
             "skipped_stale=0",
             limit,
+            hot_rank_label(ind_present),
             len(rows),
         )
         return self._attach_jev_stance(self._attach_liquidity([dict(r) for r in rows]))
