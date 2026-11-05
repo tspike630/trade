@@ -149,6 +149,9 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
             if isinstance(result.get("sellable_qty"), str)
             else None
         ),
+        "size_plan": (
+            result.get("size_plan") if isinstance(result.get("size_plan"), dict) else None
+        ),
     }
 
 

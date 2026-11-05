@@ -37,6 +37,7 @@ from execution.executors.binance_spot import (
 BLOCK_SELL_ENV = "BINANCE_SPOT_BLOCK_SELL_ON_KILL"
 FEE_BPS_ENV = "BINANCE_SPOT_TAKER_FEE_BPS"
 ENTRY_MIN_NOTIONAL_USDT = Decimal("20")
+BOOK_ENV = "BINANCE_SPOT_BOOK_USDT"
 DEFAULT_TAKER_FEE_BPS = Decimal("10")
 OCO_PATH = "/api/v3/orderList/oco"
 ORDER_LIST_PATH = "/api/v3/orderList"
@@ -526,6 +527,81 @@ def dust_detail(error: str | None) -> str | None:
     if error in _DUST_DETAILS:
         return error
     return None
+
+
+def _explicit_order_size(extras: dict[str, Any]) -> bool:
+    for key in ("quote_order_qty", "quoteOrderQty", "quantity"):
+        if extras.get(key) not in (None, ""):
+            return True
+    return False
+
+
+def book_usdt(environ: Any | None = None) -> Decimal | None:
+    """Operator book for ``size_pct``. Not a wallet balance and not invented."""
+    env = os.environ if environ is None else environ
+    raw = env.get(BOOK_ENV) if hasattr(env, "get") else None
+    if raw is None or not str(raw).strip():
+        return None
+    return _to_decimal(str(raw).strip())
+
+
+def resolve_entry_size(
+    sig: dict[str, Any],
+    extras: dict[str, Any],
+    *,
+    require_book: bool = True,
+    environ: Any | None = None,
+) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
+    """Turn ``size_pct`` into a spot order size. Explicit qty/quote wins.
+
+    ``quote = size_pct * BINANCE_SPOT_BOOK_USDT``. Below 20 USDT is refused.
+    A missing book is ``missing_book_usdt``; nothing is guessed. MARKET buys
+    get ``quoteOrderQty``. LIMIT buys get base ``quantity = quote / limit``.
+    """
+    if str(sig.get("action") or "").strip().lower() != "buy":
+        return extras, None, None
+    if _explicit_order_size(extras):
+        return extras, None, {"source": "explicit"}
+    if sig.get("size_pct") in (None, ""):
+        return extras, None, None
+    pct = _to_decimal(sig.get("size_pct"))
+    if pct is None or pct <= 0 or pct > 1:
+        return extras, "invalid_size_pct", None
+    book = book_usdt(environ)
+    if book is None:
+        if not require_book:
+            return extras, None, None
+        return extras, "missing_book_usdt", None
+    quote = pct * book
+    quote_text = _decimal_text(quote)
+    plan: dict[str, Any] = {
+        "source": "size_pct",
+        "size_pct": _decimal_text(pct),
+        "book_usdt": _decimal_text(book),
+        "quote_usdt": quote_text,
+    }
+    if quote < ENTRY_MIN_NOTIONAL_USDT:
+        return extras, "entry_notional_below_min", plan
+    order_type = str(extras.get("order_type") or extras.get("binance_order_type") or "MARKET").strip().upper()
+    sized = dict(extras)
+    if order_type == "LIMIT":
+        price = _to_decimal(extras.get("limit_price"))
+        if price is None:
+            price = _to_decimal(extras.get("price"))
+        if price is None:
+            return extras, "missing_limit_price", plan
+        qty = quote / price
+        if qty <= 0:
+            return extras, "entry_not_viable:below_min_qty", plan
+        sized["quantity"] = _decimal_text(qty)
+        plan["order_type"] = "LIMIT"
+        plan["needs_lot_floor"] = True
+        return sized, None, plan
+    if order_type not in {"MARKET", ""}:
+        return extras, "invalid_order_type", plan
+    sized["quote_order_qty"] = quote_text
+    plan["order_type"] = "MARKET"
+    return sized, None, plan
 
 
 def tracked_exit(position: dict[str, Any]) -> bool:
