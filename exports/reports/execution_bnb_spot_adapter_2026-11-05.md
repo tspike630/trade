@@ -51,4 +51,8 @@ python -m execution.run --loop \
 
 不要 `--accept-purpose live_tech_boll_fade`。不要把纸面 peer 的 `--accept-purpose` 改成 `live_bnb_boll_fade`。不要和 `race_tech_boll_fade` 共用账本或 `paper_eq_tech_boll_fade.db`。
 
+## 持仓保护（仍不打开实盘）
+
+入场 `newOrder` 不附带 OCO / STOP_LOSS_LIMIT，回执仍是 `protective_order=not_supported_not_sent`。上面这个循环在处理新决策之后，会对本账本里已成交的多单调用 `protective_exit_reason`。入场回执没有 base `executedQty` 时先记成未确认，下一拍在闸打开的情况下用入场 `orderId` 再读一次；读到数量才允许卖。标记价触及绝对止损，或触及下单时记下的止盈（决策当时的 `boll_mid`），就按该符号的 LOT_SIZE / MARKET_LOT_SIZE 向下取整，市价卖出全部 base 数量。取整后低于最小数量或最小名义，不发单，仓位保持 open。卖单被拒或 HTTP 失败也不改成已平，下一拍用同一个 `bnbfade-x-<decision_log_id>` 再试，避免换号打出第二笔。干跑不记仓。杀开关文件还在，或 `BINANCE_SPOT_LIVE_ENABLED` 不是开，保护卖单同样不发。进程停着的时候，交易所上没有休息着的保护单。
+
 有疑问：把 `LIVE_TRADING_DISABLED` 放回去，并取消 `BINANCE_SPOT_LIVE_ENABLED`。

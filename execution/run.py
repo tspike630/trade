@@ -12,7 +12,9 @@ CLI for execution management Step A/B/C.
   #     --ledger execution_ledger_race_rsi_bounce.db \
   #     --accept-purpose race_rsi_bounce
   # Binance spot arm (still refuses live newOrder while LIVE_TRADING_DISABLED
-  # is present or BINANCE_SPOT_LIVE_ENABLED is off). Not a paper peer:
+  # is present or BINANCE_SPOT_LIVE_ENABLED is off). Not a paper peer.
+  # The same loop sells a filled long when its absolute stop or take-profit
+  # is touched. Dry-run does not arm that position.
   #   python -m execution.run --loop \
   #     --ledger execution_ledger_live_bnb_boll_fade.db \
   #     --accept-purpose live_bnb_boll_fade
@@ -42,6 +44,21 @@ from execution.ledger import resolve_ledger_path  # noqa: E402
 log = get_logger("execution.run")
 
 DEFAULT_POLL_SEC = float(os.environ.get("EXECUTION_POLL_SEC", "5"))
+
+
+def tick_live_bnb_exits(
+    gw: ExecutionGateway,
+    accept_purposes: frozenset[str] | None,
+    marks: dict | None = None,
+) -> list:
+    """Protective full-position sells for this process's Binance arm only.
+
+    ``race_tech_boll_fade`` and every other purpose get an empty list. The
+    adapter is not asked to exit those books.
+    """
+    if accept_purposes != frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}):
+        return []
+    return list(gw.tick_binance_protective_exits(marks))
 
 
 def _default_paper_db() -> str | None:
@@ -354,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
                 paper = gw._get_paper()
                 if paper is not None:
                     tick_actions = paper.tick()
+            protective_exits = tick_live_bnb_exits(gw, accept_purposes)
             summary = {
                 "processed": stats.processed,
                 "validation_ok": stats.validation_ok,
@@ -370,13 +388,23 @@ def main(argv: list[str] | None = None) -> int:
                     sorted(accept_purposes) if accept_purposes is not None else None
                 ),
                 "paper_tick_closed": tick_actions,
+                "protective_exits": [
+                    {
+                        "symbol": item.get("symbol"),
+                        "reason": item.get("reason"),
+                        "submitted": item.get("submitted"),
+                        "error": item.get("error"),
+                        "position_status": item.get("position_status"),
+                    }
+                    for item in protective_exits
+                ],
                 "sample": stats.receipts[:3] if stats.receipts else [],
             }
             if args.json:
                 print(json.dumps(summary, ensure_ascii=False, default=str))
             else:
                 log.info(
-                    "tick processed=%s ok=%s fail=%s pm_rej=%s executed_ok=%s cursor=%s paper=%s pm=%s tick_closed=%s",
+                    "tick processed=%s ok=%s fail=%s pm_rej=%s executed_ok=%s cursor=%s paper=%s pm=%s tick_closed=%s protective_exits=%s",
                     stats.processed,
                     stats.validation_ok,
                     stats.validation_fail,
@@ -386,6 +414,7 @@ def main(argv: list[str] | None = None) -> int:
                     paper_enabled,
                     pm_enabled,
                     len(tick_actions),
+                    len(protective_exits),
                 )
             return summary
 
@@ -405,6 +434,7 @@ def main(argv: list[str] | None = None) -> int:
                             "cursor": summary["cursor"],
                             "paper_enabled": summary["paper_enabled"],
                             "pm_enabled": summary["pm_enabled"],
+                            "protective_exits": summary["protective_exits"],
                             "sample_receipts": summary["sample"],
                         },
                         ensure_ascii=False,
