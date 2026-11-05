@@ -30,9 +30,9 @@
 只写这两张表，和 Solana `token_indicators` / `pair_history` 分开：
 
 - `binance_klines`（另存公开 K 线数组下标 10 的 `taker_buy_quote_volume`）
-- `binance_indicators`（另存影子列 `avg_trade_size`、`trades_spike_ratio`、`taker_buy_quote_ratio`）
+- `binance_indicators`（另存影子列 `avg_trade_size`、`trades_spike_ratio`、`taker_buy_quote_ratio`、`change_5m_z`）
 
-这三列和 taker 列只作拥挤旁证，不进 `list_binance_hot_tokens` 的扫描行，也不进 `tech_boll_fade` 硬门。口径见 `docs/crowding_spot_shadow_columns_2026-11-05.md`。`volume_strength` 仍是原来的 1 小时 quote 合计比 24 小时均值。
+这些列只作旁证，不进 `list_binance_hot_tokens` 的扫描行，也不进 `tech_boll_fade` 硬门。`change_5m_z` 是当前 5m 收益（百分点，与 `change_5m` 同单位）除以前 20 根 5m 收益的 σ，不是把入场改成 k·σ，也不拿 `volatility_24h` 当这个 σ。BOLL 仍是 20, 2σ。口径见 `docs/crowding_spot_shadow_columns_2026-11-05.md`。`volume_strength` 仍是原来的 1 小时 quote 合计比 24 小时均值。
 
 `INDICATORS_WEIGHT_*` 保持 0。不把 `local_score` 当入场门。不下单。
 

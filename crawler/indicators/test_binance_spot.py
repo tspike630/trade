@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import tempfile
@@ -18,9 +19,11 @@ from config import (
 from decision_engine.core.binance_indicators import list_binance_hot_tokens
 from decision_engine.strategies.tech_boll_fade import TechBollFadeStrategy
 from indicators.binance_spot import (
+    CHANGE_5M_Z_PRIOR_RETURNS,
     TRADES_SPIKE_PRIOR_BARS,
     SpotSymbol,
     canonical_spot_usdt,
+    change_5m_z_from_klines,
     crowding_shadow_from_klines,
     ensure_schema,
     factors_from_klines,
@@ -626,6 +629,7 @@ class CrowdingShadowTests(unittest.TestCase):
             self.assertIn("avg_trade_size", ind_cols)
             self.assertIn("trades_spike_ratio", ind_cols)
             self.assertIn("taker_buy_quote_ratio", ind_cols)
+            self.assertIn("change_5m_z", ind_cols)
             old_kline = conn.execute(
                 """
                 SELECT quote_volume, trades, taker_buy_quote_volume
@@ -636,11 +640,11 @@ class CrowdingShadowTests(unittest.TestCase):
             old_vs = conn.execute(
                 """
                 SELECT volume_strength, avg_trade_size, trades_spike_ratio,
-                       taker_buy_quote_ratio
+                       taker_buy_quote_ratio, change_5m_z
                 FROM binance_indicators WHERE symbol = 'OLDUSDT'
                 """
             ).fetchone()
-            self.assertEqual(tuple(old_vs), (1.25, None, None, None))
+            self.assertEqual(tuple(old_vs), (1.25, None, None, None, None))
 
             bars = []
             for i in range(12):
@@ -661,6 +665,7 @@ class CrowdingShadowTests(unittest.TestCase):
             self.assertAlmostEqual(stored["avg_trade_size"], 100.0)
             self.assertAlmostEqual(stored["trades_spike_ratio"], 4.0)
             self.assertAlmostEqual(stored["taker_buy_quote_ratio"], 0.25)
+            self.assertIsNone(stored["change_5m_z"])
             self.assertAlmostEqual(
                 stored["volume_strength"],
                 volume_strength(price_series_from_klines(bars)),
@@ -676,18 +681,121 @@ class CrowdingShadowTests(unittest.TestCase):
             self.assertAlmostEqual(saved_taker[0], 1000.0)
             saved = conn.execute(
                 """
-                SELECT avg_trade_size, trades_spike_ratio, taker_buy_quote_ratio
+                SELECT avg_trade_size, trades_spike_ratio, taker_buy_quote_ratio,
+                       change_5m_z
                 FROM binance_indicators WHERE symbol = 'ZZQBOLLUSDT'
                 """
             ).fetchone()
-            self.assertEqual(tuple(saved), (100.0, 4.0, 0.25))
+            self.assertEqual(tuple(saved), (100.0, 4.0, 0.25, None))
             hot = list_binance_hot_tokens(conn, limit=5, fresh_sec=3600)
             shaped = [row for row in hot if row["token_address"] == "ZZQBOLLUSDT"]
             self.assertEqual(len(shaped), 1)
-            for key in ("avg_trade_size", "trades_spike_ratio", "taker_buy_quote_ratio"):
+            for key in (
+                "avg_trade_size",
+                "trades_spike_ratio",
+                "taker_buy_quote_ratio",
+                "change_5m_z",
+            ):
                 self.assertNotIn(key, shaped[0])
             self.assertEqual(_dump(conn, "token_indicators"), before_token)
             conn.close()
+
+
+def _bars_from_closes(closes: list[float]) -> list:
+    bars = []
+    for i, close in enumerate(closes):
+        bar = parse_kline_row(_rest_bar(i, close=close))
+        assert bar is not None
+        bars.append(bar)
+    return bars
+
+
+class Change5mZTests(unittest.TestCase):
+    def test_z_is_latest_pct_over_prior_20_and_not_volatility_24h(self) -> None:
+        self.assertEqual(CHANGE_5M_Z_PRIOR_RETURNS, 20)
+        closes = [100.0]
+        for i in range(20):
+            closes.append(closes[-1] * (1.5 if i % 2 == 0 else 0.5))
+        closes.append(closes[-1] * 2.0)
+        bars = _bars_from_closes(closes)
+        # Prior 20 returns are ±50 percentage points. Current step is +100.
+        expected = 2.0 * math.sqrt(19.0 / 20.0)
+        z = change_5m_z_from_klines(bars)
+        self.assertAlmostEqual(z or 0.0, expected, places=9)
+        factors = factors_from_klines(bars)
+        assert factors is not None
+        self.assertAlmostEqual(factors["change_5m"], 100.0, places=6)
+        self.assertAlmostEqual(factors["change_5m_z"], expected, places=9)
+        self.assertAlmostEqual(factors["change_5m_z"], factors["change_5m"] / (50.0 * math.sqrt(20.0 / 19.0)), places=9)
+        vol = factors["volatility_24h"]
+        assert vol is not None and vol > 0
+        self.assertNotAlmostEqual(factors["change_5m_z"], factors["change_5m"] / vol, places=4)
+
+        strategy = TechBollFadeStrategy()
+        self.assertEqual(strategy.min_change_5m, 2.0)
+        self.assertEqual(strategy.min_volume_strength, 0.5)
+        rejected = strategy.on_tick(
+            {
+                "hot_tokens": [
+                    {
+                        "chain_id": "binance",
+                        "token_address": "ZZQBOLLUSDT",
+                        "change_5m": -1.0,
+                        "volume_strength": 3.0,
+                        "boll_lower": 10.0,
+                        "price_usd": 1.0,
+                        "change_5m_z": -12.0,
+                    }
+                ]
+            }
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(strategy.rejected.get("tech_leg_fail"), 1)
+        hit = strategy.on_tick(
+            {
+                "hot_tokens": [
+                    {
+                        "chain_id": "binance",
+                        "token_address": "ZZQBOLLUSDT",
+                        "change_5m": -3.0,
+                        "volume_strength": 0.8,
+                        "boll_lower": 2.0,
+                        "price_usd": 1.0,
+                        "change_5m_z": -12.0,
+                    }
+                ]
+            }
+        )
+        self.assertEqual(len(hit), 1)
+        self.assertNotIn("change_5m_z", hit[0])
+        self.assertIn("c5=-3.000<=-2.0", hit[0]["reason"])
+
+    def test_constant_short_and_zero_sigma_stay_null(self) -> None:
+        flat = _bars_from_closes([100.0] * 30)
+        self.assertIsNone(change_5m_z_from_klines(flat))
+        flat_factors = factors_from_klines(flat)
+        assert flat_factors is not None
+        self.assertEqual(flat_factors["change_5m"], 0.0)
+        self.assertIsNone(flat_factors["change_5m_z"])
+
+        short = _bars_from_closes([100.0 + i for i in range(10)])
+        self.assertLess(len(short), CHANGE_5M_Z_PRIOR_RETURNS + 2)
+        self.assertIsNone(change_5m_z_from_klines(short))
+        short_factors = factors_from_klines(short)
+        assert short_factors is not None
+        self.assertIsNotNone(short_factors["change_5m"])
+        self.assertIsNone(short_factors["change_5m_z"])
+
+        doubled = [100.0]
+        for _ in range(25):
+            doubled.append(doubled[-1] * 2.0)
+        zero_sigma = _bars_from_closes(doubled)
+        zero_factors = factors_from_klines(zero_sigma)
+        assert zero_factors is not None
+        self.assertAlmostEqual(zero_factors["change_5m"], 100.0, places=6)
+        self.assertEqual(zero_factors["volatility_24h"], 0.0)
+        self.assertIsNone(zero_factors["change_5m_z"])
+        self.assertIsNone(change_5m_z_from_klines([]))
 
 
 if __name__ == "__main__":

@@ -14,8 +14,8 @@ price series changes (spot kline closes, trailing 1h quote volume as the
 Writes ``binance_klines`` and ``binance_indicators`` only.
 ``INDICATORS_WEIGHT_*`` stay untouched. No orders.
 
-Crowding columns are shadow readings on the same rows. They are not inputs
-to ``volume_strength`` and not entry gates. See
+Crowding columns and ``change_5m_z`` are shadow readings on the same rows.
+They are not inputs to ``volume_strength`` and not entry gates. See
 ``docs/crowding_spot_shadow_columns_2026-11-05.md``.
 """
 
@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import sqlite3
+import statistics
 import time
 import urllib.error
 import urllib.parse
@@ -106,6 +107,7 @@ _INDICATOR_COLS = (
     "avg_trade_size",
     "trades_spike_ratio",
     "taker_buy_quote_ratio",
+    "change_5m_z",
 )
 
 # /api/v3/klines, 0-based. Index 9 is taker-buy *base* volume and is not stored.
@@ -113,6 +115,10 @@ _TAKER_BUY_QUOTE_VOLUME_INDEX = 10
 # Latest bar is the numerator only. Prior 12 stored bars of the same series
 # are the mean. The live job writes 5m, so those 12 bars are one hour.
 TRADES_SPIKE_PRIOR_BARS = 12
+# Prior 5m returns only. The latest return is the numerator and is not in σ.
+CHANGE_5M_Z_PRIOR_RETURNS = 20
+# Percentage points. At or below this, σ is treated as zero and z stays NULL.
+_CHANGE_5M_Z_SIGMA_EPS = 1e-12
 
 _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "binance_klines": (("taker_buy_quote_volume", "REAL"),),
@@ -120,6 +126,7 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("avg_trade_size", "REAL"),
         ("trades_spike_ratio", "REAL"),
         ("taker_buy_quote_ratio", "REAL"),
+        ("change_5m_z", "REAL"),
     ),
 }
 
@@ -610,12 +617,57 @@ def crowding_shadow_from_klines(klines: Sequence[SpotKline]) -> dict[str, float 
     }
 
 
+def _bar_return_pct(prev_close: float, close: float) -> float | None:
+    """Simple return in percentage points, the same unit as ``change_5m``."""
+    if prev_close <= 0 or close <= 0:
+        return None
+    if prev_close != prev_close or close != close:
+        return None
+    return (close - prev_close) / prev_close * 100.0
+
+
+def change_5m_z_from_klines(klines: Sequence[SpotKline]) -> float | None:
+    """Latest 5m return / sample σ of the previous 20 bar returns.
+
+    Both sides are percentage points, matching ``change_5m`` (``-2`` is −2%,
+    not −0.02). On a regular 5m grid the numerator is the same number as
+    ``change_5m``. σ is ``statistics.stdev`` of those prior 20 returns only.
+    The current bar is not inside σ. This is not ``volatility_24h``.
+
+    None when the series has fewer than 20 prior returns, any close is
+    unusable, or σ is about 0 (``<= 1e-12`` percentage points).
+    """
+    if not klines:
+        return None
+    ordered = sorted(klines, key=lambda bar: (bar.close_time_ms, bar.open_time_ms))
+    returns: list[float] = []
+    for prev, bar in zip(ordered, ordered[1:]):
+        step = _bar_return_pct(float(prev.close), float(bar.close))
+        if step is None:
+            return None
+        returns.append(step)
+    need = CHANGE_5M_Z_PRIOR_RETURNS + 1
+    if len(returns) < need:
+        return None
+    current = returns[-1]
+    prior = returns[-need:-1]
+    if len(prior) != CHANGE_5M_Z_PRIOR_RETURNS:
+        return None
+    try:
+        sigma = statistics.stdev(prior)
+    except statistics.StatisticsError:
+        return None
+    if sigma != sigma or sigma <= _CHANGE_5M_Z_SIGMA_EPS:
+        return None
+    return current / sigma
+
+
 def factors_from_klines(klines: Sequence[SpotKline]) -> dict[str, Any] | None:
     """Same tech_boll family as paper: change_*, volume_strength, BOLL(20, 2σ) on close.
 
     ``volume_strength`` is still ``indicators.technical.volume_strength`` on the
-    trailing-1h quote series. Crowding fields are attached afterwards and are
-    not arguments to that function.
+    trailing-1h quote series. Crowding fields and ``change_5m_z`` are attached
+    afterwards and are not arguments to that function. BOLL stays 20, 2σ.
     """
     series = price_series_from_klines(klines)
     if not series:
@@ -638,6 +690,7 @@ def factors_from_klines(klines: Sequence[SpotKline]) -> dict[str, Any] | None:
     }
     out.update(fields)
     out.update(crowding_shadow_from_klines(klines))
+    out["change_5m_z"] = change_5m_z_from_klines(klines)
     return out
 
 

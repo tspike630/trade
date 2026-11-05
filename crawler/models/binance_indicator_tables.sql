@@ -2,8 +2,9 @@
 -- READ the landed universe (exports/binance_spot_universe.db / the JSON report).
 -- WRITE only the tables in this file.
 -- Never INSERT/UPDATE/DELETE token_indicators, indicator_history, or pair_history.
--- Crowding shadow columns (taker_buy_quote_volume, avg_trade_size,
--- trades_spike_ratio, taker_buy_quote_ratio) are observation only.
+-- Shadow columns (taker_buy_quote_volume, avg_trade_size,
+-- trades_spike_ratio, taker_buy_quote_ratio, change_5m_z) are observation only.
+-- change_5m_z does not replace the -2% tech_boll_fade gate. BOLL stays 20, 2σ.
 -- Existing databases gain them via ALTER in ensure_schema. Do not rebuild.
 
 CREATE TABLE IF NOT EXISTS binance_klines (
@@ -54,7 +55,8 @@ CREATE TABLE IF NOT EXISTS binance_indicators (
     updated_at TEXT NOT NULL,
     avg_trade_size REAL,
     trades_spike_ratio REAL,
-    taker_buy_quote_ratio REAL
+    taker_buy_quote_ratio REAL,
+    change_5m_z REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_binance_indicators_tech
