@@ -170,13 +170,13 @@ class DecisionEngine:
     def _load_live_bnb_hot(
         self, dex_hot: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], str]:
-        """CEX factors for ``live_bnb_boll_fade``. Same switch as indicator PR #160.
+        """CEX factors for ``live_bnb_boll_fade``.
 
         ``auto`` (default): ``binance_indicators`` once that table exists,
         even if this pass is empty — klines are not recomputed on top of it.
         If the table was never created, use ``binance_klines`` (in-process
         factors) when those bars exist. DEX∩listing only when neither CEX
-        table is available. ``binance`` never fills from DEX. ``dex_map``
+        feed is available. ``binance`` never fills from DEX. ``dex_map``
         keeps the old intersection.
         """
         source = resolve_live_bnb_factor_source(os.environ.get("LIVE_BNB_FACTOR_SOURCE"))

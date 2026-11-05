@@ -3,9 +3,10 @@
 The primary book is ``binance_indicators``. ``binance_klines`` is only the
 in-process fallback when that table has not been created. This module is
 the bypass for ``LIVE_BNB_FACTOR_SOURCE=dex_map``, or for ``auto`` when
-neither CEX feed is available. It does not recompute tech_boll factors.
-Rows that do not resolve to a listed spot ``BASEUSDT`` market are dropped
-so a Solana mint is never written as the fill id.
+neither CEX feed is available. It does not recompute tech_boll factors;
+mapped rows keep the DEX fields they arrived with. Rows that do not
+resolve to a listed spot ``BASEUSDT`` market are dropped so a Solana mint
+is never written as the fill id.
 
 Listing membership is read from local SQLite only (``cex_listing_events``
 and the ccxt side tables). No exchange client and no API key.
