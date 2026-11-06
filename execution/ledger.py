@@ -893,10 +893,12 @@ class ExecutionLedger:
     def list_binance_spot_buy_blocks(
         self, purpose: str | None = None
     ) -> list[dict[str, Any]]:
-        """Non-terminal spot rows for one arm. A new BUY must not stack on these.
+        """Non-terminal spot rows for one arm. The buy gate reads these.
 
-        ``purpose`` omitted returns every arm. Callers that pass a purpose
-        leave the other arm's open position out of this list.
+        A protected open blocks a new BUY of that same symbol. Another symbol
+        on the arm is not stacked onto that row. Unsafe rows still block the
+        arm. ``purpose`` omitted returns every arm. Callers that pass a
+        purpose leave the other arm's open position out of this list.
         """
         clause, params = _bnb_purpose_clause(purpose)
         rows = self.conn.execute(

@@ -309,7 +309,7 @@ class ClassicPurposeTests(unittest.TestCase):
         self.assertEqual(blocked["executed"], 0)
         self.assertEqual(client.calls, [])
 
-    def test_fade_hold_does_not_block_classic_and_each_arm_stays_one_position(self) -> None:
+    def test_one_arm_may_hold_another_symbol_but_not_a_second_of_the_same(self) -> None:
         fade_open = {
             "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
             "symbol": "CFGUSDT",
@@ -320,18 +320,46 @@ class ClassicPurposeTests(unittest.TestCase):
             "oco_above_order_id": "4",
             "oco_below_order_id": "5",
         }
+        # No buy symbol: fail closed, same as the old one-open arm block.
         self.assertEqual(
             buy_exposure_block([fade_open], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE),
             "position_open_blocks_buy",
         )
+        self.assertEqual(
+            buy_exposure_block(
+                [fade_open],
+                [],
+                purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                symbol="CFGUSDT",
+            ),
+            "position_open_blocks_buy",
+        )
+        self.assertIsNone(
+            buy_exposure_block(
+                [fade_open],
+                [],
+                purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                symbol="BNBUSDT",
+            )
+        )
+        # The other arm is unchanged, including a buy of the symbol fade holds.
         self.assertIsNone(
             buy_exposure_block([fade_open], [], purpose=PURPOSE_LIVE_BNB_BOLL_CLASSIC)
+        )
+        self.assertIsNone(
+            buy_exposure_block(
+                [fade_open],
+                [],
+                purpose=PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+                symbol="CFGUSDT",
+            )
         )
         self.assertEqual(
             buy_exposure_block(
                 [],
                 [{"purpose": PURPOSE_LIVE_BNB_BOLL_FADE, "status": "held_naked", "symbol": "CFGUSDT"}],
                 purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                symbol="BNBUSDT",
             ),
             "naked_holds_new_buys",
         )
@@ -364,20 +392,23 @@ class ClassicPurposeTests(unittest.TestCase):
         with mock.patch.dict(os.environ, _env(self.root)):
             opened = adapter.execute(_sig(mode="live_stub"))
         self.assertTrue(opened["consumer_allowed"], opened)
+        self.assertEqual(opened["arm_position"]["symbol"], "BNBUSDT")
         self.assertEqual(_oco_form(client)["aboveType"], ["LIMIT_MAKER"])
         self.assertEqual(_oco_form(client)["belowType"], ["STOP_LOSS_LIMIT"])
 
+        # Classic already holds BNBUSDT. A second BNB buy is still one-symbol-one-position.
         adapter.buy_blocks = [fade_open, opened["arm_position"]]
         with mock.patch.dict(os.environ, _env(self.root)):
             again = adapter.execute(_sig(mode="live_stub", decision_log_id=147903))
         self.assertEqual(again["error"], "position_open_blocks_buy")
         self.assertEqual([call[0] for call in client.calls].count("new_order"), 1)
 
+        # Fade holds CFGUSDT. A fade buy of BNBUSDT is another symbol on that arm.
         fade_client = _Client()
         fade = _adapter(self.root, fade_client)
         fade.buy_blocks = [fade_open]
         with mock.patch.dict(os.environ, _env(self.root)):
-            blocked = fade.execute(
+            fade_bnb = fade.execute(
                 _sig(
                     purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
                     mode="live_stub",
@@ -385,8 +416,46 @@ class ClassicPurposeTests(unittest.TestCase):
                     extras=_classic_extras(entry_reason="large_trade_market"),
                 )
             )
+        self.assertTrue(fade_bnb["consumer_allowed"], fade_bnb)
+        self.assertEqual(fade_bnb["symbol"], "BNBUSDT")
+        self.assertEqual([call[0] for call in fade_client.calls].count("new_order"), 1)
+
+        same_client = _Client()
+        same = _adapter(self.root, same_client)
+        same.buy_blocks = [fade_open]
+        with mock.patch.dict(os.environ, _env(self.root)):
+            blocked = same.execute(
+                _sig(
+                    purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                    mode="live_stub",
+                    decision_log_id=147905,
+                    token_address="CFGUSDT",
+                    pair_address="CFG/USDT",
+                    extras=_classic_extras(
+                        binance_symbol="CFGUSDT",
+                        entry_reason="large_trade_market",
+                    ),
+                )
+            )
         self.assertEqual(blocked["error"], "position_open_blocks_buy")
-        self.assertEqual(fade_client.calls, [])
+        self.assertEqual(same_client.calls, [])
+
+        off_client = _Client()
+        off = _adapter(self.root, off_client)
+        off.buy_blocks = [fade_open]
+        off_env = _env(self.root)
+        off_env["BINANCE_SPOT_ALLOW_MULTI_SYMBOL"] = "0"
+        with mock.patch.dict(os.environ, off_env):
+            refused = off.execute(
+                _sig(
+                    purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                    mode="live_stub",
+                    decision_log_id=147906,
+                    extras=_classic_extras(entry_reason="large_trade_market"),
+                )
+            )
+        self.assertEqual(refused["error"], "position_open_blocks_buy")
+        self.assertEqual(off_client.calls, [])
 
 
 class ClassicGatewayTests(unittest.TestCase):
