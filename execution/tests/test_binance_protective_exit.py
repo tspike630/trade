@@ -110,7 +110,8 @@ class _Client:
         return _working_oco()
 
     def ticker_price(self, symbol: str) -> dict[str, Any]:
-        raise AssertionError(f"ticker must not be fetched when a mark was given ({symbol})")
+        self.calls.append(("ticker_price", symbol))
+        return {"symbol": symbol, "price": "102"}
 
 
 def _env(root: Path, *, enabled: str) -> dict[str, str]:
@@ -262,10 +263,15 @@ class ProtectiveExitTests(unittest.TestCase):
                 self.assertEqual(held["stop_price"], "99")
                 self.assertEqual(held["take_profit_price"], "110")
                 self.assertEqual(opened["executed"], 1)
-                buy = _signed_form(self.client.calls[1][1])
+                buy_signed = next(
+                    call[1]
+                    for call in self.client.calls
+                    if call[0] == "new_order" and "side=BUY" in call[1]
+                )
+                buy = _signed_form(buy_signed)
                 self.assertEqual(buy["side"], ["BUY"])
                 self.assertNotIn("stopPrice", buy)
-                self.assertNotIn("STOP_LOSS", self.client.calls[1][1])
+                self.assertNotIn("STOP_LOSS", buy_signed)
                 exits = tick_live_bnb_exits(
                     gw,
                     frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
@@ -560,6 +566,333 @@ def _buy_without_qty(client: _Client):
         return {"orderId": "99", "status": "NEW"}
 
     return new_order
+
+
+_DASH_INFO = {
+    "symbol": "DASHUSDT",
+    "status": "TRADING",
+    "quoteAsset": "USDT",
+    "isSpotTradingAllowed": True,
+    "filters": [
+        {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "900000", "stepSize": "0.001"},
+        {"filterType": "MARKET_LOT_SIZE", "minQty": "0.001", "maxQty": "900000", "stepSize": "0.001"},
+        {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "100000", "tickSize": "0.01"},
+        {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": True},
+    ],
+}
+
+
+class _DashBook:
+    """Ticker is the live mark. Orders are recorded and not sent to Binance."""
+
+    def __init__(self, *, mark: str, oco_error: Exception | None = None) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.mark = mark
+        self.oco_error = oco_error
+
+    def exchange_info(self, symbol: str) -> dict[str, Any]:
+        self.calls.append(("exchange_info", symbol))
+        return _DASH_INFO
+
+    def ticker_price(self, symbol: str) -> dict[str, Any]:
+        self.calls.append(("ticker_price", symbol))
+        return {"symbol": symbol, "price": self.mark}
+
+    def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("new_order", signed_query, api_key))
+        return {
+            "orderId": "2953042815",
+            "status": "FILLED",
+            "executedQty": "1.082",
+            "cummulativeQuoteQty": "51.957640",
+            "symbol": "DASHUSDT",
+        }
+
+    def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("new_oco", signed_query, api_key))
+        if self.oco_error is not None:
+            raise self.oco_error
+        raise AssertionError("OCO must not be posted for this case")
+
+
+class DashUnprotectedGeometryTests(unittest.TestCase):
+    """DASH id 12: signal still above the stop, live mark and fill are not."""
+
+    def setUp(self) -> None:
+        self._net = mock.patch(
+            "execution.executors.binance_spot.urllib.request.urlopen",
+            side_effect=AssertionError("live binance HTTP is disabled in tests"),
+        )
+        self._net.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._net.stop()
+        self._tmp.cleanup()
+
+    def _adapter(self, client: Any) -> BinanceSpotAdapter:
+        return BinanceSpotAdapter(
+            client=client,
+            kill_switch_path=self.root / "absent-kill",
+            api_key="test-key",
+            api_secret="test-secret",
+            clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot={
+                "accountType": "SPOT",
+                "canTrade": True,
+                "permissions": ["SPOT"],
+                "restrictions": {
+                    "enableSpotAndMarginTrading": True,
+                    "enableReading": True,
+                    "ipRestrict": True,
+                },
+                "balances": [{"asset": "USDT", "free": "1000.00", "locked": "0"}],
+            },
+            production_book="rest_api_key",
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
+        )
+
+    def _dash_buy(self) -> dict[str, Any]:
+        return {
+            "decision_log_id": 148592,
+            "strategy_id": "tech_boll_fade_v1",
+            "action": "buy",
+            "chain_id": "binance",
+            "token_address": "DASHUSDT",
+            "pair_address": "DASH/USDT",
+            "size_pct": 0.05,
+            "mode": "live_stub",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+            "extras": {
+                "binance_symbol": "DASHUSDT",
+                "order_type": "MARKET",
+                "quote_order_qty": "51.95",
+                "price_usd": "48.10",
+                "stop_price": "48.02605",
+                "take_profit_price": "48.2895",
+                "entry_reason": "large_trade_market",
+            },
+        }
+
+    def test_live_mark_through_the_stop_refuses_the_buy(self) -> None:
+        client = _DashBook(mark="47.79")
+        adapter = self._adapter(client)
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+            "BINANCE_API_KEY": "",
+            "BINANCE_API_SECRET": "",
+            "LIVE_EXCHANGE_API_KEY": "",
+            "LIVE_EXCHANGE_API_SECRET": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            refused = adapter.execute(self._dash_buy())
+        self.assertEqual(refused["error"], "oco_price_restriction")
+        self.assertEqual(refused["executed"], 0)
+        self.assertFalse(any(call[0] == "new_order" for call in client.calls))
+        self.assertFalse(any(call[0] == "new_oco" for call in client.calls))
+
+    def test_requery_gap_does_not_mask_a_failed_oco_or_sell(self) -> None:
+        class _NoQuery:
+            calls: list[tuple[Any, ...]] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _DASH_INFO
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_oco", signed_query))
+                raise AssertionError("dead geometry must not post another OCO")
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_order", signed_query))
+                raise AssertionError("must not market-sell the naked fill")
+
+        client = _NoQuery()
+        adapter = self._adapter(client)
+        row = {
+            "id": 12,
+            "decision_log_id": 148592,
+            "symbol": "DASHUSDT",
+            "status": "oco_failed",
+            "protection": "oco_pending",
+            "quantity": "1.082",
+            "stop_price": "48.02605",
+            "take_profit_price": "48.2895",
+            "entry_order_id": "2953042815",
+            "last_error": "oco_rejected:binance_http_error:400",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+        saved: dict[str, Any] = {}
+
+        def persist(fields: dict[str, Any]) -> dict[str, Any]:
+            saved.update(fields)
+            return {**row, **saved}
+
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+            "BINANCE_API_KEY": "",
+            "BINANCE_API_SECRET": "",
+            "LIVE_EXCHANGE_API_KEY": "",
+            "LIVE_EXCHANGE_API_SECRET": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            outcome = adapter.maintain_held_position(row, "47.79", persist=persist)
+        self.assertNotEqual(saved.get("last_error"), "oco_requery_unsupported")
+        self.assertIn("oco_rejected:binance_http_error:400", str(saved.get("last_error")))
+        self.assertEqual(outcome.get("book"), "oco_failed")
+        self.assertEqual(client.calls, [])
+        self.assertNotIn("SELL", json.dumps(outcome))
+
+    def test_fill_through_the_stop_does_not_post_oco(self) -> None:
+        client = _DashBook(mark="48.10")
+        adapter = self._adapter(client)
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+            "BINANCE_API_KEY": "",
+            "BINANCE_API_SECRET": "",
+            "LIVE_EXCHANGE_API_KEY": "",
+            "LIVE_EXCHANGE_API_SECRET": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            filled = adapter.execute(self._dash_buy())
+        self.assertEqual(filled["error"], "oco_unprotectable:oco_price_restriction")
+        self.assertEqual(filled["arm_position"]["status"], "oco_failed")
+        self.assertEqual(filled["executed"], 0)
+        self.assertEqual(sum(1 for call in client.calls if call[0] == "new_order"), 1)
+        self.assertFalse(any(call[0] == "new_oco" for call in client.calls))
+        adapter.buy_blocks = [filled["arm_position"]]
+        with mock.patch.dict(os.environ, env):
+            blocked = adapter.execute(
+                {
+                    **self._dash_buy(),
+                    "decision_log_id": 148593,
+                    "token_address": "ETHUSDT",
+                    "extras": {
+                        **self._dash_buy()["extras"],
+                        "binance_symbol": "ETHUSDT",
+                        "price_usd": "100",
+                        "stop_price": "90",
+                        "take_profit_price": "120",
+                    },
+                }
+            )
+        self.assertEqual(blocked["error"], "oco_failed_blocks_buy")
+
+    def test_absent_list_code_is_not_a_working_oco_and_does_not_repost(self) -> None:
+        class _Query:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                self.calls.append("exchange_info")
+                return _DASH_INFO
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("get_order_list")
+                raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_oco")
+                raise AssertionError("price through the stop must not post")
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_order")
+                raise AssertionError("must not market-sell")
+
+        client = _Query()
+        adapter = self._adapter(client)
+        row = {
+            "id": 12,
+            "decision_log_id": 148592,
+            "symbol": "DASHUSDT",
+            "status": "oco_failed",
+            "protection": "oco_pending",
+            "quantity": "1.082",
+            "stop_price": "48.02605",
+            "take_profit_price": "48.2895",
+            "entry_order_id": "2953042815",
+            "oco_list_client_id": "bnbfade-ol-148592",
+            "last_error": "oco_rejected:binance_http_error:400",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+        saved: dict[str, Any] = {}
+
+        def persist(fields: dict[str, Any]) -> dict[str, Any]:
+            saved.update(fields)
+            return {**row, **saved}
+
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+        }
+        with mock.patch.dict(os.environ, env):
+            outcome = adapter.maintain_held_position(row, "47.79", persist=persist)
+        self.assertEqual(outcome["book"], "oco_failed")
+        self.assertIn("oco_rejected:binance_http_error:400", str(saved.get("last_error")))
+        self.assertNotIn("new_oco", client.calls)
+        self.assertNotIn("new_order", client.calls)
+        self.assertIn("get_order_list", client.calls)
+
+    def test_unknown_submit_retries_once_when_the_list_is_absent(self) -> None:
+        class _Retry:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.placed = False
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _INFO
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("get_order_list")
+                if not self.placed:
+                    raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+                return _working_oco()
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_oco")
+                self.placed = True
+                return _working_oco()
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise AssertionError("retry must not buy or market-sell")
+
+        client = _Retry()
+        adapter = self._adapter(client)
+        row = {
+            "id": 3,
+            "decision_log_id": 11,
+            "symbol": "BNBUSDT",
+            "status": "oco_unknown",
+            "protection": "oco_pending",
+            "quantity": "1.23",
+            "stop_price": "99",
+            "take_profit_price": "110",
+            "entry_order_id": "99",
+            "oco_list_client_id": "bnbfade-ol-11",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+        saved: dict[str, Any] = dict(row)
+
+        def persist(fields: dict[str, Any]) -> dict[str, Any]:
+            saved.update(fields)
+            return dict(saved)
+
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+        }
+        with mock.patch.dict(os.environ, env):
+            first = adapter.maintain_held_position(dict(saved), "102", persist=persist)
+            second = adapter.maintain_held_position(dict(saved), "102", persist=persist)
+        self.assertEqual(first["book"], "oco_working", first)
+        self.assertEqual(second["book"], "oco_working", second)
+        self.assertEqual(client.calls.count("new_oco"), 1)
+        self.assertEqual(saved.get("status"), "oco_working")
+        self.assertEqual(saved.get("oco_above_order_id"), "11")
+        self.assertEqual(saved.get("oco_below_order_id"), "10")
 
 
 if __name__ == "__main__":
