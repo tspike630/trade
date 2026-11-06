@@ -357,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "hot-token scan window, not an entry gate "
             f"(default {de_config.HOT_TOKEN_LIMIT}; "
-            "purpose live_bnb_boll_fade defaults to at least "
+            "purposes live_bnb_boll_fade and live_bnb_boll_classic default to at least "
             f"{de_config.LIVE_BNB_SCAN_LIMIT})"
         ),
     )

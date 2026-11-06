@@ -47,7 +47,8 @@ if not Path(DB_PATH).is_absolute():
 
 TICK_INTERVAL_SEC = int(os.environ.get("DECISION_TICK_INTERVAL_SEC", "60"))
 HOT_TOKEN_LIMIT = int(os.environ.get("DECISION_HOT_TOKEN_LIMIT", "50"))
-# Scan window for purpose live_bnb_boll_fade only. Not an entry gate.
+# Scan window for Binance spot purposes (live_bnb_boll_fade and
+# live_bnb_boll_classic). Not an entry gate.
 # The spot USDT universe is about 518 names. ORDER BY change_5m ASC with the
 # global HOT_TOKEN_LIMIT drops valid break-lower names ranked past 50.
 # Other purposes keep HOT_TOKEN_LIMIT. An explicit --limit still wins.

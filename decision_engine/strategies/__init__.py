@@ -304,6 +304,7 @@ STRATEGY_ALIASES: dict[str, str] = {
     "tech_boll_fade": "tech_boll_fade_v1",
     "race_tech_boll_fade": "tech_boll_fade_v1",
     "live_bnb_boll_fade": "tech_boll_fade_v1",
+    "live_bnb_boll_classic": "tech_boll_fade_v1",
     "rsi_boll_fade": "rsi_boll_fade_v1",
     "race_rsi_boll_fade": "rsi_boll_fade_v1",
     "vol_squeeze_fade": "vol_squeeze_fade_v1",

@@ -106,6 +106,9 @@ PURPOSE_RACE_RSI_BOUNCE_FADE = "race_rsi_bounce_fade"
 PURPOSE_RACE_TECH_BOLL_FADE = "race_tech_boll_fade"
 # Binance spot USDT side book for tech_boll_fade_v1. Not a DEX live shell.
 PURPOSE_LIVE_BNB_BOLL_FADE = "live_bnb_boll_fade"
+# Second Binance spot arm: the pre-entry-zone tech_boll_fade legs.
+# Not live_tech_boll_fade (on-chain) and not the paper race shell.
+PURPOSE_LIVE_BNB_BOLL_CLASSIC = "live_bnb_boll_classic"
 PURPOSE_RACE_RSI_BOLL_FADE = "race_rsi_boll_fade"
 PURPOSE_RACE_VOL_SQUEEZE_FADE = "race_vol_squeeze_fade"
 PURPOSE_RACE_CS_MOM_1W_R90 = "race_cs_mom_1w_r90"
@@ -177,6 +180,7 @@ PURPOSES = frozenset(
         PURPOSE_RACE_RSI_BOUNCE_FADE,
         PURPOSE_RACE_TECH_BOLL_FADE,
         PURPOSE_LIVE_BNB_BOLL_FADE,
+        PURPOSE_LIVE_BNB_BOLL_CLASSIC,
         PURPOSE_RACE_RSI_BOLL_FADE,
         PURPOSE_RACE_VOL_SQUEEZE_FADE,
         PURPOSE_RACE_CS_MOM_1W_R90,

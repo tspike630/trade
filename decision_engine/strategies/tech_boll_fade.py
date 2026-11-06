@@ -4,6 +4,12 @@ True AND of inverted legs (禁 OR):
   tech_fade: change_5m <= -min_change_5m AND volume_strength >= min
   boll_fade: price < boll_lower (lower-band break; invert of upper breakout)
 Missing any required field → skip.
+
+``live_bnb_boll_fade`` replaces those legs with the entry zone.
+``live_bnb_boll_classic`` keeps the legs. It writes the paper TP/SL/hold
+(``execution.exits`` 10 / 5 / 60) as extras and as absolute prices so a later
+native OCO can read them. This module does not place that order.
+``race_tech_boll_fade`` stays on the paper emit.
 """
 
 from __future__ import annotations
@@ -12,7 +18,10 @@ from typing import Any
 
 from logging_setup import get_logger
 
-from decision_engine.core.signal_bus import PURPOSE_LIVE_BNB_BOLL_FADE
+from decision_engine.core.signal_bus import (
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+    PURPOSE_LIVE_BNB_BOLL_FADE,
+)
 from decision_engine.strategies.base_strategy import BaseStrategy
 from decision_engine.strategies.entry_sizing import buy_size_fields
 from decision_engine.strategies.live_bnb_entry_zone import (
@@ -32,6 +41,13 @@ log = get_logger("decision_engine.tech_boll_fade")
 
 RULE_VERSION = "tech_boll_fade_v1_2026-11-01"
 STRATEGY_ID = "tech_boll_fade_v1"
+# Twins of execution.exits.DEFAULT_TP_PCT / DEFAULT_SL_PCT / DEFAULT_MAX_HOLD_MIN.
+# Paper applies these when a signal omits them. The classic CEX emit writes
+# the same percents and the absolute prices they imply at the break price.
+CLASSIC_TP_PCT = 10.0
+CLASSIC_SL_PCT = 5.0
+CLASSIC_MAX_HOLD_MIN = 60.0
+CLASSIC_EXIT_SHELL = "classic_fixed_tp_sl"
 
 
 def _finite(value: Any) -> float | None:
@@ -71,6 +87,8 @@ class TechBollFadeStrategy(BaseStrategy):
         purpose = str(data.get("purpose") or "")
         if purpose == PURPOSE_LIVE_BNB_BOLL_FADE:
             return self._on_tick_entry_zone(data)
+        if purpose == PURPOSE_LIVE_BNB_BOLL_CLASSIC:
+            return self._on_tick_classic_cex(data)
         return self._on_tick_paper(data)
 
     def _on_tick_entry_zone(self, data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -207,11 +225,9 @@ class TechBollFadeStrategy(BaseStrategy):
         )
         return signals
 
-    def _on_tick_paper(self, data: dict[str, Any]) -> list[dict[str, Any]]:
-        self._pending.clear()
-        self.rejected = {}
-        hot = data.get("hot_tokens") or []
-        hits = 0
+    def _collect_classic_hits(self, hot: list[Any]) -> list[dict[str, Any]]:
+        """Pre-entry-zone legs. Shared by paper and ``live_bnb_boll_classic``."""
+        hits: list[dict[str, Any]] = []
         thr = -self.min_change_5m
         for row in hot:
             c5 = _finite(row.get("change_5m"))
@@ -259,32 +275,129 @@ class TechBollFadeStrategy(BaseStrategy):
             if price >= lower:
                 self.rejected["boll_leg_fail"] = self.rejected.get("boll_leg_fail", 0) + 1
                 continue
-
-            hits += 1
-            sized = buy_size_fields(row, floor_pct=self.position_pct)
-            self.buy(
-                chain_id=str(row.get("chain_id") or ""),
-                token_address=str(row.get("token_address") or ""),
-                pair_address=row.get("primary_pair_address"),
-                size_pct=float(sized["size_pct"]),
-                size_tier=sized["size_tier"],
-                entry_r3=sized["entry_r3"],
-                size_blockers=sized["size_blockers"],
-                reason=(
-                    f"tech_boll_fade {RULE_VERSION} "
-                    f"c5={c5:.3f}<={thr} vs={vs:.3f} px={price:.8g}<lo={lower:.8g}"
-                ),
-                rule_version=RULE_VERSION,
-                change_5m=c5,
-                volume_strength=vs,
-                boll_lower=lower,
-                price_usd=price,
-                and_mode="tech_fade&boll_lower",
+            hits.append(
+                {
+                    "row": row,
+                    "c5": c5,
+                    "vs": vs,
+                    "lower": lower,
+                    "price": price,
+                    "thr": thr,
+                }
             )
+        return hits
+
+    def _classic_reason(self, hit: dict[str, Any]) -> str:
+        return (
+            f"tech_boll_fade {RULE_VERSION} "
+            f"c5={hit['c5']:.3f}<={hit['thr']} vs={hit['vs']:.3f} "
+            f"px={hit['price']:.8g}<lo={hit['lower']:.8g}"
+        )
+
+    def _emit_paper_buy(self, hit: dict[str, Any]) -> None:
+        row = hit["row"]
+        sized = buy_size_fields(row, floor_pct=self.position_pct)
+        self.buy(
+            chain_id=str(row.get("chain_id") or ""),
+            token_address=str(row.get("token_address") or ""),
+            pair_address=row.get("primary_pair_address"),
+            size_pct=float(sized["size_pct"]),
+            size_tier=sized["size_tier"],
+            entry_r3=sized["entry_r3"],
+            size_blockers=sized["size_blockers"],
+            reason=self._classic_reason(hit),
+            rule_version=RULE_VERSION,
+            change_5m=hit["c5"],
+            volume_strength=hit["vs"],
+            boll_lower=hit["lower"],
+            price_usd=hit["price"],
+            and_mode="tech_fade&boll_lower",
+        )
+
+    def _emit_classic_cex_buy(self, hit: dict[str, Any]) -> None:
+        """Same legs as paper, plus the fixed TP/SL shell as absolute prices.
+
+        ``binance_symbol`` is required. A non-positive price cannot anchor a
+        stop below the entry and a take-profit above it, so that row is not
+        written. Sizing stays on ``buy_size_fields``; the entry-zone notional
+        lift is not applied.
+        """
+        row = hit["row"]
+        raw_symbol = row.get("binance_symbol")
+        if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+            self.rejected["binance_symbol_missing"] = (
+                self.rejected.get("binance_symbol_missing", 0) + 1
+            )
+            return
+        price = float(hit["price"])
+        if not price > 0.0:
+            self.rejected["price_not_positive"] = (
+                self.rejected.get("price_not_positive", 0) + 1
+            )
+            return
+        stop_price = price * (1.0 - CLASSIC_SL_PCT / 100.0)
+        take_profit_price = price * (1.0 + CLASSIC_TP_PCT / 100.0)
+        if not stop_price < price < take_profit_price:
+            self.rejected["classic_exit_invalid"] = (
+                self.rejected.get("classic_exit_invalid", 0) + 1
+            )
+            return
+        sized = buy_size_fields(row, floor_pct=self.position_pct)
+        self.buy(
+            chain_id=str(row.get("chain_id") or ""),
+            token_address=str(row.get("token_address") or ""),
+            pair_address=row.get("primary_pair_address"),
+            size_pct=float(sized["size_pct"]),
+            size_tier=sized["size_tier"],
+            entry_r3=sized["entry_r3"],
+            size_blockers=sized["size_blockers"],
+            reason=self._classic_reason(hit),
+            rule_version=RULE_VERSION,
+            change_5m=hit["c5"],
+            volume_strength=hit["vs"],
+            boll_lower=hit["lower"],
+            price_usd=price,
+            and_mode="tech_fade&boll_lower",
+            binance_symbol=raw_symbol.strip(),
+            order_type="MARKET",
+            stop_price=stop_price,
+            take_profit_price=take_profit_price,
+            tp_pct=CLASSIC_TP_PCT,
+            sl_pct=CLASSIC_SL_PCT,
+            max_hold_min=CLASSIC_MAX_HOLD_MIN,
+            exit_shell=CLASSIC_EXIT_SHELL,
+        )
+
+    def _on_tick_classic_cex(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Binance spot arm on the original legs. Not the entry zone."""
+        self._pending.clear()
+        self.rejected = {}
+        hot = data.get("hot_tokens") or []
+        hits = self._collect_classic_hits(hot)
+        for hit in hits:
+            self._emit_classic_cex_buy(hit)
+        signals = self.drain()
+        log.info(
+            "%s classic_exit scanned=%s hits=%s signals=%s rejected=%s",
+            self.strategy_id,
+            len(hot),
+            len(hits),
+            len(signals),
+            dict(sorted(self.rejected.items())),
+        )
+        return signals
+
+    def _on_tick_paper(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        self._pending.clear()
+        self.rejected = {}
+        hot = data.get("hot_tokens") or []
+        hits = self._collect_classic_hits(hot)
+        for hit in hits:
+            self._emit_paper_buy(hit)
         signals = self.drain()
         log.info(
             "%s scanned=%s hits=%s signals=%s rejected=%s",
-            self.strategy_id, len(hot), hits, len(signals),
+            self.strategy_id, len(hot), len(hits), len(signals),
             dict(sorted(self.rejected.items())),
         )
         return signals
