@@ -33,7 +33,9 @@ Tiers (``ratio >= 1.3`` large, ``0.85 <= ratio < 1.3`` neutral, else crowded):
    strictly below ``P`` and its own odds clear 2.5. Otherwise no chase.
    Size is half the planned single-name size. The risk shell has no
    inverse-stop-width sizer; this path does not add one and does not change
-   other purposes.
+   other purposes. The live emitter may raise the emitted ``size_pct`` after
+   this decision so the quote clears the 20 USDT exchange minimum. That lift
+   does not change this multiplier or these bands.
 3. retail_crowded: no market buy. This round does not rest the deep bid at
    ``L - 0.5*S``. That price is recorded for audit only.
 
