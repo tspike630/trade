@@ -307,6 +307,87 @@ def dust_archive_fields(
     }
 
 
+def aligned_oco_prices(
+    *,
+    stop_price: str,
+    take_profit_price: str,
+    filters: list[Any],
+    mark: object = None,
+) -> tuple[dict[str, Decimal] | None, str | None]:
+    """Tick-align a long's stop and take-profit. Prices are not rewritten to fit.
+
+    ``mark``, when present, must sit strictly between the aligned stop trigger
+    and the aligned take-profit. That is the same relation a native sell OCO
+    needs against the exchange last price. A missing mark skips that check;
+    ``protective_band_error`` is the caller that refuses a missing price.
+    """
+    tick = _tick_size(filters)
+    if tick is None:
+        return None, "oco_missing_tick"
+    stop_n = _to_decimal(stop_price)
+    tp_n = _to_decimal(take_profit_price)
+    tick_n = _to_decimal(tick)
+    if stop_n is None or tp_n is None or tick_n is None:
+        return None, "oco_prices_crossed"
+    above = _align(tp_n, tick_n, ROUND_DOWN)
+    below_stop = _align(stop_n, tick_n, ROUND_DOWN)
+    below_limit = below_stop - tick_n
+    min_price = None
+    price_filter = _filter_row(filters, "PRICE_FILTER")
+    if price_filter is not None:
+        min_price = _to_decimal(price_filter.get("minPrice"))
+    if below_limit <= 0 or (min_price is not None and below_limit < min_price):
+        below_limit = below_stop
+    if not (below_limit > 0 and below_stop > below_limit and above > below_stop):
+        if not (above > below_stop > 0 and below_limit == below_stop):
+            return None, "oco_prices_crossed"
+    mark_n = _to_decimal(mark)
+    if mark_n is not None and not (below_stop < mark_n < above):
+        return None, "oco_price_restriction"
+    return {
+        "above": above,
+        "below_stop": below_stop,
+        "below_limit": below_limit,
+    }, None
+
+
+def protective_band_error(
+    *,
+    stop_price: str,
+    take_profit_price: str,
+    mark: object,
+    filters: list[Any],
+) -> str | None:
+    """Refuse a protective band that cannot be sent at ``mark``.
+
+    Does not move the stop or the take-profit. A missing mark is
+    ``mark_unavailable``, not a pass.
+    """
+    if _to_decimal(mark) is None:
+        return "mark_unavailable"
+    _aligned, error = aligned_oco_prices(
+        stop_price=stop_price,
+        take_profit_price=take_profit_price,
+        filters=filters,
+        mark=mark,
+    )
+    return error
+
+
+def fill_average_price(placed: dict[str, Any] | None) -> str | None:
+    """Average fill from quote spent and base filled. A zero qty is not a price."""
+    if not isinstance(placed, dict):
+        return None
+    quote = _to_decimal(placed.get("cummulativeQuoteQty"))
+    qty = _to_decimal(placed.get("executedQty"))
+    if quote is not None and qty is not None and qty > 0:
+        return _decimal_text(quote / qty)
+    px = _to_decimal(placed.get("price"))
+    if px is not None and px > 0:
+        return _decimal_text(px)
+    return None
+
+
 def build_spot_oco(
     *,
     symbol: str,
@@ -328,10 +409,9 @@ def build_spot_oco(
     if list_id is None or above_id is None or below_id is None:
         return None, "invalid_oco_client_id"
     lot, step = _limit_lot(filters)
-    tick = _tick_size(filters)
     if lot is None or step is None:
         return None, "oco_missing_lot_filter"
-    if tick is None:
+    if _tick_size(filters) is None:
         return None, "oco_missing_tick"
     sized = floor_base_qty(quantity, step)
     if sized is None:
@@ -340,28 +420,18 @@ def build_spot_oco(
     min_qty = _to_decimal(lot.get("minQty"))
     if sized_n is None or (min_qty is not None and sized_n < min_qty):
         return None, "oco_qty_below_min"
-    stop_n = _to_decimal(stop_price)
-    tp_n = _to_decimal(take_profit_price)
-    tick_n = _to_decimal(tick)
-    if stop_n is None or tp_n is None or tick_n is None or sized_n is None:
-        return None, "oco_prices_crossed"
-    above = _align(tp_n, tick_n, ROUND_DOWN)
-    below_stop = _align(stop_n, tick_n, ROUND_DOWN)
-    below_limit = below_stop - tick_n
-    min_price = None
-    price_filter = _filter_row(filters, "PRICE_FILTER")
-    if price_filter is not None:
-        min_price = _to_decimal(price_filter.get("minPrice"))
-    if below_limit <= 0 or (min_price is not None and below_limit < min_price):
-        below_limit = below_stop
-    if not (below_limit > 0 and below_stop > below_limit and above > below_stop):
-        # Equal stop and limit is still a valid stop-limit if the tick cannot
-        # step down. The take-profit must stay strictly above the trigger.
-        if not (above > below_stop > 0 and below_limit == below_stop):
-            return None, "oco_prices_crossed"
+    aligned, align_error = aligned_oco_prices(
+        stop_price=stop_price,
+        take_profit_price=take_profit_price,
+        filters=filters,
+        mark=mark,
+    )
+    if align_error or aligned is None:
+        return None, align_error or "oco_prices_crossed"
+    above = aligned["above"]
+    below_stop = aligned["below_stop"]
+    below_limit = aligned["below_limit"]
     mark_n = _to_decimal(mark)
-    if mark_n is not None and not (below_stop < mark_n < above):
-        return None, "oco_price_restriction"
     min_notional = _min_notional(filters)
     if min_notional is not None:
         value_px = mark_n if mark_n is not None else below_stop

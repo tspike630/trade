@@ -92,11 +92,71 @@ Opener = Callable[[urllib.request.Request, float], tuple[int, bytes]]
 
 
 class BinanceRequestError(Exception):
-    """HTTP failure. The message is only a status code, never a body or secret."""
+    """HTTP failure. Status, and a scrubbed exchange code/msg when the body has them.
 
-    def __init__(self, status: int) -> None:
+    The request URL, query, and signature are not part of the message.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        *,
+        code: int | None = None,
+        msg: str | None = None,
+    ) -> None:
         self.status = int(status)
-        super().__init__(f"binance_http_error:{self.status}")
+        self.code = code if isinstance(code, int) and not isinstance(code, bool) else None
+        text = " ".join(msg.split()) if isinstance(msg, str) else ""
+        self.msg = text[:160] if text else None
+        label = f"binance_http_error:{self.status}"
+        if self.code is not None and self.msg:
+            label = f"{label}:{self.code}:{self.msg}"
+        elif self.code is not None:
+            label = f"{label}:{self.code}"
+        elif self.msg:
+            label = f"{label}:{self.msg}"
+        super().__init__(label)
+
+
+# GET /api/v3/orderList only. -2018 is "Order list does not exist."
+# -2013 is GET /api/v3/order ("Order does not exist") for one leg.
+# -2011 is cancel ("Unknown order sent"). Neither means the list is gone.
+_ORDER_LIST_ABSENT_CODE = -2018
+_SINGLE_ORDER_ABSENT_CODES = frozenset({-2011, -2013})
+
+
+def order_list_absent(exc: BinanceRequestError) -> bool:
+    """True only for a definitive miss on ``GET /api/v3/orderList``.
+
+    A bare 400, 401, 418, 429, ``-1003``, ``-2015``, ``-2013``, or ``-2011``
+    is not absence. Those must not start a second OCO.
+    """
+    return exc.status in {400, 404} and exc.code == _ORDER_LIST_ABSENT_CODE
+
+
+def single_order_absent(exc: BinanceRequestError) -> bool:
+    """True when ``GET /api/v3/order`` says that one leg id is gone.
+
+    This does not say the OCO list is gone. A working list stays working.
+    """
+    return exc.status in {400, 404} and exc.code in _SINGLE_ORDER_ABSENT_CODES
+
+
+def _rejection(status: int, body: bytes) -> BinanceRequestError:
+    code: int | None = None
+    msg: str | None = None
+    try:
+        parsed = json.loads(body.decode("utf-8")) if body else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        raw_code = parsed.get("code")
+        if isinstance(raw_code, int) and not isinstance(raw_code, bool):
+            code = raw_code
+        raw_msg = parsed.get("msg")
+        if isinstance(raw_msg, str):
+            msg = raw_msg
+    return BinanceRequestError(status, code=code, msg=msg)
 
 
 def _env_flag(name: str) -> bool:
@@ -849,7 +909,7 @@ class BinanceSpotHttpClient:
 
 def _decode_ok(status: int, body: bytes) -> dict[str, Any]:
     if status >= 400:
-        raise BinanceRequestError(status)
+        raise _rejection(status, body)
     try:
         parsed = json.loads(body.decode("utf-8")) if body else {}
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1012,6 +1072,8 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     dust_detail,
     entry_notional_floor_error,
     entry_viability_error,
+    fill_average_price,
+    protective_band_error,
     is_request_timeout,
     ENTRY_MIN_NOTIONAL_USDT,
     resolve_entry_size,
@@ -1113,6 +1175,7 @@ class BinanceSpotAdapter:
         self.buy_blocks: list[dict[str, Any]] = []
         self.canonical_rows: list[dict[str, Any]] = []
         self._size_plan: dict[str, Any] | None = None
+        self._entry_mark: str | None = None
 
     def _credentials(self) -> tuple[str, str]:
         key = (self.api_key if self.api_key is not None else _env_secret(API_KEY_ENV)).strip()
@@ -1150,6 +1213,64 @@ class BinanceSpotAdapter:
             if rest_uid:
                 expected["uid"] = rest_uid
         return account_book_block(self.account_snapshot, book, expected)
+
+    def _trade_client(self) -> Any:
+        """HTTP client for orders and OCO queries.
+
+        A restarted process builds ``default_live_bnb_adapter`` with no client.
+        The buy path already installs one before ``new_order``. Maintenance
+        uses the same client when the book is allowed to sign REST, instead
+        of reporting ``oco_requery_unsupported`` and hiding the last error.
+        """
+        if self.client is not None:
+            return self.client
+        if self.allow_rest_http:
+            self.client = BinanceSpotHttpClient()
+        return self.client
+
+    def _read_entry_mark(
+        self, client: Any, symbol: str
+    ) -> tuple[str | None, str | None]:
+        """Live last price before a BUY. A missing or bad mark does not use the signal.
+
+        No ticker method, a transport error, or a non-positive price is
+        ``mark_unavailable``. The live BUY stops before ``new_order``.
+        """
+        ticker = getattr(client, "ticker_price", None) if client is not None else None
+        if not callable(ticker):
+            return None, "mark_unavailable"
+        try:
+            payload = ticker(symbol)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            return None, "mark_unavailable"
+        mark = payload.get("price") if isinstance(payload, dict) else None
+        if _to_decimal(mark) is None:
+            return None, "mark_unavailable"
+        return str(mark).strip(), None
+
+    def _repost_band(self, row: dict[str, Any], mark: object) -> tuple[bool, str | None]:
+        """True only when the original stop and take-profit still bracket ``mark``."""
+        band = self._held_band_error(row, mark)
+        return band is None, band
+
+    def _held_band_error(self, row: dict[str, Any], mark: object) -> str | None:
+        """Whether this held row can still host the original stop and take-profit."""
+        if _to_decimal(mark) is None:
+            return "mark_unavailable"
+        info, info_error = self._load_symbol_info(row, self._gates())
+        if info_error or not isinstance(info, dict):
+            return info_error or "oco_missing_lot_filter"
+        filters = _symbol_filters(info, str(row.get("symbol") or ""))
+        if not filters:
+            return "oco_missing_lot_filter"
+        return protective_band_error(
+            stop_price=str(row.get("stop_price") or ""),
+            take_profit_price=str(row.get("take_profit_price") or ""),
+            mark=mark,
+            filters=filters,
+        )
 
     def _live_buy_block(
         self, sig: dict[str, Any], plan: dict[str, Any] | None, symbol: str
@@ -1200,8 +1321,10 @@ class BinanceSpotAdapter:
         sellable: str | None,
         info: dict[str, Any],
         symbol: str,
+        placed: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Arm the fill only after a verified native OCO. Never market-sell here."""
+        filters = _symbol_filters(info, symbol) if isinstance(info, dict) else None
         del info
         decision_id = int(str(sig.get("decision_log_id")).strip())
         qty = sellable or filled
@@ -1253,7 +1376,36 @@ class BinanceSpotAdapter:
         def save(fields: dict[str, Any]) -> None:
             row.update(fields)
 
-        outcome = self._try_place_oco(row, plan.get("entry_price"), save)
+        fill_price = fill_average_price(placed)
+        for candidate in (getattr(self, "_entry_mark", None), fill_price):
+            if not filters or _to_decimal(candidate) is None:
+                continue
+            band_error = protective_band_error(
+                stop_price=str(plan.get("stop_price") or ""),
+                take_profit_price=str(plan.get("take_profit_price") or ""),
+                mark=candidate,
+                filters=filters,
+            )
+            if band_error:
+                arm["status"] = "oco_failed"
+                arm["protection"] = PROTECTION_PENDING
+                detail = f"oco_unprotectable:{band_error}"
+                row["status"] = "oco_failed"
+                row["protection"] = PROTECTION_PENDING
+                row["last_error"] = detail
+                return _result(
+                    ok=False,
+                    dry_run=False,
+                    executed=0,
+                    submitted=False,
+                    error=detail,
+                    exit_plan=plan,
+                    arm_position=arm,
+                    consumer_allowed=False,
+                    **common,
+                )
+        oco_mark = getattr(self, "_entry_mark", None) or fill_price or plan.get("entry_price")
+        outcome = self._try_place_oco(row, oco_mark, save)
         oco_fields = {
             key: row.get(key)
             for key in (
@@ -1331,6 +1483,7 @@ class BinanceSpotAdapter:
 
     def execute(self, sig: dict[str, Any]) -> dict[str, Any]:
         self._size_plan = None
+        self._entry_mark = None
         gates = self._gates()
         purpose = str(sig.get("purpose") or "").strip()
         if not is_live_bnb_spot_purpose(purpose):
@@ -1755,6 +1908,50 @@ class BinanceSpotAdapter:
                         )
                     )
 
+        if side_now == "BUY" and isinstance(plan, dict):
+            mark, mark_error = self._read_entry_mark(client, symbol)
+            if mark_error:
+                return self._finish(
+                    _result(
+                        ok=False,
+                        dry_run=False,
+                        executed=0,
+                        submitted=False,
+                        error=mark_error,
+                        symbol=symbol,
+                        order=None,
+                        exchange_order_id=None,
+                        gates=gates,
+                        exit_plan=plan,
+                        consumer_allowed=False,
+                    )
+                )
+            if mark is not None:
+                self._entry_mark = mark
+                filters = _symbol_filters(info, symbol) or []
+                band_error = protective_band_error(
+                    stop_price=str(plan.get("stop_price") or ""),
+                    take_profit_price=str(plan.get("take_profit_price") or ""),
+                    mark=mark,
+                    filters=filters,
+                )
+                if band_error:
+                    return self._finish(
+                        _result(
+                            ok=False,
+                            dry_run=False,
+                            executed=0,
+                            submitted=False,
+                            error=band_error,
+                            symbol=symbol,
+                            order=None,
+                            exchange_order_id=None,
+                            gates=gates,
+                            exit_plan=plan,
+                            consumer_allowed=False,
+                        )
+                    )
+
         signed = sign_query(pairs, secret)
         try:
             placed = client.new_order(signed, api_key=key)
@@ -1828,6 +2025,7 @@ class BinanceSpotAdapter:
                     sellable=sellable,
                     info=info,
                     symbol=symbol,
+                    placed=placed,
                 )
             )
         return self._finish(
@@ -2172,6 +2370,7 @@ class BinanceSpotAdapter:
             )
 
         protection = str(row.get("protection") or "")
+        retry_place = False
         if status in {"oco_unknown", "oco_working"} or protection in {
             PROTECTION_PENDING,
             PROTECTION_EXCHANGE,
@@ -2227,32 +2426,52 @@ class BinanceSpotAdapter:
                     reason=recon.get("exit_reason"),
                 )
             if state == "requery_failed":
-                save({"last_error": recon.get("error") or "oco_requery_failed"})
+                error = str(recon.get("error") or "oco_requery_failed")
+                prior = str(row.get("last_error") or "")
+                # Keep the rejection that explains the naked fill. This tick
+                # still reports the query failure and does not post again.
+                if not (
+                    prior.startswith("oco_rejected:") or prior.startswith("oco_unprotectable:")
+                ):
+                    save({"last_error": error})
+                if status == "oco_failed":
+                    book = "oco_failed"
+                elif status == "oco_working":
+                    book = "oco_working"
+                else:
+                    book = "oco_unknown"
                 return self._coverage(
                     row,
-                    book="oco_unknown",
+                    book=book,
                     submitted=False,
-                    error=recon.get("error") or "oco_requery_failed",
+                    error=error,
                     protection=row.get("protection") or PROTECTION_PENDING,
                 )
-            if state == "absent" and status == "oco_working":
-                save({"last_error": "oco_requery_missing"})
-                return self._coverage(
-                    row,
-                    book="oco_working",
-                    submitted=False,
-                    error="oco_requery_missing",
-                    protection=PROTECTION_EXCHANGE,
-                )
-            if state == "absent" and status != "oco_unknown":
-                save({"last_error": "oco_requery_missing"})
-                return self._coverage(
-                    row,
-                    book="oco_unknown",
-                    submitted=False,
-                    error="oco_requery_missing",
-                    protection=PROTECTION_PENDING,
-                )
+            if state == "absent":
+                allowed, band = self._repost_band(row, mark)
+                if not allowed:
+                    prior = str(row.get("last_error") or "")
+                    if prior.startswith("oco_rejected:") or prior.startswith("oco_unprotectable:"):
+                        stored = prior
+                    elif band in {"oco_price_restriction", "oco_prices_crossed"}:
+                        stored = f"oco_unprotectable:{band}"
+                    else:
+                        stored = prior or band or "oco_list_absent"
+                    save(
+                        {
+                            "status": "oco_failed",
+                            "protection": PROTECTION_PENDING,
+                            "last_error": stored,
+                        }
+                    )
+                    return self._coverage(
+                        row,
+                        book="oco_failed",
+                        submitted=False,
+                        error=stored,
+                        protection=PROTECTION_PENDING,
+                    )
+                retry_place = True
             if state in {"unfilled", "partial"}:
                 remainder = recon.get("remainder_qty") or row.get("quantity")
                 detail = (
@@ -2292,10 +2511,7 @@ class BinanceSpotAdapter:
                     error=detail,
                     protection=PROTECTION_PENDING,
                 )
-            elif state == "absent":
-                # oco_unknown and the list is not on the book. Place below.
-                pass
-            elif state:
+            elif state and state != "absent":
                 save({"last_error": recon.get("error") or "oco_requery_failed"})
                 return self._coverage(
                     row,
@@ -2305,7 +2521,7 @@ class BinanceSpotAdapter:
                     protection=PROTECTION_PENDING,
                 )
 
-        if str(row.get("status") or "") in {"open", "oco_failed"}:
+        if retry_place or str(row.get("status") or "") in {"open", "oco_failed"}:
             placed = self._try_place_oco(row, mark, save)
             if placed is not None:
                 return placed
@@ -2348,7 +2564,7 @@ class BinanceSpotAdapter:
     ) -> dict[str, Any] | None:
         """Place the native list. A failure stays on the book and does not market-sell."""
         gates = self._gates()
-        client = self.client
+        client = self._trade_client()
         if client is None or not callable(getattr(client, "new_oco", None)):
             return self._oco_failed(row, save, "oco_client_unsupported")
         blocked = protective_order_block(gates)
@@ -2491,7 +2707,7 @@ class BinanceSpotAdapter:
         gates = self._gates()
         if not gates.get("live_enabled"):
             return {"state": "requery_failed", "error": "binance_spot_live_disabled"}
-        client = self.client
+        client = self._trade_client()
         query = getattr(client, "get_order_list", None) if client is not None else None
         if not callable(query):
             return {"state": "requery_failed", "error": "oco_requery_unsupported"}
@@ -2517,13 +2733,17 @@ class BinanceSpotAdapter:
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, AssertionError):
                 raise
-            if isinstance(exc, BinanceRequestError) and exc.status in {400, 404}:
-                return {"state": "absent", "error": "oco_not_found"}
+            if isinstance(exc, BinanceRequestError) and order_list_absent(exc):
+                return {"state": "absent", "error": f"oco_list_absent:{exc.code}"}
+            if is_request_timeout(exc):
+                return {"state": "requery_failed", "error": "oco_requery_transport"}
             return {"state": "requery_failed", "error": _public_error(exc, key, secret)}
         if not isinstance(payload, dict):
             return {"state": "requery_failed", "error": "oco_requery_failed"}
         if not payload.get("orderReports"):
             legs = self._load_oco_legs(payload, symbol, key, secret)
+            # A missing leg (-2013/-2011) or a leg-query failure does not
+            # cancel a list the list endpoint still says is working.
             if legs is None and not oco_is_working(payload):
                 return {"state": "requery_failed", "error": "oco_leg_requery_failed"}
             if legs:
@@ -2560,6 +2780,8 @@ class BinanceSpotAdapter:
             except Exception as exc:  # noqa: BLE001
                 if isinstance(exc, AssertionError):
                     raise
+                # -2013/-2011 name one order. They are not a list deletion.
+                # Any other leg error is also not proof the list is gone.
                 return None
             if not isinstance(leg, dict):
                 return None

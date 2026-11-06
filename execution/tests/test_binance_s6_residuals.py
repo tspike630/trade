@@ -136,7 +136,8 @@ class _Client:
         raise BinanceRequestError(400)
 
     def ticker_price(self, symbol: str) -> dict[str, Any]:
-        raise AssertionError(f"unexpected ticker {symbol}")
+        self.calls.append(("ticker_price", symbol))
+        return {"symbol": symbol, "price": "102"}
 
 
 def _env(root: Path, *, enabled: str, block_sell: str = "0") -> dict[str, str]:
