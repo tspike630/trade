@@ -64,6 +64,26 @@ def _insert_cex(db: Path) -> None:
             ("STALEUSDT", "STALE", 0.4, -6.0, 0.9, 1.0, None, None, None, 90_000.0, stale, stale),
         ],
     )
+    # Membership plus a fresh ticker quoteVolume. The indicator quote column
+    # stays the liquidity alias and is not the turnover source.
+    conn.execute(
+        "CREATE TABLE symbols (symbol TEXT, status TEXT, base_asset TEXT, quote_asset TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO symbols VALUES ('ONLYCEXUSDT', 'TRADING', 'ONLYCEX', 'USDT')"
+    )
+    conn.execute(
+        """
+        CREATE TABLE ccxt_ticks (
+            exchange TEXT, symbol TEXT, ts INTEGER,
+            quote_volume_24h REAL, volume_24h REAL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO ccxt_ticks VALUES ('binance', 'ONLYCEX/USDT', ?, 3000000, 10)",
+        (int(datetime.now(timezone.utc).timestamp() * 1000),),
+    )
     conn.commit()
     conn.close()
 

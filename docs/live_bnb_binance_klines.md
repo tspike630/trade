@@ -62,3 +62,18 @@ PYTHONPATH=crawler python -m indicators.binance_spot --db crawler/dexscreener.db
 这是扫描窗口，不是入场门。纸面 `race_tech_boll_fade` 的 `min_change_5m` / `volume_strength` / 破下轨 / TP10 / SL5 / hold 不动。`live_bnb_boll_fade` 用 Entry Zone 的绝对止损和 `boll_mid` 止盈，不套纸面 SL5/TP10。其它 purpose 继续用 `DECISION_HOT_TOKEN_LIMIT`（默认 50）。`live_bnb_boll_fade` 不传 `--limit` 时窗口至少 `LIVE_BNB_SCAN_LIMIT`（600），盖住约 518 个 TRADING `*USDT`，避免跌幅排在 51 名之后的破下轨被 `ORDER BY change_5m ASC` 裁掉。显式 `--limit` 仍按传入值截断。K 线后备的 1 小时量优先用 quote volume（USDT），与指标任务一致；某根缺 quote 才退回 base volume。
 
 `race_tech_boll_fade` 仍读 Solana `token_indicators`，不看这两张表。
+
+## 新买单：3M quoteVolume 与当前宇宙（2026-11-06）
+
+只作用在 `live_bnb_boll_fade` 和 `live_bnb_boll_classic` 的**新买**。纸面、链上、卖出、以及已经挂上的保护单都不走这道门。执行层的单臂单仓闸不改。
+
+门槛与宇宙刷新共用一个环境变量，默认都是 300 万：
+
+`BINANCE_SPOT_MIN_QUOTE_VOLUME`（`3e6` / `3000000`）。空白或无法解析时用 300 万，不用 0。
+
+一笔新买要同时满足：
+
+1. 符号在当前主宇宙快照里（`symbols` 表，或 `BINANCE_SPOT_UNIVERSE_DB` / `BINANCE_SPOT_UNIVERSE_JSON`）。快照没挂上时新买失败关闭，旧的 `binance_indicators` 行不能把已移出的名字买回来。
+2. 有一份新鲜的 24 小时 USDT `quoteVolume`，大于等于上面的门槛。来源按顺序：`ccxt_ticks.quote_volume_24h`（币安现货 ticker），否则宇宙行上带时间戳的 `quoteVolume` / `quote_volume_24h`。不用 base volume，不用 `liquidity_usd`，不用 5 分钟成交，也不用指标缓存里的 `quote_volume_24h` 顶替。缺、非有限、没有时间、过期，都失败关闭。新鲜窗口沿用 `BINANCE_INDICATORS_FRESH_SEC`（默认 3600 秒）；把它设成 0 不会把过期行情放进来。
+
+扫描窗口仍是至少 600，先筛过门槛和宇宙，再跑原来的 Entry Zone 或 classic 腿、流动性地板和冷却。通过之后按 `volume_strength` 从高到低，相同则 24h quote turnover 从高到低，再按符号。每个 purpose 每一拍最终新买最多 `LIVE_BNB_TOP_BUYS`（默认 1）。被策略、风险或冷却丢掉的名字不占这个名额。卖出不计数、不因门槛被丢掉。

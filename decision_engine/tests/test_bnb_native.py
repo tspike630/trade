@@ -7,6 +7,7 @@ import math
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -65,6 +66,23 @@ def _zone_hit_bars() -> list[tuple[int, float, float, float, float, float, float
         trades = 50 if index == len(bars) - 1 else 100
         out.append((ts, op, hi, bar_low, close, vol, quote, trades))
     return out
+
+
+def _admit_quote(conn: sqlite3.Connection, symbol: str, quote: float = 3_000_000.0) -> None:
+    """Fresh Binance ticker quoteVolume so a new buy can clear the 3M floor."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ccxt_ticks (
+            exchange TEXT, symbol TEXT, ts INTEGER,
+            quote_volume_24h REAL, volume_24h REAL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO ccxt_ticks (exchange, symbol, ts, quote_volume_24h, volume_24h) "
+        "VALUES ('binance', ?, ?, ?, 1)",
+        (symbol, int(time.time() * 1000), quote),
+    )
 
 
 def _bars(
@@ -296,6 +314,7 @@ class NativeEmitTests(unittest.TestCase):
                 "INSERT INTO token_indicators VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 ("solana", "MintShouldNotEmit", -3.0, 0.9, 1.0, 0.9, "hot", "2026-11-05T00:00:00Z"),
             )
+            _admit_quote(conn, "ZZQBOLL/USDT")
             conn.commit()
             conn.close()
             rows, payload = self._tick(db)
@@ -346,6 +365,7 @@ class NativeEmitTests(unittest.TestCase):
                     for ts, op, hi, lo, close, vol, quote, trades in _zone_hit_bars()
                 ],
             )
+            _admit_quote(conn, "ZZQBOLL/USDT")
             conn.commit()
             conn.close()
             rows, payload = self._tick(db)
@@ -452,6 +472,7 @@ class NativeEmitTests(unittest.TestCase):
                         for ts, op, hi, lo, close, vol, quote, trades in _zone_hit_bars()
                     ],
                 )
+            _admit_quote(conn, "ZZQBOLL/USDT")
             conn.commit()
             conn.close()
             os.environ["BINANCE_SPOT_UNIVERSE_JSON"] = str(listing)
@@ -626,6 +647,15 @@ class ScanWindowTests(unittest.TestCase):
             """,
             rows,
         )
+        conn.execute(
+            "CREATE TABLE symbols (symbol TEXT, status TEXT, base_asset TEXT, quote_asset TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO symbols VALUES (?, 'TRADING', ?, 'USDT')",
+            [(row[0], row[1]) for row in rows],
+        )
+        for row in rows:
+            _admit_quote(conn, f"{row[1]}/USDT")
         conn.commit()
         conn.close()
 

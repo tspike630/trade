@@ -16,6 +16,11 @@ from decision_engine.core.binance_indicators import (
 )
 from decision_engine.core.bnb_native import limit_kline_scan, load_native_candidate_rows
 from decision_engine.core.live_bnb_entry_coords import attach_live_entry_coordinates
+from decision_engine.core.live_bnb_turnover import (
+    cap_live_bnb_buys,
+    filter_live_bnb_hot,
+    stamp_turnover,
+)
 from decision_engine.core.bnb_spot_map import (
     default_listing_db_paths,
     load_binance_spot_usdt_symbols,
@@ -93,6 +98,8 @@ class DecisionEngine:
         hot = self.adapter.list_hot_tokens(limit=self.hot_limit)
         bnb_spot = self.bus.purpose in LIVE_BNB_SPOT_PURPOSES
         bnb_source: str | None = None
+        turnover_report: dict[str, Any] | None = None
+        now_ms = int(time.time() * 1000)
         if bnb_spot:
             hot, bnb_source = self._load_live_bnb_hot(hot)
             # Coordinates are the entry-zone overlay. The classic arm reads
@@ -101,13 +108,23 @@ class DecisionEngine:
                 hot = attach_live_entry_coordinates(
                     self.adapter.conn,
                     hot,
-                    now_ms=int(time.time() * 1000),
+                    now_ms=now_ms,
                 )
+        scanned = len(hot)
+        if bnb_spot:
+            # Floor and universe membership. The 600-name scan is already loaded;
+            # this does not rank or cut to Top 1.
+            hot, turnover_report = filter_live_bnb_hot(
+                self.adapter.conn,
+                self.adapter.db_path,
+                hot,
+                now_ms=now_ms,
+            )
         log.info(
             "tick#%s indicators_total=%s hot_loaded=%s bnb_factor_source=%s strategies=%s",
             self.tick_count,
             n_ind,
-            len(hot),
+            scanned,
             bnb_source or "-",
             [s.strategy_id for s in self.strategies],
         )
@@ -152,12 +169,13 @@ class DecisionEngine:
         if not candidates:
             log.info("tick#%s 无信号 (no candidates)", self.tick_count)
             return self._tick_payload(
-                hot_loaded=len(hot),
+                hot_loaded=scanned,
                 indicators_total=n_ind,
                 candidates=0,
                 emitted=0,
                 entry_ih_rejected=entry_ih_rejected,
                 bnb_factor_source=bnb_source,
+                turnover_report=turnover_report,
             )
 
         # Shared buy choke point: every strategy's candidates pass through
@@ -165,9 +183,14 @@ class DecisionEngine:
         # rows (adapter batch lookup), so tech/combined/jev do not each filter.
         # Also stamp pairCreatedAt (ms) for decision_log extras / token_age.
         self._stamp_buy_liquidity(candidates, hot)
+        if bnb_spot:
+            stamp_turnover(candidates, hot)
         passed = self.risk.filter(candidates)
         if self.token_cooldown is not None:
             passed = self.token_cooldown.filter(passed)
+        top_report: dict[str, Any] | None = None
+        if bnb_spot:
+            passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
         emitted = self.bus.publish_many(passed)
         log.info(
             "tick#%s candidates=%s emitted=%s",
@@ -176,12 +199,14 @@ class DecisionEngine:
             len(emitted),
         )
         return self._tick_payload(
-            hot_loaded=len(hot),
+            hot_loaded=scanned,
             indicators_total=n_ind,
             candidates=len(candidates),
             emitted=len(emitted),
             entry_ih_rejected=entry_ih_rejected,
             bnb_factor_source=bnb_source,
+            turnover_report=turnover_report,
+            top_report=top_report,
         )
 
     def _tick_payload(
@@ -193,6 +218,8 @@ class DecisionEngine:
         emitted: int,
         entry_ih_rejected: dict[str, int] | None,
         bnb_factor_source: str | None = None,
+        turnover_report: dict[str, Any] | None = None,
+        top_report: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "tick": self.tick_count,
@@ -205,6 +232,10 @@ class DecisionEngine:
             payload["entry_ih_rejected"] = entry_ih_rejected
         if bnb_factor_source is not None:
             payload["bnb_factor_source"] = bnb_factor_source
+        if turnover_report is not None:
+            payload["quote_turnover"] = turnover_report
+        if top_report is not None:
+            payload["live_bnb_top_buys"] = top_report
         return payload
 
     def _load_live_bnb_hot(
