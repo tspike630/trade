@@ -1151,7 +1151,9 @@ class BinanceSpotAdapter:
                 expected["uid"] = rest_uid
         return account_book_block(self.account_snapshot, book, expected)
 
-    def _live_buy_block(self, sig: dict[str, Any], plan: dict[str, Any] | None) -> str | None:
+    def _live_buy_block(
+        self, sig: dict[str, Any], plan: dict[str, Any] | None, symbol: str
+    ) -> str | None:
         """Reasons a live BUY must not be sent. None means the later checks still apply."""
         if plan is None:
             return "missing_exit_prices"
@@ -1168,6 +1170,7 @@ class BinanceSpotAdapter:
             self.buy_blocks,
             self.canonical_rows,
             purpose=str(sig.get("purpose") or ""),
+            symbol=symbol,
         )
         if held:
             return held
@@ -1543,7 +1546,7 @@ class BinanceSpotAdapter:
                 )
             )
         if side_now == "BUY":
-            buy_block = self._live_buy_block(sig, plan)
+            buy_block = self._live_buy_block(sig, plan, symbol)
             if buy_block:
                 return self._finish(
                     _result(

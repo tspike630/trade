@@ -1,7 +1,14 @@
 """Pre-trade gates for the live Binance spot arms. No network and no secrets.
 
-``live_bnb_boll_fade`` and ``live_bnb_boll_classic`` each keep one open
-position. A hold on one arm does not freeze the other.
+``live_bnb_boll_fade`` and ``live_bnb_boll_classic`` may each hold several
+symbols at once (一臂多仓). A healthy open blocks another BUY of that same
+symbol only. It does not block a different symbol, and it does not open a
+second position on the symbol already held (not 一币多仓). A hold on one
+arm does not freeze the other, including the same symbol.
+
+``BINANCE_SPOT_ALLOW_MULTI_SYMBOL`` defaults on. ``0`` restores one open
+position per arm. A caller that omits the buy symbol fails closed while a
+healthy open row exists.
 
 A live BUY is not a completed consumer event until a native spot OCO
 (``POST /api/v3/orderList/oco``) is verified: ``orderListId >= 0`` and both
@@ -20,6 +27,7 @@ inferred.
 
 from __future__ import annotations
 
+import os
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -34,6 +42,8 @@ LIVE_BNB_SPOT_PURPOSES = frozenset(
         PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     }
 )
+# Several symbols on one arm. Unset is on. This is not same-symbol pyramiding.
+ALLOW_MULTI_SYMBOL_ENV = "BINANCE_SPOT_ALLOW_MULTI_SYMBOL"
 MCP_POSITION_UID = "1289917075"
 REST_BOOK = "rest_api_key"
 MCP_BOOK = "mcp:1289917075"
@@ -501,6 +511,42 @@ def _position_ids_verified(row: dict[str, Any]) -> bool:
     )
 
 
+def allow_multi_symbol_per_arm() -> bool:
+    """Several distinct symbols per arm. Default on.
+
+    ``BINANCE_SPOT_ALLOW_MULTI_SYMBOL``: unset or blank is on.
+    ``0`` / ``false`` / ``no`` / ``off`` restores one open position per arm.
+    Any other value is off. A second BUY of a symbol the arm already holds
+    stays blocked either way.
+    """
+    raw = os.environ.get(ALLOW_MULTI_SYMBOL_ENV)
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _symbol_key(raw: object) -> str | None:
+    if isinstance(raw, str):
+        text = raw.strip().upper()
+        if text:
+            return text
+    return None
+
+
+def _same_symbol_open_block(row: dict[str, Any], symbol: str | None) -> str | None:
+    """Healthy open blocks that symbol, or the whole arm when multi-symbol is off.
+
+    A missing buy symbol or a held row with no symbol fails closed.
+    """
+    if not allow_multi_symbol_per_arm():
+        return "position_open_blocks_buy"
+    buy = _symbol_key(symbol)
+    held = _symbol_key(row.get("symbol"))
+    if buy is None or held is None or buy == held:
+        return "position_open_blocks_buy"
+    return None
+
+
 def _row_blocks_arm(row: dict[str, Any], arm: str) -> bool:
     """True when ``row`` belongs to ``arm``.
 
@@ -518,13 +564,26 @@ def buy_exposure_block(
     canonical: object,
     *,
     purpose: str | None = None,
+    symbol: str | None = None,
 ) -> str | None:
     """Block a new BUY while this arm's exposure is naked, unbound, or unfinished.
 
-    One open position per arm. Fade holding CFGUSDT does not block a classic
-    buy of another symbol, and classic does not block fade. A flat book is
-    not by itself permission to buy. Terminal rows are ignored. This does
-    not write a close for the manual FET fill.
+    With ``BINANCE_SPOT_ALLOW_MULTI_SYMBOL`` on (the default), one arm may
+    hold several symbols. A healthy ``oco_working``, verified ``open``, or
+    ``exit_submitted`` row blocks only a BUY of that same symbol. A different
+    symbol is not refused for that row. This is not a second position on the
+    same symbol, and it does not add a cross-arm same-symbol rule: fade
+    holding CFGUSDT still does not block a classic buy of CFGUSDT.
+
+    Omitting ``symbol`` fails closed while any healthy open row exists, which
+    is the previous one-open-per-arm result. ``0`` on the flag restores that
+    result even when the symbols differ.
+
+    Unsafe rows still block the whole arm: ``held_naked``, a non-terminal
+    row with no entry order id, ``qty_unconfirmed``, ``oco_failed``,
+    ``oco_unknown``, and an ``open`` that is not a verified exchange OCO.
+    A flat book is not by itself permission to buy. Terminal rows are
+    ignored. This does not write a close for the manual FET fill.
 
     ``purpose`` defaults to ``live_bnb_boll_fade`` so existing callers keep
     the fade book.
@@ -555,8 +614,14 @@ def buy_exposure_block(
         if status == "open":
             if str(row.get("protection") or "") != "exchange_oco" or not _position_ids_verified(row):
                 return "unprotected_position_blocks_buy"
-            return "position_open_blocks_buy"
+            blocked = _same_symbol_open_block(row, symbol)
+            if blocked:
+                return blocked
+            continue
         if status in {"oco_working", "exit_submitted"}:
-            return "position_open_blocks_buy"
+            blocked = _same_symbol_open_block(row, symbol)
+            if blocked:
+                return blocked
+            continue
         return "unprotected_position_blocks_buy"
     return None

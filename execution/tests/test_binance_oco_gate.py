@@ -39,6 +39,7 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     FROZEN_DECISION_ID,
     MCP_BOOK,
     MCP_POSITION_UID,
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     REST_BOOK,
     VERIFIED_FET_EXIT,
     acceptance_report,
@@ -553,6 +554,148 @@ class ConsumerGateTests(unittest.TestCase):
         self.assertIsNone(buy_exposure_block([], book["canonical_positions"]))
         self.assertEqual(str(VERIFIED_FET_FILL["client_order_id"]), FROZEN_CLIENT_ID)
         ledger.close()
+
+
+def _protected(status: str, symbol: str, **extra: Any) -> dict[str, Any]:
+    row = {
+        "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        "symbol": symbol,
+        "status": status,
+        "protection": "exchange_oco",
+        "entry_order_id": "9",
+        "oco_order_list_id": "3",
+        "oco_above_order_id": "4",
+        "oco_below_order_id": "5",
+    }
+    row.update(extra)
+    return row
+
+
+class MultiSymbolArmTests(unittest.TestCase):
+    """一臂多仓: several symbols on one arm. Not 一币多仓 (same-symbol adds)."""
+
+    def test_other_symbol_is_allowed_and_same_symbol_still_blocks(self) -> None:
+        held = _protected("oco_working", "CFGUSDT")
+        fade = PURPOSE_LIVE_BNB_BOLL_FADE
+        self.assertIsNone(buy_exposure_block([held], [], purpose=fade, symbol="BNBUSDT"))
+        self.assertIsNone(buy_exposure_block([held], [], purpose=fade, symbol="ETHUSDT"))
+        self.assertEqual(
+            buy_exposure_block([held], [], purpose=fade, symbol="CFGUSDT"),
+            "position_open_blocks_buy",
+        )
+        self.assertEqual(
+            buy_exposure_block([held], [], purpose=fade, symbol="cfgusdt"),
+            "position_open_blocks_buy",
+        )
+        # Callers that omit the buy symbol stay fail-closed.
+        self.assertEqual(
+            buy_exposure_block([held], [], purpose=fade),
+            "position_open_blocks_buy",
+        )
+        self.assertEqual(
+            buy_exposure_block([held], [], purpose=fade, symbol="  "),
+            "position_open_blocks_buy",
+        )
+        # A held row with no symbol cannot be proved to be a different coin.
+        blank = _protected("oco_working", "CFGUSDT")
+        blank["symbol"] = ""
+        self.assertEqual(
+            buy_exposure_block([blank], [], purpose=fade, symbol="BNBUSDT"),
+            "position_open_blocks_buy",
+        )
+        for status in ("open", "exit_submitted"):
+            row = _protected(status, "CFGUSDT")
+            self.assertIsNone(
+                buy_exposure_block([row], [], purpose=fade, symbol="BNBUSDT"),
+                status,
+            )
+            self.assertEqual(
+                buy_exposure_block([row], [], purpose=fade, symbol="CFGUSDT"),
+                "position_open_blocks_buy",
+                status,
+            )
+        # One matching symbol among other healthy opens still blocks.
+        self.assertEqual(
+            buy_exposure_block(
+                [_protected("oco_working", "ETHUSDT"), _protected("oco_working", "BNBUSDT")],
+                [],
+                purpose=fade,
+                symbol="BNBUSDT",
+            ),
+            "position_open_blocks_buy",
+        )
+        self.assertIsNone(
+            buy_exposure_block(
+                [_protected("oco_working", "ETHUSDT"), _protected("oco_working", "CFGUSDT")],
+                [],
+                purpose=fade,
+                symbol="BNBUSDT",
+            )
+        )
+        # Existing arm split stays. Same symbol on the other arm is not a new block.
+        self.assertIsNone(
+            buy_exposure_block(
+                [held],
+                [],
+                purpose=PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+                symbol="CFGUSDT",
+            )
+        )
+
+    def test_flag_off_restores_one_open_position_per_arm(self) -> None:
+        held = _protected("oco_working", "CFGUSDT")
+        with mock.patch.dict(os.environ, {"BINANCE_SPOT_ALLOW_MULTI_SYMBOL": "0"}):
+            self.assertEqual(
+                buy_exposure_block(
+                    [held],
+                    [],
+                    purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                    symbol="BNBUSDT",
+                ),
+                "position_open_blocks_buy",
+            )
+
+    def test_unsafe_rows_still_block_another_symbol(self) -> None:
+        fade = PURPOSE_LIVE_BNB_BOLL_FADE
+        naked = buy_exposure_block(
+            [],
+            [{"purpose": fade, "status": "held_naked", "symbol": "CFGUSDT"}],
+            purpose=fade,
+            symbol="BNBUSDT",
+        )
+        self.assertEqual(naked, "naked_holds_new_buys")
+        unbound = buy_exposure_block(
+            [],
+            [{"purpose": fade, "status": "open", "symbol": "CFGUSDT"}],
+            purpose=fade,
+            symbol="BNBUSDT",
+        )
+        self.assertEqual(unbound, "unbound_position")
+        cases = [
+            (_protected("qty_unconfirmed", "CFGUSDT"), "parent_fill_incomplete"),
+            (_protected("oco_failed", "CFGUSDT"), "oco_failed_blocks_buy"),
+            (_protected("oco_unknown", "CFGUSDT"), "oco_failed_blocks_buy"),
+            (
+                _protected("open", "CFGUSDT", protection="pending"),
+                "unprotected_position_blocks_buy",
+            ),
+            (
+                _protected("open", "CFGUSDT", oco_below_order_id=None),
+                "unprotected_position_blocks_buy",
+            ),
+            (_protected("pending", "CFGUSDT"), "unprotected_position_blocks_buy"),
+        ]
+        for row, error in cases:
+            self.assertEqual(
+                buy_exposure_block([row], [], purpose=fade, symbol="BNBUSDT"),
+                error,
+                row["status"],
+            )
+            self.assertEqual(
+                buy_exposure_block([row], [], purpose=fade, symbol="CFGUSDT"),
+                error,
+                row["status"],
+            )
 
 
 if __name__ == "__main__":

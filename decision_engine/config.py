@@ -58,7 +58,8 @@ LIVE_BNB_SCAN_LIMIT = 600
 DEFAULT_BINANCE_SPOT_MIN_QUOTE_VOLUME = 3_000_000.0
 # New buys kept per Binance purpose per tick after eligibility, risk, and cooldown.
 # One qualifier stays one. The list is not padded out to this count.
-# Execution still allows one open position per purpose.
+# Spot execution may hold several symbols on one arm. It still blocks a
+# second open on a symbol that arm already holds. This count is unchanged.
 DEFAULT_LIVE_BNB_TOP_BUYS = 2
 DEFAULT_STRATEGY = os.environ.get("DECISION_DEFAULT_STRATEGY", "jev_strength_v1")
 

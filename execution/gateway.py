@@ -1264,7 +1264,8 @@ class ExecutionGateway:
             # CEX arm: not a paper fill, and not LiveExecutor. The adapter
             # itself keeps live newOrder behind the kill switch. Buy blocks
             # are this purpose only, so the other arm's open position does
-            # not freeze this one.
+            # not freeze this one. A protected open on this arm blocks only
+            # the same symbol.
             adapter = self._binance_spot or default_live_bnb_adapter()
             self._binance_spot = adapter
             if action == "buy" and mode != "dry_run":

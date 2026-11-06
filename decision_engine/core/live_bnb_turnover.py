@@ -22,8 +22,9 @@ gets its protective exit. This module does not cancel orders.
 
 After those gates, each purpose keeps at most
 ``LIVE_BNB_TOP_BUYS`` new buys (default 2). A tick with one qualifier emits
-that one buy and does not invent a second. Execution still holds one open
-position per purpose; this cap does not open a second fill.
+that one buy and does not invent a second. Spot execution may hold several
+symbols on one arm and still blocks a second open of a symbol that arm
+already holds. This cap is only how many new buys a tick emits.
 """
 
 from __future__ import annotations
