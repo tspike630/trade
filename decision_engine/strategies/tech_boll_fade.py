@@ -19,6 +19,10 @@ from decision_engine.strategies.live_bnb_entry_zone import (
     RULE_VERSION as LIVE_ENTRY_ZONE_VERSION,
     evaluate_entry_zone,
 )
+from decision_engine.strategies.live_bnb_notional import (
+    REJECT_BELOW_MIN,
+    live_buy_notional_skip,
+)
 from decision_engine.strategies.live_bnb_size_floor import (
     ENTRY_MIN_NOTIONAL_USDT,
     lift_size_pct_for_entry_min,
@@ -73,12 +77,14 @@ class TechBollFadeStrategy(BaseStrategy):
         """Live arm only. Paper ``race_tech_boll_fade`` stays on ``_on_tick_paper``.
 
         Neutral keeps multiplier 0.5. If that quote is under 20 USDT,
-        ``size_pct`` is raised to the exchange floor. Bands are not retuned.
+        ``size_pct`` is raised to the exchange floor. A quote that is still
+        under 20 after that is not written. Bands are not retuned.
         """
         self._pending.clear()
         self.rejected = {}
         hot = data.get("hot_tokens") or []
         hits = 0
+        book_warned = False
         for row in hot:
             if not isinstance(row, dict):
                 self.rejected["row_not_dict"] = self.rejected.get("row_not_dict", 0) + 1
@@ -111,13 +117,22 @@ class TechBollFadeStrategy(BaseStrategy):
                 continue
             # 0.5 is the zone's risk half-size, not the exchange minimum.
             # Raise only the emitted fraction, and only when the book parses.
-            # This stays ahead of a later under-20 prefilter: the lifted quote
-            # is already >= 20, so that filter keeps the row.
             size_before_floor = size_pct
             size_pct, lifted = lift_size_pct_for_entry_min(size_pct)
             if not 0.0 < size_pct <= 1.0:
                 self.rejected["size_pct_invalid"] = (
                     self.rejected.get("size_pct_invalid", 0) + 1
+                )
+                continue
+            # After the lift. A quote that still cannot clear 20 USDT is not
+            # written. A missing book fails open. Paper never reaches here.
+            skip, book_warn = live_buy_notional_skip(size_pct)
+            if book_warn is not None and not book_warned:
+                log.warning("%s", book_warn)
+                book_warned = True
+            if skip:
+                self.rejected[REJECT_BELOW_MIN] = (
+                    self.rejected.get(REJECT_BELOW_MIN, 0) + 1
                 )
                 continue
             lift_extra: dict[str, Any] = {}

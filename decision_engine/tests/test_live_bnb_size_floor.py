@@ -307,11 +307,14 @@ class LiveEmitTests(unittest.TestCase):
         self.assertAlmostEqual(missing[0]["size_pct"], 0.025)
         self.assertEqual(missing[0]["position_size_multiplier"], 0.5)
         self.assertNotIn("min_notional_lift", missing[0])
+        # 1 * 10 is still under 20. The lift does not invent a size, and the
+        # prefilter then drops the unchanged 0.025 so execution never sees it.
         self._book("10")
-        _strategy, tiny = self._live([_row(0.12, 0.85)])
-        self.assertAlmostEqual(tiny[0]["size_pct"], 0.025)
-        self.assertNotIn("min_notional_lift", tiny[0])
-        err, _quote = _execution_quote(tiny[0]["size_pct"], "10")
+        strategy, tiny = self._live([_row(0.12, 0.85)])
+        self.assertEqual(tiny, [])
+        self.assertEqual(strategy.rejected.get("entry_notional_below_min_prefilter"), 1)
+        self.assertEqual(len(_persist(tiny, PURPOSE_LIVE_BNB_BOLL_FADE)), 0)
+        err, _quote = _execution_quote(0.025, "10")
         self.assertEqual(err, "entry_notional_below_min")
 
     def test_paper_purpose_keeps_its_size_when_the_book_is_under_the_floor(self) -> None:
