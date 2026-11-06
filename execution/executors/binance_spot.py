@@ -1340,6 +1340,14 @@ class BinanceSpotAdapter:
             "protection": HELD_EXIT_PROTECTION,
             "purpose": str(sig.get("purpose") or "").strip() or PURPOSE_LIVE_BNB_BOLL_FADE,
         }
+        signal_entry = plan.get("entry_price")
+        if signal_entry not in (None, ""):
+            arm["signal_entry_price"] = signal_entry
+        fill_price = fill_average_price(placed)
+        if fill_price:
+            # Ledger entry is the exchange average. The signal price stays on
+            # exit_plan and on signal_entry_price. Existing rows are not rewritten.
+            arm["entry_price"] = fill_price
         common = dict(
             symbol=symbol,
             order=dict(pairs),
@@ -1376,7 +1384,6 @@ class BinanceSpotAdapter:
         def save(fields: dict[str, Any]) -> None:
             row.update(fields)
 
-        fill_price = fill_average_price(placed)
         for candidate in (getattr(self, "_entry_mark", None), fill_price):
             if not filters or _to_decimal(candidate) is None:
                 continue

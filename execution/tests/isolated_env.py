@@ -13,8 +13,12 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 from unittest import mock
+
+# Child interpreters import sitecustomize from here before application code.
+_GUARD_DIR = str(Path(__file__).resolve().parent / "_dotenv_guard")
 
 # Enough for the interpreter, temp files, and ``python -m``. Not app policy.
 _KEEP = frozenset(
@@ -50,12 +54,25 @@ def baseline_environ() -> dict[str, str]:
     return kept
 
 
+def dotenv_guard_dir() -> str:
+    """Directory whose ``sitecustomize`` blocks operator dotenv in a child."""
+    return _GUARD_DIR
+
+
 def isolated_environ(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Baseline plus ``overrides``. A value of ``""`` sets the key empty."""
+    """Baseline plus ``overrides``. A value of ``""`` sets the key empty.
+
+    ``PYTHONPATH`` always starts with the dotenv guard. An override is
+    appended so the child can still import the repo.
+    """
     env = baseline_environ()
-    if overrides:
-        for key, value in overrides.items():
-            env[str(key)] = str(value)
+    extra = {str(key): str(value) for key, value in (overrides or {}).items()}
+    extra_path = extra.pop("PYTHONPATH", "")
+    parts = [_GUARD_DIR]
+    if extra_path:
+        parts.append(extra_path)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    env.update(extra)
     return env
 
 

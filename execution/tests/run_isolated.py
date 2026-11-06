@@ -6,8 +6,9 @@ This entry point clears them before unittest imports any test.
 
     python -m execution.tests.run_isolated
 
-The process environment may already contain a production ``.env``. This
-command does not read that file, does not edit it, and does not place orders.
+The process environment may already contain operator config. This command
+does not read or edit ``crawler/.env`` (the file ``crawler/config.py`` loads
+on import) and does not place orders. A cwd ``.env`` is not that file.
 A case that needs a production-style value sets it on an
 :func:`execution.tests.isolated_env.isolated_environ` dict.
 """

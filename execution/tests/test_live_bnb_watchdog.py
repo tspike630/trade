@@ -255,8 +255,12 @@ class WatchdogTests(unittest.TestCase):
         self.assertNotIn("unlink", prod_text)
         mode = script.stat().st_mode
         self.assertTrue(mode & stat.S_IXUSR)
-        env = isolated_environ(self.env)
-        env["PYTHONPATH"] = f"{ROOT}:{ROOT / 'crawler'}"
+        env = isolated_environ(
+            {
+                **self.env,
+                "PYTHONPATH": f"{ROOT}{os.pathsep}{ROOT / 'crawler'}",
+            }
+        )
         done = subprocess.run(
             [str(script)],
             cwd=str(ROOT),
