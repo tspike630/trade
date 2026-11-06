@@ -45,13 +45,19 @@ Comparisons use a 1e-9 absolute tolerance so a boundary built as
 wider band.
 
 Stop ``>=`` the entry price makes odds undefined (``stop_not_below_price``).
-``P`` below the tier floor or at/above ``M`` does not get a market buy.
+Odds are a ratio, so a tight band can still clear them while the stop sits
+a few basis points under the entry. A BUY is not emitted unless the stop is
+at least ``MIN_ENTRY_STOP_GAP`` under the intended entry (signal price for
+MARKET, limit for LIMIT): ``stop_too_close_to_entry``. ``P`` below the tier
+floor or at/above ``M`` does not get a market buy.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
+
+from decision_engine.core.stop_gap import stop_distance_reason
 
 ALPHA_FLOOR = 0.08
 ALPHA_CAP = 0.40
@@ -70,7 +76,7 @@ _DAY_MS = 24 * 60 * 60 * 1000
 Tier = Literal["large_trade", "neutral", "retail_crowded"]
 OrderType = Literal["MARKET", "LIMIT"]
 
-RULE_VERSION = "live_bnb_entry_zone_v1_2026-11-05"
+RULE_VERSION = "live_bnb_entry_zone_v2_2026-11-06"
 
 
 def _finite(value: Any) -> float | None:
@@ -420,28 +426,33 @@ def _limit_or_reject(
     base: dict[str, Any],
 ) -> EntryDecision:
     """Resting bid at ``L+0.20*S``. A limit at or above ``P`` would take, so it is not sent."""
-    refused = _empty(
-        reason="neutral_limit_not_executable",
-        tier="neutral",
-        ratio=base["ratio"],
-        zone=(base["zone_min"], base["zone_max"]),
-        stop_price=stop_price,
-        take_profit_price=base["take_profit"],
-        alpha=base["alpha"],
-        span=base["span"],
-        low=base["low"],
-        mid=base["mid"],
-        price=base["price"],
-        deep=base["deep"],
-        legacy=base["legacy"],
-        ratio_source=base["ratio_source"],
-        baseline_bars=base["baseline_bars"],
-    )
+
+    def _refused(reason: str) -> EntryDecision:
+        return _empty(
+            reason=reason,
+            tier="neutral",
+            ratio=base["ratio"],
+            zone=(base["zone_min"], base["zone_max"]),
+            stop_price=stop_price,
+            take_profit_price=base["take_profit"],
+            alpha=base["alpha"],
+            span=base["span"],
+            low=base["low"],
+            mid=base["mid"],
+            price=base["price"],
+            deep=base["deep"],
+            legacy=base["legacy"],
+            ratio_source=base["ratio_source"],
+            baseline_bars=base["baseline_bars"],
+        )
+
     if not _gt(price, limit_price) or limit_price <= 0 or stop_price >= limit_price:
-        return refused
+        return _refused("neutral_limit_not_executable")
     odds = reward_risk(mid, limit_price, stop_price)
     if odds is None or not _gte(odds, NEUTRAL_MIN_ODDS):
-        return refused
+        return _refused("neutral_limit_not_executable")
+    if stop_distance_reason(limit_price, stop_price):
+        return _refused("stop_too_close_to_entry")
     return _emit(
         tier="neutral",
         entry_reason="neutral_limit",
@@ -622,6 +633,16 @@ def evaluate_entry_zone(
                 take_profit_price=take_profit,
                 **common,
             )
+        if stop_distance_reason(price, stop_price):
+            return _empty(
+                reason="stop_too_close_to_entry",
+                tier=tier,
+                ratio=ratio,
+                zone=zone,
+                stop_price=stop_price,
+                take_profit_price=take_profit,
+                **common,
+            )
         return _emit(
             tier="large_trade",
             entry_reason="large_trade_market",
@@ -656,6 +677,16 @@ def evaluate_entry_zone(
         if in_band:
             odds = reward_risk(mid, price, stop_price)
             if odds is not None and _gte(odds, NEUTRAL_MIN_ODDS):
+                if stop_distance_reason(price, stop_price):
+                    return _empty(
+                        reason="stop_too_close_to_entry",
+                        tier=tier,
+                        ratio=ratio,
+                        zone=zone,
+                        stop_price=stop_price,
+                        take_profit_price=take_profit,
+                        **common,
+                    )
                 return _emit(
                     tier="neutral",
                     entry_reason="neutral_market",
