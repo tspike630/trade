@@ -21,6 +21,7 @@ from decision_engine.core.engine import DecisionEngine
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import (
     DEFAULT_PURPOSE,
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
     PURPOSE_LIVE_CANDIDATE,
     PURPOSE_RACE_TECH_BOLL_FADE,
@@ -66,9 +67,13 @@ class PurposeEnumTests(unittest.TestCase):
         self.assertEqual(PURPOSES, expected)
         self.assertEqual(DEFAULT_PURPOSE, PURPOSE_LIVE_CANDIDATE)
         self.assertEqual(PURPOSE_LIVE_BNB_BOLL_FADE, "live_bnb_boll_fade")
+        self.assertEqual(PURPOSE_LIVE_BNB_BOLL_CLASSIC, "live_bnb_boll_classic")
         self.assertIn(PURPOSE_LIVE_BNB_BOLL_FADE, PURPOSES)
+        self.assertIn(PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSES)
         self.assertIn(PURPOSE_RACE_TECH_BOLL_FADE, PURPOSES)
         self.assertNotEqual(PURPOSE_LIVE_BNB_BOLL_FADE, PURPOSE_RACE_TECH_BOLL_FADE)
+        self.assertNotEqual(PURPOSE_LIVE_BNB_BOLL_FADE, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
+        self.assertNotEqual(PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSE_RACE_TECH_BOLL_FADE)
         self.assertNotEqual(PURPOSE_LIVE_BNB_BOLL_FADE, PURPOSE_LIVE_CANDIDATE)
         self.assertEqual(
             resolve_run_purpose(
@@ -77,6 +82,14 @@ class PurposeEnumTests(unittest.TestCase):
                 live_min_strength=0.3,
             ),
             PURPOSE_LIVE_BNB_BOLL_FADE,
+        )
+        self.assertEqual(
+            resolve_run_purpose(
+                "live_bnb_boll_classic",
+                min_jev_strength=None,
+                live_min_strength=0.3,
+            ),
+            PURPOSE_LIVE_BNB_BOLL_CLASSIC,
         )
 
     def test_resident_loop_and_once_default_live_candidate(self) -> None:

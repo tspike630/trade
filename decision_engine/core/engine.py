@@ -25,25 +25,38 @@ from decision_engine.core.bnb_spot_map import (
 )
 from decision_engine.core.data_adapter import IndicatorDataAdapter
 from decision_engine.core.risk_manager import RiskManager
-from decision_engine.core.signal_bus import PURPOSE_LIVE_BNB_BOLL_FADE, SignalBus
+from decision_engine.core.signal_bus import (
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+    PURPOSE_LIVE_BNB_BOLL_FADE,
+    SignalBus,
+)
 from decision_engine.entry_ih_age import filter_buys_by_entry_ih_age
 from decision_engine.strategies.base_strategy import BaseStrategy
 
 log = get_logger("decision_engine.engine")
+
+# Binance spot scan and factor feed. Entry rules stay on the strategy.
+LIVE_BNB_SPOT_PURPOSES = frozenset(
+    {
+        PURPOSE_LIVE_BNB_BOLL_FADE,
+        PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+    }
+)
 
 
 def scan_limit_for_purpose(purpose: str, explicit: int | None = None) -> int:
     """How many names one tick may load.
 
     A scan window, not an entry gate. Strategy thresholds stay put.
-    ``live_bnb_boll_fade`` defaults to at least ``LIVE_BNB_SCAN_LIMIT`` so a
-    broad dump does not drop spot names ranked past the global hot limit
-    (universe about 518). Other purposes keep ``HOT_TOKEN_LIMIT``.
-    An explicit limit, including ``--limit``, is kept as given.
+    Binance spot purposes (``live_bnb_boll_fade``, ``live_bnb_boll_classic``)
+    default to at least ``LIVE_BNB_SCAN_LIMIT`` so a broad dump does not drop
+    spot names ranked past the global hot limit (universe about 518). Other
+    purposes keep ``HOT_TOKEN_LIMIT``. An explicit limit, including
+    ``--limit``, is kept as given.
     """
     if explicit is not None:
         return int(explicit)
-    if purpose == PURPOSE_LIVE_BNB_BOLL_FADE:
+    if purpose in LIVE_BNB_SPOT_PURPOSES:
         return max(int(de_config.HOT_TOKEN_LIMIT), int(de_config.LIVE_BNB_SCAN_LIMIT))
     return int(de_config.HOT_TOKEN_LIMIT)
 
@@ -78,15 +91,18 @@ class DecisionEngine:
         self.tick_count += 1
         n_ind = self.adapter.count_indicators()
         hot = self.adapter.list_hot_tokens(limit=self.hot_limit)
-        bnb_spot = self.bus.purpose == PURPOSE_LIVE_BNB_BOLL_FADE
+        bnb_spot = self.bus.purpose in LIVE_BNB_SPOT_PURPOSES
         bnb_source: str | None = None
         if bnb_spot:
             hot, bnb_source = self._load_live_bnb_hot(hot)
-            hot = attach_live_entry_coordinates(
-                self.adapter.conn,
-                hot,
-                now_ms=int(time.time() * 1000),
-            )
+            # Coordinates are the entry-zone overlay. The classic arm reads
+            # the factor fields the paper legs already use.
+            if self.bus.purpose == PURPOSE_LIVE_BNB_BOLL_FADE:
+                hot = attach_live_entry_coordinates(
+                    self.adapter.conn,
+                    hot,
+                    now_ms=int(time.time() * 1000),
+                )
         log.info(
             "tick#%s indicators_total=%s hot_loaded=%s bnb_factor_source=%s strategies=%s",
             self.tick_count,
@@ -194,7 +210,7 @@ class DecisionEngine:
     def _load_live_bnb_hot(
         self, dex_hot: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], str]:
-        """CEX factors for ``live_bnb_boll_fade``.
+        """CEX factors for a Binance spot purpose.
 
         ``auto`` (default): ``binance_indicators`` once that table exists,
         even if this pass is empty — klines are not recomputed on top of it.

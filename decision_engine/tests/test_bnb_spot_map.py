@@ -161,12 +161,16 @@ class SpotSymbolTests(unittest.TestCase):
 
     def test_alias_is_the_same_strategy_class(self) -> None:
         self.assertEqual(resolve_strategy_id("live_bnb_boll_fade"), "tech_boll_fade_v1")
+        self.assertEqual(resolve_strategy_id("live_bnb_boll_classic"), "tech_boll_fade_v1")
         self.assertEqual(resolve_strategy_id("race_tech_boll_fade"), "tech_boll_fade_v1")
         live = get_strategy("live_bnb_boll_fade")
+        classic = get_strategy("live_bnb_boll_classic")
         race = get_strategy("race_tech_boll_fade")
         self.assertIsInstance(live, TechBollFadeStrategy)
+        self.assertIsInstance(classic, TechBollFadeStrategy)
         self.assertIsInstance(race, TechBollFadeStrategy)
         self.assertEqual(live.strategy_id, race.strategy_id)
+        self.assertEqual(classic.strategy_id, race.strategy_id)
         self.assertEqual(live.min_change_5m, race.min_change_5m)
         self.assertEqual(live.min_volume_strength, race.min_volume_strength)
 
