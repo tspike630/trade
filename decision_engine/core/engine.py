@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 from logging_setup import get_logger
@@ -20,6 +21,13 @@ from decision_engine.core.live_bnb_turnover import (
     cap_live_bnb_buys,
     filter_live_bnb_hot,
     stamp_turnover,
+)
+from decision_engine.core.live_buy_guards import apply_live_buy_guards
+from decision_engine.core.protection_halt import (
+    ProtectionBook,
+    purpose_halt_reason,
+    read_protection_book,
+    resolve_ledger_path,
 )
 from decision_engine.core.bnb_spot_map import (
     default_listing_db_paths,
@@ -77,6 +85,8 @@ class DecisionEngine:
         hot_limit: int | None = None,
         token_cooldown: Any = None,
         entry_ih_min_hours: float | None = None,
+        protection_book: ProtectionBook | None = None,
+        protection_ledger: str | Path | None = None,
     ):
         self.adapter = adapter
         self.bus = bus
@@ -87,6 +97,17 @@ class DecisionEngine:
         self.entry_ih_min_hours = (
             None if entry_ih_min_hours is None else float(entry_ih_min_hours)
         )
+        if protection_book is not None:
+            self._protection_book: ProtectionBook | None = protection_book
+            self._protection_ledger: Path | None = None
+        else:
+            self._protection_book = None
+            self._protection_ledger = (
+                Path(protection_ledger).expanduser()
+                if protection_ledger is not None
+                else resolve_ledger_path()
+            )
+        self._protection_unwired_logged = False
         self.tick_count = 0
         resolved = getattr(adapter, "db_path", None)
         if resolved is not None:
@@ -99,6 +120,10 @@ class DecisionEngine:
         bnb_spot = self.bus.purpose in LIVE_BNB_SPOT_PURPOSES
         bnb_source: str | None = None
         turnover_report: dict[str, Any] | None = None
+        protection_book = self._protection_snapshot() if bnb_spot else ProtectionBook.unwired()
+        protection_halt = (
+            purpose_halt_reason(self.bus.purpose, protection_book) if bnb_spot else None
+        )
         now_ms = int(time.time() * 1000)
         if bnb_spot:
             hot, bnb_source = self._load_live_bnb_hot(hot)
@@ -176,6 +201,7 @@ class DecisionEngine:
                 entry_ih_rejected=entry_ih_rejected,
                 bnb_factor_source=bnb_source,
                 turnover_report=turnover_report,
+                protection_halt=protection_halt,
             )
 
         # Shared buy choke point: every strategy's candidates pass through
@@ -188,6 +214,11 @@ class DecisionEngine:
         passed = self.risk.filter(candidates)
         if self.token_cooldown is not None:
             passed = self.token_cooldown.filter(passed)
+        passed, guard_report = apply_live_buy_guards(
+            passed,
+            purpose=self.bus.purpose,
+            book=protection_book,
+        )
         top_report: dict[str, Any] | None = None
         if bnb_spot:
             passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
@@ -207,6 +238,8 @@ class DecisionEngine:
             bnb_factor_source=bnb_source,
             turnover_report=turnover_report,
             top_report=top_report,
+            protection_halt=guard_report.get("protection_halt") or protection_halt,
+            stop_gap_rejected=int(guard_report.get("stop_gap_rejected") or 0),
         )
 
     def _tick_payload(
@@ -220,6 +253,8 @@ class DecisionEngine:
         bnb_factor_source: str | None = None,
         turnover_report: dict[str, Any] | None = None,
         top_report: dict[str, Any] | None = None,
+        protection_halt: str | None = None,
+        stop_gap_rejected: int = 0,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "tick": self.tick_count,
@@ -236,7 +271,31 @@ class DecisionEngine:
             payload["quote_turnover"] = turnover_report
         if top_report is not None:
             payload["live_bnb_top_buys"] = top_report
+        if protection_halt:
+            payload["protection_halt"] = protection_halt
+        if stop_gap_rejected:
+            payload["stop_gap_rejected"] = stop_gap_rejected
         return payload
+
+    def _protection_snapshot(self) -> ProtectionBook:
+        """Ledger book for this tick. A static book is the test injection.
+
+        An unconfigured path stays unwired. A configured path that cannot
+        be read comes back with ``error`` set so the halt fails closed.
+        """
+        if self._protection_book is not None:
+            return self._protection_book
+        path = self._protection_ledger
+        if path is None:
+            if not self._protection_unwired_logged:
+                log.info(
+                    "protection_book_unwired purpose=%s "
+                    "set DECISION_EXECUTION_LEDGER to the execution ledger",
+                    self.bus.purpose,
+                )
+                self._protection_unwired_logged = True
+            return ProtectionBook.unwired()
+        return read_protection_book(path)
 
     def _load_live_bnb_hot(
         self, dex_hot: list[dict[str, Any]]

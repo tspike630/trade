@@ -22,6 +22,7 @@ from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
 )
+from decision_engine.core.stop_gap import stop_distance_reason
 from decision_engine.strategies.base_strategy import BaseStrategy
 from decision_engine.strategies.entry_sizing import buy_size_fields
 from decision_engine.strategies.live_bnb_entry_zone import (
@@ -340,6 +341,11 @@ class TechBollFadeStrategy(BaseStrategy):
         if not stop_price < price < take_profit_price:
             self.rejected["classic_exit_invalid"] = (
                 self.rejected.get("classic_exit_invalid", 0) + 1
+            )
+            return
+        if stop_distance_reason(price, stop_price):
+            self.rejected["stop_too_close_to_entry"] = (
+                self.rejected.get("stop_too_close_to_entry", 0) + 1
             )
             return
         sized = buy_size_fields(row, floor_pct=self.position_pct)
