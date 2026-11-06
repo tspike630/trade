@@ -53,6 +53,13 @@ HOT_TOKEN_LIMIT = int(os.environ.get("DECISION_HOT_TOKEN_LIMIT", "50"))
 # global HOT_TOKEN_LIMIT drops valid break-lower names ranked past 50.
 # Other purposes keep HOT_TOKEN_LIMIT. An explicit --limit still wins.
 LIVE_BNB_SCAN_LIMIT = 600
+# Same name and default as the universe refresh
+# (BINANCE_SPOT_MIN_QUOTE_VOLUME=3e6). Decision reads the env on each tick.
+DEFAULT_BINANCE_SPOT_MIN_QUOTE_VOLUME = 3_000_000.0
+# New buys kept per Binance purpose per tick after eligibility, risk, and cooldown.
+# One qualifier stays one. The list is not padded out to this count.
+# Execution still allows one open position per purpose.
+DEFAULT_LIVE_BNB_TOP_BUYS = 2
 DEFAULT_STRATEGY = os.environ.get("DECISION_DEFAULT_STRATEGY", "jev_strength_v1")
 
 # Reader-side hot freshness. Indicators own the writes; this layer only drops stale rows.

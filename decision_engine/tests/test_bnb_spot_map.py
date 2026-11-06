@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -280,11 +282,23 @@ class EnginePurposeUniverseTests(unittest.TestCase):
         return _decision_rows(db)
 
     def test_live_purpose_emits_binance_symbol_only(self) -> None:
-        """auto, no indicator table: the DEX∩listing bypass still stamps the symbol.
+        """DEX∩listing bypass still stamps the symbol once quote turnover is fresh.
 
-        Closed klines supply the entry-zone coordinates. Without them the
-        live purpose fails closed and does not fall back to the paper legs.
+        A ``symbols`` snapshot makes auto prefer the kline book, so this test
+        pins ``dex_map``. Closed-bar coordinates are on the DEX row. Without
+        them the entry zone fails closed and does not fall back to the paper legs.
         """
+        old_source = os.environ.get("LIVE_BNB_FACTOR_SOURCE")
+        os.environ["LIVE_BNB_FACTOR_SOURCE"] = "dex_map"
+        try:
+            self._live_purpose_emits_binance_symbol_only()
+        finally:
+            if old_source is None:
+                os.environ.pop("LIVE_BNB_FACTOR_SOURCE", None)
+            else:
+                os.environ["LIVE_BNB_FACTOR_SOURCE"] = old_source
+
+    def _live_purpose_emits_binance_symbol_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "d.db"
             _seed(db)
@@ -300,6 +314,24 @@ class EnginePurposeUniverseTests(unittest.TestCase):
                 SET boll_mid = 1.2, kline_low = 0.825, trade_size_ratio = 2.0
                 WHERE token_address = 'MintA'
                 """
+            )
+            conn.execute(
+                "CREATE TABLE symbols (symbol TEXT, status TEXT, base_asset TEXT, quote_asset TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO symbols VALUES ('ZZQBOLLUSDT', 'TRADING', 'ZZQBOLL', 'USDT')"
+            )
+            conn.execute(
+                """
+                CREATE TABLE ccxt_ticks (
+                    exchange TEXT, symbol TEXT, ts INTEGER,
+                    quote_volume_24h REAL, volume_24h REAL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO ccxt_ticks VALUES ('binance', 'ZZQBOLL/USDT', ?, 3000000, 1)",
+                (int(time.time() * 1000),),
             )
             conn.commit()
             conn.close()

@@ -10,6 +10,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -38,6 +39,32 @@ from decision_engine.strategies.tech_boll_fade import (
     TechBollFadeStrategy,
 )
 from decision_engine.tests.test_binance_indicators import _insert_cex, _seed, _tick
+
+
+def _admit_listed_quote(db: Path, spot: str, ccxt_symbol: str) -> None:
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS symbols (symbol TEXT, status TEXT, base_asset TEXT, quote_asset TEXT)"
+    )
+    base = spot[: -len("USDT")] if spot.endswith("USDT") else spot
+    conn.execute(
+        "INSERT INTO symbols VALUES (?, 'TRADING', ?, 'USDT')",
+        (spot, base),
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ccxt_ticks (
+            exchange TEXT, symbol TEXT, ts INTEGER,
+            quote_volume_24h REAL, volume_24h REAL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO ccxt_ticks VALUES ('binance', ?, ?, 3000000, 1)",
+        (ccxt_symbol, int(time.time() * 1000)),
+    )
+    conn.commit()
+    conn.close()
 from execution.exits import DEFAULT_MAX_HOLD_MIN, DEFAULT_SL_PCT, DEFAULT_TP_PCT
 from execution.executors.binance_spot import build_exit_plan
 
@@ -269,13 +296,27 @@ class ClassicScanTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 db = Path(tmp) / "d.db"
                 _seed(db)
+                bare_rows, bare_payload = _tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
+                self.assertEqual(bare_payload["bnb_factor_source"], "dex_map")
+                self.assertEqual(bare_rows, [])
+                self.assertIn(
+                    "universe_unavailable",
+                    bare_payload["quote_turnover"]["reasons"],
+                )
+                # A symbols table is a primary snapshot, so auto would leave
+                # dex_map for the kline book. Pin dex_map to keep this feed.
+                os.environ["LIVE_BNB_FACTOR_SOURCE"] = "dex_map"
+                _admit_listed_quote(db, "ZZQBOLLUSDT", "ZZQBOLL/USDT")
                 rows, payload = _tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
         finally:
-            if old is not None:
+            if old is None:
+                os.environ.pop("LIVE_BNB_FACTOR_SOURCE", None)
+            else:
                 os.environ["LIVE_BNB_FACTOR_SOURCE"] = old
         self.assertEqual(payload["bnb_factor_source"], "dex_map")
-        self.assertEqual([row["token_address"] for row in rows], ["ZZQBOLLUSDT"])
-        extras = json.loads(rows[0]["raw_json"])["extras"]
+        classic = [row for row in rows if row["token_address"] == "ZZQBOLLUSDT"]
+        self.assertEqual(len(classic), 1)
+        extras = json.loads(classic[0]["raw_json"])["extras"]
         self.assertEqual(extras["and_mode"], "tech_fade&boll_lower")
         self.assertEqual(extras["exit_shell"], CLASSIC_EXIT_SHELL)
         self.assertEqual(extras["binance_symbol"], "ZZQBOLLUSDT")
@@ -396,6 +437,26 @@ class ClassicScanTests(unittest.TestCase):
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
+            )
+            now_ms = int(time.time() * 1000)
+            conn.execute(
+                "CREATE TABLE symbols (symbol TEXT, status TEXT, base_asset TEXT, quote_asset TEXT)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE ccxt_ticks (
+                    exchange TEXT, symbol TEXT, ts INTEGER,
+                    quote_volume_24h REAL, volume_24h REAL
+                )
+                """
+            )
+            conn.executemany(
+                "INSERT INTO symbols VALUES (?, 'TRADING', ?, 'USDT')",
+                [(row[0], row[1]) for row in rows],
+            )
+            conn.executemany(
+                "INSERT INTO ccxt_ticks VALUES ('binance', ?, ?, 3000000, 1)",
+                [(f"{row[1]}/USDT", now_ms) for row in rows],
             )
             conn.commit()
             conn.close()
