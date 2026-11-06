@@ -19,6 +19,10 @@ from decision_engine.strategies.live_bnb_entry_zone import (
     RULE_VERSION as LIVE_ENTRY_ZONE_VERSION,
     evaluate_entry_zone,
 )
+from decision_engine.strategies.live_bnb_size_floor import (
+    ENTRY_MIN_NOTIONAL_USDT,
+    lift_size_pct_for_entry_min,
+)
 
 log = get_logger("decision_engine.tech_boll_fade")
 
@@ -66,7 +70,11 @@ class TechBollFadeStrategy(BaseStrategy):
         return self._on_tick_paper(data)
 
     def _on_tick_entry_zone(self, data: dict[str, Any]) -> list[dict[str, Any]]:
-        """Live arm only. Paper ``race_tech_boll_fade`` stays on ``_on_tick_paper``."""
+        """Live arm only. Paper ``race_tech_boll_fade`` stays on ``_on_tick_paper``.
+
+        Neutral keeps multiplier 0.5. If that quote is under 20 USDT,
+        ``size_pct`` is raised to the exchange floor. Bands are not retuned.
+        """
         self._pending.clear()
         self.rejected = {}
         hot = data.get("hot_tokens") or []
@@ -101,6 +109,31 @@ class TechBollFadeStrategy(BaseStrategy):
                     self.rejected.get("size_pct_invalid", 0) + 1
                 )
                 continue
+            # 0.5 is the zone's risk half-size, not the exchange minimum.
+            # Raise only the emitted fraction, and only when the book parses.
+            # This stays ahead of a later under-20 prefilter: the lifted quote
+            # is already >= 20, so that filter keeps the row.
+            size_before_floor = size_pct
+            size_pct, lifted = lift_size_pct_for_entry_min(size_pct)
+            if not 0.0 < size_pct <= 1.0:
+                self.rejected["size_pct_invalid"] = (
+                    self.rejected.get("size_pct_invalid", 0) + 1
+                )
+                continue
+            lift_extra: dict[str, Any] = {}
+            if lifted:
+                lift_extra = {
+                    "size_pct_before_min_notional": size_before_floor,
+                    "min_notional_lift": True,
+                    "min_notional_usdt": format(ENTRY_MIN_NOTIONAL_USDT, "f"),
+                }
+                log.info(
+                    "entry_min_notional_lift symbol=%s size_pct=%s -> %s multiplier=%s",
+                    row.get("binance_symbol"),
+                    size_before_floor,
+                    size_pct,
+                    multiplier,
+                )
             hits += 1
             order_type = decision.order_type or "MARKET"
             self.buy(
@@ -146,6 +179,7 @@ class TechBollFadeStrategy(BaseStrategy):
                 legacy_volume_strength_pass=decision.legacy_volume_strength_pass,
                 legacy_boll_lower_break=decision.legacy_boll_lower_break,
                 and_mode="entry_zone",
+                **lift_extra,
             )
         signals = self.drain()
         log.info(
