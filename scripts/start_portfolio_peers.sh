@@ -17,7 +17,7 @@ start_one() {
     >>"logs/execution_peer_${purpose}.log" 2>&1 &
   echo "[portfolio] started $purpose pid=$!"; sleep 0.4
 }
-start_one race_portfolio_risk paper_eq_portfolio_risk.db execution_ledger_race_portfolio_risk.db
-start_one race_portfolio_tight_sl paper_eq_portfolio_tight_sl.db execution_ledger_race_portfolio_tight_sl.db
-start_one race_portfolio_and_blend paper_eq_portfolio_and_blend.db execution_ledger_race_portfolio_and_blend.db
+# PAUSED paper-focus Yang 2026-11-05 keep only race_tech_boll_fade — do not auto-restart: start_one race_portfolio_risk paper_eq_portfolio_risk.db execution_ledger_race_portfolio_risk.db
+# PAUSED paper-focus Yang 2026-11-05 keep only race_tech_boll_fade — do not auto-restart: start_one race_portfolio_tight_sl paper_eq_portfolio_tight_sl.db execution_ledger_race_portfolio_tight_sl.db
+# PAUSED paper-focus Yang 2026-11-05 keep only race_tech_boll_fade — do not auto-restart: start_one race_portfolio_and_blend paper_eq_portfolio_and_blend.db execution_ledger_race_portfolio_and_blend.db
 echo "[portfolio] done."
