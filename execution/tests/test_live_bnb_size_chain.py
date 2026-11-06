@@ -91,6 +91,10 @@ class _Client:
             ],
         }
 
+    def ticker_price(self, symbol: str) -> dict[str, Any]:
+        self.calls.append(("ticker_price", symbol))
+        return {"symbol": symbol, "price": "102"}
+
     def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("get_order_list", signed_query, api_key))
         if not self.oco:
@@ -213,7 +217,9 @@ class SizeChainTests(unittest.TestCase):
                 plan = receipt["exec_result"]["size_plan"]
                 self.assertEqual(plan["quote_usdt"], "50")
                 self.assertEqual(plan["size_pct"], "0.05")
-                buy = parse_qs(self.client.calls[1][1])
+                buy = parse_qs(
+                    next(call[1] for call in self.client.calls if call[0] == "new_order")
+                )
                 self.assertEqual(buy["side"], ["BUY"])
                 self.assertEqual(buy["quoteOrderQty"], ["50"])
                 self.assertNotIn("quantity", buy)
@@ -271,7 +277,7 @@ class SizeChainTests(unittest.TestCase):
         plan = receipt["exec_result"]["size_plan"]
         self.assertEqual(plan["quote_usdt"], "21.88190495")
         self.assertEqual(plan["size_pct"], "0.05")
-        buy = parse_qs(self.client.calls[1][1])
+        buy = parse_qs(next(call[1] for call in self.client.calls if call[0] == "new_order"))
         self.assertEqual(buy["side"], ["BUY"])
         self.assertEqual(buy["type"], ["MARKET"])
         self.assertEqual(buy["quoteOrderQty"], ["21.88190495"])

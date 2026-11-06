@@ -105,6 +105,10 @@ class _Client:
         self.calls.append(("get_order_list", signed_query, api_key))
         return _working()
 
+    def ticker_price(self, symbol: str) -> dict[str, Any]:
+        self.calls.append(("ticker_price", symbol))
+        return {"symbol": symbol, "price": "102"}
+
 
 class _Boom:
     def execute(self, sig: dict[str, Any]) -> dict[str, Any]:

@@ -134,6 +134,10 @@ class _Client:
             raise self.oco
         return self.oco
 
+    def ticker_price(self, symbol: str) -> dict[str, Any]:
+        self.calls.append(("ticker_price", symbol))
+        return {"symbol": symbol, "price": "102"}
+
 
 def _buy(decision_id: int = 147841) -> dict[str, Any]:
     return {

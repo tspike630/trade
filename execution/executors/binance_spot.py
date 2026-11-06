@@ -118,23 +118,28 @@ class BinanceRequestError(Exception):
         super().__init__(label)
 
 
-# Binance "does not exist" codes. Any other 4xx code is a real rejection,
-# not proof that the protective list was never created.
-_OCO_ABSENT_CODES = frozenset({-2011, -2013, -2018})
+# GET /api/v3/orderList only. -2018 is "Order list does not exist."
+# -2013 is GET /api/v3/order ("Order does not exist") for one leg.
+# -2011 is cancel ("Unknown order sent"). Neither means the list is gone.
+_ORDER_LIST_ABSENT_CODE = -2018
+_SINGLE_ORDER_ABSENT_CODES = frozenset({-2011, -2013})
 
 
-def oco_list_absent(exc: BinanceRequestError) -> bool:
-    """True when the exchange says that list or order id is not on the book.
+def order_list_absent(exc: BinanceRequestError) -> bool:
+    """True only for a definitive miss on ``GET /api/v3/orderList``.
 
-    A bare ``BinanceRequestError(400)`` with no code stays absent so existing
-    not-found doubles keep their meaning. A parsed code outside
-    ``_OCO_ABSENT_CODES`` is not absence.
+    A bare 400, 401, 418, 429, ``-1003``, ``-2015``, ``-2013``, or ``-2011``
+    is not absence. Those must not start a second OCO.
     """
-    if exc.status not in {400, 404}:
-        return False
-    if exc.code is None:
-        return True
-    return exc.code in _OCO_ABSENT_CODES
+    return exc.status in {400, 404} and exc.code == _ORDER_LIST_ABSENT_CODE
+
+
+def single_order_absent(exc: BinanceRequestError) -> bool:
+    """True when ``GET /api/v3/order`` says that one leg id is gone.
+
+    This does not say the OCO list is gone. A working list stays working.
+    """
+    return exc.status in {400, 404} and exc.code in _SINGLE_ORDER_ABSENT_CODES
 
 
 def _rejection(status: int, body: bytes) -> BinanceRequestError:
@@ -1226,13 +1231,14 @@ class BinanceSpotAdapter:
     def _read_entry_mark(
         self, client: Any, symbol: str
     ) -> tuple[str | None, str | None]:
-        """Live last price before a BUY. No ticker method means the caller has no mark.
+        """Live last price before a BUY. A missing or bad mark does not use the signal.
 
-        A transport failure is ``mark_unavailable`` and must not become a buy.
+        No ticker method, a transport error, or a non-positive price is
+        ``mark_unavailable``. The live BUY stops before ``new_order``.
         """
         ticker = getattr(client, "ticker_price", None) if client is not None else None
         if not callable(ticker):
-            return None, None
+            return None, "mark_unavailable"
         try:
             payload = ticker(symbol)
         except Exception as exc:  # noqa: BLE001
@@ -2422,18 +2428,23 @@ class BinanceSpotAdapter:
             if state == "requery_failed":
                 error = str(recon.get("error") or "oco_requery_failed")
                 prior = str(row.get("last_error") or "")
-                # A missing query method must not erase the rejection that
-                # already explains why this fill has no list.
-                stored = prior if error == "oco_requery_unsupported" and prior and prior != error else error
-                save({"last_error": stored})
-                book = "oco_failed" if status == "oco_failed" else "oco_unknown"
-                if status == "oco_working" and error == "oco_requery_unsupported":
+                # Keep the rejection that explains the naked fill. This tick
+                # still reports the query failure and does not post again.
+                if not (
+                    prior.startswith("oco_rejected:") or prior.startswith("oco_unprotectable:")
+                ):
+                    save({"last_error": error})
+                if status == "oco_failed":
+                    book = "oco_failed"
+                elif status == "oco_working":
                     book = "oco_working"
+                else:
+                    book = "oco_unknown"
                 return self._coverage(
                     row,
                     book=book,
                     submitted=False,
-                    error=stored,
+                    error=error,
                     protection=row.get("protection") or PROTECTION_PENDING,
                 )
             if state == "absent":
@@ -2722,11 +2733,8 @@ class BinanceSpotAdapter:
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, AssertionError):
                 raise
-            if isinstance(exc, BinanceRequestError) and oco_list_absent(exc):
-                detail = "oco_list_absent"
-                if exc.code is not None:
-                    detail = f"oco_list_absent:{exc.code}"
-                return {"state": "absent", "error": detail}
+            if isinstance(exc, BinanceRequestError) and order_list_absent(exc):
+                return {"state": "absent", "error": f"oco_list_absent:{exc.code}"}
             if is_request_timeout(exc):
                 return {"state": "requery_failed", "error": "oco_requery_transport"}
             return {"state": "requery_failed", "error": _public_error(exc, key, secret)}
@@ -2734,6 +2742,8 @@ class BinanceSpotAdapter:
             return {"state": "requery_failed", "error": "oco_requery_failed"}
         if not payload.get("orderReports"):
             legs = self._load_oco_legs(payload, symbol, key, secret)
+            # A missing leg (-2013/-2011) or a leg-query failure does not
+            # cancel a list the list endpoint still says is working.
             if legs is None and not oco_is_working(payload):
                 return {"state": "requery_failed", "error": "oco_leg_requery_failed"}
             if legs:
@@ -2770,6 +2780,8 @@ class BinanceSpotAdapter:
             except Exception as exc:  # noqa: BLE001
                 if isinstance(exc, AssertionError):
                     raise
+                # -2013/-2011 name one order. They are not a list deletion.
+                # Any other leg error is also not proof the list is gone.
                 return None
             if not isinstance(leg, dict):
                 return None
