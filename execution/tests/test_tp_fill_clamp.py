@@ -31,6 +31,8 @@ from execution.pricing import (  # noqa: E402
     paper_tp_clamp_enabled,
     sell_fill_price,
 )
+import paper_trade  # noqa: E402
+from execution.tests.isolated_env import baseline_environ  # noqa: E402
 from paper_trade import tick as paper_tick  # noqa: E402
 
 TP_CLAMP_ENV = "EXECUTION_PAPER_TP_CLAMP"
@@ -176,12 +178,13 @@ class LimitExitFillPriceUnitTests(unittest.TestCase):
 
 class TpClampIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._prev = {
-            k: os.environ.get(k)
-            for k in (TP_CLAMP_ENV, MIN_LIQ_ENV, "EXECUTION_PAPER_SIZE_MULT")
-        }
-        for k in (TP_CLAMP_ENV, MIN_LIQ_ENV, "EXECUTION_PAPER_SIZE_MULT"):
-            os.environ.pop(k, None)
+        # Drop the whole operator environment, not a guessed key list.
+        # paper_trade also keeps one stop confirmer for the process.
+        self._saved_env = dict(os.environ)
+        os.environ.clear()
+        os.environ.update(baseline_environ())
+        paper_trade._MAIN_STOP_CONFIRMER._s.clear()
+        paper_trade._MAIN_STOP_CONFIRMER.events.clear()
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
         self.prices = _PriceDB(root / "crawler.db")
@@ -191,11 +194,8 @@ class TpClampIntegrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.ex.close()
         self._tmp.cleanup()
-        for k, v in self._prev.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        os.environ.clear()
+        os.environ.update(self._saved_env)
 
     def test_tp_mid_far_above_clamps_to_limit(self) -> None:
         opened = _buy(self.ex, 0.1, tp_pct=10.0)
@@ -228,6 +228,7 @@ class TpClampIntegrationTests(unittest.TestCase):
         self.prices.set_quote(entry * 2.0, liquidity=1_000_000.0)
         self.ex.tick()
         closed = self.ex.ledger.get_position(pid)
+        self.assertEqual(closed["status"], "closed", closed)
         meta = json.loads(closed["meta_json"] or "{}")
         self.assertEqual(meta.get("clamp_ver"), "v2")
         self.assertTrue(meta.get("tp_clamped"))

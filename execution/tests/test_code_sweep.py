@@ -28,6 +28,7 @@ from dashboard.parsing import rejection_key  # noqa: E402
 from execution.executors.paper_executor import PaperExecutor  # noqa: E402
 from execution.exits import exit_reason  # noqa: E402
 from execution.gateway import ExecutionGateway, _risk_rejected_event_detail  # noqa: E402
+from execution.tests.isolated_env import isolated_environ  # noqa: E402
 from execution.ledger import ExecutionLedger  # noqa: E402
 from execution.order_events import event_chain  # noqa: E402
 from execution.risk.limits import check_daily_loss  # noqa: E402
@@ -951,14 +952,8 @@ class RiskAndPmTests(unittest.TestCase):
 
 class DefaultGatesTests(unittest.TestCase):
     def test_paper_pm_risk_default_off(self) -> None:
-        env = os.environ.copy()
-        for key in (
-            "EXECUTION_PAPER_ENABLED",
-            "PM_ENABLED",
-            "EXECUTION_RISK_ENABLED",
-            "EXECUTION_PAPER_TICK",
-        ):
-            env.pop(key, None)
+        # Default-off child: interpreter basics only. The operator .env is not copied.
+        env = isolated_environ()
         code = (
             "import sys\n"
             f"sys.path[:0] = [{str(ROOT)!r}, {str(CRAWLER)!r}]\n"
@@ -982,6 +977,30 @@ class DefaultGatesTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("defaults_off", proc.stdout)
+
+    def test_daily_loss_explicit_value_is_read(self) -> None:
+        """An operator limit is config, not a default. The child sees only the value we pass."""
+        before = os.environ.get("EXECUTION_DAILY_LOSS_USD")
+        env = isolated_environ({"EXECUTION_DAILY_LOSS_USD": "200"})
+        code = (
+            "import sys\n"
+            f"sys.path[:0] = [{str(ROOT)!r}, {str(CRAWLER)!r}]\n"
+            "import importlib\n"
+            "import execution.config as cfg\n"
+            "importlib.reload(cfg)\n"
+            "assert cfg.EXECUTION_DAILY_LOSS_USD == 200.0, cfg.EXECUTION_DAILY_LOSS_USD\n"
+            "print('daily_loss_set')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("daily_loss_set", proc.stdout)
+        self.assertEqual(os.environ.get("EXECUTION_DAILY_LOSS_USD"), before)
 
 
 if __name__ == "__main__":

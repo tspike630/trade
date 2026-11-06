@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CRAWLER))
 
 import execution.gateway as gateway_mod  # noqa: E402
+from execution.tests.isolated_env import isolated_environ  # noqa: E402
 from execution.close_observe import record_closed_position  # noqa: E402
 from execution.config import f1_circuit_enabled  # noqa: E402
 from execution.executors.paper_executor import (  # noqa: E402
@@ -67,9 +68,8 @@ def _now() -> datetime:
 
 
 def _py_env() -> dict[str, str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(CRAWLER), env.get("PYTHONPATH", "")])
-    env.pop("EXECUTION_F1_CIRCUIT", None)
+    env = isolated_environ()
+    env["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(CRAWLER)])
     return env
 
 

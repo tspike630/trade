@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CRAWLER))
 
 from execution.executors.binance_spot import BinanceSpotAdapter  # noqa: E402
+from execution.tests.isolated_env import patch_isolated  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
 from execution.ledger import ExecutionLedger  # noqa: E402
 from execution.live_bnb_dispatch import (  # noqa: E402
@@ -139,7 +140,7 @@ class LiveBnbDispatchTests(unittest.TestCase):
         ledger = self._ledger()
         import_verified_fet_fill(ledger)
         probe = CatalogProbe(("spot.orderList.oco",), reachable=False)
-        with mock.patch.dict(os.environ, self.env, clear=False):
+        with patch_isolated(self.env):
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
                 ledger=ledger,
@@ -178,7 +179,7 @@ class LiveBnbDispatchTests(unittest.TestCase):
 
     def test_empty_book_and_other_purpose_fail_closed(self) -> None:
         ledger = self._ledger()
-        with mock.patch.dict(os.environ, self.env, clear=False):
+        with patch_isolated(self.env):
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
                 ledger=ledger,
@@ -241,7 +242,7 @@ class LiveBnbDispatchTests(unittest.TestCase):
             production_book="rest_api_key",
             rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
         )
-        with mock.patch.dict(os.environ, self.env, clear=False):
+        with patch_isolated(self.env):
             result = adapter.execute(
                 {
                     "purpose": "live_bnb_boll_fade",
@@ -265,21 +266,17 @@ class LiveBnbDispatchTests(unittest.TestCase):
         self.assertNotIn("sentinelsecret-not-read", json.dumps(result))
 
     def test_paper_env_must_be_explicitly_cleared(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {"PAPER_DB_PATH": "paper_trading.db", "EXECUTION_PAPER_DB": "", "EXECUTION_PAPER_ENABLED": ""},
-            clear=False,
+        with patch_isolated(
+            {"PAPER_DB_PATH": "paper_trading.db", "EXECUTION_PAPER_DB": "", "EXECUTION_PAPER_ENABLED": ""}
         ):
             blocked = live_bnb_paper_env_block(paper_enabled=False, accept_live_bnb=True)
         self.assertIn("PAPER_DB_PATH", blocked or "")
-        with mock.patch.dict(
-            os.environ,
+        with patch_isolated(
             {
                 "PAPER_DB_PATH": "",
                 "EXECUTION_PAPER_DB": "",
                 "EXECUTION_PAPER_ENABLED": "",
-            },
-            clear=False,
+            }
         ):
             self.assertIsNone(
                 live_bnb_paper_env_block(paper_enabled=False, accept_live_bnb=True)
