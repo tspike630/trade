@@ -1,9 +1,12 @@
-"""Operator dotenv is reapplied on import unless the test guard is installed.
+"""Operator dotenv follows whichever ``config.py`` ``paper_trade`` imports.
 
-The fixture is a temporary copy of this tree. It does not read, delete, or
-rewrite the repository ``.env`` or ``crawler/.env``. ``crawler/config.py`` in
-the copy loads that copy's ``crawler/.env``. Guarded children still stub
-``dotenv``. Production load behavior is unchanged.
+The runtime process imports ``/workspace/.../paper_trade.py``, whose parent
+is the repository root, so ``from config import`` loads the root ``config.py``
+and that file's ``.env``. ``crawler/config.py`` is also on disk and is not the
+module that runs. This fixture builds that flat layout in a temporary tree,
+with a synthetic ``.env`` only there. The child drops the live repository
+root and ``crawler/`` from ``sys.path`` before the import. It does not read,
+delete, or rewrite a live ``.env``. Production load behavior is unchanged.
 """
 
 from __future__ import annotations
@@ -49,10 +52,25 @@ def _fingerprint(path: Path) -> tuple[int, int, int, bool] | None:
 
 
 def _child(root: Path) -> str:
-    crawler = root / "crawler"
+    """Import ``paper_trade`` from ``root``, never from the live checkout."""
+    live = {str(ROOT.resolve()), str(CRAWLER.resolve())}
     return (
         "import importlib.util, sys\n"
-        f"sys.path[:0] = [{str(root)!r}, {str(crawler)!r}]\n"
+        "from pathlib import Path\n"
+        f"live = {live!r}\n"
+        f"temp_root = Path({str(root)!r})\n"
+        "kept = []\n"
+        "for entry in sys.path:\n"
+        "    if not entry:\n"
+        "        continue\n"
+        "    try:\n"
+        "        resolved = str(Path(entry).resolve())\n"
+        "    except OSError:\n"
+        "        continue\n"
+        "    if resolved in live:\n"
+        "        continue\n"
+        "    kept.append(entry)\n"
+        "sys.path[:] = [str(temp_root), str(temp_root / 'crawler'), *kept]\n"
         f"spec = importlib.util.spec_from_file_location('_dotenv_load_trace', {str(_TRACE)!r})\n"
         "mod = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(mod)\n"
@@ -66,6 +84,12 @@ def _child(root: Path) -> str:
         "mod.report_end(paper=_env_bool('EXECUTION_PAPER_ENABLED', False), "
         "loss=cfg.EXECUTION_DAILY_LOSS_USD)\n"
     )
+
+
+def _flat_runtime(tree: Path) -> None:
+    """Root ``paper_trade.py`` and ``config.py`` win over ``crawler/`` copies."""
+    shutil.copy2(CRAWLER / "paper_trade.py", tree / "paper_trade.py")
+    shutil.copy2(CRAWLER / "config.py", tree / "config.py")
 
 
 def _public(proc: subprocess.CompletedProcess[str]) -> str:
@@ -97,38 +121,65 @@ class OperatorDotenvFileTests(unittest.TestCase):
         )
 
     def _expect(
-        self, proc: subprocess.CompletedProcess[str], paper: str, loss: str
+        self,
+        proc: subprocess.CompletedProcess[str],
+        tree: Path,
+        paper: str,
+        loss: str,
     ) -> None:
         shown = f"\n{proc.stdout}"
         self.assertEqual(proc.returncode, 0, _public(proc))
         self.assertIn(f"\npaper={paper}\n", shown, _public(proc))
         self.assertIn(f"\nloss={loss}", shown, _public(proc))
+        config_path = str((tree / "config.py").resolve())
+        paper_path = str((tree / "paper_trade.py").resolve())
+        self.assertIn(f"diag.module.config={config_path}", proc.stdout, _public(proc))
+        self.assertIn(f"diag.module.paper_trade={paper_path}", proc.stdout, _public(proc))
+        self.assertNotIn(
+            f"diag.module.config={ROOT.resolve() / 'config.py'}", proc.stdout
+        )
+        self.assertNotIn(
+            f"diag.load.path={(ROOT / '.env').resolve()}", proc.stdout
+        )
+        live = {str(ROOT.resolve()), str(CRAWLER.resolve())}
+        for line in proc.stdout.splitlines():
+            if not line.startswith("diag.path["):
+                continue
+            entry = line.split("=", 1)[1]
+            self.assertTrue(entry, line)
+            self.assertNotIn(str(Path(entry).resolve()), live, line)
 
     def test_crawler_dotenv_reloads_after_a_clean_child_unless_guarded(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dotenv-fixture-") as tmp:
             tree = Path(tmp) / "tree"
             shutil.copytree(ROOT, tree, symlinks=True, ignore=_ignore)
+            _flat_runtime(tree)
+            self.assertTrue((tree / "config.py").is_file())
+            self.assertTrue((tree / "crawler" / "config.py").is_file())
             self.assertFalse((tree / ".env").exists())
             self.assertFalse((tree / "crawler" / ".env").exists())
-            cwd = Path(tmp) / "cwd"
-            cwd.mkdir()
-            (cwd / ".env").write_text(_FILE, encoding="utf-8")
             bare = baseline_environ()
             bare["PYTHONPATH"] = os.pathsep.join(
                 [str(_NEUTRAL), str(tree), str(tree / "crawler")]
             )
-            cwd_only = self._run(tree, bare, cwd=cwd)
-            self._expect(cwd_only, "False", "None")
+            # cwd is the temp root, matching path[0] on the runtime. The live
+            # checkout is not on sys.path and has no synthetic file.
+            clean = self._run(tree, bare, cwd=tree)
+            self._expect(clean, tree, "False", "None")
+            self.assertIn(f"diag.load.path={tree / '.env'}", clean.stdout)
+            self.assertIn("diag.load.exists=False", clean.stdout)
 
-            (tree / "crawler" / ".env").write_text(_FILE, encoding="utf-8")
-            leaked = self._run(tree, bare, cwd=cwd)
-            self._expect(leaked, "True", "200")
+            (tree / ".env").write_text(_FILE, encoding="utf-8")
+            leaked = self._run(tree, bare, cwd=tree)
+            self._expect(leaked, tree, "True", "200")
+            self.assertIn(f"diag.load.path={tree / '.env'}", leaked.stdout)
+            self.assertIn("diag.load.exists=True", leaked.stdout)
 
             guarded = isolated_environ(
                 {"PYTHONPATH": os.pathsep.join([str(tree), str(tree / "crawler")])}
             )
-            blocked = self._run(tree, guarded, cwd=cwd)
-            self._expect(blocked, "False", "None")
+            blocked = self._run(tree, guarded, cwd=tree)
+            self._expect(blocked, tree, "False", "None")
 
             explicit = isolated_environ(
                 {
@@ -137,5 +188,5 @@ class OperatorDotenvFileTests(unittest.TestCase):
                     "EXECUTION_RISK_ENABLED": "1",
                 }
             )
-            injected = self._run(tree, explicit, cwd=cwd)
-            self._expect(injected, "False", "250")
+            injected = self._run(tree, explicit, cwd=tree)
+            self._expect(injected, tree, "False", "250")

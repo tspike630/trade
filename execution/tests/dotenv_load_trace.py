@@ -127,11 +127,20 @@ def report_start() -> None:
         print(f"diag.path[{index}]={entry}")
 
 
+def _module_file(module: ModuleType | None) -> str | None:
+    file = getattr(module, "__file__", None)
+    if not file:
+        return None
+    try:
+        return str(Path(file).resolve())
+    except OSError:
+        return str(file)
+
+
 def report_end(*, paper: bool, loss: object) -> None:
     """Print module files, traced loads, and the two non-secret results."""
-    for name in ("config", "dotenv", "decision_engine.config", "sitecustomize"):
-        module = sys.modules.get(name)
-        print(f"diag.module.{name}={getattr(module, '__file__', None)}")
+    for name in ("config", "paper_trade", "dotenv", "decision_engine.config", "sitecustomize"):
+        print(f"diag.module.{name}={_module_file(sys.modules.get(name))}")
     for line in _EVENTS:
         print(line)
     print(f"paper={paper}")
