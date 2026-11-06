@@ -32,6 +32,7 @@ from execution.executors.binance_spot import (  # noqa: E402
     BinanceSpotAdapter,
     BinanceSpotHttpClient,
     OCO_PATH,
+    held_position_spec,
     sign_query,
 )
 from execution.executors.binance_spot_gate import (  # noqa: E402
@@ -311,6 +312,67 @@ class ConsumerGateTests(unittest.TestCase):
             [call[0] for call in failed_client.calls if call[0] == "new_order"],
             ["new_order"],
         )
+
+    def test_fill_average_is_the_ledger_entry_and_signal_stays_on_the_plan(self) -> None:
+        """Signal 48.08, exchange average 48.02. The new row stores 48.02.
+
+        An older row is not rewritten. The signal remains on the exit plan.
+        """
+        class _AverageFill(_Client):
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                self.calls.append(("ticker_price", symbol))
+                return {"symbol": symbol, "price": "48.05"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_order", signed_query, api_key))
+                return {
+                    "orderId": "9001",
+                    "status": "FILLED",
+                    "executedQty": "1",
+                    "cummulativeQuoteQty": "48.02",
+                    "symbol": "BNBUSDT",
+                }
+
+        client = _AverageFill()
+        sig = _buy(9002)
+        sig["extras"] = dict(sig["extras"])
+        sig["extras"]["price_usd"] = "48.08"
+        sig["extras"]["stop_price"] = "47"
+        sig["extras"]["take_profit_price"] = "49.5"
+        sig["extras"]["quote_order_qty"] = "48.02"
+        adapter = self._adapter(client)
+        ledger = ExecutionLedger(self.root / "book.db")
+        prior = ledger.arm_binance_spot_position(
+            {
+                "decision_log_id": 1,
+                "symbol": "DASHUSDT",
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "status": "oco_filled",
+                "quantity": "1",
+                "stop_price": "47",
+                "take_profit_price": "49.5",
+                "entry_price": "48.08",
+                "entry_order_id": "1",
+                "protection": "exchange_oco",
+            }
+        )
+        with mock.patch.dict(os.environ, _env(self.root)):
+            result = adapter.execute(sig)
+        self.assertEqual(result["executed"], 1, result)
+        self.assertEqual(result["exit_plan"]["entry_price"], "48.08")
+        self.assertEqual(result["arm_position"]["signal_entry_price"], "48.08")
+        self.assertEqual(result["arm_position"]["entry_price"], "48.02")
+        spec = held_position_spec(sig, result)
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        armed = ledger.arm_binance_spot_position(spec)
+        self.assertEqual(armed["entry_price"], "48.02")
+        self.assertEqual(armed["decision_log_id"], 9002)
+        kept = ledger.binance_spot_position_by_decision(int(prior["decision_log_id"]))
+        self.assertIsNotNone(kept)
+        assert kept is not None
+        self.assertEqual(kept["entry_price"], "48.08")
+        self.assertEqual(kept["status"], "oco_filled")
 
     def test_kill_blocks_only_the_new_buy(self) -> None:
         kill = self.root / "LIVE_TRADING_DISABLED"

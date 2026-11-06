@@ -68,8 +68,9 @@ def _now() -> datetime:
 
 
 def _py_env() -> dict[str, str]:
-    env = isolated_environ()
-    env["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(CRAWLER)])
+    env = isolated_environ(
+        {"PYTHONPATH": os.pathsep.join([str(ROOT), str(CRAWLER)])}
+    )
     return env
 
 

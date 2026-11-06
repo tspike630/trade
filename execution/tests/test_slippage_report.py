@@ -32,8 +32,7 @@ AS_OF = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
 
 
 def _py_env() -> dict[str, str]:
-    env = isolated_environ()
-    env["PYTHONPATH"] = str(ROOT)
+    env = isolated_environ({"PYTHONPATH": str(ROOT)})
     return env
 
 
