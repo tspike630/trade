@@ -80,7 +80,7 @@ PYTHONPATH=crawler python -m indicators.binance_spot --db crawler/dexscreener.db
 
 1. 停掉对同一个 `binance_spot_universe.db` 的 `refresh_binance_spot_universe.py`。该脚本不在本仓库，现有 crontab / `run_binance_spot_loop.sh` 也不调用它。K 线循环只读 `symbols`，不会删 `quoteVolume_collected_at`。若库外脚本继续重建 `symbols` 或不改时间只改 `quoteVolume_24h`，采集时刻会丢，或出现新 quote 配旧时间。
 2. 合入 reader。旧行没有 `quoteVolume_collected_at`，新买保持拒绝。
-3. 用 `scripts/run_binance_universe_quote_loop.sh` 周期跑 `python -m indicators.binance_universe_quote`。默认 300 秒，必须小于 `BINANCE_INDICATORS_FRESH_SEC`（默认 3600）。只跑一次会在窗口过后整批拒买。成功的一轮在同一事务里写下该次 ticker 的 quote 和同一个采集时刻；失败不改上一轮。不要用文件 mtime。
+3. 只用 `scripts/run_binance_universe_quote_loop.sh`，并写明工作根、解释器和主库，不要靠脚本所在目录猜 `crawler/.venv`。采集名单在写入时就去掉不足 `BINANCE_SPOT_MIN_QUOTE_VOLUME`（默认 300 万）的现货，因为 K 线循环会扫整张 `symbols`、自己不再滤 quote。决策侧仍按同一门槛和新鲜度复核，Top 2 不变。镜像用主库提交后的 SQLite backup 再改名覆盖，不是再拉一次行情；某一份镜像失败就留着它上一份完整文件。JSON 同样在主库提交之后整文件替换。只跑一次会在 3600 秒后整批拒买，所以周期必须短于新鲜窗口。用户启动公开行情 loop 的确认还没落地，本仓库不自启。
 4. 干跑 `live_bnb_boll_fade`，看 `live_bnb_turnover` 与 `live_bnb_top_buys`。决策进程要读到 `exports/binance_spot_universe.db`（指标库同级的 `exports/`，或 `BINANCE_SPOT_UNIVERSE_DB`）。
 
 不要摘 `LIVE_TRADING_DISABLED`，不要启动 classic。本仓库没有现网调度，不能视为端到端已接通。

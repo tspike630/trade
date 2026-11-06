@@ -55,6 +55,7 @@ from indicators.binance_universe_quote import (
     QUOTE_COLUMN,
     build_snapshot_rows,
     collection_timestamp,
+    min_quote_volume_usdt as collector_floor,
     refresh_universe,
 )
 
@@ -755,11 +756,11 @@ class UniverseQuoteContractTests(EngineTurnoverTests):
         collected = datetime.now(timezone.utc)
         info = {
             "symbols": [
-                {"symbol": "HIGHUSDT", "baseAsset": "HIGH", "quoteAsset": "USDT", "status": "TRADING"},
-                {"symbol": "MIDUSDT", "baseAsset": "MID", "quoteAsset": "USDT", "status": "TRADING"},
-                {"symbol": "LOWUSDT", "baseAsset": "LOW", "quoteAsset": "USDT", "status": "TRADING"},
-                {"symbol": "BTCUSDT_PERP", "baseAsset": "BTC", "quoteAsset": "USDT", "status": "TRADING"},
-                {"symbol": "ETHUSDT", "baseAsset": "ETH", "quoteAsset": "USDT", "status": "BREAK"},
+                {"symbol": "HIGHUSDT", "baseAsset": "HIGH", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
+                {"symbol": "MIDUSDT", "baseAsset": "MID", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
+                {"symbol": "LOWUSDT", "baseAsset": "LOW", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
+                {"symbol": "BTCUSDT_PERP", "baseAsset": "BTC", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": False},
+                {"symbol": "ETHUSDT", "baseAsset": "ETH", "quoteAsset": "USDT", "status": "BREAK", "isSpotTradingAllowed": True},
                 {
                     "symbol": "SOL/USDT:USDT",
                     "baseAsset": "SOL",
@@ -771,14 +772,14 @@ class UniverseQuoteContractTests(EngineTurnoverTests):
         ticker = [
             {"symbol": "HIGHUSDT", "quoteVolume": "4000000", "volume": "999999999"},
             {"symbol": "MIDUSDT", "quoteVolume": "3500000", "volume": "1"},
-            {"symbol": "LOWUSDT", "quoteVolume": "1000", "volume": "999999999"},
+            {"symbol": "LOWUSDT", "quoteVolume": "2999999.99", "volume": "999999999"},
             {"symbol": "BADUSDT", "quoteVolume": "nan", "volume": "5"},
             {"symbol": "BTCUSDT_PERP", "quoteVolume": "9000000000"},
         ]
         rows = build_snapshot_rows(
             info, ticker, collected_at=collection_timestamp(collected)
         )
-        self.assertEqual([row[0] for row in rows], ["HIGHUSDT", "LOWUSDT", "MIDUSDT"])
+        self.assertEqual([row[0] for row in rows], ["HIGHUSDT", "MIDUSDT"])
         self.assertNotIn("BTCUSDT_PERP", [row[0] for row in rows])
 
         def _fetch(url: str) -> object:
@@ -880,8 +881,8 @@ class UniverseQuoteContractTests(EngineTurnoverTests):
         second_at = datetime.now(timezone.utc)
         info = {
             "symbols": [
-                {"symbol": "HIGHUSDT", "baseAsset": "HIGH", "quoteAsset": "USDT", "status": "TRADING"},
-                {"symbol": "GONEUSDT", "baseAsset": "GONE", "quoteAsset": "USDT", "status": "TRADING"},
+                {"symbol": "HIGHUSDT", "baseAsset": "HIGH", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
+                {"symbol": "GONEUSDT", "baseAsset": "GONE", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
             ]
         }
         first_ticker = [
@@ -890,7 +891,7 @@ class UniverseQuoteContractTests(EngineTurnoverTests):
         ]
         second_info = {
             "symbols": [
-                {"symbol": "HIGHUSDT", "baseAsset": "HIGH", "quoteAsset": "USDT", "status": "TRADING"},
+                {"symbol": "HIGHUSDT", "baseAsset": "HIGH", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True},
             ]
         }
         second_ticker = [{"symbol": "HIGHUSDT", "quoteVolume": "7000000"}]
@@ -968,10 +969,20 @@ class UniverseQuoteContractTests(EngineTurnoverTests):
         self.assertNotIn("refresh_binance_spot_universe", loop)
         script = root / "crawler" / "scripts" / "run_binance_universe_quote_loop.sh"
         env = os.environ.copy()
-        env["BINANCE_UNIVERSE_QUOTE_INTERVAL_SEC"] = "3600"
         env["BINANCE_INDICATORS_FRESH_SEC"] = "3600"
         proc = subprocess.run(
-            ["bash", str(script)],
+            [
+                "bash",
+                str(script),
+                "--work-root",
+                "/workspace/dexscreener-crawler",
+                "--python",
+                "/workspace/dexscreener-crawler/.venv/bin/python",
+                "--db",
+                "/workspace/dexscreener-crawler/exports/binance_spot_universe.db",
+                "--interval",
+                "3600",
+            ],
             env=env,
             capture_output=True,
             text=True,
@@ -980,6 +991,158 @@ class UniverseQuoteContractTests(EngineTurnoverTests):
         )
         self.assertEqual(proc.returncode, 2)
         self.assertIn("interval", proc.stderr)
+
+    def test_floor_boundary_mirrors_and_production_layout(self) -> None:
+        self.assertEqual(collector_floor(), min_quote_volume_usdt())
+        spot = {
+            "symbol": "EDGEUSDT",
+            "baseAsset": "EDGE",
+            "quoteAsset": "USDT",
+            "status": "TRADING",
+            "isSpotTradingAllowed": True,
+        }
+        below = dict(spot, symbol="TINYUSDT", baseAsset="TINY")
+        hidden = dict(spot, symbol="NOSPOTUSDT", baseAsset="NOSPOT")
+        hidden.pop("isSpotTradingAllowed")
+        info = {"symbols": [spot, below, hidden]}
+        ticker = [
+            {"symbol": "EDGEUSDT", "quoteVolume": "3000000"},
+            {"symbol": "TINYUSDT", "quoteVolume": "2999999.99"},
+            {"symbol": "NOSPOTUSDT", "quoteVolume": "9000000"},
+            {"symbol": "EDGEUSDT", "quoteVolume": "inf"},
+        ]
+        # Last EDGE row is illegal and must not replace the exact 3M print.
+        # ticker_quote_volume keeps the last finite value only if it parses;
+        # inf is omitted, so the earlier 3000000 remains.
+        built = build_snapshot_rows(info, ticker, collected_at="2026-11-06T09:00:00Z")
+        self.assertEqual([row[0] for row in built], ["EDGEUSDT"])
+        self.assertEqual(built[0][4], 3_000_000.0)
+
+        def _fetch(url: str) -> object:
+            if url.endswith("/api/v3/exchangeInfo"):
+                return info
+            if url.endswith("/api/v3/ticker/24hr"):
+                return [
+                    {"symbol": "EDGEUSDT", "quoteVolume": "3000000"},
+                    {"symbol": "TINYUSDT", "quoteVolume": "2999999.99"},
+                    {"symbol": "GHOSTUSDT", "quoteVolume": None},
+                ]
+            raise AssertionError(url)
+
+        collected = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            primary = root / "exports" / "binance_spot_universe.db"
+            mirror_a = root / "crawler" / "exports" / "binance_spot_universe.db"
+            mirror_b = root / "other" / "binance_spot_universe.db"
+            report = root / "exports" / "reports" / "universe.json"
+            for path in (primary, mirror_a, mirror_b):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            old = sqlite3.connect(mirror_a)
+            old.execute(
+                "CREATE TABLE symbols (symbol TEXT, quoteVolume_24h REAL, quoteVolume_collected_at TEXT)"
+            )
+            old.execute(
+                "INSERT INTO symbols VALUES ('OLDUSDT', 8000000, '2026-11-06T08:00:00Z')"
+            )
+            old.commit()
+            old.close()
+            mirror_b.write_bytes(mirror_a.read_bytes())
+
+            def _boom(_url: str) -> object:
+                raise RuntimeError("down")
+
+            failed = refresh_universe(
+                primary,
+                fetch_json=_boom,
+                collected_at=collected,
+                json_path=report,
+                mirrors=(mirror_a, mirror_b),
+            )
+            self.assertFalse(failed["wrote"])
+            self.assertFalse(primary.exists())
+            self.assertFalse(report.exists())
+            kept = sqlite3.connect(mirror_a)
+            self.assertEqual(
+                kept.execute("SELECT symbol, quoteVolume_collected_at FROM symbols").fetchone(),
+                ("OLDUSDT", "2026-11-06T08:00:00Z"),
+            )
+            kept.close()
+
+            result = refresh_universe(
+                primary,
+                fetch_json=_fetch,
+                collected_at=collected,
+                json_path=report,
+                mirrors=(mirror_a, mirror_b),
+            )
+            self.assertTrue(result["wrote"])
+            self.assertEqual(result["symbols"], 1)
+            stamp = collection_timestamp(collected)
+
+            def _names(path: Path) -> list[tuple[str, float, str]]:
+                conn = sqlite3.connect(path)
+                found = conn.execute(
+                    "SELECT symbol, quoteVolume_24h, quoteVolume_collected_at FROM symbols"
+                ).fetchall()
+                conn.close()
+                return [(row[0], row[1], row[2]) for row in found]
+
+            self.assertEqual(_names(primary), [("EDGEUSDT", 3_000_000.0, stamp)])
+            self.assertEqual(_names(mirror_a), _names(primary))
+            self.assertEqual(_names(mirror_b), _names(primary))
+            body = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(body[0]["symbol"], "EDGEUSDT")
+            self.assertEqual(body[0]["quoteVolume_24h"], 3_000_000.0)
+            self.assertEqual(body[0]["quoteVolume_collected_at"], stamp)
+            self.assertNotIn("TINYUSDT", {row["symbol"] for row in body})
+
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "crawler"
+            / "scripts"
+            / "run_binance_universe_quote_loop.sh"
+        )
+        proc = subprocess.run(
+            [
+                "bash",
+                str(script),
+                "--dry-run",
+                "--work-root",
+                "/workspace/dexscreener-crawler",
+                "--python",
+                "/workspace/dexscreener-crawler/.venv/bin/python",
+                "--db",
+                "/workspace/dexscreener-crawler/exports/binance_spot_universe.db",
+                "--json",
+                "/workspace/dexscreener-crawler/exports/reports/binance_spot_usdt_trading_2026-11-05.json",
+                "--mirror",
+                "/workspace/dexscreener-crawler/crawler/exports/binance_spot_universe.db",
+                "--mirror",
+                "/workspace/exports/binance_spot_universe.db",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("work_root=/workspace/dexscreener-crawler", proc.stdout)
+        self.assertIn("python=/workspace/dexscreener-crawler/.venv/bin/python", proc.stdout)
+        self.assertIn(
+            "db=/workspace/dexscreener-crawler/exports/binance_spot_universe.db",
+            proc.stdout,
+        )
+        self.assertIn("mirror=/workspace/exports/binance_spot_universe.db", proc.stdout)
+        self.assertNotIn("python=crawler/.venv", proc.stdout)
+        missing = subprocess.run(
+            ["bash", str(script), "--dry-run"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(missing.returncode, 2)
 
     def _write_indicator(
         self,
