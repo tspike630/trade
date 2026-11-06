@@ -8,10 +8,13 @@ A buy has to clear two checks the indicator cache does not:
    old ``binance_indicators`` row is still on disk.
 2. A fresh 24h USDT quote turnover is at least
    ``BINANCE_SPOT_MIN_QUOTE_VOLUME`` (default 3_000_000, the same env and
-   default the universe refresh uses). The value is ticker ``quoteVolume``:
-   ``ccxt_ticks.quote_volume_24h``, or a timestamped ``quoteVolume`` on the
-   universe row. It is not base volume, not ``liquidity_usd``, not a 5m bar,
-   and not ``binance_indicators.quote_volume_24h``.
+   default the universe refresh uses). The value is Binance spot ticker
+   ``quoteVolume``: ``ccxt_ticks.quote_volume_24h`` with ``ts``, or universe
+   ``symbols.quoteVolume_24h`` with ``quoteVolume_collected_at``. The
+   timestamp is the collection time written by a successful ticker refresh.
+   A ``quoteVolume_24h`` with no collected-at fails closed. File mtime, a
+   migration clock, base volume, ``liquidity_usd``, a 5m bar, and
+   ``binance_indicators.quote_volume_24h`` are not this quote.
 
 Missing, non-finite, negative, undated, or stale quotes fail closed. Sells
 are not filtered: a held name such as one dropped for low turnover still
@@ -48,7 +51,10 @@ ENV_MIN_QUOTE_VOLUME = "BINANCE_SPOT_MIN_QUOTE_VOLUME"
 ENV_TOP_BUYS = "LIVE_BNB_TOP_BUYS"
 
 SOURCE_TICKER = "ccxt_ticks.quote_volume_24h"
-SOURCE_UNIVERSE = "binance_spot_universe.quoteVolume"
+SOURCE_UNIVERSE = "binance_spot_universe.quoteVolume_24h"
+# Same spelling the universe snapshot already uses, plus the collection clock.
+UNIVERSE_QUOTE_COLUMN = "quoteVolume_24h"
+UNIVERSE_COLLECTED_AT_COLUMN = "quoteVolume_collected_at"
 
 REASON_UNIVERSE_UNAVAILABLE = "universe_unavailable"
 REASON_UNIVERSE_NOT_ELIGIBLE = "universe_not_eligible"
@@ -59,8 +65,10 @@ REASON_TURNOVER_STALE = "turnover_stale"
 REASON_TURNOVER_TIME_MISSING = "turnover_time_missing"
 REASON_TURNOVER_BELOW = "turnover_below_min"
 
-_QUOTE_COLUMNS = ("quote_volume_24h", "quotevolume", "quote_volume")
-_TIME_COLUMNS = ("updated_at", "refreshed_at", "asof", "ts")
+# Lower-cased. ``quoteVolume_24h`` is the production column. Generic
+# ``updated_at`` is not a collection time and does not qualify.
+_QUOTE_COLUMNS = ("quotevolume_24h", "quote_volume_24h")
+_TIME_COLUMNS = ("quotevolume_collected_at",)
 _FUTURE_SKEW_MS = 120_000
 _SAMPLE = 15
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -221,6 +229,7 @@ def _universe_paths(indicator_db: Path) -> list[Path]:
         paths.extend(
             (
                 repo / "exports" / "binance_spot_universe.db",
+                indicator_db.parent / "exports" / "binance_spot_universe.db",
                 indicator_db.parent / "binance_spot_universe.db",
                 repo / "crawler" / "exports" / "binance_spot_universe.db",
             )

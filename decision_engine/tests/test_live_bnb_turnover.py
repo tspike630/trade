@@ -19,6 +19,7 @@ from pathlib import Path
 import decision_engine  # noqa: F401 — crawler/ on path for logging_setup
 from decision_engine.core.data_adapter import IndicatorDataAdapter
 from decision_engine.core.engine import DecisionEngine
+from decision_engine.core import live_bnb_turnover as turnover_gate
 from decision_engine.core.live_bnb_turnover import (
     ENV_MIN_QUOTE_VOLUME,
     ENV_TOP_BUYS,
@@ -48,6 +49,13 @@ from decision_engine.strategies import get_strategy
 from decision_engine.strategies.live_bnb_size_floor import ENTRY_MIN_NOTIONAL_USDT
 from decision_engine.strategies.tech_boll_fade import CLASSIC_TP_PCT
 from decision_engine.tests.test_bnb_spot_map import _seed
+from indicators.binance_universe_quote import (
+    COLLECTED_AT_COLUMN,
+    QUOTE_COLUMN,
+    build_snapshot_rows,
+    collection_timestamp,
+    refresh_universe,
+)
 
 _ENVS = (
     "LIVE_BNB_IGNORE_REPO_UNIVERSE",
@@ -291,8 +299,12 @@ class EngineTurnoverTests(TurnoverContractTests):
         conn.execute(
             """
             CREATE TABLE symbols (
-                symbol TEXT, status TEXT, base_asset TEXT, quote_asset TEXT,
-                quoteVolume REAL, updated_at TEXT
+                symbol TEXT,
+                baseAsset TEXT,
+                quoteAsset TEXT,
+                status TEXT,
+                quoteVolume_24h REAL,
+                quoteVolume_collected_at TEXT
             )
             """
         )
@@ -333,7 +345,12 @@ class EngineTurnoverTests(TurnoverContractTests):
                 if quote is not None:
                     asof = _iso(now - timedelta(milliseconds=int(spec["universe_age_ms"])))
                 conn.execute(
-                    "INSERT INTO symbols VALUES (?, 'TRADING', ?, 'USDT', ?, ?)",
+                    """
+                    INSERT INTO symbols (
+                        symbol, baseAsset, quoteAsset, status,
+                        quoteVolume_24h, quoteVolume_collected_at
+                    ) VALUES (?, ?, 'USDT', 'TRADING', ?, ?)
+                    """,
                     (spec["symbol"], spec["base"], quote, asof),
                 )
             if spec["tick"] is not None:
@@ -692,6 +709,208 @@ class EngineTurnoverTests(TurnoverContractTests):
                 extras = json.loads(row["raw_json"]).get("extras") or {}
                 self.assertNotIn("quote_turnover_24h_usdt", extras)
                 self.assertNotIn("stop_price", extras)
+
+
+class UniverseQuoteContractTests(EngineTurnoverTests):
+    def test_column_names_match_the_collector(self) -> None:
+        self.assertEqual(QUOTE_COLUMN, "quoteVolume_24h")
+        self.assertEqual(COLLECTED_AT_COLUMN, "quoteVolume_collected_at")
+        self.assertIn(QUOTE_COLUMN.lower(), turnover_gate._QUOTE_COLUMNS)
+        self.assertEqual(turnover_gate._TIME_COLUMNS, (COLLECTED_AT_COLUMN.lower(),))
+        self.assertNotIn("updated_at", turnover_gate._TIME_COLUMNS)
+
+    def test_old_schema_without_collected_at_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "d.db"
+            self._write_indicator(db)
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                CREATE TABLE symbols (
+                    symbol TEXT PRIMARY KEY,
+                    baseAsset TEXT,
+                    quoteAsset TEXT,
+                    status TEXT,
+                    quoteVolume_24h REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO symbols VALUES ('KEEPUSDT', 'KEEP', 'USDT', 'TRADING', 9000000)
+                """
+            )
+            conn.commit()
+            conn.close()
+            os.utime(db, None)
+            rows, payload = self._tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
+            self.assertEqual(rows, [])
+            self.assertEqual(
+                payload["quote_turnover"]["reasons"].get("turnover_time_missing"),
+                1,
+            )
+
+    def test_refresh_writes_collected_at_and_reader_ranks_top2(self) -> None:
+        collected = datetime.now(timezone.utc)
+        info = {
+            "symbols": [
+                {"symbol": "HIGHUSDT", "baseAsset": "HIGH", "quoteAsset": "USDT", "status": "TRADING"},
+                {"symbol": "MIDUSDT", "baseAsset": "MID", "quoteAsset": "USDT", "status": "TRADING"},
+                {"symbol": "LOWUSDT", "baseAsset": "LOW", "quoteAsset": "USDT", "status": "TRADING"},
+                {"symbol": "BTCUSDT_PERP", "baseAsset": "BTC", "quoteAsset": "USDT", "status": "TRADING"},
+                {"symbol": "ETHUSDT", "baseAsset": "ETH", "quoteAsset": "USDT", "status": "BREAK"},
+                {
+                    "symbol": "SOL/USDT:USDT",
+                    "baseAsset": "SOL",
+                    "quoteAsset": "USDT",
+                    "status": "TRADING",
+                },
+            ]
+        }
+        ticker = [
+            {"symbol": "HIGHUSDT", "quoteVolume": "4000000", "volume": "999999999"},
+            {"symbol": "MIDUSDT", "quoteVolume": "3500000", "volume": "1"},
+            {"symbol": "LOWUSDT", "quoteVolume": "1000", "volume": "999999999"},
+            {"symbol": "BADUSDT", "quoteVolume": "nan", "volume": "5"},
+            {"symbol": "BTCUSDT_PERP", "quoteVolume": "9000000000"},
+        ]
+        rows = build_snapshot_rows(
+            info, ticker, collected_at=collection_timestamp(collected)
+        )
+        self.assertEqual([row[0] for row in rows], ["HIGHUSDT", "LOWUSDT", "MIDUSDT"])
+        self.assertNotIn("BTCUSDT_PERP", [row[0] for row in rows])
+
+        def _fetch(url: str) -> object:
+            if url.endswith("/api/v3/exchangeInfo"):
+                return info
+            if url.endswith("/api/v3/ticker/24hr"):
+                return ticker
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            universe = root / "exports" / "binance_spot_universe.db"
+            mirror = root / "exports" / "universe.json"
+            universe.parent.mkdir(parents=True, exist_ok=True)
+            prior = sqlite3.connect(universe)
+            prior.execute(
+                """
+                CREATE TABLE symbols (
+                    symbol TEXT PRIMARY KEY,
+                    quoteVolume_24h REAL,
+                    quoteVolume_collected_at TEXT
+                )
+                """
+            )
+            prior.execute(
+                "INSERT INTO symbols VALUES ('OLDUSDT', 8000000, '2026-11-06T08:00:00Z')"
+            )
+            prior.commit()
+            prior.close()
+            def _boom(_url: str) -> object:
+                raise RuntimeError("down")
+
+            failed = refresh_universe(
+                universe,
+                fetch_json=_boom,
+                collected_at=collected,
+            )
+            self.assertFalse(failed["wrote"])
+            still = sqlite3.connect(universe)
+            kept = still.execute(
+                "SELECT quoteVolume_24h, quoteVolume_collected_at FROM symbols WHERE symbol='OLDUSDT'"
+            ).fetchone()
+            still.close()
+            self.assertEqual(tuple(kept), (8000000, "2026-11-06T08:00:00Z"))
+
+            result = refresh_universe(
+                universe,
+                fetch_json=_fetch,
+                collected_at=collected,
+                json_path=mirror,
+            )
+            self.assertTrue(result["wrote"])
+            self.assertEqual(result["collected_at"], collection_timestamp(collected))
+            conn = sqlite3.connect(universe)
+            stored = {
+                row[0]: (row[1], row[2])
+                for row in conn.execute(
+                    "SELECT symbol, quoteVolume_24h, quoteVolume_collected_at FROM symbols"
+                )
+            }
+            conn.close()
+            self.assertEqual(
+                stored["HIGHUSDT"],
+                (4000000.0, collection_timestamp(collected)),
+            )
+            self.assertNotIn("OLDUSDT", stored)
+            self.assertNotIn("BADUSDT", stored)
+            body = json.loads(mirror.read_text(encoding="utf-8"))
+            self.assertIn(COLLECTED_AT_COLUMN, body[0])
+            self.assertIn(QUOTE_COLUMN, body[0])
+
+            decision = root / "dexscreener.db"
+            self._write_indicator(
+                decision,
+                [
+                    ("HIGHUSDT", "HIGH", 2.0),
+                    ("MIDUSDT", "MID", 1.0),
+                    ("LOWUSDT", "LOW", 0.4),
+                    ("OLDUSDT", "OLD", 9.0),
+                ],
+            )
+            os.environ["BINANCE_SPOT_UNIVERSE_DB"] = str(universe)
+            rows_out, payload = self._tick(decision, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
+            self.assertEqual(
+                payload["live_bnb_top_buys"]["selected"],
+                ["HIGHUSDT", "MIDUSDT"],
+            )
+            self.assertEqual(
+                {row["token_address"] for row in rows_out},
+                {"HIGHUSDT", "MIDUSDT"},
+            )
+            extras = json.loads(rows_out[0]["raw_json"])["extras"]
+            self.assertEqual(extras["quote_turnover_24h_source"], SOURCE_UNIVERSE)
+            self.assertNotIn("OLDUSDT", {row["token_address"] for row in rows_out})
+            self.assertNotIn("LOWUSDT", payload["live_bnb_top_buys"]["selected"])
+
+    def _write_indicator(
+        self,
+        db: Path,
+        names: list[tuple[str, str, float]] | None = None,
+    ) -> None:
+        if names is None:
+            names = [("KEEPUSDT", "KEEP", 1.0)]
+        now = _iso(datetime.now(timezone.utc))
+        db.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """
+            CREATE TABLE binance_indicators (
+                symbol TEXT PRIMARY KEY,
+                base_asset TEXT,
+                quote_asset TEXT,
+                status TEXT,
+                price_usd REAL,
+                change_5m REAL,
+                volume_strength REAL,
+                boll_lower REAL,
+                quote_volume_24h REAL,
+                tech_updated_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO binance_indicators VALUES (
+                ?, ?, 'USDT', 'TRADING', 0.8, -4, ?, 1.0, 90000000, ?, ?
+            )
+            """,
+            [(symbol, base, strength, now, now) for symbol, base, strength in names],
+        )
+        conn.commit()
+        conn.close()
 
 
 if __name__ == "__main__":

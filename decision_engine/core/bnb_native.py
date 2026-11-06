@@ -302,6 +302,7 @@ def load_trading_usdt_symbols(
     if not ignore_repo and not env_db and not env_json:
         for path in (
             repo / "exports" / "binance_spot_universe.db",
+            indicator_db.parent / "exports" / "binance_spot_universe.db",
             indicator_db.parent / "binance_spot_universe.db",
             repo / "crawler" / "exports" / "binance_spot_universe.db",
         ):
@@ -360,6 +361,7 @@ def load_trading_usdt_symbols(
 def _side_db_paths(indicator_db: Path) -> list[Path]:
     repo = Path(__file__).resolve().parents[2]
     candidates = [
+        indicator_db.parent / "exports" / "binance_spot_universe.db",
         indicator_db.parent / "binance_spot_universe.db",
         indicator_db.parent / "binance_indicators.db",
         indicator_db.parent / "ccxt.db",

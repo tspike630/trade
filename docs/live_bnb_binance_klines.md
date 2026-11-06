@@ -74,7 +74,9 @@ PYTHONPATH=crawler python -m indicators.binance_spot --db crawler/dexscreener.db
 一笔新买要同时满足：
 
 1. 符号在当前主宇宙快照里（`symbols` 表，或 `BINANCE_SPOT_UNIVERSE_DB` / `BINANCE_SPOT_UNIVERSE_JSON`）。快照没挂上时新买失败关闭，旧的 `binance_indicators` 行不能把已移出的名字买回来。
-2. 有一份新鲜的 24 小时 USDT `quoteVolume`，大于等于上面的门槛。来源按顺序：`ccxt_ticks.quote_volume_24h`（币安现货 ticker），否则宇宙行上带时间戳的 `quoteVolume` / `quote_volume_24h`。不用 base volume，不用 `liquidity_usd`，不用 5 分钟成交，也不用指标缓存里的 `quote_volume_24h` 顶替。缺、非有限、没有时间、过期，都失败关闭。新鲜窗口沿用 `BINANCE_INDICATORS_FRESH_SEC`（默认 3600 秒）；把它设成 0 不会把过期行情放进来。
+2. 有一份新鲜的 24 小时 USDT `quoteVolume`，大于等于上面的门槛。来源按顺序：`ccxt_ticks.quote_volume_24h` 加 `ts`，否则宇宙表 `symbols.quoteVolume_24h` 加 `quoteVolume_collected_at`。后者是 `python -m indicators.binance_universe_quote` 在 `GET /api/v3/ticker/24hr` 与 `exchangeInfo` 都解析成功时写下的采集时刻，不是文件 mtime，也不是迁移时刻。只有 `quoteVolume_24h`、没有 `quoteVolume_collected_at` 的旧行失败关闭。不用 base volume，不用 `liquidity_usd`，不用 5 分钟 K 线，也不用 `binance_indicators.quote_volume_24h`。缺、非有限、没有采集时刻、过期，都失败关闭。新鲜窗口沿用 `BINANCE_INDICATORS_FRESH_SEC`（默认 3600 秒）；把它设成 0 不会把过期行情放进来。
+
+上线顺序（本 PR 不执行）：先合入 reader，此时旧宇宙仍无采集时刻，新买保持拒绝；再跑一次采集刷新，成功后才出现 `quoteVolume_collected_at`；然后干跑决策看 `live_bnb_turnover`。刷新失败不会改时间，也不会把旧行标成刚采集。决策进程要能读到 `exports/binance_spot_universe.db`（与指标库同级的 `exports/`，或显式 `BINANCE_SPOT_UNIVERSE_DB`）。不要摘 `LIVE_TRADING_DISABLED`，不要启动 classic。
 
 扫描窗口仍是至少 600，先筛过门槛和宇宙，再跑原来的 Entry Zone 或 classic 腿、流动性地板和冷却。通过之后按 `volume_strength` 从高到低，相同则 24h quoteVolume 从高到低，再按符号。每个 purpose 每一拍最终新买最多 `LIVE_BNB_TOP_BUYS`（默认 2）。只有 1 个合格就发 1 个，不补齐；一个都没有就发 0。被策略、风险或冷却丢掉的名字不占名额。同一符号只留排序更高的一条。卖出不计数、不因门槛被丢掉。
 
