@@ -532,11 +532,14 @@ class PurposeGateTests(unittest.TestCase):
 
     def test_gates_stay_off_by_default(self) -> None:
         env = os.environ.copy()
+        # Default-off is about an unset process, not the operator .env.
+        # EXECUTION_DAILY_LOSS_USD=200 in production must not leak in here.
         for key in (
             "EXECUTION_PAPER_ENABLED",
             "PM_ENABLED",
             "EXECUTION_RISK_ENABLED",
             "EXECUTION_PAPER_TICK",
+            "EXECUTION_DAILY_LOSS_USD",
         ):
             env.pop(key, None)
         code = (

@@ -35,6 +35,19 @@ from paper_trade import tick as paper_tick  # noqa: E402
 
 TP_CLAMP_ENV = "EXECUTION_PAPER_TP_CLAMP"
 MIN_LIQ_ENV = "EXECUTION_PAPER_CLOSE_MIN_LIQ_USD"
+# Inherited app config that can stop a close or change the audit this class checks.
+# Popped for the test only; tearDown puts the process env back.
+_CLAMP_ISOLATED_ENV = (
+    TP_CLAMP_ENV,
+    MIN_LIQ_ENV,
+    "EXECUTION_PAPER_SIZE_MULT",
+    "PAPER_STOP_CONFIRM_ENABLED",
+    "PAPER_PRICE_MAX_AGE_SEC",
+    "EXECUTION_PAPER_TP_PCT",
+    "EXECUTION_PAPER_SL_PCT",
+    "EXECUTION_PAPER_MAX_HOLD_MIN",
+    "EXECUTION_PAPER_JUMP_RATIO",
+)
 CASH = 10_000.0
 
 
@@ -176,12 +189,16 @@ class LimitExitFillPriceUnitTests(unittest.TestCase):
 
 class TpClampIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._prev = {
-            k: os.environ.get(k)
-            for k in (TP_CLAMP_ENV, MIN_LIQ_ENV, "EXECUTION_PAPER_SIZE_MULT")
-        }
-        for k in (TP_CLAMP_ENV, MIN_LIQ_ENV, "EXECUTION_PAPER_SIZE_MULT"):
+        self._prev = {k: os.environ.get(k) for k in _CLAMP_ISOLATED_ENV}
+        for k in _CLAMP_ISOLATED_ENV:
             os.environ.pop(k, None)
+        # paper_trade keeps one confirmer for the process. Another test, or
+        # PAPER_STOP_CONFIRM_ENABLED in the operator env, can hold this pair's
+        # mark and skip the close. This class does not use that gate.
+        import paper_trade
+
+        paper_trade._MAIN_STOP_CONFIRMER._s.clear()
+        paper_trade._MAIN_STOP_CONFIRMER.events.clear()
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
         self.prices = _PriceDB(root / "crawler.db")
@@ -228,6 +245,7 @@ class TpClampIntegrationTests(unittest.TestCase):
         self.prices.set_quote(entry * 2.0, liquidity=1_000_000.0)
         self.ex.tick()
         closed = self.ex.ledger.get_position(pid)
+        self.assertEqual(closed["status"], "closed", closed)
         meta = json.loads(closed["meta_json"] or "{}")
         self.assertEqual(meta.get("clamp_ver"), "v2")
         self.assertTrue(meta.get("tp_clamped"))
