@@ -5,11 +5,17 @@ together, and only after ``GET /api/v3/ticker/24hr`` and
 ``GET /api/v3/exchangeInfo`` both parse. The timestamp is that successful
 collection, not the file mtime and not a migration clock.
 
-A failed fetch does not open a write. A symbol with no finite ``quoteVolume``
-is left out of the new snapshot instead of keeping an older timestamp that
-would still look fresh. Spot USDT only; names with ``:`` are futures and are
-ignored. This module does not read ``binance_indicators`` and does not place
-orders.
+A failed fetch does not open a write. A symbol with no finite ``quoteVolume``,
+or with quoteVolume under ``BINANCE_SPOT_MIN_QUOTE_VOLUME`` (default
+3_000_000), is left out of the snapshot. The kline loop reads every row in
+``symbols`` and does not apply that floor itself. Spot TRADING USDT with
+``isSpotTradingAllowed`` set is required. Names with ``:`` are futures and
+are ignored. This module does not read ``binance_indicators`` and does not
+place orders.
+
+Extra copies are SQLite backups of the committed primary file, renamed into
+place. They are not a second collection, so they cannot carry a new timestamp
+on an old quote. A copy that fails leaves that path on its previous file.
 
 ``python -m indicators.binance_universe_quote --db <universe.db>``
 """
@@ -18,12 +24,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from logging_setup import get_logger, setup_logging
 
@@ -34,6 +42,8 @@ COLLECTED_AT_COLUMN = "quoteVolume_collected_at"
 TICKER_24H_PATH = "/api/v3/ticker/24hr"
 EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
 DEFAULT_BASE = "https://api.binance.com"
+ENV_MIN_QUOTE_VOLUME = "BINANCE_SPOT_MIN_QUOTE_VOLUME"
+DEFAULT_MIN_QUOTE_VOLUME = 3_000_000.0
 
 _CREATE_NEXT = f"""
 CREATE TABLE symbols_next (
@@ -69,6 +79,34 @@ def fetch_json(url: str, *, timeout: float = 30.0) -> Any:
     return json.loads(payload.decode("utf-8"))
 
 
+def min_quote_volume_usdt() -> float:
+    """Same floor and fallback as the decision reader. Unusable env keeps 3_000_000."""
+    raw = os.environ.get(ENV_MIN_QUOTE_VOLUME)
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_MIN_QUOTE_VOLUME
+    text = str(raw).strip().replace("_", "")
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        log.warning("%s unusable %r; using 3000000", ENV_MIN_QUOTE_VOLUME, raw)
+        return DEFAULT_MIN_QUOTE_VOLUME
+    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        log.warning("%s unusable %r; using 3000000", ENV_MIN_QUOTE_VOLUME, raw)
+        return DEFAULT_MIN_QUOTE_VOLUME
+    return value
+
+
+def _spot_allowed(value: Any) -> bool:
+    """Binance ``isSpotTradingAllowed``. Missing is not treated as spot."""
+    if value is True:
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"true", "1"}:
+        return True
+    if value == 1:
+        return True
+    return False
+
+
 def _finite_quote(value: Any) -> float | None:
     if isinstance(value, bool) or value is None or value == "":
         return None
@@ -96,8 +134,7 @@ def trading_spot_usdt(exchange_info: Any) -> dict[str, tuple[str, str]]:
         status = str(item.get("status") or "").strip().upper()
         if not symbol or ":" in symbol or status != "TRADING" or quote != "USDT":
             continue
-        spot_flag = item.get("isSpotTradingAllowed")
-        if spot_flag is False or str(spot_flag).strip().lower() in {"false", "0"}:
+        if not _spot_allowed(item.get("isSpotTradingAllowed")):
             continue
         if not base:
             if not symbol.endswith("USDT"):
@@ -135,14 +172,21 @@ def build_snapshot_rows(
     ticker_payload: Any,
     *,
     collected_at: str,
+    floor: float | None = None,
 ) -> list[tuple[str, str, str, str, float, str]]:
-    """Rows that have both a TRADING spot identity and a parsed quoteVolume."""
+    """TRADING spot USDT names whose ticker quoteVolume clears the floor.
+
+    The kline loop reads every ``symbols`` row and does not apply this floor.
+    Names under 3_000_000 USDT stay out of the table. The decision reader
+    still checks the same floor on whatever row it sees.
+    """
+    minimum = min_quote_volume_usdt() if floor is None else float(floor)
     listed = trading_spot_usdt(exchange_info)
     quotes = ticker_quote_volume(ticker_payload)
     rows: list[tuple[str, str, str, str, float, str]] = []
     for symbol in sorted(listed):
         quote = quotes.get(symbol)
-        if quote is None:
+        if quote is None or quote < minimum:
             continue
         base, quote_asset = listed[symbol]
         rows.append((symbol, base, quote_asset, "TRADING", quote, collected_at))
@@ -174,6 +218,44 @@ def _replace_symbols(
         raise
 
 
+def _sqlite_uri(path: Path) -> str:
+    return "file:" + urllib.parse.quote(path.resolve().as_posix(), safe="/")
+
+
+def publish_sqlite_snapshot(src: Path, dest: Path) -> None:
+    """Copy a committed database, then rename over the destination.
+
+    The copy is a SQLite backup of ``src`` after its transaction committed.
+    ``dest`` is replaced only when the backup finishes, so a crash leaves the
+    previous file intact. This is not a second live collection.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".next")
+    if tmp.exists():
+        tmp.unlink()
+    src_conn = sqlite3.connect(_sqlite_uri(src) + "?mode=ro", uri=True)
+    dst_conn = sqlite3.connect(tmp)
+    try:
+        src_conn.backup(dst_conn)
+        dst_conn.commit()
+    except Exception:
+        dst_conn.close()
+        src_conn.close()
+        if tmp.exists():
+            tmp.unlink()
+        raise
+    dst_conn.close()
+    src_conn.close()
+    os.replace(tmp, dest)
+
+
+def _write_json_snapshot(path: Path, payload: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".next")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def refresh_universe(
     db_path: Path,
     *,
@@ -181,6 +263,8 @@ def refresh_universe(
     collected_at: datetime | None = None,
     base_url: str = DEFAULT_BASE,
     json_path: Path | None = None,
+    mirrors: Sequence[Path] | None = None,
+    floor: float | None = None,
 ) -> dict[str, Any]:
     """Replace ``symbols`` only after both public payloads parse.
 
@@ -195,9 +279,15 @@ def refresh_universe(
         log.warning("universe quote refresh failed closed: %s", exc)
         return {"ok": False, "wrote": False, "error": str(exc), "symbols": 0}
     stamp = collection_timestamp(collected_at)
-    rows = build_snapshot_rows(exchange_info, ticker_payload, collected_at=stamp)
+    minimum = min_quote_volume_usdt() if floor is None else float(floor)
+    rows = build_snapshot_rows(
+        exchange_info,
+        ticker_payload,
+        collected_at=stamp,
+        floor=minimum,
+    )
     if not rows:
-        log.warning("universe quote refresh produced no finite quoteVolume rows")
+        log.warning("universe quote refresh produced no rows at or above %s", minimum)
         return {"ok": False, "wrote": False, "error": "no_quote_rows", "symbols": 0}
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=30.0)
@@ -208,6 +298,13 @@ def refresh_universe(
         return {"ok": False, "wrote": False, "error": str(exc), "symbols": 0}
     finally:
         conn.close()
+    mirror_errors: list[str] = []
+    for mirror in mirrors or ():
+        try:
+            publish_sqlite_snapshot(db_path, mirror)
+        except Exception as exc:  # noqa: BLE001 — primary snapshot already committed
+            mirror_errors.append(f"{mirror}: {exc}")
+            log.warning("universe mirror copy failed dest=%s err=%s", mirror, exc)
     if json_path is not None:
         payload = [
             {
@@ -220,10 +317,26 @@ def refresh_universe(
             }
             for symbol, base, quote_asset, status, quote, _stamp in rows
         ]
-        json_path.parent.mkdir(parents=True, exist_ok=True)
-        json_path.write_text(json.dumps(payload), encoding="utf-8")
-    log.info("universe quote refresh wrote=%s collected_at=%s", len(rows), stamp)
-    return {"ok": True, "wrote": True, "symbols": len(rows), "collected_at": stamp}
+        try:
+            _write_json_snapshot(json_path, payload)
+        except OSError as exc:
+            mirror_errors.append(f"{json_path}: {exc}")
+            log.warning("universe json replace failed path=%s err=%s", json_path, exc)
+    log.info(
+        "universe quote refresh wrote=%s floor=%s collected_at=%s mirror_errors=%s",
+        len(rows),
+        minimum,
+        stamp,
+        len(mirror_errors),
+    )
+    return {
+        "ok": True,
+        "wrote": True,
+        "symbols": len(rows),
+        "collected_at": stamp,
+        "floor": minimum,
+        "mirror_errors": mirror_errors,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -234,8 +347,18 @@ def main(argv: list[str] | None = None) -> int:
             "ticker quoteVolume. Does not place orders."
         )
     )
-    parser.add_argument("--db", required=True, help="Universe sqlite path")
-    parser.add_argument("--json", default="", help="Optional JSON mirror written after the sqlite commit")
+    parser.add_argument("--db", required=True, help="Authoritative universe sqlite path")
+    parser.add_argument(
+        "--json",
+        default="",
+        help="Optional JSON mirror, replaced only after the sqlite commit",
+    )
+    parser.add_argument(
+        "--mirror",
+        action="append",
+        default=[],
+        help="Extra copy of the committed db, replaced by backup+rename (repeatable)",
+    )
     parser.add_argument("--base-url", default=DEFAULT_BASE)
     args = parser.parse_args(argv)
     result = refresh_universe(
@@ -243,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         fetch_json=fetch_json,
         base_url=args.base_url,
         json_path=Path(args.json) if args.json else None,
+        mirrors=[Path(item) for item in args.mirror],
     )
     if not result.get("wrote"):
         return 2
