@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import time
 import unittest
@@ -873,6 +874,112 @@ class UniverseQuoteContractTests(EngineTurnoverTests):
             self.assertEqual(extras["quote_turnover_24h_source"], SOURCE_UNIVERSE)
             self.assertNotIn("OLDUSDT", {row["token_address"] for row in rows_out})
             self.assertNotIn("LOWUSDT", payload["live_bnb_top_buys"]["selected"])
+
+    def test_second_refresh_moves_quote_and_timestamp_together(self) -> None:
+        first_at = datetime.now(timezone.utc) - timedelta(minutes=20)
+        second_at = datetime.now(timezone.utc)
+        info = {
+            "symbols": [
+                {"symbol": "HIGHUSDT", "baseAsset": "HIGH", "quoteAsset": "USDT", "status": "TRADING"},
+                {"symbol": "GONEUSDT", "baseAsset": "GONE", "quoteAsset": "USDT", "status": "TRADING"},
+            ]
+        }
+        first_ticker = [
+            {"symbol": "HIGHUSDT", "quoteVolume": "4000000"},
+            {"symbol": "GONEUSDT", "quoteVolume": "5000000"},
+        ]
+        second_info = {
+            "symbols": [
+                {"symbol": "HIGHUSDT", "baseAsset": "HIGH", "quoteAsset": "USDT", "status": "TRADING"},
+            ]
+        }
+        second_ticker = [{"symbol": "HIGHUSDT", "quoteVolume": "7000000"}]
+
+        def _fetch_first(url: str) -> object:
+            if url.endswith("/api/v3/exchangeInfo"):
+                return info
+            if url.endswith("/api/v3/ticker/24hr"):
+                return first_ticker
+            raise AssertionError(url)
+
+        def _fetch_second(url: str) -> object:
+            if url.endswith("/api/v3/exchangeInfo"):
+                return second_info
+            if url.endswith("/api/v3/ticker/24hr"):
+                return second_ticker
+            raise AssertionError(url)
+
+        def _boom(_url: str) -> object:
+            raise RuntimeError("down")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            universe = Path(tmp) / "binance_spot_universe.db"
+            first = refresh_universe(
+                universe, fetch_json=_fetch_first, collected_at=first_at
+            )
+            self.assertTrue(first["wrote"])
+            failed = refresh_universe(
+                universe, fetch_json=_boom, collected_at=second_at
+            )
+            self.assertFalse(failed["wrote"])
+            conn = sqlite3.connect(universe)
+            after_fail = {
+                row[0]: (row[1], row[2])
+                for row in conn.execute(
+                    "SELECT symbol, quoteVolume_24h, quoteVolume_collected_at FROM symbols"
+                )
+            }
+            conn.close()
+            first_stamp = collection_timestamp(first_at)
+            self.assertEqual(after_fail["HIGHUSDT"], (4000000.0, first_stamp))
+            self.assertEqual(after_fail["GONEUSDT"], (5000000.0, first_stamp))
+            second = refresh_universe(
+                universe, fetch_json=_fetch_second, collected_at=second_at
+            )
+            self.assertTrue(second["wrote"])
+            conn = sqlite3.connect(universe)
+            cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(symbols)")
+            }
+            after = {
+                row[0]: (row[1], row[2])
+                for row in conn.execute(
+                    "SELECT symbol, quoteVolume_24h, quoteVolume_collected_at FROM symbols"
+                )
+            }
+            conn.close()
+            second_stamp = collection_timestamp(second_at)
+            self.assertIn("quoteVolume_collected_at", cols)
+            self.assertEqual(after, {"HIGHUSDT": (7000000.0, second_stamp)})
+            self.assertNotEqual(after["HIGHUSDT"][1], first_stamp)
+            self.assertNotIn((7000000.0, first_stamp), after.values())
+            self.assertNotIn((4000000.0, second_stamp), after.values())
+
+    def test_repo_kline_entry_does_not_rebuild_symbols(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        self.assertFalse((root / "crawler" / "scripts" / "refresh_binance_spot_universe.py").is_file())
+        self.assertFalse((root / "refresh_binance_spot_universe.py").is_file())
+        kline = (root / "crawler" / "indicators" / "binance_spot.py").read_text(encoding="utf-8")
+        self.assertNotIn("DROP TABLE symbols", kline)
+        self.assertNotIn("quoteVolume_collected_at", kline)
+        loop = (root / "crawler" / "scripts" / "run_binance_spot_loop.sh").read_text(encoding="utf-8")
+        self.assertNotIn("binance_universe_quote", loop)
+        self.assertNotIn("refresh_binance_spot_universe", loop)
+        script = root / "crawler" / "scripts" / "run_binance_universe_quote_loop.sh"
+        env = os.environ.copy()
+        env["BINANCE_UNIVERSE_QUOTE_INTERVAL_SEC"] = "3600"
+        env["BINANCE_INDICATORS_FRESH_SEC"] = "3600"
+        proc = subprocess.run(
+            ["bash", str(script)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("interval", proc.stderr)
 
     def _write_indicator(
         self,

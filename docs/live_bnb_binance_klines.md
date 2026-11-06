@@ -76,7 +76,14 @@ PYTHONPATH=crawler python -m indicators.binance_spot --db crawler/dexscreener.db
 1. 符号在当前主宇宙快照里（`symbols` 表，或 `BINANCE_SPOT_UNIVERSE_DB` / `BINANCE_SPOT_UNIVERSE_JSON`）。快照没挂上时新买失败关闭，旧的 `binance_indicators` 行不能把已移出的名字买回来。
 2. 有一份新鲜的 24 小时 USDT `quoteVolume`，大于等于上面的门槛。来源按顺序：`ccxt_ticks.quote_volume_24h` 加 `ts`，否则宇宙表 `symbols.quoteVolume_24h` 加 `quoteVolume_collected_at`。后者是 `python -m indicators.binance_universe_quote` 在 `GET /api/v3/ticker/24hr` 与 `exchangeInfo` 都解析成功时写下的采集时刻，不是文件 mtime，也不是迁移时刻。只有 `quoteVolume_24h`、没有 `quoteVolume_collected_at` 的旧行失败关闭。不用 base volume，不用 `liquidity_usd`，不用 5 分钟 K 线，也不用 `binance_indicators.quote_volume_24h`。缺、非有限、没有采集时刻、过期，都失败关闭。新鲜窗口沿用 `BINANCE_INDICATORS_FRESH_SEC`（默认 3600 秒）；把它设成 0 不会把过期行情放进来。
 
-上线顺序（本 PR 不执行）：先合入 reader，此时旧宇宙仍无采集时刻，新买保持拒绝；再跑一次采集刷新，成功后才出现 `quoteVolume_collected_at`；然后干跑决策看 `live_bnb_turnover`。刷新失败不会改时间，也不会把旧行标成刚采集。决策进程要能读到 `exports/binance_spot_universe.db`（与指标库同级的 `exports/`，或显式 `BINANCE_SPOT_UNIVERSE_DB`）。不要摘 `LIVE_TRADING_DISABLED`，不要启动 classic。
+上线顺序（本 PR 不执行，也还没有接到现网调度）：
+
+1. 停掉对同一个 `binance_spot_universe.db` 的 `refresh_binance_spot_universe.py`。该脚本不在本仓库，现有 crontab / `run_binance_spot_loop.sh` 也不调用它。K 线循环只读 `symbols`，不会删 `quoteVolume_collected_at`。若库外脚本继续重建 `symbols` 或不改时间只改 `quoteVolume_24h`，采集时刻会丢，或出现新 quote 配旧时间。
+2. 合入 reader。旧行没有 `quoteVolume_collected_at`，新买保持拒绝。
+3. 用 `scripts/run_binance_universe_quote_loop.sh` 周期跑 `python -m indicators.binance_universe_quote`。默认 300 秒，必须小于 `BINANCE_INDICATORS_FRESH_SEC`（默认 3600）。只跑一次会在窗口过后整批拒买。成功的一轮在同一事务里写下该次 ticker 的 quote 和同一个采集时刻；失败不改上一轮。不要用文件 mtime。
+4. 干跑 `live_bnb_boll_fade`，看 `live_bnb_turnover` 与 `live_bnb_top_buys`。决策进程要读到 `exports/binance_spot_universe.db`（指标库同级的 `exports/`，或 `BINANCE_SPOT_UNIVERSE_DB`）。
+
+不要摘 `LIVE_TRADING_DISABLED`，不要启动 classic。本仓库没有现网调度，不能视为端到端已接通。
 
 扫描窗口仍是至少 600，先筛过门槛和宇宙，再跑原来的 Entry Zone 或 classic 腿、流动性地板和冷却。通过之后按 `volume_strength` 从高到低，相同则 24h quoteVolume 从高到低，再按符号。每个 purpose 每一拍最终新买最多 `LIVE_BNB_TOP_BUYS`（默认 2）。只有 1 个合格就发 1 个，不补齐；一个都没有就发 0。被策略、风险或冷却丢掉的名字不占名额。同一符号只留排序更高的一条。卖出不计数、不因门槛被丢掉。
 
