@@ -54,6 +54,7 @@ from execution.executors.binance_spot import (
     BinanceSpotAdapter,
     held_position_spec,
     kill_switch_active,
+    public_exchange_error,
 )
 from execution.live_bnb_dispatch import (
     CatalogProbe,
@@ -147,7 +148,7 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
         }
     else:
         public_order = None
-    return {
+    published: dict[str, Any] = {
         "ok": bool(result.get("ok")),
         "dry_run": bool(result.get("dry_run")),
         "executed": int(result.get("executed") or 0),
@@ -183,6 +184,10 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
             result.get("oco_fields") if isinstance(result.get("oco_fields"), dict) else None
         ),
     }
+    exchange_error = public_exchange_error(result.get("exchange_error"))
+    if exchange_error is not None:
+        published["exchange_error"] = exchange_error
+    return published
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -1311,6 +1316,9 @@ class ExecutionGateway:
             submitted_to_executor = bool(exec_result.get("submitted"))
             receipt_body["step"] = "binance_spot"
             receipt_body["exec_result"] = exec_result
+            reported = exec_result.get("exchange_error")
+            if isinstance(reported, dict):
+                receipt_body["exchange_error"] = reported
             if exec_result.get("dry_run"):
                 executed = 0
                 if exec_result.get("ok"):

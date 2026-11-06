@@ -91,10 +91,76 @@ _Side = Literal["BUY", "SELL"]
 Opener = Callable[[urllib.request.Request, float], tuple[int, bytes]]
 
 
-class BinanceRequestError(Exception):
-    """HTTP failure. Status, and a scrubbed exchange code/msg when the body has them.
+_DIAGNOSTIC_LIMIT = 160
+_BODY_PREFIX = 4096
+_CODE_MIN = -1_000_000
+_CODE_MAX = 1_000_000
+_SAFE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,;:_%+=()/'\"*-"
+)
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_LABELED_SECRET_RE = re.compile(
+    r"(?i)\b(?:signature|api[_-]?key|api[_-]?secret|secret|x-mbx-apikey|authorization|bearer|token)\b\s*[:=]\s*\S+"
+)
+_QUERY_RE = re.compile(
+    r"(?i)(?:[?&])(?:signature|timestamp|recvwindow|apikey|api_key|api-key)=[^&\s]*"
+)
+_LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9]{32,}\b")
+# Leftover request material after the labeled-value scrub. Bare words such as
+# "API-key" and "Signature for this request is not valid." are Binance msgs.
+_UNSAFE_MARKER_RE = re.compile(r"(?i)(https?://|x-mbx-apikey|authorization\s*:|bearer\s+\S)")
 
-    The request URL, query, and signature are not part of the message.
+
+def _valid_exchange_code(raw: object) -> bool:
+    return isinstance(raw, int) and not isinstance(raw, bool) and _CODE_MIN <= raw <= _CODE_MAX
+
+
+def _scrub_diagnostic(text: object, secrets: tuple[str, ...] = ()) -> str | None:
+    """Bound a Binance ``msg`` or fallback excerpt. Drop URLs, queries, and secrets."""
+    if not isinstance(text, str) or not text:
+        return None
+    cleaned = text
+    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+        cleaned = cleaned.replace(secret, " ")
+    cleaned = _URL_RE.sub(" ", cleaned)
+    cleaned = _QUERY_RE.sub(" ", cleaned)
+    cleaned = _LABELED_SECRET_RE.sub(" ", cleaned)
+    cleaned = _LONG_TOKEN_RE.sub(" ", cleaned)
+    cleaned = "".join(ch if ch in _SAFE_CHARS else " " for ch in cleaned)
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) > _DIAGNOSTIC_LIMIT:
+        cleaned = cleaned[:_DIAGNOSTIC_LIMIT].rstrip()
+    if not cleaned or not any(ch.isalnum() for ch in cleaned):
+        return None
+    if _UNSAFE_MARKER_RE.search(cleaned):
+        return None
+    return cleaned
+
+
+def _format_exchange_error(
+    status: int,
+    code: int | None,
+    message: str | None,
+    detail: str | None,
+) -> str:
+    base = f"binance_http_error:{status}"
+    if code is not None and message:
+        return f"{base}:{code}:{message}"
+    if code is not None:
+        return f"{base}:{code}"
+    if message:
+        return f"{base}:{message}"
+    if detail:
+        return f"{base}:detail:{detail}"
+    return base
+
+
+class BinanceRequestError(Exception):
+    """HTTP failure. Status is always kept. Code and msg are optional and scrubbed.
+
+    A body-less error stays ``binance_http_error:<status>``. The request URL,
+    query, signature, and API key are not part of the message. ``msg`` is the
+    keyword order-list checks already pass; ``message`` is the body-decoder alias.
     """
 
     def __init__(
@@ -103,19 +169,69 @@ class BinanceRequestError(Exception):
         *,
         code: int | None = None,
         msg: str | None = None,
+        message: str | None = None,
+        detail: str | None = None,
+        secrets: tuple[str, ...] = (),
     ) -> None:
         self.status = int(status)
-        self.code = code if isinstance(code, int) and not isinstance(code, bool) else None
-        text = " ".join(msg.split()) if isinstance(msg, str) else ""
-        self.msg = text[:160] if text else None
-        label = f"binance_http_error:{self.status}"
-        if self.code is not None and self.msg:
-            label = f"{label}:{self.code}:{self.msg}"
-        elif self.code is not None:
-            label = f"{label}:{self.code}"
-        elif self.msg:
-            label = f"{label}:{self.msg}"
-        super().__init__(label)
+        self.code = code if _valid_exchange_code(code) else None
+        raw_message = message if message is not None else msg
+        self.exchange_message = _scrub_diagnostic(raw_message, secrets)
+        self.msg = self.exchange_message
+        self.detail = _scrub_diagnostic(detail, secrets)
+        super().__init__(
+            _format_exchange_error(
+                self.status,
+                self.code,
+                self.exchange_message,
+                self.detail,
+            )
+        )
+
+    def public_view(self, secrets: tuple[str, ...] = ()) -> dict[str, Any]:
+        """Status plus a scrubbed code/msg/detail. Other response fields are dropped."""
+        msg = _scrub_diagnostic(self.exchange_message, secrets) if self.exchange_message else None
+        detail = _scrub_diagnostic(self.detail, secrets) if self.detail else None
+        payload: dict[str, Any] = {"status": self.status}
+        if self.code is not None:
+            payload["code"] = self.code
+        if msg:
+            payload["msg"] = msg
+        if detail:
+            payload["detail"] = detail
+        return payload
+
+    def redacted_text(self, secrets: tuple[str, ...] = ()) -> str:
+        view = self.public_view(secrets)
+        code = view.get("code")
+        msg = view.get("msg")
+        detail = view.get("detail")
+        return _format_exchange_error(
+            self.status,
+            code if _valid_exchange_code(code) else None,
+            msg if isinstance(msg, str) else None,
+            detail if isinstance(detail, str) else None,
+        )
+
+
+def public_exchange_error(raw: object) -> dict[str, Any] | None:
+    """Receipt copy of an exchange rejection. Only status, code, msg, and detail."""
+    if not isinstance(raw, dict):
+        return None
+    status = raw.get("status")
+    if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+        return None
+    out: dict[str, Any] = {"status": status}
+    code = raw.get("code")
+    if _valid_exchange_code(code):
+        out["code"] = code
+    msg = _scrub_diagnostic(raw.get("msg"))
+    if msg:
+        out["msg"] = msg
+    detail = _scrub_diagnostic(raw.get("detail"))
+    if detail:
+        out["detail"] = detail
+    return out
 
 
 # GET /api/v3/orderList only. -2018 is "Order list does not exist."
@@ -140,23 +256,6 @@ def single_order_absent(exc: BinanceRequestError) -> bool:
     This does not say the OCO list is gone. A working list stays working.
     """
     return exc.status in {400, 404} and exc.code in _SINGLE_ORDER_ABSENT_CODES
-
-
-def _rejection(status: int, body: bytes) -> BinanceRequestError:
-    code: int | None = None
-    msg: str | None = None
-    try:
-        parsed = json.loads(body.decode("utf-8")) if body else None
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        parsed = None
-    if isinstance(parsed, dict):
-        raw_code = parsed.get("code")
-        if isinstance(raw_code, int) and not isinstance(raw_code, bool):
-            code = raw_code
-        raw_msg = parsed.get("msg")
-        if isinstance(raw_msg, str):
-            msg = raw_msg
-    return BinanceRequestError(status, code=code, msg=msg)
 
 
 def _env_flag(name: str) -> bool:
@@ -825,7 +924,7 @@ class BinanceSpotHttpClient:
             },
         )
         status, body = self._opener(request, self.timeout)
-        return _decode_ok(status, body)
+        return _decode_ok(status, body, secrets=(api_key,))
 
     def get_api_restrictions(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         """Signed read of ``GET /sapi/v1/account/apiRestrictions``. Not an order."""
@@ -838,7 +937,7 @@ class BinanceSpotHttpClient:
             },
         )
         status, body = self._opener(request, self.timeout)
-        return _decode_ok(status, body)
+        return _decode_ok(status, body, secrets=(api_key,))
 
     def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -852,7 +951,7 @@ class BinanceSpotHttpClient:
             },
         )
         status, body = self._opener(request, self.timeout)
-        return _decode_ok(status, body)
+        return _decode_ok(status, body, secrets=(api_key,))
 
     def ticker_price(self, symbol: str) -> dict[str, Any]:
         query = urllib.parse.urlencode(
@@ -878,7 +977,7 @@ class BinanceSpotHttpClient:
             },
         )
         status, body = self._opener(request, self.timeout)
-        return _decode_ok(status, body)
+        return _decode_ok(status, body, secrets=(api_key,))
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -892,7 +991,7 @@ class BinanceSpotHttpClient:
             },
         )
         status, body = self._opener(request, self.timeout)
-        return _decode_ok(status, body)
+        return _decode_ok(status, body, secrets=(api_key,))
 
     def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -904,12 +1003,66 @@ class BinanceSpotHttpClient:
             },
         )
         status, body = self._opener(request, self.timeout)
-        return _decode_ok(status, body)
+        return _decode_ok(status, body, secrets=(api_key,))
 
 
-def _decode_ok(status: int, body: bytes) -> dict[str, Any]:
+def _decode_body_prefix(body: bytes) -> str | None:
+    """UTF-8 prefix only. Invalid bytes contribute no text."""
+    if not body:
+        return None
+    chunk = bytes(body[:_BODY_PREFIX])
+    try:
+        return chunk.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if len(body) > _BODY_PREFIX and exc.start > 0:
+            try:
+                return chunk[: exc.start].decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+        return None
+
+
+def _rejection_from_body(
+    status: int,
+    body: object,
+    secrets: tuple[str, ...],
+) -> BinanceRequestError:
+    if not isinstance(body, (bytes, bytearray)) or not body:
+        return BinanceRequestError(status)
+    text = _decode_body_prefix(bytes(body))
+    if text is None:
+        return BinanceRequestError(status)
+    stripped = text.lstrip("\ufeff").strip()
+    if not stripped:
+        return BinanceRequestError(status)
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return BinanceRequestError(status, detail=stripped, secrets=secrets)
+    if not isinstance(parsed, dict):
+        return BinanceRequestError(status)
+    code = parsed.get("code")
+    msg = parsed.get("msg")
+    safe_code = code if _valid_exchange_code(code) else None
+    safe_msg = msg if isinstance(msg, str) else None
+    if safe_code is None and safe_msg is None:
+        return BinanceRequestError(status)
+    return BinanceRequestError(
+        status,
+        code=safe_code,
+        message=safe_msg,
+        secrets=secrets,
+    )
+
+
+def _decode_ok(
+    status: int,
+    body: bytes,
+    *,
+    secrets: tuple[str, ...] = (),
+) -> dict[str, Any]:
     if status >= 400:
-        raise _rejection(status, body)
+        raise _rejection_from_body(status, body, secrets)
     try:
         parsed = json.loads(body.decode("utf-8")) if body else {}
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1024,6 +1177,7 @@ def _result(
     consumer_allowed: bool | None = None,
     arm_position: dict[str, Any] | None = None,
     oco_fields: dict[str, Any] | None = None,
+    exchange_error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "ok": ok,
@@ -1046,6 +1200,8 @@ def _result(
         body["arm_position"] = arm_position
     if oco_fields is not None:
         body["oco_fields"] = oco_fields
+    if exchange_error is not None:
+        body["exchange_error"] = exchange_error
     return body
 
 
@@ -1823,18 +1979,20 @@ class BinanceSpotAdapter:
         try:
             info = client.exchange_info(symbol)
         except Exception as exc:  # noqa: BLE001 — surface a redacted refusal, no retry
+            error, exchange_error = _exchange_failure(exc, key, secret)
             return self._finish(
                 _result(
                     ok=False,
                     dry_run=False,
                     executed=0,
                     submitted=False,
-                    error=_public_error(exc, key, secret),
+                    error=error,
                     symbol=symbol,
                     order=dict(pairs),
                     exchange_order_id=None,
                     gates=gates,
                     exit_plan=plan,
+                    exchange_error=exchange_error,
                 )
             )
         if not isinstance(info, dict) or not symbol_status_trading(info, symbol):
@@ -1971,19 +2129,21 @@ class BinanceSpotAdapter:
         signed = sign_query(pairs, secret)
         try:
             placed = client.new_order(signed, api_key=key)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — rejection is final; do not post again
+            error, exchange_error = _exchange_failure(exc, key, secret)
             return self._finish(
                 _result(
                     ok=False,
                     dry_run=False,
                     executed=0,
                     submitted=False,
-                    error=_public_error(exc, key, secret),
+                    error=error,
                     symbol=symbol,
                     order=dict(pairs),
                     exchange_order_id=None,
                     gates=gates,
                     exit_plan=plan,
+                    exchange_error=exchange_error,
                 )
             )
         if not isinstance(placed, dict):
@@ -2941,6 +3101,18 @@ class BinanceSpotAdapter:
 
 def _public_error(exc: BaseException, key: str, secret: str) -> str:
     if isinstance(exc, BinanceRequestError):
-        return _redact(str(exc), (key, secret))
-    text = _redact(f"{type(exc).__name__}", (key, secret))
+        return _redact(exc.redacted_text((key, secret)), (key, secret))
+    text = _redact(type(exc).__name__, (key, secret))
     return f"binance_http_error:{text}"
+
+
+def _exchange_failure(
+    exc: BaseException,
+    key: str,
+    secret: str,
+) -> tuple[str, dict[str, Any] | None]:
+    """Public error string plus a receipt-safe code/msg. No second order."""
+    error = _public_error(exc, key, secret)
+    if not isinstance(exc, BinanceRequestError):
+        return error, None
+    return error, public_exchange_error(exc.public_view((key, secret)))
