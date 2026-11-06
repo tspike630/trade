@@ -30,6 +30,7 @@ from execution.executors.binance_spot import (
     _symbol_filters,
     _to_decimal,
     floor_base_qty,
+    floor_decimal_places,
 )
 
 BLOCK_SELL_ENV = "BINANCE_SPOT_BLOCK_SELL_ON_KILL"
@@ -571,15 +572,20 @@ def resolve_entry_size(
             return extras, None, None
         return extras, "missing_book_usdt", None
     quote = pct * book
-    quote_text = _decimal_text(quote)
     plan: dict[str, Any] = {
         "source": "size_pct",
         "size_pct": _decimal_text(pct),
         "book_usdt": _decimal_text(book),
-        "quote_usdt": quote_text,
+        "quote_usdt": _decimal_text(quote),
     }
     if quote < ENTRY_MIN_NOTIONAL_USDT:
         return extras, "entry_notional_below_min", plan
+    # Floor only after the 20 USDT check so a half-size book still refuses.
+    quote_text = floor_decimal_places(quote)
+    sent_quote = None if quote_text is None else _to_decimal(quote_text)
+    if quote_text is None or sent_quote is None or sent_quote < ENTRY_MIN_NOTIONAL_USDT:
+        return extras, "entry_notional_below_min", plan
+    plan["quote_usdt"] = quote_text
     order_type = str(extras.get("order_type") or extras.get("binance_order_type") or "MARKET").strip().upper()
     sized = dict(extras)
     if order_type == "LIMIT":
@@ -588,10 +594,13 @@ def resolve_entry_size(
             price = _to_decimal(extras.get("price"))
         if price is None:
             return extras, "missing_limit_price", plan
-        qty = quote / price
+        qty = sent_quote / price
         if qty <= 0:
             return extras, "entry_not_viable:below_min_qty", plan
-        sized["quantity"] = _decimal_text(qty)
+        qty_text = floor_decimal_places(qty)
+        if qty_text is None:
+            return extras, "entry_not_viable:below_min_qty", plan
+        sized["quantity"] = qty_text
         plan["order_type"] = "LIMIT"
         plan["needs_lot_floor"] = True
         return sized, None, plan

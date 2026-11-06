@@ -403,6 +403,36 @@ def _decimal_text(number: Decimal) -> str:
     return text
 
 
+# USDT quoteAssetPrecision. More fraction digits on quoteOrderQty is Binance -1111.
+EXCHANGE_DECIMAL_PLACES = 8
+
+
+def floor_decimal_places(number: object, places: int = EXCHANGE_DECIMAL_PLACES) -> str | None:
+    """Floor to ``places`` fraction digits. Never rounds up and never uses float.
+
+    A digit string that already fits is returned unchanged. Longer values are
+    truncated the same way ``floor_base_qty`` truncates onto a lot step, so a
+    ``size_pct * book`` product such as ``21.8819049515`` becomes ``21.88190495``.
+    """
+    if isinstance(number, str):
+        text = number.strip()
+        if _positive_decimal(text) is None:
+            return None
+        if len(text.partition(".")[2]) <= places:
+            return text
+        raw: object = text
+    else:
+        raw = number
+    qty = _to_decimal(raw)
+    if qty is None or places < 0:
+        return None
+    quantum = Decimal(1).scaleb(-places)
+    floored = qty.quantize(quantum, rounding=ROUND_DOWN)
+    if floored <= 0 or floored > qty:
+        return None
+    return _decimal_text(floored)
+
+
 def floor_base_qty(quantity: object, step: object) -> str | None:
     """Floor ``quantity`` to ``step``. Never rounds up and never exceeds it."""
     qty = _to_decimal(quantity)
@@ -816,9 +846,15 @@ def _order_pairs(
             if quote_qty and quantity:
                 return None, "ambiguous_order_qty"
             if quote_qty:
-                pairs.append(("quoteOrderQty", quote_qty))
+                sent_quote = floor_decimal_places(quote_qty)
+                if sent_quote is None:
+                    return None, "invalid_order_qty"
+                pairs.append(("quoteOrderQty", sent_quote))
             elif quantity:
-                pairs.append(("quantity", quantity))
+                sent_qty = floor_decimal_places(quantity)
+                if sent_qty is None:
+                    return None, "invalid_order_qty"
+                pairs.append(("quantity", sent_qty))
             else:
                 return None, "missing_order_qty"
         elif side == "SELL":
@@ -826,7 +862,10 @@ def _order_pairs(
                 return None, "ambiguous_order_qty"
             if not quantity:
                 return None, "missing_order_qty"
-            pairs.append(("quantity", quantity))
+            sent_qty = floor_decimal_places(quantity)
+            if sent_qty is None:
+                return None, "invalid_order_qty"
+            pairs.append(("quantity", sent_qty))
         else:
             unexpected_side: never = side
             return None, f"invalid_side:{unexpected_side}"
@@ -837,10 +876,13 @@ def _order_pairs(
             return None, "missing_order_qty"
         if not price:
             return None, "missing_limit_price"
+        sent_qty = floor_decimal_places(quantity)
+        if sent_qty is None:
+            return None, "invalid_order_qty"
         pairs.extend(
             (
                 ("timeInForce", "GTC"),
-                ("quantity", quantity),
+                ("quantity", sent_qty),
                 ("price", price),
             )
         )
