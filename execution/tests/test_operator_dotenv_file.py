@@ -2,8 +2,11 @@
 
 ``crawler/config.py`` loads ``crawler/.env`` (and ``decision_engine.config``
 resolves to that same file in this tree). A ``.env`` in the process cwd is
-not that file. Production load behavior is unchanged: this test only runs
-in children.
+not that path. A startup ``sitecustomize`` on ``PYTHONPATH`` can still load
+the repository ``.env`` before that import. The unguarded children put a
+no-op ``sitecustomize`` first so they measure ``crawler/config.py`` itself.
+The guarded children stub ``dotenv`` and therefore ignore every ``.env``.
+Production load behavior is unchanged: this test only runs in children.
 """
 
 from __future__ import annotations
@@ -21,6 +24,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CRAWLER))
 
 from execution.tests.isolated_env import baseline_environ, isolated_environ  # noqa: E402
+
+_NEUTRAL = Path(__file__).resolve().parent / "_dotenv_neutral"
 
 _FILE = """
 EXECUTION_PAPER_ENABLED=1
@@ -79,7 +84,9 @@ class OperatorDotenvFileTests(unittest.TestCase):
             cwd_file.write_text(_FILE, encoding="utf-8")
             self.path.unlink(missing_ok=True)
             bare = baseline_environ()
-            bare["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(CRAWLER)])
+            # Neutral sitecustomize first: a project or venv hook must not
+            # preload the repository .env before crawler/config.py runs.
+            bare["PYTHONPATH"] = os.pathsep.join([str(_NEUTRAL), str(ROOT), str(CRAWLER)])
             cwd_only = self._run(bare, cwd=Path(tmp))
             self.assertEqual(cwd_only.returncode, 0, cwd_only.stderr)
             self.assertIn("paper=False", cwd_only.stdout)
