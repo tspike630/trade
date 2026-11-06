@@ -76,4 +76,6 @@ PYTHONPATH=crawler python -m indicators.binance_spot --db crawler/dexscreener.db
 1. 符号在当前主宇宙快照里（`symbols` 表，或 `BINANCE_SPOT_UNIVERSE_DB` / `BINANCE_SPOT_UNIVERSE_JSON`）。快照没挂上时新买失败关闭，旧的 `binance_indicators` 行不能把已移出的名字买回来。
 2. 有一份新鲜的 24 小时 USDT `quoteVolume`，大于等于上面的门槛。来源按顺序：`ccxt_ticks.quote_volume_24h`（币安现货 ticker），否则宇宙行上带时间戳的 `quoteVolume` / `quote_volume_24h`。不用 base volume，不用 `liquidity_usd`，不用 5 分钟成交，也不用指标缓存里的 `quote_volume_24h` 顶替。缺、非有限、没有时间、过期，都失败关闭。新鲜窗口沿用 `BINANCE_INDICATORS_FRESH_SEC`（默认 3600 秒）；把它设成 0 不会把过期行情放进来。
 
-扫描窗口仍是至少 600，先筛过门槛和宇宙，再跑原来的 Entry Zone 或 classic 腿、流动性地板和冷却。通过之后按 `volume_strength` 从高到低，相同则 24h quote turnover 从高到低，再按符号。每个 purpose 每一拍最终新买最多 `LIVE_BNB_TOP_BUYS`（默认 1）。被策略、风险或冷却丢掉的名字不占这个名额。卖出不计数、不因门槛被丢掉。
+扫描窗口仍是至少 600，先筛过门槛和宇宙，再跑原来的 Entry Zone 或 classic 腿、流动性地板和冷却。通过之后按 `volume_strength` 从高到低，相同则 24h quoteVolume 从高到低，再按符号。每个 purpose 每一拍最终新买最多 `LIVE_BNB_TOP_BUYS`（默认 2）。只有 1 个合格就发 1 个，不补齐；一个都没有就发 0。被策略、风险或冷却丢掉的名字不占名额。同一符号只留排序更高的一条。卖出不计数、不因门槛被丢掉。
+
+执行层仍是每个 purpose 最多 1 个持仓。决策多给的第 2 个候选不会变成第二笔成交，也不绕过持仓闸。

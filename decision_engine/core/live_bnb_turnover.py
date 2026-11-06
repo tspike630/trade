@@ -16,6 +16,11 @@ A buy has to clear two checks the indicator cache does not:
 Missing, non-finite, negative, undated, or stale quotes fail closed. Sells
 are not filtered: a held name such as one dropped for low turnover still
 gets its protective exit. This module does not cancel orders.
+
+After those gates, each purpose keeps at most
+``LIVE_BNB_TOP_BUYS`` new buys (default 2). A tick with one qualifier emits
+that one buy and does not invent a second. Execution still holds one open
+position per purpose; this cap does not open a second fill.
 """
 
 from __future__ import annotations
@@ -86,7 +91,7 @@ def min_quote_volume_usdt() -> float:
 
 
 def top_buys_per_tick() -> int:
-    """How many new buys one Binance purpose may emit. Default 1."""
+    """Maximum new buys one Binance purpose may emit. Default 2. Never pads."""
     raw = os.environ.get(ENV_TOP_BUYS)
     if raw is None or str(raw).strip() == "":
         return int(de_config.DEFAULT_LIVE_BNB_TOP_BUYS)
@@ -94,10 +99,10 @@ def top_buys_per_tick() -> int:
     try:
         value = int(text)
     except (TypeError, ValueError):
-        log.warning("%s unusable %r; using 1", ENV_TOP_BUYS, raw)
+        log.warning("%s unusable %r; using default 2", ENV_TOP_BUYS, raw)
         return int(de_config.DEFAULT_LIVE_BNB_TOP_BUYS)
     if value < 1:
-        log.warning("%s unusable %r; using 1", ENV_TOP_BUYS, raw)
+        log.warning("%s unusable %r; using default 2", ENV_TOP_BUYS, raw)
         return int(de_config.DEFAULT_LIVE_BNB_TOP_BUYS)
     return value
 

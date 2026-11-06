@@ -1,4 +1,4 @@
-"""3M quoteVolume floor and Top 1 new buy for the two Binance spot purposes.
+"""3M quoteVolume floor and at most Top 2 new buys for the two Binance spot purposes.
 
 Paper rows and sells are not filtered. Indicator-cache quote volume is not a
 turnover source. Counts from the feed report are not fixtures.
@@ -85,7 +85,7 @@ class TurnoverContractTests(unittest.TestCase):
 
     def test_floor_default_is_the_feed_env_at_3m(self) -> None:
         self.assertEqual(min_quote_volume_usdt(), 3_000_000.0)
-        self.assertEqual(top_buys_per_tick(), 1)
+        self.assertEqual(top_buys_per_tick(), 2)
         self.assertEqual(ENTRY_MIN_NOTIONAL_USDT, Decimal("20"))
         os.environ[ENV_MIN_QUOTE_VOLUME] = "3e6"
         self.assertEqual(min_quote_volume_usdt(), 3_000_000.0)
@@ -95,6 +95,8 @@ class TurnoverContractTests(unittest.TestCase):
         self.assertEqual(min_quote_volume_usdt(), 3_000_000.0)
         os.environ.pop(ENV_MIN_QUOTE_VOLUME, None)
         os.environ[ENV_TOP_BUYS] = "0"
+        self.assertEqual(top_buys_per_tick(), 2)
+        os.environ[ENV_TOP_BUYS] = "1"
         self.assertEqual(top_buys_per_tick(), 1)
 
     def test_exact_3m_passes_and_below_fails(self) -> None:
@@ -189,7 +191,7 @@ class TurnoverContractTests(unittest.TestCase):
         )
         self.assertEqual(why_removed, REASON_UNIVERSE_NOT_ELIGIBLE)
 
-    def test_sells_are_kept_and_buys_cap_at_one(self) -> None:
+    def test_sells_are_kept_and_buys_cap_at_two_without_padding(self) -> None:
         now = _now_ms()
         asof = _iso(datetime.now(timezone.utc))
 
@@ -214,17 +216,31 @@ class TurnoverContractTests(unittest.TestCase):
         }
         sell_other = {"action": "sell", "chain_id": "binance", "token_address": "ETHUSDT"}
         kept, report = cap_live_bnb_buys(
-            [sell_cfg, _buy("LOWUSDT", 0.2), _buy("HIGHUSDT", 3.0), sell_other, _buy("HIGHUSDT", 1.0)],
+            [
+                sell_cfg,
+                _buy("LOWUSDT", 0.2),
+                _buy("HIGHUSDT", 3.0),
+                sell_other,
+                _buy("HIGHUSDT", 1.0),
+                _buy("MIDUSDT", 1.0),
+            ],
             now_ms=now,
         )
         buys = [row for row in kept if row["action"] == "buy"]
         sells = [row for row in kept if row["action"] == "sell"]
-        self.assertEqual(len(buys), 1)
-        self.assertEqual(buys[0]["binance_symbol"], "HIGHUSDT")
+        self.assertEqual([row["binance_symbol"] for row in buys], ["HIGHUSDT", "MIDUSDT"])
         self.assertEqual(buys[0]["volume_strength"], 3.0)
         self.assertEqual(sells, [sell_cfg, sell_other])
-        self.assertEqual(report["selected"], ["HIGHUSDT"])
-        self.assertLessEqual(report["buys_kept"], 1)
+        self.assertEqual(report["selected"], ["HIGHUSDT", "MIDUSDT"])
+        self.assertEqual(report["buys_kept"], 2)
+        self.assertNotIn("LOWUSDT", report["selected"])
+        alone, alone_report = cap_live_bnb_buys([_buy("ONLYUSDT", 0.4)], now_ms=now)
+        self.assertEqual(len(alone), 1)
+        self.assertEqual(alone_report["selected"], ["ONLYUSDT"])
+        empty, empty_report = cap_live_bnb_buys([sell_cfg], now_ms=now)
+        self.assertEqual(empty, [sell_cfg])
+        self.assertEqual(empty_report["selected"], [])
+        self.assertEqual(empty_report["buys_kept"], 0)
 
 
 class EngineTurnoverTests(TurnoverContractTests):
@@ -476,10 +492,17 @@ class EngineTurnoverTests(TurnoverContractTests):
                 ],
             )
             rows, payload = self._tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
-            self.assertEqual([row["token_address"] for row in rows], ["HIGHUSDT"])
+            self.assertEqual(
+                {row["token_address"] for row in rows},
+                {"HIGHUSDT", "MIDUSDT"},
+            )
+            self.assertEqual(len(rows), 2)
             self.assertEqual(payload["quote_turnover"]["passed"], 3)
-            self.assertEqual(payload["live_bnb_top_buys"]["ranked"][0], "HIGHUSDT")
-            self.assertEqual(len(payload["live_bnb_top_buys"]["selected"]), 1)
+            self.assertEqual(
+                payload["live_bnb_top_buys"]["selected"],
+                ["HIGHUSDT", "MIDUSDT"],
+            )
+            self.assertNotIn("LOWUSDT", payload["live_bnb_top_buys"]["selected"])
 
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "d.db"
@@ -490,8 +513,15 @@ class EngineTurnoverTests(TurnoverContractTests):
                     self._spec(symbol="ALPHAUSDT", base="ALPHA", vs=1.5, tick=9_000_000.0),
                 ],
             )
-            rows, _payload = self._tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
-            self.assertEqual([row["token_address"] for row in rows], ["ALPHAUSDT"])
+            rows, payload = self._tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
+            self.assertEqual(
+                payload["live_bnb_top_buys"]["selected"],
+                ["ALPHAUSDT", "ZEDUSDT"],
+            )
+            self.assertEqual(
+                {row["token_address"] for row in rows},
+                {"ALPHAUSDT", "ZEDUSDT"},
+            )
 
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "d.db"
@@ -499,11 +529,20 @@ class EngineTurnoverTests(TurnoverContractTests):
                 db,
                 [
                     self._spec(symbol="ZEDUSDT", base="ZED", vs=1.5, tick=4_000_000.0),
+                    self._spec(symbol="MMMUSDT", base="MMM", vs=1.5, tick=4_000_000.0),
                     self._spec(symbol="ALPHAUSDT", base="ALPHA", vs=1.5, tick=4_000_000.0),
                 ],
             )
-            rows, _payload = self._tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
-            self.assertEqual([row["token_address"] for row in rows], ["ALPHAUSDT"])
+            rows, payload = self._tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
+            self.assertEqual(
+                payload["live_bnb_top_buys"]["selected"],
+                ["ALPHAUSDT", "MMMUSDT"],
+            )
+            self.assertEqual(
+                {row["token_address"] for row in rows},
+                {"ALPHAUSDT", "MMMUSDT"},
+            )
+            self.assertNotIn("ZEDUSDT", {row["token_address"] for row in rows})
 
     def test_rejected_or_cooled_strongest_does_not_consume_the_slot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -512,11 +551,16 @@ class EngineTurnoverTests(TurnoverContractTests):
                 db,
                 [
                     self._spec(symbol="HIGHUSDT", base="HIGH", vs=9.0, price=5.0, lower=1.0),
+                    self._spec(symbol="MIDUSDT", base="MID", vs=1.1),
                     self._spec(symbol="LOWUSDT", base="LOW", vs=0.6),
                 ],
             )
             rows, payload = self._tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
-            self.assertEqual([row["token_address"] for row in rows], ["LOWUSDT"])
+            self.assertEqual(
+                payload["live_bnb_top_buys"]["selected"],
+                ["MIDUSDT", "LOWUSDT"],
+            )
+            self.assertEqual({row["token_address"] for row in rows}, {"MIDUSDT", "LOWUSDT"})
             self.assertNotIn("HIGHUSDT", payload["live_bnb_top_buys"]["ranked"])
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -525,11 +569,16 @@ class EngineTurnoverTests(TurnoverContractTests):
                 db,
                 [
                     self._spec(symbol="HIGHUSDT", base="HIGH", vs=9.0, liq=1.0, tick=6_000_000.0),
+                    self._spec(symbol="MIDUSDT", base="MID", vs=1.1),
                     self._spec(symbol="LOWUSDT", base="LOW", vs=0.6),
                 ],
             )
             rows, payload = self._tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
-            self.assertEqual([row["token_address"] for row in rows], ["LOWUSDT"])
+            self.assertEqual(
+                payload["live_bnb_top_buys"]["selected"],
+                ["MIDUSDT", "LOWUSDT"],
+            )
+            self.assertEqual({row["token_address"] for row in rows}, {"MIDUSDT", "LOWUSDT"})
             self.assertNotIn("HIGHUSDT", payload["live_bnb_top_buys"]["ranked"])
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -538,6 +587,7 @@ class EngineTurnoverTests(TurnoverContractTests):
                 db,
                 [
                     self._spec(symbol="HIGHUSDT", base="HIGH", vs=9.0),
+                    self._spec(symbol="MIDUSDT", base="MID", vs=1.2),
                     self._spec(symbol="LOWUSDT", base="LOW", vs=0.6),
                 ],
             )
@@ -555,8 +605,12 @@ class EngineTurnoverTests(TurnoverContractTests):
             rows, payload = self._tick(
                 db, PURPOSE_LIVE_BNB_BOLL_CLASSIC, cooldown=cooldown
             )
-            self.assertEqual([row["token_address"] for row in rows], ["LOWUSDT"])
-            self.assertEqual(payload["live_bnb_top_buys"]["selected"], ["LOWUSDT"])
+            self.assertEqual(
+                payload["live_bnb_top_buys"]["selected"],
+                ["MIDUSDT", "LOWUSDT"],
+            )
+            self.assertEqual({row["token_address"] for row in rows}, {"MIDUSDT", "LOWUSDT"})
+            self.assertNotIn("HIGHUSDT", payload["live_bnb_top_buys"]["selected"])
 
     def test_scan_window_still_reaches_a_later_eligible_name(self) -> None:
         specs = [
@@ -592,6 +646,7 @@ class EngineTurnoverTests(TurnoverContractTests):
                 db,
                 [
                     self._spec(symbol="HIGHUSDT", base="HIGH", vs=2.0),
+                    self._spec(symbol="MIDUSDT", base="MID", vs=1.0),
                     self._spec(symbol="LOWUSDT", base="LOW", vs=0.7),
                 ],
             )
@@ -600,9 +655,18 @@ class EngineTurnoverTests(TurnoverContractTests):
                 PURPOSE_LIVE_BNB_BOLL_CLASSIC,
                 strategies=[get_strategy("tech_boll_fade_v1"), get_strategy("tech_boll_fade_v1")],
             )
-            self.assertEqual([row["token_address"] for row in rows], ["HIGHUSDT"])
-            self.assertEqual(payload["emitted"], 1)
-            self.assertLessEqual(payload["live_bnb_top_buys"]["buys_kept"], 1)
+            self.assertEqual(
+                payload["live_bnb_top_buys"]["selected"],
+                ["HIGHUSDT", "MIDUSDT"],
+            )
+            self.assertEqual(
+                {row["token_address"] for row in rows},
+                {"HIGHUSDT", "MIDUSDT"},
+            )
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(payload["emitted"], 2)
+            self.assertNotIn("LOWUSDT", {row["token_address"] for row in rows})
+            self.assertLessEqual(payload["live_bnb_top_buys"]["buys_kept"], 2)
 
     def test_entry_zone_recipe_stays_on_its_purpose(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -113,7 +113,7 @@ class DecisionEngine:
         scanned = len(hot)
         if bnb_spot:
             # Floor and universe membership. The 600-name scan is already loaded;
-            # this does not rank or cut to Top 1.
+            # Top 2 is applied only after eligibility, risk, and cooldown.
             hot, turnover_report = filter_live_bnb_hot(
                 self.adapter.conn,
                 self.adapter.db_path,
