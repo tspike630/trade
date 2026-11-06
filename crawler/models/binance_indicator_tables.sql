@@ -52,3 +52,9 @@ CREATE TABLE IF NOT EXISTS binance_indicators (
 
 CREATE INDEX IF NOT EXISTS idx_binance_indicators_tech
     ON binance_indicators (tech_updated_at);
+
+-- Action-zone / α-ruler columns are not listed in the CREATE above.
+-- ensure_schema adds them with ALTER TABLE binance_indicators ADD COLUMN.
+-- Do not rebuild the table. They are not live entry gates.
+-- Canonical stop column is stop_price_zone (L - 0.1*S).
+-- natural_stop_price is the non-canonical pin_low - 10 bps variant.

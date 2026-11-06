@@ -13,6 +13,10 @@ price series changes (spot kline closes, trailing 1h quote volume as the
 
 Writes ``binance_klines`` and ``binance_indicators`` only.
 ``INDICATORS_WEIGHT_*`` stay untouched. No orders.
+
+Action-zone and α-ruler columns are attached after the tech_boll factors.
+They are not inputs to ``volume_strength`` or BOLL, and this module does not
+change the live entry. See ``docs/entry_zone_alpha_crowding_2026-11-05.md``.
 """
 
 from __future__ import annotations
@@ -32,6 +36,12 @@ from typing import Any, Callable, Sequence
 
 from logging_setup import get_logger, setup_logging
 
+from indicators.action_zone_shadow import (
+    action_zone_row_from_klines,
+    add_action_zone_columns,
+    indicator_write_columns,
+    lock_shadow_row,
+)
 from indicators.base import INTERVAL_SEC, utc_now_iso
 from indicators.library_apply import apply_library_fields
 from indicators.technical import change_pct, volatility_stdev_returns, volume_strength
@@ -511,8 +521,20 @@ def quote_volume_24h(klines: Sequence[SpotKline]) -> float | None:
     return total
 
 
-def factors_from_klines(klines: Sequence[SpotKline]) -> dict[str, Any] | None:
-    """Same tech_boll family as paper: change_*, volume_strength, BOLL(20, 2σ) on close."""
+def factors_from_klines(
+    klines: Sequence[SpotKline],
+    *,
+    symbol: str | None = None,
+    now_ms: int | None = None,
+    futures_db: Path | None = None,
+) -> dict[str, Any] | None:
+    """Same tech_boll family as paper: change_*, volume_strength, BOLL(20, 2σ) on close.
+
+    ``volume_strength`` is still ``indicators.technical.volume_strength`` on the
+    trailing-1h quote series, including a still-forming bar if one was passed in.
+    Shadow columns are attached afterwards from closed bars only. They are not
+    arguments to ``volume_strength`` or BOLL, and they are not entry gates.
+    """
     series = price_series_from_klines(klines)
     if not series:
         return None
@@ -533,13 +555,32 @@ def factors_from_klines(klines: Sequence[SpotKline]) -> dict[str, Any] | None:
         "kline_close_time_ms": max(bar.close_time_ms for bar in klines),
     }
     out.update(fields)
+    shadow = action_zone_row_from_klines(
+        klines,
+        symbol=symbol,
+        now_ms=now_ms,
+        futures_db=futures_db,
+    )
+    # PR #164 writes avg_trade_size for the newest bar. Keep that value when
+    # it is already present. trade_size_ratio is computed inline from the pin
+    # bar and does not read this column back.
+    if out.get("avg_trade_size") is not None:
+        shadow["avg_trade_size"] = out["avg_trade_size"]
+    out.update(shadow)
     return out
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create binance_* tables. Does not migrate token_indicators."""
+    """Create binance_* tables, then ALTER shadow columns. Does not rebuild.
+
+    Does not migrate token_indicators. Existing ``binance_indicators`` rows
+    keep their values; new columns start NULL until the next write. A second
+    call does not add a column that is already there.
+    """
     script = _SQL_PATH.read_text(encoding="utf-8")
     conn.executescript(script)
+    add_action_zone_columns(conn)
+    conn.commit()
 
 
 def connect_rw(path: Path) -> sqlite3.Connection:
@@ -588,11 +629,13 @@ def upsert_klines(
 
 def upsert_indicator(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     ensure_schema(conn)
-    placeholders = ", ".join("?" for _ in _INDICATOR_COLS)
-    names = ", ".join(_INDICATOR_COLS)
+    stored = lock_shadow_row(dict(row))
+    cols = indicator_write_columns(_INDICATOR_COLS)
+    placeholders = ", ".join("?" for _ in cols)
+    names = ", ".join(cols)
     conn.execute(
         f"INSERT OR REPLACE INTO binance_indicators ({names}) VALUES ({placeholders})",
-        tuple(row.get(col) for col in _INDICATOR_COLS),
+        tuple(stored.get(col) for col in cols),
     )
 
 
@@ -605,7 +648,7 @@ def persist_klines_and_factors(
     updated_at: str | None = None,
 ) -> dict[str, Any] | None:
     """Write one symbol's klines and tech_boll row. DEX tables are not touched."""
-    factors = factors_from_klines(klines)
+    factors = factors_from_klines(klines, symbol=meta.symbol)
     if factors is None:
         return None
     now = updated_at or utc_now_iso()
