@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -29,7 +30,15 @@ from decision_engine.core.signal_bus import (  # noqa: E402
 )
 from decision_engine.strategies.tech_boll_fade import TechBollFadeStrategy  # noqa: E402
 from decision_engine.tests.test_live_bnb_entry_zone import _row  # noqa: E402
-from execution.executors.binance_spot import BinanceRequestError, BinanceSpotAdapter  # noqa: E402
+from execution.executors.binance_spot import (  # noqa: E402
+    BinanceRequestError,
+    BinanceSpotAdapter,
+    _order_pairs,
+)
+from execution.executors.binance_spot_protect import (  # noqa: E402
+    ENTRY_MIN_NOTIONAL_USDT,
+    resolve_entry_size,
+)
 from execution.gateway import ExecutionGateway  # noqa: E402
 from execution.run import tick_live_bnb_exits  # noqa: E402
 
@@ -250,6 +259,100 @@ class SizeChainTests(unittest.TestCase):
         self.assertFalse(
             any(c[0] == "new_order" and "side=SELL" in c[1] for c in self.client.calls)
         )
+
+    def test_long_book_quote_is_sent_at_exchange_precision(self) -> None:
+        # 0.05 * 437.63809903 = 21.8819049515. Binance -1111 rejects >8 dp.
+        book = "437.63809903"
+        with mock.patch.dict(os.environ, _env(self.root, book)):
+            gw, receipt = self._publish_and_run(book)
+            gw.__exit__(None, None, None)
+        self.assertIsNone(receipt["error"], receipt)
+        self.assertEqual(receipt["executed"], 1, receipt)
+        plan = receipt["exec_result"]["size_plan"]
+        self.assertEqual(plan["quote_usdt"], "21.88190495")
+        self.assertEqual(plan["size_pct"], "0.05")
+        buy = parse_qs(self.client.calls[1][1])
+        self.assertEqual(buy["side"], ["BUY"])
+        self.assertEqual(buy["type"], ["MARKET"])
+        self.assertEqual(buy["quoteOrderQty"], ["21.88190495"])
+        self.assertLessEqual(len(buy["quoteOrderQty"][0].split(".")[1]), 8)
+
+
+class QuotePrecisionTests(unittest.TestCase):
+    def test_half_size_stays_under_the_20u_floor(self) -> None:
+        # Neutral half size: 0.025 * 437.63809903 = 10.94095247575 < 20.
+        sized, error, plan = resolve_entry_size(
+            {"action": "buy", "size_pct": "0.025"},
+            {},
+            environ={"BINANCE_SPOT_BOOK_USDT": "437.63809903"},
+        )
+        self.assertEqual(error, "entry_notional_below_min")
+        self.assertNotIn("quote_order_qty", sized)
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan["quote_usdt"], "10.94095247575")
+        self.assertLess(Decimal(plan["quote_usdt"]), ENTRY_MIN_NOTIONAL_USDT)
+        self.assertEqual(ENTRY_MIN_NOTIONAL_USDT, Decimal("20"))
+
+    def test_market_quote_floors_the_long_product(self) -> None:
+        sized, error, plan = resolve_entry_size(
+            {"action": "buy", "size_pct": "0.05"},
+            {},
+            environ={"BINANCE_SPOT_BOOK_USDT": "437.63809903"},
+        )
+        self.assertIsNone(error)
+        self.assertEqual(sized["quote_order_qty"], "21.88190495")
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan["quote_usdt"], "21.88190495")
+        self.assertEqual(plan["order_type"], "MARKET")
+
+    def test_order_pairs_sends_exchange_ready_quote_and_limit_qty(self) -> None:
+        market, market_error = _order_pairs(
+            symbol="BNBUSDT",
+            side="BUY",
+            order_type="MARKET",
+            extras={"quote_order_qty": "21.8819049515"},
+            client_id=None,
+            timestamp_ms=1_700_000_000_000,
+        )
+        self.assertIsNone(market_error)
+        assert market is not None
+        self.assertEqual(dict(market)["quoteOrderQty"], "21.88190495")
+
+        short, short_error = _order_pairs(
+            symbol="BNBUSDT",
+            side="BUY",
+            order_type="MARKET",
+            extras={"quote_order_qty": "21.88"},
+            client_id=None,
+            timestamp_ms=1_700_000_000_000,
+        )
+        self.assertIsNone(short_error)
+        assert short is not None
+        self.assertEqual(dict(short)["quoteOrderQty"], "21.88")
+
+        sized, error, _plan = resolve_entry_size(
+            {"action": "buy", "size_pct": "0.05"},
+            {"order_type": "LIMIT", "limit_price": "600"},
+            environ={"BINANCE_SPOT_BOOK_USDT": "437.63809903"},
+        )
+        self.assertIsNone(error)
+        self.assertEqual(sized["quantity"], "0.03646984")
+        self.assertNotIn("quote_order_qty", sized)
+        limit, limit_error = _order_pairs(
+            symbol="BNBUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            extras=sized,
+            client_id=None,
+            timestamp_ms=1_700_000_000_000,
+        )
+        self.assertIsNone(limit_error)
+        assert limit is not None
+        self.assertEqual(dict(limit)["quantity"], "0.03646984")
+        self.assertNotIn("quoteOrderQty", dict(limit))
+        self.assertLessEqual(len(dict(limit)["quantity"].split(".")[1]), 8)
 
 
 if __name__ == "__main__":
