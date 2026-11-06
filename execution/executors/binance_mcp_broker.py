@@ -1,4 +1,4 @@
-"""Parent gate for ``live_bnb_boll_fade``. This process does not send orders.
+"""Parent gate for the live Binance spot arms. This process does not send orders.
 
 Trade permission on the connector is already the selected scope. The gap is
 tool selection: an empty handshake is fail-closed, and a later catalog is
@@ -20,13 +20,16 @@ from decimal import ROUND_DOWN, Decimal
 from typing import Any, Iterable, Literal, Protocol
 
 from execution.executors.binance_spot import (
-    PURPOSE_LIVE_BNB_BOLL_FADE,
     _client_order_id,
     _decimal_text,
     _to_decimal,
     floor_base_qty,
 )
-from execution.executors.binance_spot_gate import replay_block
+from execution.executors.binance_spot_gate import (
+    PURPOSE_LIVE_BNB_BOLL_FADE,
+    is_live_bnb_spot_purpose,
+    replay_block,
+)
 
 GateExpr = Literal[
     "original_api_key",
@@ -202,12 +205,21 @@ def _rows(book: dict[str, Any], key: str) -> list[dict[str, Any]]:
     return [row for row in raw if isinstance(row, dict)]
 
 
-def _naked_rows(book: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _naked_rows(
+    book: dict[str, Any] | None,
+    purpose: str = PURPOSE_LIVE_BNB_BOLL_FADE,
+) -> list[dict[str, Any]]:
+    """Naked holds for one arm. Fade's naked row does not freeze classic."""
     if not isinstance(book, dict):
         return []
+    arm = str(purpose or "").strip() or PURPOSE_LIVE_BNB_BOLL_FADE
     held: list[dict[str, Any]] = []
     for row in _rows(book, "canonical_positions"):
-        same_purpose = str(row.get("purpose") or "") == PURPOSE_LIVE_BNB_BOLL_FADE
+        raw = str(row.get("purpose") or "").strip()
+        if raw:
+            same_purpose = raw == arm
+        else:
+            same_purpose = arm == PURPOSE_LIVE_BNB_BOLL_FADE
         if same_purpose and str(row.get("status") or "") == HELD_NAKED:
             held.append(row)
     return held
@@ -229,15 +241,16 @@ def reconcile_block(
     book: dict[str, Any] | None,
     *,
     client_order_id: str | None,
+    purpose: str = PURPOSE_LIVE_BNB_BOLL_FADE,
 ) -> str | None:
-    """Same client id, or any naked hold. A spent fill does not retire the symbol."""
+    """Same client id, or a naked hold on this arm. A spent fill does not retire the symbol."""
     if not isinstance(book, dict):
         return None
     if client_order_id and client_order_id in _spent_clients(book):
         return "spent_client_order"
     if replay_block(None, client_order_id):
         return "historical_client_replay"
-    if _naked_rows(book):
+    if _naked_rows(book, purpose):
         return "naked_holds_new_buys"
     return None
 
@@ -364,9 +377,8 @@ class LiveMCPBroker:
         symbol = _symbol_of(signal)
         client_id = _client_order_id(signal)
         oco_name = _oco_tool(self._catalog)
-        naked = _naked_rows(book)
         purpose = str(signal.get("purpose") or "").strip()
-        if purpose != PURPOSE_LIVE_BNB_BOLL_FADE:
+        if not is_live_bnb_spot_purpose(purpose):
             return self._result(
                 reason="purpose_not_live_bnb_boll_fade",
                 signal=signal,
@@ -378,6 +390,7 @@ class LiveMCPBroker:
                 duplicate_prevented=False,
                 report=report,
             )
+        naked = _naked_rows(book, purpose)
         action = str(signal.get("action") or "").strip().lower()
         if action == "sell":
             if not HOLD_NAKED_NO_AUTO_SELL:
@@ -413,7 +426,7 @@ class LiveMCPBroker:
             )
         if extras.get("quantity") not in (None, ""):
             mapping.append(map_quantity(extras.get("quantity"), extras.get("lot_step")))
-        held = reconcile_block(book, client_order_id=client_id)
+        held = reconcile_block(book, client_order_id=client_id, purpose=purpose)
         if held is not None:
             reason = held
         elif oco_name is None:

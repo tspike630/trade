@@ -1,4 +1,9 @@
-"""Binance spot USDT adapter for purpose ``live_bnb_boll_fade`` only.
+"""Binance spot USDT adapter for ``live_bnb_boll_fade`` and ``live_bnb_boll_classic``.
+
+Any other purpose is refused with ``purpose_not_live_bnb_boll_fade``. Classic
+reads the signal's absolute stop and take-profit, or the
+``classic_fixed_tp_sl`` shell (TP 10% / SL 5%) when those prices are absent.
+The fade entry-zone recipe is unchanged.
 
 Live ``POST /api/v3/order`` stays off unless every gate below is open:
 
@@ -43,9 +48,14 @@ from typing import Any, Callable, Literal
 
 from logging_setup import get_logger
 
+from execution.executors.binance_spot_gate import (
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+    PURPOSE_LIVE_BNB_BOLL_FADE,
+    is_live_bnb_spot_purpose,
+)
+
 log = get_logger("execution.binance_spot")
 
-PURPOSE_LIVE_BNB_BOLL_FADE = "live_bnb_boll_fade"
 EXECUTOR_NAME = "binance_spot"
 ENABLE_ENV = "BINANCE_SPOT_LIVE_ENABLED"
 KILL_SWITCH_ENV = "LIVE_KILL_SWITCH_PATH"
@@ -403,6 +413,44 @@ def _decimal_text(number: Decimal) -> str:
     return text
 
 
+CLASSIC_EXIT_SHELL = "classic_fixed_tp_sl"
+_CLASSIC_TP_PCT = Decimal("10")
+_CLASSIC_SL_PCT = Decimal("5")
+
+
+def apply_classic_exit_shell(extras: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Fill classic stop/take from the 10/5 shell when the signal omitted them.
+
+    Absolute prices already on the signal win. Fade never calls this. Returns
+    the extras to plan with, and whether the shell supplied a missing price.
+    """
+    if str(extras.get("exit_shell") or "") != CLASSIC_EXIT_SHELL:
+        return extras, False
+    stop_missing = extras.get("stop_price") in (None, "")
+    tp_missing = extras.get("take_profit_price") in (None, "")
+    if not stop_missing and not tp_missing:
+        return extras, False
+    price = None
+    for key in ("price_usd", "entry_price", "price"):
+        if extras.get(key) in (None, ""):
+            continue
+        price = _to_decimal(extras.get(key))
+        if price is not None:
+            break
+    if price is None:
+        return extras, False
+    filled = dict(extras)
+    if stop_missing:
+        filled["stop_price"] = _decimal_text(price * (Decimal(1) - _CLASSIC_SL_PCT / Decimal(100)))
+    if tp_missing:
+        filled["take_profit_price"] = _decimal_text(
+            price * (Decimal(1) + _CLASSIC_TP_PCT / Decimal(100))
+        )
+    if filled.get("order_type") in (None, "") and filled.get("binance_order_type") in (None, ""):
+        filled["order_type"] = "MARKET"
+    return filled, True
+
+
 # USDT quoteAssetPrecision. More fraction digits on quoteOrderQty is Binance -1111.
 EXCHANGE_DECIMAL_PLACES = 8
 
@@ -590,6 +638,7 @@ def held_position_spec(
         ),
         "status": "open" if qty else "qty_unconfirmed",
         "protection": HELD_EXIT_PROTECTION,
+        "purpose": str(sig.get("purpose") or "").strip() or PURPOSE_LIVE_BNB_BOLL_FADE,
     }
 
 
@@ -1115,7 +1164,11 @@ class BinanceSpotAdapter:
         decision = str(sig.get("decision_log_id") or "").strip()
         if not decision.isdigit():
             return "invalid_oco_client_id"
-        held = buy_exposure_block(self.buy_blocks, self.canonical_rows)
+        held = buy_exposure_block(
+            self.buy_blocks,
+            self.canonical_rows,
+            purpose=str(sig.get("purpose") or ""),
+        )
         if held:
             return held
         planned = None
@@ -1159,6 +1212,7 @@ class BinanceSpotAdapter:
             "entry_order_id": order_id,
             "status": "qty_unconfirmed",
             "protection": HELD_EXIT_PROTECTION,
+            "purpose": str(sig.get("purpose") or "").strip() or PURPOSE_LIVE_BNB_BOLL_FADE,
         }
         common = dict(
             symbol=symbol,
@@ -1276,7 +1330,7 @@ class BinanceSpotAdapter:
         self._size_plan = None
         gates = self._gates()
         purpose = str(sig.get("purpose") or "").strip()
-        if purpose != PURPOSE_LIVE_BNB_BOLL_FADE:
+        if not is_live_bnb_spot_purpose(purpose):
             return self._finish(
                 _result(
                     ok=False,
@@ -1294,6 +1348,9 @@ class BinanceSpotAdapter:
         extras = sig.get("extras")
         if not isinstance(extras, dict):
             extras = {}
+        shell_filled = False
+        if purpose == PURPOSE_LIVE_BNB_BOLL_CLASSIC:
+            extras, shell_filled = apply_classic_exit_shell(extras)
         mode = str(sig.get("mode") or "").strip().lower()
         raw_symbol = extras.get("binance_symbol")
         if raw_symbol is None or (isinstance(raw_symbol, str) and not raw_symbol.strip()):
@@ -1343,6 +1400,8 @@ class BinanceSpotAdapter:
             )
 
         plan, plan_error = build_exit_plan(sig, extras)
+        if isinstance(plan, dict) and shell_filled:
+            plan["price_source"] = CLASSIC_EXIT_SHELL
         if plan_error:
             return self._finish(
                 _result(

@@ -18,6 +18,10 @@ CLI for execution management Step A/B/C.
   #   python -m execution.run --loop \
   #     --ledger execution_ledger_live_bnb_boll_fade.db \
   #     --accept-purpose live_bnb_boll_fade
+  # Second arm, own ledger and own cursor. Do not share the fade ledger.
+  #   python -m execution.run --loop \
+  #     --ledger execution_ledger_live_bnb_boll_classic.db \
+  #     --accept-purpose live_bnb_boll_classic
 """
 
 from __future__ import annotations
@@ -35,14 +39,24 @@ if str(_ROOT) not in sys.path:
 
 from logging_setup import get_logger, setup_logging  # noqa: E402
 
-from execution.executors.binance_spot import (  # noqa: E402
+from execution.executors.binance_spot_gate import (  # noqa: E402
+    LIVE_BNB_SPOT_PURPOSES,
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
+    sole_live_bnb_purpose,
 )
-from execution.live_bnb_dispatch import live_bnb_paper_env_block
+from execution.live_bnb_dispatch import live_bnb_paper_env_block  # noqa: E402
 from execution.gateway import ExecutionGateway, _env_bool  # noqa: E402
 from execution.ledger import resolve_ledger_path  # noqa: E402
 
 log = get_logger("execution.run")
+
+# One file per arm. Sharing the other arm's ledger shares its cursor, and a
+# purpose reject advances that cursor past the other arm's decisions.
+_LIVE_BNB_LEDGERS = {
+    PURPOSE_LIVE_BNB_BOLL_FADE: "execution_ledger_live_bnb_boll_fade.db",
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC: "execution_ledger_live_bnb_boll_classic.db",
+}
 
 DEFAULT_POLL_SEC = float(os.environ.get("EXECUTION_POLL_SEC", "5"))
 
@@ -52,12 +66,13 @@ def tick_live_bnb_exits(
     accept_purposes: frozenset[str] | None,
     marks: dict | None = None,
 ) -> list:
-    """Protective full-position sells for this process's Binance arm only.
+    """Protective maintenance for this process's Binance arm only.
 
     ``race_tech_boll_fade`` and every other purpose get an empty list. The
-    adapter is not asked to exit those books.
+    adapter is not asked to exit those books. Classic uses the same native
+    OCO maintenance as fade, on its own rows.
     """
-    if accept_purposes != frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}):
+    if sole_live_bnb_purpose(accept_purposes) is None:
         return []
     return list(gw.tick_binance_protective_exits(marks))
 
@@ -118,21 +133,37 @@ def _peer_isolation_guard(
         return None
     if not accept_purposes:
         return "EXECUTION_ACCEPT_PURPOSE / --accept-purpose resolved empty"
-    if PURPOSE_LIVE_BNB_BOLL_FADE in accept_purposes:
-        if accept_purposes != frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}):
+    live = accept_purposes & LIVE_BNB_SPOT_PURPOSES
+    if live:
+        if accept_purposes != live or len(live) != 1:
+            named = sorted(live)[0]
             return (
-                "live_bnb_boll_fade must be the only --accept-purpose "
+                f"{named} must be the only --accept-purpose "
                 "on this process"
             )
+        purpose = next(iter(live))
         main_ledger = _default_main_ledger_path()
         if ledger_path.resolve() == main_ledger:
             return (
-                "live_bnb_boll_fade requires an isolated --ledger "
+                f"{purpose} requires an isolated --ledger "
                 f"(not shared {main_ledger.name})"
+            )
+        other_ledger = next(
+            (
+                name
+                for arm, name in _LIVE_BNB_LEDGERS.items()
+                if arm != purpose and ledger_path.name == name
+            ),
+            None,
+        )
+        if other_ledger is not None:
+            return (
+                f"{purpose} requires its own --ledger "
+                f"(not {other_ledger})"
             )
         if paper_enabled:
             return (
-                "live_bnb_boll_fade does not use the paper book; "
+                f"{purpose} does not use the paper book; "
                 "omit --paper-enabled"
             )
         paper_name = ""
@@ -140,7 +171,7 @@ def _peer_isolation_guard(
             paper_name = Path(str(paper_db)).name
         if paper_name in {"paper_trading.db", "paper_eq_tech_boll_fade.db"}:
             return (
-                "live_bnb_boll_fade must not target "
+                f"{purpose} must not target "
                 "paper_trading.db or paper_eq_tech_boll_fade.db"
             )
         return None
@@ -345,9 +376,11 @@ def main(argv: list[str] | None = None) -> int:
     if peer_err:
         log.error("refusing to start: %s", peer_err)
         return 2
+    live_arm = sole_live_bnb_purpose(accept_purposes)
     paper_env_err = live_bnb_paper_env_block(
         paper_enabled=paper_enabled,
-        accept_live_bnb=accept_purposes == frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
+        accept_live_bnb=live_arm is not None,
+        purpose=live_arm,
     )
     if paper_env_err:
         log.error("refusing to start: %s", paper_env_err)

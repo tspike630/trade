@@ -80,19 +80,25 @@ def parent_queue_view(evaluation: dict[str, Any]) -> list[dict[str, Any]]:
     return parent_calls(evaluation)
 
 
-def live_bnb_paper_env_block(*, paper_enabled: bool, accept_live_bnb: bool) -> str | None:
+def live_bnb_paper_env_block(
+    *,
+    paper_enabled: bool,
+    accept_live_bnb: bool,
+    purpose: str | None = None,
+) -> str | None:
     """Refuse the live arm when dotenv paper settings are still present."""
     if not accept_live_bnb:
         return None
+    label = str(purpose or "").strip() or PURPOSE_LIVE_BNB_BOLL_FADE
     if paper_enabled:
         return (
-            "live_bnb_boll_fade requires explicit --no-paper-enabled "
+            f"{label} requires explicit --no-paper-enabled "
             "(EXECUTION_PAPER_ENABLED must not enable paper)"
         )
     dirty = [name for name in _PAPER_ENV if os.environ.get(name, "").strip()]
     if dirty:
         return (
-            "live_bnb_boll_fade refuses paper env "
+            f"{label} refuses paper env "
             + ",".join(dirty)
             + "; pass --no-paper-enabled with PAPER_DB_PATH= "
             "EXECUTION_PAPER_DB= EXECUTION_PAPER_ENABLED="

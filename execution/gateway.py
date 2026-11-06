@@ -12,12 +12,13 @@ to allow a single alternate purpose such as ``race_*`` or ``shadow_entry_ih_ge1h
 for that process only; other purposes stay rejected. Paper / PM / risk stay
 default off. Never calls LiveExecutor. Main decision DB is read-only.
 
-Purpose ``live_bnb_boll_fade`` (only when that purpose is on this process's
-allowlist) is handed to ``BinanceSpotAdapter`` instead of PaperExecutor.
-The adapter refuses a live BUY while the kill-switch file is present or
-``BINANCE_SPOT_LIVE_ENABLED`` is off. A completed BUY requires a verified
-native OCO. ``mode=dry_run`` never submits. No other purpose can reach
-that adapter.
+``live_bnb_boll_fade`` and ``live_bnb_boll_classic`` (only when that one
+purpose is on this process's allowlist) are handed to ``BinanceSpotAdapter``
+instead of PaperExecutor. The adapter refuses a live BUY while the
+kill-switch file is present or ``BINANCE_SPOT_LIVE_ENABLED`` is off. A
+completed BUY requires a verified native OCO. ``mode=dry_run`` never
+submits. No other purpose can reach that adapter. Each arm blocks a second
+open of its own; one arm's hold does not freeze the other.
 """
 
 from __future__ import annotations
@@ -39,10 +40,14 @@ from execution.config import (
     EXECUTION_RISK_ENABLED,
 )
 from execution.binance_account_snapshot import default_live_bnb_adapter
-from execution.executors.binance_spot_gate import REST_BOOK, consumer_read_cursor
+from execution.executors.binance_spot_gate import (
+    REST_BOOK,
+    consumer_read_cursor,
+    is_live_bnb_spot_purpose,
+    sole_live_bnb_purpose,
+)
 from execution.executors.binance_spot import (
     EXECUTOR_NAME as BINANCE_SPOT_EXECUTOR,
-    PURPOSE_LIVE_BNB_BOLL_FADE,
     BinanceSpotAdapter,
     held_position_spec,
     kill_switch_active,
@@ -1119,6 +1124,7 @@ class ExecutionGateway:
             "protection": armed.get("protection"),
             "stop_price": armed.get("stop_price"),
             "take_profit_price": armed.get("take_profit_price"),
+            "purpose": armed.get("purpose"),
         }
         exec_result["held_position"] = receipt_body["held_position"]
 
@@ -1133,7 +1139,7 @@ class ExecutionGateway:
                 return self._reject_purpose(sig, reason)
             if (
                 str(sig.get("action") or "").strip().lower() == "buy"
-                and sig.get("purpose") != PURPOSE_LIVE_BNB_BOLL_FADE
+                and not is_live_bnb_spot_purpose(sig.get("purpose"))
                 and paper_open_paused()
             ):
                 return self._reject_purpose(sig, PAPER_OPEN_PAUSED_REASON)
@@ -1209,7 +1215,7 @@ class ExecutionGateway:
             receipt_body["status"] = "validation_failed"
             receipt_body["note"] = "validation_failed; not executed"
         elif (
-            sig.get("purpose") == PURPOSE_LIVE_BNB_BOLL_FADE
+            is_live_bnb_spot_purpose(sig.get("purpose"))
             and mode != "dry_run"
             and not self._binance_injected
             and os.environ.get("BINANCE_SPOT_PRODUCTION_BOOK", "").strip() != REST_BOOK
@@ -1254,13 +1260,17 @@ class ExecutionGateway:
                     action,
                     evaluation.get("reason"),
                 )
-        elif sig.get("purpose") == PURPOSE_LIVE_BNB_BOLL_FADE:
+        elif is_live_bnb_spot_purpose(sig.get("purpose")):
             # CEX arm: not a paper fill, and not LiveExecutor. The adapter
-            # itself keeps live newOrder behind the kill switch.
+            # itself keeps live newOrder behind the kill switch. Buy blocks
+            # are this purpose only, so the other arm's open position does
+            # not freeze this one.
             adapter = self._binance_spot or default_live_bnb_adapter()
             self._binance_spot = adapter
             if action == "buy" and mode != "dry_run":
-                adapter.buy_blocks = self.ledger.list_binance_spot_buy_blocks()
+                adapter.buy_blocks = self.ledger.list_binance_spot_buy_blocks(
+                    purpose=str(sig.get("purpose") or "")
+                )
                 book = self.ledger.mcp_book()
                 canonical = book.get("canonical_positions")
                 adapter.canonical_rows = canonical if isinstance(canonical, list) else []
@@ -1398,7 +1408,7 @@ class ExecutionGateway:
         cursor = consumer_read_cursor(
             persisted=persisted,
             since_id=since_id,
-            live_arm=self.accept_purposes == frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
+            live_arm=sole_live_bnb_purpose(self.accept_purposes) is not None,
         )
         rows = self.fetch_pending(cursor, limit=limit)
         stats = ProcessStats()
@@ -1456,15 +1466,17 @@ class ExecutionGateway:
         self,
         marks: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Full-position sells for open ``live_bnb_boll_fade`` spot longs.
+        """Full-position maintenance for this process's live spot arm.
 
-        Other purposes are not scanned. No mark fetch and no order when the
-        book has nothing open. Callers that pass ``marks`` own the prices;
-        a missing symbol is not filled in with a network read.
+        Fade and classic each scan only their own rows. Other purposes are
+        not scanned. No mark fetch and no order when the book has nothing
+        open. Callers that pass ``marks`` own the prices; a missing symbol
+        is not filled in with a network read.
         """
-        if self.accept_purposes != frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}):
+        arm = sole_live_bnb_purpose(self.accept_purposes)
+        if arm is None:
             return []
-        positions = self.ledger.list_binance_spot_positions_for_exit()
+        positions = self.ledger.list_binance_spot_positions_for_exit(purpose=arm)
         if not positions:
             return []
         adapter = self._binance_spot or default_live_bnb_adapter()

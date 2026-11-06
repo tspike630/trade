@@ -1,4 +1,7 @@
-"""Pre-trade gates for ``live_bnb_boll_fade``. No network and no secrets.
+"""Pre-trade gates for the live Binance spot arms. No network and no secrets.
+
+``live_bnb_boll_fade`` and ``live_bnb_boll_classic`` each keep one open
+position. A hold on one arm does not freeze the other.
 
 A live BUY is not a completed consumer event until a native spot OCO
 (``POST /api/v3/orderList/oco``) is verified: ``orderListId >= 0`` and both
@@ -24,6 +27,13 @@ from typing import Any
 from execution.verified_fet import VERIFIED_FET_EXIT
 
 PURPOSE_LIVE_BNB_BOLL_FADE = "live_bnb_boll_fade"
+PURPOSE_LIVE_BNB_BOLL_CLASSIC = "live_bnb_boll_classic"
+LIVE_BNB_SPOT_PURPOSES = frozenset(
+    {
+        PURPOSE_LIVE_BNB_BOLL_FADE,
+        PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+    }
+)
 MCP_POSITION_UID = "1289917075"
 REST_BOOK = "rest_api_key"
 MCP_BOOK = "mcp:1289917075"
@@ -90,6 +100,27 @@ REPLAY_SCOPE = {
         "canonical_status": "closed",
     },
 }
+
+def is_live_bnb_spot_purpose(purpose: object) -> bool:
+    """True for a Binance spot arm this adapter may fill."""
+    return str(purpose or "").strip() in LIVE_BNB_SPOT_PURPOSES
+
+
+def sole_live_bnb_purpose(
+    accept_purposes: frozenset[str] | set[str] | None,
+) -> str | None:
+    """The one live spot arm on this process, or None.
+
+    Fade and classic each run as their own consumer. A process that lists
+    both, or mixes either with a paper purpose, is not a sole arm.
+    """
+    if not accept_purposes or len(accept_purposes) != 1:
+        return None
+    purpose = next(iter(accept_purposes))
+    if purpose not in LIVE_BNB_SPOT_PURPOSES:
+        return None
+    return purpose
+
 
 def acceptance_report() -> dict[str, Any]:
     """Environment is not attested. REST binding does not need a uid."""
@@ -470,21 +501,39 @@ def _position_ids_verified(row: dict[str, Any]) -> bool:
     )
 
 
+def _row_blocks_arm(row: dict[str, Any], arm: str) -> bool:
+    """True when ``row`` belongs to ``arm``.
+
+    A tagged row blocks only that purpose. An untagged row is a legacy fade
+    hold: it still blocks fade, and it does not block classic.
+    """
+    raw = str(row.get("purpose") or "").strip()
+    if raw:
+        return raw == arm
+    return arm == PURPOSE_LIVE_BNB_BOLL_FADE
+
+
 def buy_exposure_block(
     positions: object,
     canonical: object,
+    *,
+    purpose: str | None = None,
 ) -> str | None:
-    """Block a new BUY while any live exposure is naked, unbound, or unfinished.
+    """Block a new BUY while this arm's exposure is naked, unbound, or unfinished.
 
-    A flat book is not by itself permission to buy. Terminal rows are ignored.
-    This does not write a close for the manual FET fill.
+    One open position per arm. Fade holding CFGUSDT does not block a classic
+    buy of another symbol, and classic does not block fade. A flat book is
+    not by itself permission to buy. Terminal rows are ignored. This does
+    not write a close for the manual FET fill.
+
+    ``purpose`` defaults to ``live_bnb_boll_fade`` so existing callers keep
+    the fade book.
     """
+    requested = str(purpose or "").strip()
+    arm = requested if requested in LIVE_BNB_SPOT_PURPOSES else PURPOSE_LIVE_BNB_BOLL_FADE
     rows = canonical if isinstance(canonical, list) else []
     for row in rows:
-        if not isinstance(row, dict):
-            continue
-        purpose = str(row.get("purpose") or "")
-        if purpose and purpose != PURPOSE_LIVE_BNB_BOLL_FADE:
+        if not isinstance(row, dict) or not _row_blocks_arm(row, arm):
             continue
         status = str(row.get("status") or "")
         if status == "held_naked":
@@ -494,7 +543,7 @@ def buy_exposure_block(
                 return "unbound_position"
     held = positions if isinstance(positions, list) else []
     for row in held:
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or not _row_blocks_arm(row, arm):
             continue
         status = str(row.get("status") or "")
         if not status or status in _TERMINAL_POSITION:

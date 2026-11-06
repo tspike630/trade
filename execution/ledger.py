@@ -21,10 +21,26 @@ from execution.order_events import record_event
 log = logging.getLogger("execution.ledger")
 
 BUSY_TIMEOUT_MS = 30_000
+# Legacy and untagged rows belong to this arm. Kept as a literal so the
+# ledger does not import the spot adapter package.
+_FADE_ARM = "live_bnb_boll_fade"
 
 
 def _utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _bnb_purpose_clause(purpose: str | None) -> tuple[str, tuple[Any, ...]]:
+    """Limit a spot-position query to one arm.
+
+    Untagged rows are legacy fade holds. An empty ``purpose`` does not filter.
+    """
+    arm = str(purpose or "").strip()
+    if not arm:
+        return "", ()
+    if arm == _FADE_ARM:
+        return " AND (purpose IS NULL OR purpose = '' OR purpose = ?)", (arm,)
+    return " AND purpose = ?", (arm,)
 
 
 def resolve_ledger_path(explicit: str | Path | None = None) -> Path:
@@ -201,6 +217,7 @@ class ExecutionLedger:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 decision_log_id INTEGER NOT NULL UNIQUE,
                 symbol TEXT NOT NULL,
+                purpose TEXT,
                 status TEXT NOT NULL,
                 quantity TEXT,
                 stop_price TEXT NOT NULL,
@@ -249,6 +266,7 @@ class ExecutionLedger:
             "oco_below_client_id",
             "residual_qty",
             "residual_quote",
+            "purpose",
         ):
             if name not in have:
                 self.conn.execute(
@@ -768,17 +786,19 @@ class ExecutionLedger:
         """Insert a held long once. A replay returns the existing row unchanged."""
         decision_id = int(spec["decision_log_id"])
         now = _utc()
+        purpose = str(spec.get("purpose") or "").strip() or _FADE_ARM
         self.conn.execute(
             """
             INSERT OR IGNORE INTO binance_spot_positions (
-                decision_log_id, symbol, status, quantity, stop_price,
+                decision_log_id, symbol, purpose, status, quantity, stop_price,
                 take_profit_price, entry_price, entry_order_id, protection,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 decision_id,
                 str(spec["symbol"]),
+                purpose,
                 str(spec["status"]),
                 spec.get("quantity"),
                 str(spec["stop_price"]),
@@ -853,26 +873,40 @@ class ExecutionLedger:
         self.conn.commit()
         return self.binance_spot_position_by_id(position_id)
 
-    def list_binance_spot_positions_for_exit(self) -> list[dict[str, Any]]:
+    def list_binance_spot_positions_for_exit(
+        self, purpose: str | None = None
+    ) -> list[dict[str, Any]]:
+        clause, params = _bnb_purpose_clause(purpose)
         rows = self.conn.execute(
-            """
+            f"""
             SELECT * FROM binance_spot_positions
             WHERE status IN (
                 'open', 'qty_unconfirmed', 'oco_working', 'oco_unknown', 'oco_failed'
             )
+            {clause}
             ORDER BY id ASC
-            """
+            """,
+            params,
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_binance_spot_buy_blocks(self) -> list[dict[str, Any]]:
-        """Non-terminal spot rows. A new BUY must not stack on these."""
+    def list_binance_spot_buy_blocks(
+        self, purpose: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Non-terminal spot rows for one arm. A new BUY must not stack on these.
+
+        ``purpose`` omitted returns every arm. Callers that pass a purpose
+        leave the other arm's open position out of this list.
+        """
+        clause, params = _bnb_purpose_clause(purpose)
         rows = self.conn.execute(
-            """
+            f"""
             SELECT * FROM binance_spot_positions
             WHERE status NOT IN ('closed', 'closed_dust', 'oco_filled')
+            {clause}
             ORDER BY id ASC
-            """
+            """,
+            params,
         ).fetchall()
         return [dict(row) for row in rows]
 
