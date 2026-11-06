@@ -25,19 +25,15 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from execution.slippage_report import build_report, format_report, main as report_main  # noqa: E402
+from execution.tests.isolated_env import isolated_environ  # noqa: E402
 
 
 AS_OF = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
 
 
 def _py_env() -> dict[str, str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")])
-    env.pop("EXECUTION_LEDGER_PATH", None)
-    env.pop("EXECUTION_PAPER_DB", None)
-    env.pop("PAPER_DB_PATH", None)
-    env.pop("CRAWLER_DB", None)
-    env.pop("DB_PATH", None)
+    env = isolated_environ()
+    env["PYTHONPATH"] = str(ROOT)
     return env
 
 

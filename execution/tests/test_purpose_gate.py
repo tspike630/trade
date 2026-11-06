@@ -8,7 +8,6 @@ Run from the repo root:
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import sys
@@ -34,6 +33,7 @@ from execution.gateway import (  # noqa: E402
     purpose_reject_reason,
 )
 from execution.order_events import event_chain  # noqa: E402
+from execution.tests.isolated_env import isolated_environ  # noqa: E402
 from paper_trade import PaperLedger  # noqa: E402
 
 
@@ -531,17 +531,8 @@ class PurposeGateTests(unittest.TestCase):
             self.assertEqual(_errors(row), [PURPOSE_REJECT_SAMPLE])
 
     def test_gates_stay_off_by_default(self) -> None:
-        env = os.environ.copy()
-        # Default-off is about an unset process, not the operator .env.
-        # EXECUTION_DAILY_LOSS_USD=200 in production must not leak in here.
-        for key in (
-            "EXECUTION_PAPER_ENABLED",
-            "PM_ENABLED",
-            "EXECUTION_RISK_ENABLED",
-            "EXECUTION_PAPER_TICK",
-            "EXECUTION_DAILY_LOSS_USD",
-        ):
-            env.pop(key, None)
+        # Default-off child: interpreter basics only. The operator .env is not copied.
+        env = isolated_environ()
         code = (
             "import json, sqlite3, sys, tempfile\n"
             "from pathlib import Path\n"

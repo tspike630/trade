@@ -28,6 +28,7 @@ from dashboard.parsing import rejection_key  # noqa: E402
 from execution.executors.paper_executor import PaperExecutor  # noqa: E402
 from execution.exits import exit_reason  # noqa: E402
 from execution.gateway import ExecutionGateway, _risk_rejected_event_detail  # noqa: E402
+from execution.tests.isolated_env import isolated_environ  # noqa: E402
 from execution.ledger import ExecutionLedger  # noqa: E402
 from execution.order_events import event_chain  # noqa: E402
 from execution.risk.limits import check_daily_loss  # noqa: E402
@@ -951,17 +952,8 @@ class RiskAndPmTests(unittest.TestCase):
 
 class DefaultGatesTests(unittest.TestCase):
     def test_paper_pm_risk_default_off(self) -> None:
-        env = os.environ.copy()
-        # Default-off is about an unset process, not the operator .env.
-        # EXECUTION_DAILY_LOSS_USD=200 in production must not leak in here.
-        for key in (
-            "EXECUTION_PAPER_ENABLED",
-            "PM_ENABLED",
-            "EXECUTION_RISK_ENABLED",
-            "EXECUTION_PAPER_TICK",
-            "EXECUTION_DAILY_LOSS_USD",
-        ):
-            env.pop(key, None)
+        # Default-off child: interpreter basics only. The operator .env is not copied.
+        env = isolated_environ()
         code = (
             "import sys\n"
             f"sys.path[:0] = [{str(ROOT)!r}, {str(CRAWLER)!r}]\n"
@@ -989,8 +981,7 @@ class DefaultGatesTests(unittest.TestCase):
     def test_daily_loss_explicit_value_is_read(self) -> None:
         """An operator limit is config, not a default. The child sees only the value we pass."""
         before = os.environ.get("EXECUTION_DAILY_LOSS_USD")
-        env = os.environ.copy()
-        env["EXECUTION_DAILY_LOSS_USD"] = "200"
+        env = isolated_environ({"EXECUTION_DAILY_LOSS_USD": "200"})
         code = (
             "import sys\n"
             f"sys.path[:0] = [{str(ROOT)!r}, {str(CRAWLER)!r}]\n"

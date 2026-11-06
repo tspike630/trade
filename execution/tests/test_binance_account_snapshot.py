@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "crawler"))
 
+from execution.tests.isolated_env import patch_isolated  # noqa: E402
 from execution.binance_account_snapshot import (  # noqa: E402
     load_snapshot_file,
     main,
@@ -244,7 +245,7 @@ class SnapshotFileTests(unittest.TestCase):
 
         env = _env(self.root, None)
         env["BINANCE_SPOT_LIVE_ENABLED"] = "0"
-        with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+        with patch_isolated(env), mock.patch(
             "execution.executors.binance_spot.urllib.request.urlopen", urlopen
         ), mock.patch(
             "execution.binance_account_snapshot.time.time", return_value=1_700_000_000
@@ -372,7 +373,7 @@ class ProductionAssemblyTests(unittest.TestCase):
         kill.write_text("off\n", encoding="utf-8")
         env = dict(self.env)
         env["LIVE_KILL_SWITCH_PATH"] = str(kill)
-        with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+        with patch_isolated(env), mock.patch(
             "execution.binance_account_snapshot.time.time", return_value=1_700_000_000
         ):
             with ExecutionGateway(
@@ -390,7 +391,7 @@ class ProductionAssemblyTests(unittest.TestCase):
     def test_missing_snapshot_stops_before_http(self) -> None:
         env = dict(self.env)
         env["BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH"] = str(self.root / "missing.json")
-        with mock.patch.dict(os.environ, env, clear=False):
+        with patch_isolated(env):
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
                 ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
@@ -417,7 +418,7 @@ class ProductionAssemblyTests(unittest.TestCase):
 
         self._net.stop()
         try:
-            with mock.patch.dict(os.environ, self.env, clear=False), mock.patch(
+            with patch_isolated(self.env), mock.patch(
                 "execution.binance_account_snapshot.time.time", return_value=1_700_000_000
             ), mock.patch(
                 "execution.executors.binance_spot.urllib.request.urlopen", urlopen
@@ -440,7 +441,7 @@ class ProductionAssemblyTests(unittest.TestCase):
 
     def test_watchdog_rejects_a_stale_snapshot_and_does_not_spawn(self) -> None:
         env = dict(self.env)
-        with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+        with patch_isolated(env), mock.patch(
             "execution.binance_account_snapshot.time.time",
             return_value=1_700_003_700,
         ), mock.patch(

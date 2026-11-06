@@ -20,6 +20,7 @@ from execution.binance_account_snapshot import (  # noqa: E402
     seal_snapshot,
     write_snapshot_file,
 )
+from execution.tests.isolated_env import isolated_environ, patch_isolated  # noqa: E402
 from execution.live_bnb_watchdog import (  # noqa: E402
     RESTART_DELAY_SEC,
     child_argv,
@@ -83,7 +84,7 @@ class WatchdogTests(unittest.TestCase):
 
     def test_dry_preflight_refuses_and_does_not_touch_gates(self) -> None:
         before = self.kill.read_bytes()
-        with mock.patch.dict(os.environ, self.env, clear=False):
+        with patch_isolated(self.env):
             flag_before = os.environ.get("BINANCE_SPOT_LIVE_ENABLED")
             report = preflight()
             self.assertEqual(os.environ.get("BINANCE_SPOT_LIVE_ENABLED"), flag_before)
@@ -104,7 +105,7 @@ class WatchdogTests(unittest.TestCase):
         opened["BINANCE_SPOT_BOOK_USDT"] = "1000"
         opened["BINANCE_API_KEY"] = ""
         opened["BINANCE_API_SECRET"] = SECRET
-        with mock.patch.dict(os.environ, opened, clear=False):
+        with patch_isolated(opened):
             report = preflight()
         self.assertFalse(report["would_start"])
         self.assertEqual(
@@ -129,7 +130,7 @@ class WatchdogTests(unittest.TestCase):
         )
         self.assertIsNone(write_snapshot_file(snap, sealed))
         ready["BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH"] = str(snap)
-        with mock.patch.dict(os.environ, ready, clear=False), mock.patch(
+        with patch_isolated(ready), mock.patch(
             "execution.executors.binance_spot.urllib.request.urlopen",
             side_effect=AssertionError("watchdog must not call Binance"),
         ), mock.patch(
@@ -161,7 +162,7 @@ class WatchdogTests(unittest.TestCase):
         )
         self.assertIsNone(write_snapshot_file(snap, sealed))
         broke["BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH"] = str(snap)
-        with mock.patch.dict(os.environ, broke, clear=False), mock.patch(
+        with patch_isolated(broke), mock.patch(
             "execution.binance_account_snapshot.time.time",
             return_value=1_700_000_000,
         ), mock.patch(
@@ -199,7 +200,7 @@ class WatchdogTests(unittest.TestCase):
         def sleeper(seconds: float) -> None:
             delays.append(seconds)
 
-        with mock.patch.dict(os.environ, ready, clear=False), mock.patch(
+        with patch_isolated(ready), mock.patch(
             "execution.binance_account_snapshot.time.time",
             return_value=1_700_000_000,
         ):
@@ -228,7 +229,7 @@ class WatchdogTests(unittest.TestCase):
         held = (self.root / "one.lock").open("a", encoding="utf-8")
         fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            with mock.patch.dict(os.environ, ready, clear=False), mock.patch(
+            with patch_isolated(ready), mock.patch(
                 "execution.binance_account_snapshot.time.time",
                 return_value=1_700_000_000,
             ):
@@ -254,8 +255,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertNotIn("unlink", prod_text)
         mode = script.stat().st_mode
         self.assertTrue(mode & stat.S_IXUSR)
-        env = os.environ.copy()
-        env.update(self.env)
+        env = isolated_environ(self.env)
         env["PYTHONPATH"] = f"{ROOT}:{ROOT / 'crawler'}"
         done = subprocess.run(
             [str(script)],

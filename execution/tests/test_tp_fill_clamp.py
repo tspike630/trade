@@ -31,23 +31,12 @@ from execution.pricing import (  # noqa: E402
     paper_tp_clamp_enabled,
     sell_fill_price,
 )
+import paper_trade  # noqa: E402
+from execution.tests.isolated_env import baseline_environ  # noqa: E402
 from paper_trade import tick as paper_tick  # noqa: E402
 
 TP_CLAMP_ENV = "EXECUTION_PAPER_TP_CLAMP"
 MIN_LIQ_ENV = "EXECUTION_PAPER_CLOSE_MIN_LIQ_USD"
-# Inherited app config that can stop a close or change the audit this class checks.
-# Popped for the test only; tearDown puts the process env back.
-_CLAMP_ISOLATED_ENV = (
-    TP_CLAMP_ENV,
-    MIN_LIQ_ENV,
-    "EXECUTION_PAPER_SIZE_MULT",
-    "PAPER_STOP_CONFIRM_ENABLED",
-    "PAPER_PRICE_MAX_AGE_SEC",
-    "EXECUTION_PAPER_TP_PCT",
-    "EXECUTION_PAPER_SL_PCT",
-    "EXECUTION_PAPER_MAX_HOLD_MIN",
-    "EXECUTION_PAPER_JUMP_RATIO",
-)
 CASH = 10_000.0
 
 
@@ -189,14 +178,11 @@ class LimitExitFillPriceUnitTests(unittest.TestCase):
 
 class TpClampIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._prev = {k: os.environ.get(k) for k in _CLAMP_ISOLATED_ENV}
-        for k in _CLAMP_ISOLATED_ENV:
-            os.environ.pop(k, None)
-        # paper_trade keeps one confirmer for the process. Another test, or
-        # PAPER_STOP_CONFIRM_ENABLED in the operator env, can hold this pair's
-        # mark and skip the close. This class does not use that gate.
-        import paper_trade
-
+        # Drop the whole operator environment, not a guessed key list.
+        # paper_trade also keeps one stop confirmer for the process.
+        self._saved_env = dict(os.environ)
+        os.environ.clear()
+        os.environ.update(baseline_environ())
         paper_trade._MAIN_STOP_CONFIRMER._s.clear()
         paper_trade._MAIN_STOP_CONFIRMER.events.clear()
         self._tmp = tempfile.TemporaryDirectory()
@@ -208,11 +194,8 @@ class TpClampIntegrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.ex.close()
         self._tmp.cleanup()
-        for k, v in self._prev.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        os.environ.clear()
+        os.environ.update(self._saved_env)
 
     def test_tp_mid_far_above_clamps_to_limit(self) -> None:
         opened = _buy(self.ex, 0.1, tp_pct=10.0)

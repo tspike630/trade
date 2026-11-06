@@ -32,6 +32,7 @@ from execution.executors.binance_spot import (  # noqa: E402
     sign_query,
     symbol_status_trading,
 )
+from execution.tests.isolated_env import patch_isolated  # noqa: E402
 from execution.gateway import (  # noqa: E402
     BINANCE_SPOT_EXECUTOR,
     STEP_A_EXECUTOR,
@@ -538,7 +539,11 @@ class GatewayHookTests(unittest.TestCase):
 
     def test_paper_peer_and_frozen_onchain_purpose_stay_off_the_adapter(self) -> None:
         paper = _RecordingPaper()
-        with self._gateway(
+        # Risk and daily-loss are bound when execution.config is first imported.
+        # This case is the default-off process, even if the parent shell is not.
+        with mock.patch("execution.gateway.EXECUTION_RISK_ENABLED", False), mock.patch(
+            "execution.gateway.EXECUTION_DAILY_LOSS_USD", None
+        ), self._gateway(
             purposes=frozenset({"race_tech_boll_fade"}),
             adapter=_Boom(),
             paper=paper,
@@ -551,7 +556,9 @@ class GatewayHookTests(unittest.TestCase):
         self.assertEqual(len(paper.calls), 1)
 
         paper2 = _RecordingPaper()
-        with self._gateway(
+        with mock.patch("execution.gateway.EXECUTION_RISK_ENABLED", False), mock.patch(
+            "execution.gateway.EXECUTION_DAILY_LOSS_USD", None
+        ), self._gateway(
             purposes=frozenset({"live_tech_boll_fade"}),
             adapter=_Boom(),
             paper=paper2,
@@ -821,7 +828,7 @@ class DynamicExitPlanTests(unittest.TestCase):
             clock_ms=lambda: 1_700_000_000_000,
         )
         extras = self._zone_extras(quote_order_qty="25")
-        with mock.patch.dict(os.environ, _env(self.root, enabled="1", kill_exists=False)):
+        with patch_isolated(_env(self.root, enabled="1", kill_exists=False)):
             result = adapter.execute(
                 _sig(mode="live_stub", token_address="BNBUSDT", extras=extras)
             )
