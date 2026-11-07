@@ -32,6 +32,8 @@
 - `binance_klines`
 - `binance_indicators`
 
+只读列（taker 量、`change_7d`、`volume_7d_avg`、买卖比、`trade_size_ratio`、`lower_wick_ratio`）的口径和决策层怎么读，见 `docs/binance_readonly_fields_2026-11-07.md`。那些列不是入场门。
+
 `INDICATORS_WEIGHT_*` 保持 0。不把 `local_score` 当入场门。不下单。
 
 ```bash
