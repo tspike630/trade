@@ -12,8 +12,10 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 import decision_engine  # noqa: F401 — crawler/ on path for logging_setup
 from decision_engine import config as de_config
@@ -39,6 +41,47 @@ from decision_engine.strategies.tech_boll_fade import (
     TechBollFadeStrategy,
 )
 from decision_engine.tests.test_binance_indicators import _insert_cex, _seed, _tick
+
+# Cleared for the bare auto tick. A checkout beside ccxt.db, prior.db, or a
+# collection snapshot must still exercise the no-CEX-feed path.
+_SIBLING_FEED_ENVS = (
+    "LIVE_BNB_IGNORE_REPO_UNIVERSE",
+    "BINANCE_SPOT_UNIVERSE_DB",
+    "BINANCE_SPOT_UNIVERSE_JSON",
+    "LIVE_BNB_KLINE_FETCH",
+)
+
+
+@contextmanager
+def _hide_sibling_cex_feeds():
+    """Drop repo listing, kline, and collection-snapshot discovery for one tick."""
+    saved = {key: os.environ.get(key) for key in _SIBLING_FEED_ENVS}
+    os.environ["LIVE_BNB_IGNORE_REPO_UNIVERSE"] = "1"
+    for key in _SIBLING_FEED_ENVS[1:]:
+        os.environ.pop(key, None)
+    try:
+        with (
+            patch("decision_engine.core.bnb_native._side_db_paths", return_value=[]),
+            patch(
+                "decision_engine.core.bnb_native.default_listing_db_paths",
+                return_value=[],
+            ),
+            patch(
+                "decision_engine.core.engine.default_listing_db_paths",
+                return_value=[],
+            ),
+            patch(
+                "decision_engine.core.live_bnb_turnover.default_listing_db_paths",
+                return_value=[],
+            ),
+        ):
+            yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _admit_listed_quote(db: Path, spot: str, ccxt_symbol: str) -> None:
@@ -296,7 +339,10 @@ class ClassicScanTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 db = Path(tmp) / "d.db"
                 _seed(db)
-                bare_rows, bare_payload = _tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
+                # A sibling ccxt.db / prior.db is a real kline book for auto.
+                # This tick is the empty-feed case, so hide that discovery.
+                with _hide_sibling_cex_feeds():
+                    bare_rows, bare_payload = _tick(db, PURPOSE_LIVE_BNB_BOLL_CLASSIC)
                 self.assertEqual(bare_payload["bnb_factor_source"], "dex_map")
                 self.assertEqual(bare_rows, [])
                 self.assertIn(
