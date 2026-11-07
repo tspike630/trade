@@ -15,7 +15,7 @@
 | `taker_buy_volume` | `/api/v3/klines` 下标 9，可空 |
 | `taker_buy_quote_volume` | 下标 10，可空 |
 
-8 或 9 个字段的旧行仍能解析，这两列是 NULL，不是 0。下标坏了只让该格变成 NULL，不丢掉这根 OHLC。
+8 或 9 个字段的旧行仍能解析。下标 7 的 quote 若是空的或不是数字，这根 K 线留下，`quote_volume` 是 NULL，不写成 0，也不把这根从时间网格里拿掉。用到 quote 的窗口只要含这根，整段结果是 NULL，不把剩下的根加总来冒充。taker 下标坏了同样只让该格变成 NULL。
 
 ## 八列
 
@@ -25,14 +25,14 @@
 |---|---|
 | `taker_buy_quote_volume_5m` | 最新一根的 `taker_buy_quote_volume`。没有就是 NULL |
 | `buy_ratio_5m` | 最新一根 `taker_buy_quote_volume / quote_volume`。taker 缺失、quote 缺失或 quote ≤ 0 → NULL。taker 为 0 且 quote > 0 → 0 |
-| `buy_ratio_1h` | 含最新一根在内的连续 12 根已收盘 5m。`sum(taker_buy_quote_volume) / sum(quote_volume)`。少一根、中间有洞、任一根本身缺 `taker_buy_volume` 或 `taker_buy_quote_volume`、quote 缺失、或 quote 合计 ≤ 0 → NULL。正好 60 分钟前开盘的那根不在这 12 根里 |
+| `buy_ratio_1h` | 含最新一根在内的连续 12 根已收盘 5m。`sum(taker_buy_quote_volume) / sum(quote_volume)`。少一根、中间有洞、任一根本身缺 taker quote 或 quote、或 quote 合计 ≤ 0 → NULL。缺的是 taker **base**（下标 9）时不因此作废。正好 60 分钟前开盘的那根不在这 12 根里 |
 | `avg_trade_usd_5m` | 最新一根 `quote_volume / trades`。笔数缺失或 ≤ 0 → NULL。quote 为 0 且笔数 > 0 → 0 |
 | `trade_size_ratio` | 见下一节 |
 | `lower_wick_ratio` | `(close - low) / (high - low)`。这是收盘在整根高低区间里的位置，不是下影线。真下影线是 `(min(open, close) - low) / (high - low)`，这里不用。`high == low`（平棒）为 0。`high < low` 为 NULL。不夹到 `[0, 1]` |
 | `change_7d` | 见 7 日 |
 | `volume_7d_avg` | 见 7 日 |
 
-`buy_ratio_5m` 只看最新一根的 quote taker。`buy_ratio_1h` 额外要求 12 根上 base taker 和 quote taker 都有值（0 算有，NULL 不算）。
+`buy_ratio_5m` 和 `buy_ratio_1h` 都只看 taker quote 和 quote volume。taker base 不参与，缺了也不把比值打成 NULL。quote taker 的 0 是有值。NULL 不是 0。
 
 ## `trade_size_ratio` 怎么选的
 
@@ -47,7 +47,15 @@
 - `live_bnb_entry_zone.trade_size_ratio_from_bars` 也是 `sum(quote)/sum(trades)`，当前根不进分母，收盘正好落在 24h 边界上的那根算进去。它按时间窗收，不要求满 288 根，中间缺笔数才失败。满 288 连续且字段齐全时，本列和那个函数是同一个数。
 - 未合并的 PR #165 用的是紧前 288 根每根均额的算术平均，不是 sum/sum。本列不采用那个平均。PR #164 的 `avg_trade_size` 是当前根均额，没有 `trade_size_ratio`；列名不同，本模块不写 `avg_trade_size`。
 
-决策层若把本列里的有限数抄进扫描行，入场会直接用它，不再自己重算。NULL 不要当成非法比值；现有读法是「键缺失或值为 NULL 就继续往下算」。短历史时本列是 NULL，决策层仍可按它自己的时间窗出数。这一处不改那个回退。
+主分支的 `list_binance_hot_tokens` 已经把非空的 `trade_size_ratio` 抄进扫描行。`resolve_trade_size_ratio` 看到有限数就直接用，不再用 K 线重算。所以本列一旦写成非 NULL，现有入场逻辑就会吃到它。阈值没改，输入会变。NULL 不会被抄进去，短历史仍走原来的时间窗回退。
+
+不改决策文件时，能挡住这件事的只有生产者侧：
+
+1. 继续写这个列名。部署指标任务之后，满 288 根连续 K 线的符号，入场用的是本任务算的 sum/sum，不再是决策当时从 K 线重算的数。这是现在的做法。
+2. 不建、不写 `trade_size_ratio`。决策文件不用动，入场保持重算。八列少一列。
+3. 改存一个决策层不读的列名。入场不动，但和点名的列名不一致。
+
+决策侧若要保留本列、又不要它进门，得在扫描行上不要这个键。那是他们的文件，这里不动。
 
 ## 7 日
 
@@ -59,10 +67,12 @@
 
 `volume_h24` 只在该根已经有连续 289 根（含自己，开盘跨度正好 24h）时写成这 289 根的 quote 合计。更短的前缀是 NULL，不用 `volume_h1` 去乘，也不把第一天的残段填上。
 
-因此：
+因此这不是生产者多加的一天，是 `volume_7d_avg` 自己的规则：
 
-- 连续正好 7 天：`change_7d` 可以有数（锚点那根收盘在）。`volume_7d_avg` 仍是 NULL，因为锚点附近还没有一根真实的 trailing `volume_h24`（第一根完整日额大约出现在序列开端之后 24h，落在函数允许的 6h skew 外面）。
-- 连续大约 8 天（7 天再加前面 24h）：锚点那根有真实 `volume_h24`，`volume_7d_avg` 才按函数自己的日桶均值出数。日桶取的是该桶里最晚一条 `volume_h24`，不是 7 天 quote 加总再除以 7。
+- 它要最早一条 `volume_h24` 落在 `end - 7d` 之后的 6 小时内，并且把该字段当成已经算好的 trailing 24h。
+- 连续正好 7 天时，第一根真实的 289 根 trailing 日额出现在开端之后约 24 小时，出了这 6 小时。只盖真实日额时，函数返回 NULL。`change_7d` 不依赖这个字段，所以可以有数。
+- 若把开端那段不满 24h 的 quote 合计也写成 `volume_h24`，函数会出数，但第一个日桶留下的是这段短合计（每根 quote 为 100 时是 288×100，不是 289×100）。七个桶的均值不是七个完整 trailing 日。这是拿短窗冒充日额，不做。
+- 连续大约 8 天（7 天再加前面 24h）时，锚点那根才有真实 trailing `volume_h24`，`volume_7d_avg` 等于函数的日桶均值。日桶取该桶最晚一条，不是 7 天 quote 加总再除以 7。
 
 ## 给决策层的读法
 

@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS binance_indicators (
     tech_updated_at TEXT,
     updated_at TEXT NOT NULL,
     -- Read-only producer fields. NULL when the closed 5m history does not cover
-    -- the window. They are not entry gates. See docs/binance_readonly_fields_2026-11-07.md.
+    -- the window. trade_size_ratio is already read by list_binance_hot_tokens
+    -- when the value is not NULL. See docs/binance_readonly_fields_2026-11-07.md.
     change_7d REAL,
     volume_7d_avg REAL,
     taker_buy_quote_volume_5m REAL,

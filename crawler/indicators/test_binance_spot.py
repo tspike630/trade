@@ -463,6 +463,40 @@ class ReadonlyFieldTests(unittest.TestCase):
         # Positional construction from before these fields still works.
         legacy = SpotKline(1, 2, 3, 1, 2, 1, 4, 10, trades=2)
         self.assertIsNone(legacy.taker_buy_quote_volume)
+        blank_quote = [
+            open_ms,
+            "100",
+            "101",
+            "99",
+            "100",
+            "10",
+            open_ms + _STEP - 1,
+            "",
+            4,
+        ]
+        self.assertEqual(len(blank_quote), 9)
+        kept = parse_kline_row(blank_quote)
+        assert kept is not None
+        self.assertIsNone(kept.quote_volume)
+        self.assertNotEqual(kept.quote_volume, 0)
+        self.assertEqual(kept.trades, 4)
+        self.assertEqual(kept.close, 100.0)
+        priced = _grid(2)
+        priced[0] = replace(priced[0], quote_volume=None)
+        priced_factors = factors_from_klines(priced, now_ms=priced[-1].close_time_ms)
+        assert priced_factors is not None
+        self.assertEqual(priced_factors["change_5m"], 0.0)
+        self.assertIsNone(priced_factors["quote_volume_24h"])
+        self.assertAlmostEqual(priced_factors["buy_ratio_5m"], 40.0 / 100.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(Path(tmp) / "q.db")
+            upsert_klines(conn, "BNBUSDT", "5m", [kept])
+            conn.commit()
+            loaded = load_stored_klines(conn, "BNBUSDT", "5m")
+            self.assertEqual(len(loaded), 1)
+            self.assertIsNone(loaded[0].quote_volume)
+            self.assertEqual(loaded[0].close, 100.0)
+            conn.close()
 
     def test_migration_is_repeatable_and_keeps_rows_and_foreign_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -732,8 +766,15 @@ class ReadonlyFieldTests(unittest.TestCase):
             missing_base, now_ms=missing_base[-1].close_time_ms
         )
         assert missing_hour is not None
-        self.assertIsNone(missing_hour["buy_ratio_1h"])
+        self.assertAlmostEqual(missing_hour["buy_ratio_1h"], taker_sum / quote_sum)
         self.assertAlmostEqual(missing_hour["buy_ratio_5m"], 9.0 / 30.0)
+        missing_quote = list(bars[-12:])
+        missing_quote[2] = replace(missing_quote[2], quote_volume=None)
+        self.assertIsNone(
+            factors_from_klines(missing_quote, now_ms=missing_quote[-1].close_time_ms)[
+                "buy_ratio_1h"
+            ]
+        )
         missing_quote_taker = list(bars[-12:])
         missing_quote_taker[3] = replace(missing_quote_taker[3], taker_buy_quote_volume=None)
         self.assertIsNone(

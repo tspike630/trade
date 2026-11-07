@@ -186,7 +186,7 @@ class SpotKline:
     low: float
     close: float
     volume: float
-    quote_volume: float
+    quote_volume: float | None
     close_time_ms: int
     trades: int | None = None
     taker_buy_volume: float | None = None
@@ -497,9 +497,10 @@ def _optional_float(raw: Sequence[Any], index: int) -> float | None:
 def parse_kline_row(raw: Any) -> SpotKline | None:
     """One Binance ``/api/v3/klines`` element. Malformed rows are skipped.
 
-    A row of 8 or 9 fields (no taker columns) still parses. Index 9 is
-    taker buy base volume and index 10 is taker buy quote volume. A bad
-    taker cell becomes None and does not drop the OHLC row.
+    A row of 8 or 9 fields (no taker columns) still parses. Index 7 is quote
+    volume. A blank or non-numeric quote stays None and does not drop the
+    OHLC row, and it is not stored as 0. Index 9 is taker buy base volume
+    and index 10 is taker buy quote volume. A bad taker cell becomes None.
     """
     if not isinstance(raw, (list, tuple)) or len(raw) < 8:
         return None
@@ -513,8 +514,8 @@ def parse_kline_row(raw: Any) -> SpotKline | None:
     lo = _float_or_none(raw[3])
     close = _float_or_none(raw[4])
     volume = _float_or_none(raw[5])
-    quote = _float_or_none(raw[7])
-    if None in (op, hi, lo, close, volume, quote):
+    quote = _optional_float(raw, 7)
+    if None in (op, hi, lo, close, volume):
         return None
     if op <= 0 or close <= 0 or hi <= 0 or lo <= 0:
         return None
@@ -551,24 +552,33 @@ def price_series_from_klines(klines: Sequence[SpotKline]) -> list[dict[str, Any]
     ``volume_strength`` already reads; the ratio is unchanged.
 
     ``volume_h24`` is set only when the bar ends a continuous run of 289
-    5m bars (the prior 288 plus this one, open span exactly 24h). It is the
-    sum of those bars' quote volume. A shorter prefix or a gap leaves it
-    None so ``volume_7d_avg`` cannot treat a partial day as a trailing day.
-    The walk is linear; it does not rescan the prefix per bar.
+    5m bars (the prior 288 plus this one, open span exactly 24h) and every
+    bar in that run has a quote volume. It is the sum of those quotes. A
+    shorter prefix, a gap, or a missing quote leaves it None. A missing
+    quote is not added as 0. The walk is linear.
     """
     ordered = sorted(klines, key=lambda bar: (bar.close_time_ms, bar.open_time_ms))
     series: list[dict[str, Any]] = []
     hour_start = 0
     hour_total = 0.0
+    hour_missing = 0
     day_start = 0
     day_total = 0.0
+    day_missing = 0
     run = 0
     for index, bar in enumerate(ordered):
-        quote = float(bar.quote_volume)
-        hour_total += quote
+        quote = bar.quote_volume
+        if quote is None:
+            hour_missing += 1
+        else:
+            hour_total += float(quote)
         cutoff = bar.close_time_ms - _HOUR_MS
         while hour_start <= index and ordered[hour_start].close_time_ms <= cutoff:
-            hour_total -= float(ordered[hour_start].quote_volume)
+            old = ordered[hour_start].quote_volume
+            if old is None:
+                hour_missing -= 1
+            else:
+                hour_total -= float(old)
             hour_start += 1
         if index > 0 and bar.open_time_ms == ordered[index - 1].open_time_ms + _5M_MS:
             run += 1
@@ -576,18 +586,30 @@ def price_series_from_klines(klines: Sequence[SpotKline]) -> list[dict[str, Any]
             run = 1
             day_start = index
             day_total = 0.0
-        day_total += quote
+            day_missing = 0
+        if quote is None:
+            day_missing += 1
+        else:
+            day_total += float(quote)
         while index - day_start + 1 > _TRAILING_DAY_BARS:
-            day_total -= float(ordered[day_start].quote_volume)
+            old = ordered[day_start].quote_volume
+            if old is None:
+                day_missing -= 1
+            else:
+                day_total -= float(old)
             day_start += 1
         volume_h24: float | None = None
-        if run >= _TRAILING_DAY_BARS and index - day_start + 1 == _TRAILING_DAY_BARS:
+        if (
+            run >= _TRAILING_DAY_BARS
+            and index - day_start + 1 == _TRAILING_DAY_BARS
+            and day_missing == 0
+        ):
             volume_h24 = day_total
         series.append(
             {
                 "price_usd": float(bar.close),
                 "recorded_at": _iso_ms(bar.close_time_ms),
-                "volume_h1": hour_total,
+                "volume_h1": None if hour_missing else hour_total,
                 "volume_h24": volume_h24,
             }
         )
@@ -605,6 +627,8 @@ def quote_volume_24h(klines: Sequence[SpotKline]) -> float | None:
     for bar in klines:
         if bar.close_time_ms < cutoff:
             continue
+        if bar.quote_volume is None:
+            return None
         total += float(bar.quote_volume)
         seen = True
     if not seen:
@@ -665,33 +689,22 @@ def _buy_ratio_5m(bar: SpotKline) -> float | None:
     return float(taker) / float(quote)
 
 
-def _taker_fields_present(bar: SpotKline) -> bool:
-    base = bar.taker_buy_volume
-    quote = bar.taker_buy_quote_volume
-    if base is None or quote is None:
-        return False
-    return base >= 0 and quote >= 0
-
-
 def _buy_ratio_1h(ordered: Sequence[SpotKline]) -> float | None:
     """Sum of taker quote / sum of quote over 12 continuous closed 5m bars.
 
-    The latest bar is included. Any missing taker base, taker quote, or quote
-    volume in that window, or a quote sum of 0, is NULL. A shorter or gappy
-    hour is NULL. The bar that opened 60m earlier is not in the window.
+    The latest bar is included. The ratio uses taker quote and quote volume
+    only. A missing taker base volume does not blank it. Any missing taker
+    quote or quote volume in that window, or a quote sum of 0, is NULL. A
+    shorter or gappy hour is NULL. The bar that opened 60m earlier is outside.
     """
     if not _continuous_tail(ordered, _HOUR_BARS):
         return None
     taker_sum = 0.0
     quote_sum = 0.0
     for bar in ordered[-_HOUR_BARS:]:
-        if not _taker_fields_present(bar):
-            return None
         quote = bar.quote_volume
-        if quote is None or quote < 0:
-            return None
         taker_quote = bar.taker_buy_quote_volume
-        if taker_quote is None:
+        if taker_quote is None or quote is None or taker_quote < 0 or quote < 0:
             return None
         taker_sum += float(taker_quote)
         quote_sum += float(quote)
@@ -748,10 +761,12 @@ def _week_fields(
     Both helpers accept a 6h skew and ``volume_7d_avg`` skips empty days, so
     a hole or a window a few hours short of 7d can still produce a number.
     Those results are not stored. The grid is the last 2017 closed 5m bars
-    (open span exactly 7d). ``volume_7d_avg`` can still return None on that
-    grid: it needs a ``volume_h24`` reading within 6h of the 7d anchor, and
-    a trailing day is only stamped once 289 continuous bars exist. That
-    reading appears about 24h after the first stored bar.
+    (open span exactly 7d). ``volume_h24`` is stamped only for a real
+    trailing 289-bar day. On a series that starts at the 7d anchor, the
+    first such stamp is ~24h later, outside the helper's 6h skew, so
+    ``volume_7d_avg`` stays None. Filling the early bars with a prefix sum
+    is not a trailing day: the helper then keeps that short sum for the
+    first bucket (288 bars, not 289) and the average is not seven full days.
     """
     empty = {"change_7d": None, "volume_7d_avg": None}
     if not _continuous_tail(ordered, _WEEK_BARS):
@@ -941,7 +956,7 @@ def load_stored_klines(
         close = _float_or_none(row[4])
         volume = _float_or_none(row[5])
         quote = _float_or_none(row[6])
-        if None in (op, hi, lo, close, volume, quote):
+        if None in (op, hi, lo, close, volume):
             continue
         if op <= 0 or hi <= 0 or lo <= 0 or close <= 0:
             continue
