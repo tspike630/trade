@@ -5,14 +5,16 @@ Read-only against the crawl/decision DB. Never writes main-library business tabl
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from execution.observe_schema import ensure_observe_schema
 from execution.verified_fet import VERIFIED_FET_EXIT
@@ -24,6 +26,10 @@ BUSY_TIMEOUT_MS = 30_000
 # Legacy and untagged rows belong to this arm. Kept as a literal so the
 # ledger does not import the spot adapter package.
 _FADE_ARM = "live_bnb_boll_fade"
+_CLASSIC_ARM = "live_bnb_boll_classic"
+_FADE_LEDGER_NAME = "execution_ledger_live_bnb_boll_fade.db"
+_CLASSIC_LEDGER_NAME = "execution_ledger_live_bnb_boll_classic.db"
+_BUY_LOCK_NAME = "binance_spot_shared_buy.lock"
 
 
 def _utc() -> str:
@@ -41,6 +47,64 @@ def _bnb_purpose_clause(purpose: str | None) -> tuple[str, tuple[Any, ...]]:
     if arm == _FADE_ARM:
         return " AND (purpose IS NULL OR purpose = '' OR purpose = ?)", (arm,)
     return " AND purpose = ?", (arm,)
+
+
+def peer_live_bnb_ledger_path(path: str | Path) -> Path | None:
+    """The other arm's ledger file when ``path`` is one of the two named books."""
+    current = Path(path)
+    name = current.name
+    if name == _FADE_LEDGER_NAME:
+        return current.with_name(_CLASSIC_LEDGER_NAME)
+    if name == _CLASSIC_LEDGER_NAME:
+        return current.with_name(_FADE_LEDGER_NAME)
+    return None
+
+
+def read_spot_buy_blocks_readonly(path: str | Path) -> list[dict[str, Any]]:
+    """Non-terminal spot rows from another file. Missing file or table is empty.
+
+    Opens read-only and does not create the database.
+    """
+    file = Path(path)
+    if not file.is_file():
+        return []
+    uri = "file:" + file.resolve().as_posix() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    except sqlite3.Error:
+        return []
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM binance_spot_positions
+            WHERE status NOT IN ('closed', 'closed_dust', 'oco_filled')
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+@contextmanager
+def buy_reservation_lock(ledger_path: str | Path) -> Iterator[None]:
+    """One exclusive lock for both arms' ledgers in the same directory.
+
+    Held across the funding read and the ledger insert so the other process
+    cannot pass the same free balance first.     Does not place an order itself.
+    """
+    directory = Path(ledger_path).resolve().parent
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = (directory / _BUY_LOCK_NAME).open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def resolve_ledger_path(explicit: str | Path | None = None) -> Path:

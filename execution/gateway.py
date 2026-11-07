@@ -17,8 +17,10 @@ purpose is on this process's allowlist) are handed to ``BinanceSpotAdapter``
 instead of PaperExecutor. The adapter refuses a live BUY while the
 kill-switch file is present or ``BINANCE_SPOT_LIVE_ENABLED`` is off. A
 completed BUY requires a verified native OCO. ``mode=dry_run`` never
-submits. No other purpose can reach that adapter. Each arm blocks a second
-open of its own; one arm's hold does not freeze the other.
+submits. No other purpose can reach that adapter. Each arm may hold several
+symbols. The same symbol is refused when the other arm already has it open.
+A sealed USDT free balance is reduced by priced holds on either arm before
+the buy.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,7 +60,13 @@ from execution.live_bnb_dispatch import (
     dispatch_live_bnb,
     parent_queue_view,
 )
-from execution.ledger import ExecutionLedger, _utc
+from execution.ledger import (
+    ExecutionLedger,
+    _utc,
+    buy_reservation_lock,
+    peer_live_bnb_ledger_path,
+    read_spot_buy_blocks_readonly,
+)
 from execution.order_events import init_events
 from execution.risk import run_all
 import execution.risk.limits  # noqa: F401 — register checkers on import
@@ -1262,20 +1271,42 @@ class ExecutionGateway:
                 )
         elif is_live_bnb_spot_purpose(sig.get("purpose")):
             # CEX arm: not a paper fill, and not LiveExecutor. The adapter
-            # itself keeps live newOrder behind the kill switch. Buy blocks
-            # are this purpose only, so the other arm's open position does
-            # not freeze this one. A protected open on this arm blocks only
-            # the same symbol.
+            # itself keeps live newOrder behind the kill switch. A protected
+            # open on this arm blocks only the same symbol. The other arm's
+            # same symbol blocks too. Live buys share one lock so both arms
+            # cannot spend the sealed free balance twice.
             adapter = self._binance_spot or default_live_bnb_adapter()
             self._binance_spot = adapter
-            if action == "buy" and mode != "dry_run":
-                adapter.buy_blocks = self.ledger.list_binance_spot_buy_blocks(
-                    purpose=str(sig.get("purpose") or "")
-                )
-                book = self.ledger.mcp_book()
-                canonical = book.get("canonical_positions")
-                adapter.canonical_rows = canonical if isinstance(canonical, list) else []
-            exec_result = _binance_public_result(adapter.execute(sig))
+            live_buy = action == "buy" and mode != "dry_run"
+            reserve = buy_reservation_lock(self.ledger.path) if live_buy else nullcontext()
+            with reserve:
+                if live_buy:
+                    purpose = str(sig.get("purpose") or "")
+                    own = self.ledger.list_binance_spot_buy_blocks(purpose=purpose)
+                    own_ids = {row.get("id") for row in own}
+                    same_book = [
+                        row
+                        for row in self.ledger.list_binance_spot_buy_blocks(purpose=None)
+                        if row.get("id") not in own_ids
+                    ]
+                    peer_path = peer_live_bnb_ledger_path(self.ledger.path)
+                    other_book = (
+                        read_spot_buy_blocks_readonly(peer_path)
+                        if peer_path is not None
+                        else []
+                    )
+                    adapter.buy_blocks = own
+                    adapter.peer_buy_blocks = same_book + other_book
+                    book = self.ledger.mcp_book()
+                    canonical = book.get("canonical_positions")
+                    adapter.canonical_rows = canonical if isinstance(canonical, list) else []
+                exec_result = _binance_public_result(adapter.execute(sig))
+                if (
+                    live_buy
+                    and not exec_result.get("dry_run")
+                    and exec_result.get("arm_position")
+                ):
+                    self._arm_binance_position(sig, exec_result, receipt_body)
             executor = BINANCE_SPOT_EXECUTOR
             submitted_to_executor = bool(exec_result.get("submitted"))
             receipt_body["step"] = "binance_spot"
@@ -1300,10 +1331,7 @@ class ExecutionGateway:
                 executed = 1
                 receipt_body["status"] = "binance_spot_submitted"
                 receipt_body["note"] = "binance spot buy covered by a verified native OCO"
-                self._arm_binance_position(sig, exec_result, receipt_body)
             else:
-                if exec_result.get("arm_position"):
-                    self._arm_binance_position(sig, exec_result, receipt_body)
                 executed = 0
                 exec_error = str(exec_result.get("error") or "binance_spot_refused")
                 receipt_body["status"] = "live_refused"

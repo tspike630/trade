@@ -1053,7 +1053,9 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     REST_BOOK,
     account_book_block,
     buy_exposure_block,
-    funding_block,
+    cross_arm_symbol_block,
+    funding_after_reservation,
+    reserved_quote_usdt,
     native_oco_verified,
     replay_block,
     snapshot_usdt_free,
@@ -1173,6 +1175,7 @@ class BinanceSpotAdapter:
         self.snapshot_error = snapshot_error
         self.allow_rest_http = bool(allow_rest_http)
         self.buy_blocks: list[dict[str, Any]] = []
+        self.peer_buy_blocks: list[dict[str, Any]] = []
         self.canonical_rows: list[dict[str, Any]] = []
         self._size_plan: dict[str, Any] | None = None
         self._entry_mark: str | None = None
@@ -1287,14 +1290,19 @@ class BinanceSpotAdapter:
         decision = str(sig.get("decision_log_id") or "").strip()
         if not decision.isdigit():
             return "invalid_oco_client_id"
+        purpose = str(sig.get("purpose") or "")
         held = buy_exposure_block(
             self.buy_blocks,
             self.canonical_rows,
-            purpose=str(sig.get("purpose") or ""),
+            purpose=purpose,
             symbol=symbol,
         )
         if held:
             return held
+        shared = list(self.buy_blocks) + list(self.peer_buy_blocks)
+        other_arm = cross_arm_symbol_block(shared, purpose=purpose, symbol=symbol)
+        if other_arm:
+            return other_arm
         planned = None
         if isinstance(self._size_plan, dict):
             planned = self._size_plan.get("quote_usdt")
@@ -1302,10 +1310,11 @@ class BinanceSpotAdapter:
             planned = sig.get("extras", {}).get("quote_order_qty") if isinstance(sig.get("extras"), dict) else None
             if planned in (None, "") and isinstance(sig.get("extras"), dict):
                 planned = sig["extras"].get("quoteOrderQty")
-        return funding_block(
+        return funding_after_reservation(
             snapshot_usdt_free(self.account_snapshot),
             ENTRY_MIN_NOTIONAL_USDT,
             planned,
+            reserved_quote_usdt(shared),
         )
 
     def _buy_with_native_oco(

@@ -3,8 +3,9 @@
 ``live_bnb_boll_fade`` and ``live_bnb_boll_classic`` may each hold several
 symbols at once (一臂多仓). A healthy open blocks another BUY of that same
 symbol only. It does not block a different symbol, and it does not open a
-second position on the symbol already held (not 一币多仓). A hold on one
-arm does not freeze the other, including the same symbol.
+second position on the symbol already held (not 一币多仓). The other arm
+may hold a different symbol. It may not hold the same symbol, healthy or
+unprotected.
 
 ``BINANCE_SPOT_ALLOW_MULTI_SYMBOL`` defaults on. ``0`` restores one open
 position per arm. A caller that omits the buy symbol fails closed while a
@@ -421,6 +422,66 @@ def funding_block(free: object, minimum: object, planned: object = None) -> str 
     return None
 
 
+def row_quote_usdt(row: object) -> Decimal | None:
+    """Quote already taken by one spot row. Missing price or qty is unknown."""
+    if not isinstance(row, dict):
+        return None
+    qty = _decimal_text(row.get("quantity"))
+    price = _decimal_text(row.get("entry_price"))
+    if qty is None or price is None:
+        return None
+    return Decimal(qty) * Decimal(price)
+
+
+def _nonterminal_spot_row(row: dict[str, Any]) -> bool:
+    status = str(row.get("status") or "")
+    if not status or status == "flat" or status in _TERMINAL_POSITION:
+        return False
+    return True
+
+
+def reserved_quote_usdt(rows: object) -> Decimal:
+    """Sum priced non-terminal quote. Unpriced rows add nothing.
+
+    The symbol gate still sees those rows. A sealed snapshot does not.
+    """
+    total = Decimal(0)
+    if not isinstance(rows, list):
+        return total
+    for row in rows:
+        if not isinstance(row, dict) or not _nonterminal_spot_row(row):
+            continue
+        quote = row_quote_usdt(row)
+        if quote is None:
+            continue
+        total += quote
+    return total
+
+
+def funding_after_reservation(
+    free: object,
+    minimum: object,
+    planned: object,
+    reserved: object,
+) -> str | None:
+    """``funding_block`` against free minus already reserved quote.
+
+    Unknown free stays the old check. Reserved quote cannot raise the free
+    balance. The 20 USDT floor is unchanged.
+    """
+    free_text = _decimal_text(free)
+    reserved_text = _decimal_text(reserved)
+    if free_text is None or reserved_text is None:
+        return funding_block(free, minimum, planned)
+    available = Decimal(free_text) - Decimal(reserved_text)
+    if available < 0:
+        available = Decimal(0)
+    text = format(available, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return funding_block(text or "0", minimum, planned)
+
+
 def bind_rest_book(
     snapshot: object,
     expected: object,
@@ -572,8 +633,7 @@ def buy_exposure_block(
     hold several symbols. A healthy ``oco_working``, verified ``open``, or
     ``exit_submitted`` row blocks only a BUY of that same symbol. A different
     symbol is not refused for that row. This is not a second position on the
-    same symbol, and it does not add a cross-arm same-symbol rule: fade
-    holding CFGUSDT still does not block a classic buy of CFGUSDT.
+    same symbol. The other arm's rows are not read here.
 
     Omitting ``symbol`` fails closed while any healthy open row exists, which
     is the previous one-open-per-arm result. ``0`` on the flag restores that
@@ -624,4 +684,35 @@ def buy_exposure_block(
                 return blocked
             continue
         return "unprotected_position_blocks_buy"
+    return None
+
+
+def cross_arm_symbol_block(
+    rows: object,
+    *,
+    purpose: str | None = None,
+    symbol: str | None = None,
+) -> str | None:
+    """Refuse a BUY when the other arm already has this symbol open.
+
+    Healthy and unprotected non-terminal rows both count. A different symbol
+    on the other arm does not. A missing buy symbol, or a held row with no
+    symbol, fails closed. Same-arm rows are ignored; ``buy_exposure_block``
+    still owns those. ``MULTI_SYMBOL`` stays on for distinct symbols.
+    """
+    requested = str(purpose or "").strip()
+    arm = requested if requested in LIVE_BNB_SPOT_PURPOSES else PURPOSE_LIVE_BNB_BOLL_FADE
+    held = rows if isinstance(rows, list) else []
+    for row in held:
+        if not isinstance(row, dict) or _row_blocks_arm(row, arm):
+            continue
+        if not _nonterminal_spot_row(row):
+            continue
+        other = str(row.get("purpose") or "").strip()
+        if other and other not in LIVE_BNB_SPOT_PURPOSES and other != "":
+            continue
+        buy = _symbol_key(symbol)
+        held_symbol = _symbol_key(row.get("symbol"))
+        if buy is None or held_symbol is None or buy == held_symbol:
+            return "cross_arm_symbol_blocks_buy"
     return None
