@@ -22,15 +22,25 @@ CRAWLER = ROOT / "crawler"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CRAWLER))
 
+from decimal import Decimal  # noqa: E402
+
 from execution.executors.binance_spot import (  # noqa: E402
     PURPOSE_LIVE_BNB_BOLL_FADE,
     BinanceSpotAdapter,
     BinanceSpotHttpClient,
     build_exit_plan,
+    extract_symbol_filters,
+    floor_to_step,
     is_spot_usdt_symbol,
+    plan_maker_ack,
     protective_exit_reason,
     sign_query,
     symbol_status_trading,
+)
+from execution.executors.binance_spot_gate import REST_BOOK  # noqa: E402
+from execution.executors.binance_spot_protect import (  # noqa: E402
+    fill_average_price,
+    reference_protection_prices,
 )
 from execution.tests.isolated_env import patch_isolated  # noqa: E402
 from execution.gateway import (  # noqa: E402
@@ -869,6 +879,343 @@ class DynamicExitPlanTests(unittest.TestCase):
         self.assertFalse(plan["defaults_applied"])
         self.assertEqual(paper.calls, [])
         self.assertEqual(adapter.client.calls, [])
+
+
+_MAKER_FILTERS = [
+    {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "9000", "stepSize": "0.003"},
+    {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000", "tickSize": "0.01"},
+    {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": True},
+    {"filterType": "PERCENT_PRICE_BY_SIDE", "bidMultiplierUp": "1.2", "bidMultiplierDown": "0.2", "askMultiplierUp": "5", "askMultiplierDown": "0.8", "avgPriceMins": 1},
+    {"filterType": "MIN_NOTIONAL", "minNotional": "1", "applyToMarket": True},
+]
+
+
+def _maker_info(symbol: str = "BTCUSDT") -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "status": "TRADING",
+        "quoteAsset": "USDT",
+        "isSpotTradingAllowed": True,
+        "filters": _MAKER_FILTERS,
+    }
+
+
+class _MakerClient:
+    def __init__(self, *, bid: str = "100.019", ask: str = "100.03") -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.bid = bid
+        self.ask = ask
+        self.open_rows: list[dict[str, Any]] = []
+        self.cancel_status = "CANCELED"
+        self.cancel_executed = "0"
+
+    def exchange_info(self, symbol: str) -> dict[str, Any]:
+        self.calls.append(("exchange_info", symbol))
+        return _maker_info(symbol)
+
+    def book_ticker(self, symbol: str) -> dict[str, Any]:
+        self.calls.append(("book_ticker", symbol))
+        return {
+            "symbol": symbol,
+            "bidPrice": self.bid,
+            "bidQty": "2",
+            "askPrice": self.ask,
+            "askQty": "2",
+        }
+
+    def ticker_price(self, symbol: str) -> dict[str, Any]:
+        self.calls.append(("ticker_price", symbol))
+        return {"symbol": symbol, "price": self.bid}
+
+    def open_orders(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        self.calls.append(("open_orders", signed_query, api_key))
+        return list(self.open_rows)
+
+    def cancel_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("cancel_order", signed_query, api_key))
+        return {"orderId": "8", "status": self.cancel_status, "executedQty": self.cancel_executed}
+
+    def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("new_order", signed_query, api_key))
+        return {"orderId": "9", "status": "FILLED", "executedQty": "1", "cummulativeQuoteQty": "100"}
+
+    def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("new_oco", signed_query, api_key))
+        raise AssertionError("maker refusal must not place an OCO")
+
+
+class MakerExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._net = mock.patch(
+            "execution.executors.binance_spot.urllib.request.urlopen",
+            side_effect=AssertionError("live binance HTTP is disabled in tests"),
+        )
+        self._net.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._net.stop()
+        self._tmp.cleanup()
+
+    def _adapter(self, client: Any, **kwargs: Any) -> BinanceSpotAdapter:
+        return BinanceSpotAdapter(
+            client=client,
+            kill_switch_path=self.root / "LIVE_TRADING_DISABLED",
+            api_key="test-key",
+            api_secret="test-secret",
+            clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot={
+                "accountType": "SPOT",
+                "canTrade": True,
+                "permissions": ["SPOT"],
+                "restrictions": {
+                    "enableSpotAndMarginTrading": True,
+                    "enableReading": True,
+                    "ipRestrict": True,
+                },
+                "balances": [{"asset": "USDT", "free": "1000.00", "locked": "0"}],
+            },
+            production_book=REST_BOOK,
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
+            **kwargs,
+        )
+
+    def _buy(self, **extra: Any) -> dict[str, Any]:
+        extras = {
+            "binance_symbol": "BTCUSDT",
+            "order_type": "LIMIT_MAKER",
+            "quote_order_qty": "25",
+            "price_usd": "100",
+            "stop_price": "90",
+            "take_profit_price": "120",
+            "entry_reason": "large_trade_market",
+        }
+        extras.update(extra)
+        return _sig(mode="live_stub", token_address="BTCUSDT", extras=extras)
+
+    def test_floor_step_and_filter_precedence(self) -> None:
+        self.assertEqual(floor_to_step("1", "0.3"), "0.9")
+        self.assertEqual(floor_to_step(Decimal("1"), "0.3"), "0.9")
+        self.assertEqual(floor_to_step("0.3", None), "0.3")
+        with self.assertRaises(ValueError):
+            floor_to_step(1.0, "0.3")  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            floor_to_step("nan", "0.1")
+        info = {
+            "symbols": [
+                _maker_info("ETHUSDT"),
+                {"symbol": "BTCUSDT", "filters": [{"filterType": "NOTIONAL", "minNotional": "nope"}, {"filterType": "MIN_NOTIONAL", "minNotional": "1"}, {"filterType": "LOT_SIZE", "stepSize": "0.1", "minQty": "0.1"}, {"filterType": "PRICE_FILTER", "tickSize": "0.1"}]},
+            ]
+        }
+        self.assertIsNone(extract_symbol_filters(info, "BNBUSDT"))
+        self.assertIsNone(extract_symbol_filters({"symbol": "ETHUSDT"}, "BTCUSDT"))
+        broken = extract_symbol_filters(info, "BTCUSDT")
+        self.assertIsNotNone(broken)
+        assert broken is not None
+        self.assertIsNone(broken["min_notional"])
+        healthy = extract_symbol_filters(info, "ETHUSDT")
+        self.assertIsNotNone(healthy)
+        assert healthy is not None
+        self.assertEqual(healthy["min_notional"], "5")
+        self.assertEqual(healthy["step_size"], "0.003")
+
+    def test_limit_maker_buy_uses_bid_and_omits_time_in_force(self) -> None:
+        client = _MakerClient()
+        adapter = self._adapter(client)
+        with mock.patch.dict(os.environ, _env(self.root, enabled="1", kill_exists=False)):
+            result = adapter.execute(self._buy())
+        self.assertEqual(result["error"], "maker_live_lifecycle_unsupported")
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["executed"], 0)
+        self.assertFalse(result["consumer_allowed"])
+        self.assertEqual(result["order"]["type"], "LIMIT_MAKER")
+        self.assertEqual(result["order"]["side"], "BUY")
+        self.assertEqual(result["order"]["price"], "100.01")
+        self.assertEqual(result["order"]["quantity"], "0.249")
+        self.assertNotIn("timeInForce", result["order"])
+        self.assertNotIn("quoteOrderQty", result["order"])
+        self.assertEqual([name for name, *_rest in client.calls], ["exchange_info", "book_ticker"])
+        self.assertIn("PERCENT_PRICE_BY_SIDE", result["maker_lifecycle"]["unchecked_filters"])
+        self.assertEqual(result["maker_lifecycle"]["state"], "pending")
+        self.assertFalse(result["maker_lifecycle"]["protected"])
+        self.assertFalse(result["maker_lifecycle"]["retry"])
+        self.assertIsNone(result["maker_lifecycle"]["oco_qty"])
+
+    def test_explicit_crossing_price_is_refused(self) -> None:
+        client = _MakerClient()
+        adapter = self._adapter(client)
+        with mock.patch.dict(os.environ, _env(self.root, enabled="1", kill_exists=False)):
+            result = adapter.execute(self._buy(price="101"))
+        self.assertEqual(result["error"], "maker_price_crosses")
+        self.assertEqual(client.calls, [("exchange_info", "BTCUSDT"), ("book_ticker", "BTCUSDT")])
+
+    def test_sell_below_min_notional_or_qty_does_not_post(self) -> None:
+        client = _MakerClient(bid="9.99", ask="10.00")
+        adapter = self._adapter(client)
+        env = _env(self.root, enabled="1", kill_exists=False)
+        dust = {
+            "binance_symbol": "BTCUSDT",
+            "order_type": "LIMIT_MAKER",
+            "quantity": "0.2",
+            "price": "10",
+        }
+        with mock.patch.dict(os.environ, env):
+            below_notional = adapter.execute(
+                _sig(mode="live_stub", action="sell", token_address="BTCUSDT", extras=dust)
+            )
+        self.assertEqual(below_notional["error"], "below_min_notional_or_lot")
+        self.assertNotIn("new_order", [name for name, *_rest in client.calls])
+        client.calls.clear()
+        tiny = dict(dust, quantity="0.0004")
+        with mock.patch.dict(os.environ, env):
+            below_qty = adapter.execute(
+                _sig(mode="live_stub", action="sell", token_address="BTCUSDT", extras=tiny)
+            )
+        self.assertEqual(below_qty["error"], "below_min_notional_or_lot")
+        self.assertEqual(client.calls[0][0], "exchange_info")
+        self.assertNotIn("new_order", [name for name, *_rest in client.calls])
+
+    def test_bad_book_and_filters_do_not_post(self) -> None:
+        client = _MakerClient(bid="0", ask="1")
+        adapter = self._adapter(client)
+        env = _env(self.root, enabled="1", kill_exists=False)
+        with mock.patch.dict(os.environ, env):
+            bad_book = adapter.execute(self._buy())
+        self.assertEqual(bad_book["error"], "maker_book_unavailable")
+        self.assertNotIn("new_order", [name for name, *_rest in client.calls])
+
+        class _NoFilters(_MakerClient):
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                self.calls.append(("exchange_info", symbol))
+                return {"symbol": symbol, "status": "TRADING", "quoteAsset": "USDT", "filters": []}
+
+        bare = _NoFilters()
+        with mock.patch.dict(os.environ, env):
+            bad_filters = self._adapter(bare).execute(self._buy())
+        self.assertEqual(bad_filters["error"], "maker_filters_unavailable")
+        self.assertEqual([name for name, *_rest in bare.calls], ["exchange_info"])
+
+    def test_stop_loss_cancels_resting_sell_before_market(self) -> None:
+        client = _MakerClient()
+        client.open_rows = [
+            {"orderId": 8, "side": "SELL", "type": "LIMIT_MAKER", "status": "NEW", "orderListId": -1}
+        ]
+        adapter = self._adapter(client)
+        env = _env(self.root, enabled="1", kill_exists=False)
+        env["BINANCE_SPOT_MAKER_FIRST"] = "1"
+        extras = {
+            "binance_symbol": "BTCUSDT",
+            "order_type": "LIMIT_MAKER",
+            "quantity": "1",
+            "exit_reason": "stop_loss",
+        }
+        with mock.patch.dict(os.environ, env):
+            sold = adapter.execute(
+                _sig(mode="live_stub", action="sell", token_address="BTCUSDT", extras=extras)
+            )
+        names = [name for name, *_rest in client.calls]
+        self.assertEqual(names, ["exchange_info", "open_orders", "cancel_order", "new_order"])
+        self.assertTrue(sold["submitted"], sold)
+        self.assertEqual(sold["order"]["type"], "MARKET")
+        self.assertNotIn("timeInForce", sold["order"])
+        client.calls.clear()
+        client.cancel_status = "NEW"
+        with mock.patch.dict(os.environ, env):
+            stuck = adapter.execute(
+                _sig(mode="live_stub", action="sell", token_address="BTCUSDT", extras=extras)
+            )
+        self.assertEqual(stuck["error"], "stop_loss_cancel_unconfirmed")
+        self.assertNotIn("new_order", [name for name, *_rest in client.calls])
+
+    def test_kill_switch_sell_is_reducing_only_when_enabled(self) -> None:
+        client = _MakerClient()
+        adapter = self._adapter(client)
+        env = _env(self.root, enabled="1", kill_exists=True)
+        extras = {"binance_symbol": "BTCUSDT", "quantity": "0.5", "order_type": "MARKET"}
+        with mock.patch.dict(os.environ, env):
+            blocked = adapter.execute(
+                _sig(mode="live_stub", action="sell", token_address="BTCUSDT", extras=extras)
+            )
+            buy = adapter.execute(self._buy())
+        self.assertEqual(blocked["error"], "inbound_sell_not_protective")
+        self.assertTrue(str(buy["error"]).startswith("kill_switch:"))
+        self.assertEqual(client.calls, [])
+        env["BINANCE_SPOT_ALLOW_SELL_ON_KILL"] = "1"
+        with mock.patch.dict(os.environ, env):
+            unknown = adapter.execute(
+                _sig(mode="live_stub", action="sell", token_address="BTCUSDT", extras=extras)
+            )
+        self.assertEqual(unknown["error"], "sell_not_reducing_inventory")
+        self.assertNotIn("new_order", [name for name, *_rest in client.calls])
+        client.calls.clear()
+        adapter.buy_blocks = [
+            {"symbol": "BTCUSDT", "status": "open", "quantity": "1", "protection": "exchange_oco"}
+        ]
+        with mock.patch.dict(os.environ, env):
+            allowed = adapter.execute(
+                _sig(mode="live_stub", action="sell", token_address="BTCUSDT", extras=extras)
+            )
+        self.assertTrue(allowed["ok"], allowed)
+        self.assertEqual(allowed["order"]["side"], "SELL")
+        self.assertEqual(allowed["order"]["quantity"], "0.5")
+        self.assertIn("new_order", [name for name, *_rest in client.calls])
+
+    def test_maker_ack_does_not_protect_partial_or_retry(self) -> None:
+        pending = plan_maker_ack(
+            {"status": "NEW", "executedQty": "0", "price": "100", "origQty": "1"},
+            order_qty="1",
+            limit_price="100",
+        )
+        self.assertEqual(pending["state"], "pending")
+        self.assertFalse(pending["protected"])
+        self.assertIsNone(pending["oco_qty"])
+        self.assertEqual(pending["reserved_quote"], "100")
+        self.assertFalse(pending["retry"])
+        partial = plan_maker_ack(
+            {"status": "PARTIALLY_FILLED", "executedQty": "0.4", "price": "999"},
+            order_qty="1",
+            limit_price="100",
+        )
+        self.assertEqual(partial["oco_qty"], "0.4")
+        self.assertEqual(partial["reserved_quote"], "60")
+        self.assertFalse(partial["protected"])
+        filled = plan_maker_ack(
+            {"status": "FILLED", "executedQty": "1", "cummulativeQuoteQty": "100", "price": "90"},
+            order_qty="1",
+            limit_price="100",
+        )
+        self.assertEqual(filled["state"], "filled")
+        self.assertEqual(filled["oco_qty"], "1")
+        self.assertFalse(filled["protected"])
+        rejected = plan_maker_ack({"status": "REJECTED", "executedQty": "0"}, order_qty="1", limit_price="100")
+        self.assertEqual(rejected["state"], "rejected")
+        self.assertFalse(rejected["retry"])
+        self.assertIsNone(fill_average_price({"status": "NEW", "executedQty": "0", "price": "100", "cummulativeQuoteQty": "0"}))
+        self.assertEqual(fill_average_price({"executedQty": "1", "cummulativeQuoteQty": "100", "price": "90"}), "100")
+        reference = reference_protection_prices("100")
+        self.assertIsNotNone(reference)
+        assert reference is not None
+        self.assertEqual(reference["take_profit_price"], "110")
+        self.assertEqual(reference["stop_price"], "95")
+        self.assertEqual(Decimal(reference["stop_limit_price"]), Decimal("94.70"))
+        self.assertEqual(reference["applied_to_live_orders"], "no")
+
+    def test_book_ticker_get_shape(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def opener(request: urllib.request.Request, timeout: float) -> tuple[int, bytes]:
+            seen["url"] = request.full_url
+            seen["method"] = request.get_method()
+            seen["agent"] = request.get_header("User-agent")
+            return 200, b'{"symbol":"BTCUSDT","bidPrice":"1","askPrice":"2"}'
+
+        client = BinanceSpotHttpClient(base_url="https://api.binance.test/", opener=opener)
+        payload = client.book_ticker("BTCUSDT")
+        self.assertEqual(payload["bidPrice"], "1")
+        self.assertEqual(seen["method"], "GET")
+        self.assertEqual(seen["agent"], "trade-binance-spot")
+        self.assertTrue(str(seen["url"]).startswith("https://api.binance.test/api/v3/ticker/bookTicker?symbol=BTCUSDT"))
 
 
 if __name__ == "__main__":

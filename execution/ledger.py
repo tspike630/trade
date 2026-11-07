@@ -36,6 +36,61 @@ def _utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _format_utc(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_utc(raw: object) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.strptime(raw.strip(), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+_FADE_SLOT_ACTIVE = frozenset({"reserved", "pending", "filled"})
+FADE_COOLDOWN_ENV = "BINANCE_SPOT_SYMBOL_COOLDOWN_MIN"
+FADE_WINDOW_ENV = "BINANCE_SPOT_WINDOW_MIN"
+FADE_MAX_OPEN_ENV = "BINANCE_SPOT_MAX_OPEN"
+_FADE_FREQUENCY_INVALID = "bnb_spot_frequency_config_invalid"
+
+
+def _positive_minutes(raw: object, default: int) -> int | None:
+    """Unset uses ``default``. A set value must be a positive integer."""
+    if raw is None:
+        return default
+    text = str(raw).strip()
+    if not text:
+        return default
+    if not text.isdigit():
+        return None
+    value = int(text)
+    if value <= 0:
+        return None
+    return value
+
+
+def fade_frequency_settings(
+    environ: Any | None = None,
+) -> tuple[int, int, int] | str:
+    """Cooldown minutes, window minutes, and rolling max. Not a holdings cap.
+
+    Defaults are 240, 120, and 3. Invalid text fails closed. This count is
+    fade live buys over a lookback, including reserved and pending slots.
+    It does not replace the open-position gate.
+    """
+    env = os.environ if environ is None else environ
+    getter = env.get if hasattr(env, "get") else lambda _name, _default=None: None
+    cooldown = _positive_minutes(getter(FADE_COOLDOWN_ENV), 240)
+    window = _positive_minutes(getter(FADE_WINDOW_ENV), 120)
+    maximum = _positive_minutes(getter(FADE_MAX_OPEN_ENV), 3)
+    if cooldown is None or window is None or maximum is None:
+        return _FADE_FREQUENCY_INVALID
+    return cooldown, window, maximum
+
+
 def _bnb_purpose_clause(purpose: str | None) -> tuple[str, tuple[Any, ...]]:
     """Limit a spot-position query to one arm.
 
@@ -216,6 +271,7 @@ class ExecutionLedger:
         self._ensure_unique_decision()
         self._ensure_binance_spot_positions()
         self._ensure_binance_spot_position_columns()
+        self._ensure_fade_buy_slots()
         self._ensure_mcp_book()
 
     def _ensure_status_columns(self) -> None:
@@ -1048,3 +1104,164 @@ class ExecutionLedger:
             (int(position_id),),
         ).fetchone()
         return dict(saved) if saved else None
+
+    def _ensure_fade_buy_slots(self) -> None:
+        """Rolling fade buy slots. One row per decision. Not a position cap."""
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS binance_spot_fade_buy_slots (
+                decision_log_id INTEGER PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _fade_slot(self, decision_log_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM binance_spot_fade_buy_slots WHERE decision_log_id = ?",
+            (int(decision_log_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _write_fade_slot(
+        self,
+        *,
+        decision_log_id: int,
+        symbol: str,
+        state: str,
+        created_at: str,
+        updated_at: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO binance_spot_fade_buy_slots (
+                decision_log_id, symbol, state, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(decision_log_id) DO UPDATE SET
+                symbol = excluded.symbol,
+                state = excluded.state,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at
+            """,
+            (int(decision_log_id), symbol, state, created_at, updated_at),
+        )
+        self.conn.commit()
+
+    def admit_fade_buy_frequency(
+        self,
+        *,
+        decision_log_id: int,
+        symbol: str,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Reserve one fade slot, then refuse if the rolling counts are full.
+
+        The caller's own slot is not counted against itself. A refusal releases
+        a slot this call just reserved and leaves an older filled or pending
+        slot in place. Same-symbol cooldown looks at filled slots only.
+        The rolling max counts filled, pending, and reserved slots.
+        """
+        settings = fade_frequency_settings()
+        if isinstance(settings, str):
+            return settings
+        cooldown, window, maximum = settings
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        stamp = _format_utc(moment)
+        symbol_key = symbol.strip().upper()
+        existing = self._fade_slot(decision_log_id)
+        if existing is not None and existing.get("state") in _FADE_SLOT_ACTIVE:
+            created = str(existing.get("created_at") or stamp)
+        else:
+            created = stamp
+            self._write_fade_slot(
+                decision_log_id=decision_log_id,
+                symbol=symbol_key,
+                state="reserved",
+                created_at=created,
+                updated_at=stamp,
+            )
+        block = self._fade_frequency_block(
+            symbol=symbol_key,
+            decision_log_id=decision_log_id,
+            now=moment,
+            cooldown_min=cooldown,
+            window_min=window,
+            max_open=maximum,
+        )
+        if block and (existing is None or existing.get("state") == "released"):
+            self._write_fade_slot(
+                decision_log_id=decision_log_id,
+                symbol=symbol_key,
+                state="released",
+                created_at=created,
+                updated_at=stamp,
+            )
+        return block
+
+    def _fade_frequency_block(
+        self,
+        *,
+        symbol: str,
+        decision_log_id: int,
+        now: datetime,
+        cooldown_min: int,
+        window_min: int,
+        max_open: int,
+    ) -> str | None:
+        rows = self.conn.execute(
+            "SELECT * FROM binance_spot_fade_buy_slots"
+        ).fetchall()
+        in_window = 0
+        symbol_filled = False
+        for row in rows:
+            item = dict(row)
+            if int(item["decision_log_id"]) == int(decision_log_id):
+                continue
+            state = str(item.get("state") or "")
+            if state not in _FADE_SLOT_ACTIVE:
+                continue
+            created = _parse_utc(item.get("created_at"))
+            if created is None:
+                age_min = 0.0
+            else:
+                age_min = (now - created).total_seconds() / 60.0
+            if age_min <= window_min:
+                in_window += 1
+            if (
+                state == "filled"
+                and str(item.get("symbol") or "").upper() == symbol
+                and age_min <= cooldown_min
+            ):
+                symbol_filled = True
+        if symbol_filled:
+            return "bnb_spot_symbol_cooldown"
+        if in_window >= max_open:
+            return "bnb_spot_max_open_reached"
+        return None
+
+    def settle_fade_buy_slot(
+        self,
+        decision_log_id: int,
+        outcome: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Keep one filled or pending slot. Rejected and zero-fill attempts release."""
+        row = self._fade_slot(decision_log_id)
+        if row is None:
+            return
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        state = outcome if outcome in {"filled", "pending"} else "released"
+        self._write_fade_slot(
+            decision_log_id=decision_log_id,
+            symbol=str(row.get("symbol") or ""),
+            state=state,
+            created_at=str(row.get("created_at") or _format_utc(moment)),
+            updated_at=_format_utc(moment),
+        )

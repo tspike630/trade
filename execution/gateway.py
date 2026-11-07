@@ -20,7 +20,10 @@ completed BUY requires a verified native OCO. ``mode=dry_run`` never
 submits. No other purpose can reach that adapter. Each arm may hold several
 symbols. The same symbol is refused when the other arm already has it open.
 A sealed USDT free balance is reduced by priced holds on either arm before
-the buy.
+the buy. Fade live buys also take a rolling frequency slot
+(``BINANCE_SPOT_SYMBOL_COOLDOWN_MIN`` / ``BINANCE_SPOT_WINDOW_MIN`` /
+``BINANCE_SPOT_MAX_OPEN``) before ``new_order``. That count is not the
+open-position cap.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ from execution.config import (
 )
 from execution.binance_account_snapshot import default_live_bnb_adapter
 from execution.executors.binance_spot_gate import (
+    PURPOSE_LIVE_BNB_BOLL_FADE,
     REST_BOOK,
     consumer_read_cursor,
     is_live_bnb_spot_purpose,
@@ -52,6 +56,7 @@ from execution.executors.binance_spot_gate import (
 from execution.executors.binance_spot import (
     EXECUTOR_NAME as BINANCE_SPOT_EXECUTOR,
     BinanceSpotAdapter,
+    classify_fade_slot,
     held_position_spec,
     kill_switch_active,
     public_exchange_error,
@@ -177,6 +182,11 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
             result.get("size_plan") if isinstance(result.get("size_plan"), dict) else None
         ),
         "consumer_allowed": result.get("consumer_allowed") is True,
+        "maker_slot": (
+            result.get("maker_slot")
+            if result.get("maker_slot") in {"pending", "filled", "release"}
+            else None
+        ),
         "arm_position": (
             result.get("arm_position") if isinstance(result.get("arm_position"), dict) else None
         ),
@@ -1208,6 +1218,7 @@ class ExecutionGateway:
         executor = STEP_A_EXECUTOR
         exec_result: dict[str, Any] | None = None
         exec_error: str | None = None
+        frequency_hold = False
         risk_reasons: list[dict[str, Any]] | None = None
         submitted_to_executor = False
 
@@ -1283,7 +1294,14 @@ class ExecutionGateway:
             adapter = self._binance_spot or default_live_bnb_adapter()
             self._binance_spot = adapter
             live_buy = action == "buy" and mode != "dry_run"
+            fade_live_buy = (
+                live_buy
+                and mode == "live_stub"
+                and str(sig.get("purpose") or "").strip() == PURPOSE_LIVE_BNB_BOLL_FADE
+            )
             reserve = buy_reservation_lock(self.ledger.path) if live_buy else nullcontext()
+            frequency_block: str | None = None
+            slot_open = False
             with reserve:
                 if live_buy:
                     purpose = str(sig.get("purpose") or "")
@@ -1305,21 +1323,71 @@ class ExecutionGateway:
                     book = self.ledger.mcp_book()
                     canonical = book.get("canonical_positions")
                     adapter.canonical_rows = canonical if isinstance(canonical, list) else []
-                exec_result = _binance_public_result(adapter.execute(sig))
-                if (
-                    live_buy
-                    and not exec_result.get("dry_run")
-                    and exec_result.get("arm_position")
-                ):
-                    self._arm_binance_position(sig, exec_result, receipt_body)
-            executor = BINANCE_SPOT_EXECUTOR
-            submitted_to_executor = bool(exec_result.get("submitted"))
-            receipt_body["step"] = "binance_spot"
-            receipt_body["exec_result"] = exec_result
+                if fade_live_buy:
+                    extras_now = sig.get("extras") if isinstance(sig.get("extras"), dict) else {}
+                    symbol_now = str(extras_now.get("binance_symbol") or "").strip().upper()
+                    if symbol_now:
+                        frequency_block = self.ledger.admit_fade_buy_frequency(
+                            decision_log_id=int(sig["decision_log_id"]),
+                            symbol=symbol_now,
+                        )
+                        slot_open = frequency_block is None
+                if frequency_block:
+                    exec_result = {
+                        "ok": False,
+                        "dry_run": False,
+                        "executed": 0,
+                        "submitted": False,
+                        "error": frequency_block,
+                        "consumer_allowed": False,
+                    }
+                else:
+                    try:
+                        exec_result = _binance_public_result(adapter.execute(sig))
+                        if slot_open:
+                            self.ledger.settle_fade_buy_slot(
+                                int(sig["decision_log_id"]),
+                                classify_fade_slot(exec_result),
+                            )
+                    except Exception:
+                        if slot_open:
+                            self.ledger.settle_fade_buy_slot(
+                                int(sig["decision_log_id"]),
+                                "release",
+                            )
+                        raise
+                    if (
+                        live_buy
+                        and not exec_result.get("dry_run")
+                        and exec_result.get("arm_position")
+                    ):
+                        self._arm_binance_position(sig, exec_result, receipt_body)
+            if frequency_block:
+                executor = PM_GATE
+                frequency_hold = True
+                executed = 0
+                submitted_to_executor = False
+                exec_error = frequency_block
+                receipt_body["status"] = "pm_rejected"
+                receipt_body["error"] = frequency_block
+                receipt_body["note"] = (
+                    "fade rolling buy frequency; not a concurrent holdings cap; "
+                    "adapter was not called"
+                )
+                receipt_body["frequency_cap"] = "rolling_filled_pending_and_reserved"
+                receipt_body["exec_result"] = exec_result
+            else:
+                executor = BINANCE_SPOT_EXECUTOR
+                submitted_to_executor = bool(exec_result.get("submitted"))
+            if not frequency_block:
+                receipt_body["step"] = "binance_spot"
+                receipt_body["exec_result"] = exec_result
             reported = exec_result.get("exchange_error")
             if isinstance(reported, dict):
                 receipt_body["exchange_error"] = reported
-            if exec_result.get("dry_run"):
+            if frequency_block:
+                pass
+            elif exec_result.get("dry_run"):
                 executed = 0
                 if exec_result.get("ok"):
                     receipt_body["status"] = "dry_run_acked"
@@ -1404,11 +1472,13 @@ class ExecutionGateway:
                         else "validated; action not buy/sell"
                     )
 
-        if ok:
+        if frequency_hold:
+            order_status = "pm_rejected"
+        elif ok:
             order_status = "executed" if executed == 1 else "validated"
         else:
             order_status = "rejected"
-        if exec_error:
+        if exec_error and order_status != "pm_rejected":
             order_status = "rejected"
 
         return self._finalize(
