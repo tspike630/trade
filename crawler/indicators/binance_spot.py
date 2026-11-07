@@ -13,6 +13,10 @@ price series changes (spot kline closes, trailing 1h quote volume as the
 
 Writes ``binance_klines`` and ``binance_indicators`` only.
 ``INDICATORS_WEIGHT_*`` stay untouched. No orders.
+
+Crowding columns and ``change_5m_z`` are shadow readings on the same rows.
+They are not inputs to ``volume_strength`` and not entry gates. See
+``docs/crowding_spot_shadow_columns_2026-11-05.md``.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import argparse
 import json
 import os
 import sqlite3
+import statistics
 import time
 import urllib.error
 import urllib.parse
@@ -99,7 +104,31 @@ _INDICATOR_COLS = (
     "tier",
     "tech_updated_at",
     "updated_at",
+    "avg_trade_size",
+    "trades_spike_ratio",
+    "taker_buy_quote_ratio",
+    "change_5m_z",
 )
+
+# /api/v3/klines, 0-based. Index 9 is taker-buy *base* volume and is not stored.
+_TAKER_BUY_QUOTE_VOLUME_INDEX = 10
+# Latest bar is the numerator only. Prior 12 stored bars of the same series
+# are the mean. The live job writes 5m, so those 12 bars are one hour.
+TRADES_SPIKE_PRIOR_BARS = 12
+# Prior 5m returns only. The latest return is the numerator and is not in σ.
+CHANGE_5M_Z_PRIOR_RETURNS = 20
+# Percentage points. At or below this, σ is treated as zero and z stays NULL.
+_CHANGE_5M_Z_SIGMA_EPS = 1e-12
+
+_ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "binance_klines": (("taker_buy_quote_volume", "REAL"),),
+    "binance_indicators": (
+        ("avg_trade_size", "REAL"),
+        ("trades_spike_ratio", "REAL"),
+        ("taker_buy_quote_ratio", "REAL"),
+        ("change_5m_z", "REAL"),
+    ),
+}
 
 _SQL_PATH = Path(__file__).resolve().parents[1] / "models" / "binance_indicator_tables.sql"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -128,6 +157,7 @@ class SpotKline:
     quote_volume: float
     close_time_ms: int
     trades: int | None = None
+    taker_buy_quote_volume: float | None = None
 
 
 def repo_root() -> Path:
@@ -449,6 +479,9 @@ def parse_kline_row(raw: Any) -> SpotKline | None:
             trades = int(raw[8])
         except (TypeError, ValueError):
             trades = None
+    taker_quote: float | None = None
+    if len(raw) > _TAKER_BUY_QUOTE_VOLUME_INDEX:
+        taker_quote = _float_or_none(raw[_TAKER_BUY_QUOTE_VOLUME_INDEX])
     return SpotKline(
         open_time_ms=open_time,
         open=op,
@@ -459,6 +492,7 @@ def parse_kline_row(raw: Any) -> SpotKline | None:
         quote_volume=quote,
         close_time_ms=close_time,
         trades=trades,
+        taker_buy_quote_volume=taker_quote,
     )
 
 
@@ -511,8 +545,130 @@ def quote_volume_24h(klines: Sequence[SpotKline]) -> float | None:
     return total
 
 
+def _avg_trade_size(bar: SpotKline) -> float | None:
+    """Current bar quote_volume / trades. Empty or non-positive trades → None."""
+    trades = bar.trades
+    if trades is None or trades <= 0:
+        return None
+    quote = float(bar.quote_volume)
+    if quote != quote or quote < 0:
+        return None
+    return quote / float(trades)
+
+
+def _taker_buy_quote_ratio(bar: SpotKline) -> float | None:
+    """Current bar taker_buy_quote_volume / quote_volume. Not clipped to 1."""
+    taker = bar.taker_buy_quote_volume
+    if taker is None or taker != taker or taker < 0:
+        return None
+    quote = float(bar.quote_volume)
+    if quote != quote or quote <= 0:
+        return None
+    return float(taker) / quote
+
+
+def _trades_spike_ratio(ordered: Sequence[SpotKline]) -> float | None:
+    """Latest trades / mean of the previous ``TRADES_SPIKE_PRIOR_BARS`` bars.
+
+    The latest bar is not inside the mean. A missing trade count anywhere in
+    that window, a short series, or a non-positive mean stays None. A latest
+    count of 0 with a positive mean is 0, not an error.
+    """
+    need = TRADES_SPIKE_PRIOR_BARS + 1
+    if len(ordered) < need:
+        return None
+    last = ordered[-1]
+    if last.trades is None or last.trades < 0:
+        return None
+    prior = ordered[-need:-1]
+    if len(prior) != TRADES_SPIKE_PRIOR_BARS:
+        return None
+    samples: list[float] = []
+    for bar in prior:
+        if bar.trades is None or bar.trades < 0:
+            return None
+        samples.append(float(bar.trades))
+    mean = sum(samples) / float(len(samples))
+    if mean <= 0:
+        return None
+    return float(last.trades) / mean
+
+
+def crowding_shadow_from_klines(klines: Sequence[SpotKline]) -> dict[str, float | None]:
+    """Shadow crowding readings for the newest bar. Not an entry gate.
+
+    ``avg_trade_size`` and ``taker_buy_quote_ratio`` use that bar alone.
+    ``trades_spike_ratio`` uses it over the previous 12 stored bars.
+    Empty input returns three Nones and does not raise.
+    """
+    empty: dict[str, float | None] = {
+        "avg_trade_size": None,
+        "trades_spike_ratio": None,
+        "taker_buy_quote_ratio": None,
+    }
+    if not klines:
+        return empty
+    ordered = sorted(klines, key=lambda bar: (bar.close_time_ms, bar.open_time_ms))
+    last = ordered[-1]
+    return {
+        "avg_trade_size": _avg_trade_size(last),
+        "trades_spike_ratio": _trades_spike_ratio(ordered),
+        "taker_buy_quote_ratio": _taker_buy_quote_ratio(last),
+    }
+
+
+def _bar_return_pct(prev_close: float, close: float) -> float | None:
+    """Simple return in percentage points, the same unit as ``change_5m``."""
+    if prev_close <= 0 or close <= 0:
+        return None
+    if prev_close != prev_close or close != close:
+        return None
+    return (close - prev_close) / prev_close * 100.0
+
+
+def change_5m_z_from_klines(klines: Sequence[SpotKline]) -> float | None:
+    """Latest 5m return / sample σ of the previous 20 bar returns.
+
+    Both sides are percentage points, matching ``change_5m`` (``-2`` is −2%,
+    not −0.02). On a regular 5m grid the numerator is the same number as
+    ``change_5m``. σ is ``statistics.stdev`` of those prior 20 returns only.
+    The current bar is not inside σ. This is not ``volatility_24h``.
+
+    None when the series has fewer than 20 prior returns, any close is
+    unusable, or σ is about 0 (``<= 1e-12`` percentage points).
+    """
+    if not klines:
+        return None
+    ordered = sorted(klines, key=lambda bar: (bar.close_time_ms, bar.open_time_ms))
+    returns: list[float] = []
+    for prev, bar in zip(ordered, ordered[1:]):
+        step = _bar_return_pct(float(prev.close), float(bar.close))
+        if step is None:
+            return None
+        returns.append(step)
+    need = CHANGE_5M_Z_PRIOR_RETURNS + 1
+    if len(returns) < need:
+        return None
+    current = returns[-1]
+    prior = returns[-need:-1]
+    if len(prior) != CHANGE_5M_Z_PRIOR_RETURNS:
+        return None
+    try:
+        sigma = statistics.stdev(prior)
+    except statistics.StatisticsError:
+        return None
+    if sigma != sigma or sigma <= _CHANGE_5M_Z_SIGMA_EPS:
+        return None
+    return current / sigma
+
+
 def factors_from_klines(klines: Sequence[SpotKline]) -> dict[str, Any] | None:
-    """Same tech_boll family as paper: change_*, volume_strength, BOLL(20, 2σ) on close."""
+    """Same tech_boll family as paper: change_*, volume_strength, BOLL(20, 2σ) on close.
+
+    ``volume_strength`` is still ``indicators.technical.volume_strength`` on the
+    trailing-1h quote series. Crowding fields and ``change_5m_z`` are attached
+    afterwards and are not arguments to that function. BOLL stays 20, 2σ.
+    """
     series = price_series_from_klines(klines)
     if not series:
         return None
@@ -533,13 +689,33 @@ def factors_from_klines(klines: Sequence[SpotKline]) -> dict[str, Any] | None:
         "kline_close_time_ms": max(bar.close_time_ms for bar in klines),
     }
     out.update(fields)
+    out.update(crowding_shadow_from_klines(klines))
+    out["change_5m_z"] = change_5m_z_from_klines(klines)
     return out
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {str(row[1]) for row in rows}
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create binance_* tables. Does not migrate token_indicators."""
+    """Create binance_* tables, then ADD COLUMN on ones that already exist.
+
+    Does not migrate token_indicators, futures side tables, or any other
+    table in the file. Repeat calls are no-ops once the columns are present.
+    """
     script = _SQL_PATH.read_text(encoding="utf-8")
     conn.executescript(script)
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = _table_columns(conn, table)
+        if not existing:
+            continue
+        for name, typ in columns:
+            if name in existing:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+    conn.commit()
 
 
 def connect_rw(path: Path) -> sqlite3.Connection:
@@ -571,6 +747,7 @@ def upsert_klines(
             bar.quote_volume,
             bar.close_time_ms,
             bar.trades,
+            bar.taker_buy_quote_volume,
         )
         for bar in klines
     ]
@@ -578,8 +755,8 @@ def upsert_klines(
         """
         INSERT OR REPLACE INTO binance_klines (
             symbol, interval, open_time_ms, open, high, low, close,
-            volume, quote_volume, close_time_ms, trades
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            volume, quote_volume, close_time_ms, trades, taker_buy_quote_volume
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
