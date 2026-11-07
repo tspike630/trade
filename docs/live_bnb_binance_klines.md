@@ -59,9 +59,25 @@ PYTHONPATH=crawler python -m indicators.binance_spot --db crawler/dexscreener.db
 
 新鲜度：`BINANCE_INDICATORS_FRESH_SEC`（默认 3600）。扫描顺序默认 `change_5m` 升序，可用 `BINANCE_INDICATORS_SORT=volume_strength` 或 `quote_volume_24h`。
 
-这是扫描窗口，不是入场门。纸面 `race_tech_boll_fade` 的 `min_change_5m` / `volume_strength` / 破下轨 / TP10 / SL5 / hold 不动。`live_bnb_boll_fade` 用 Entry Zone 的绝对止损和 `boll_mid` 止盈，不套纸面 SL5/TP10。其它 purpose 继续用 `DECISION_HOT_TOKEN_LIMIT`（默认 50）。`live_bnb_boll_fade` 不传 `--limit` 时窗口至少 `LIVE_BNB_SCAN_LIMIT`（600），盖住约 518 个 TRADING `*USDT`，避免跌幅排在 51 名之后的破下轨被 `ORDER BY change_5m ASC` 裁掉。显式 `--limit` 仍按传入值截断。K 线后备的 1 小时量优先用 quote volume（USDT），与指标任务一致；某根缺 quote 才退回 base volume。
+这是扫描窗口，不是入场门。纸面 `race_tech_boll_fade` 的 `min_change_5m` / `volume_strength` / 破下轨 / TP10 / SL5 / hold 不动。`live_bnb_boll_fade` 用 Entry Zone 的绝对止损和 `boll_mid` 止盈，不套纸面 SL5/TP10。其它 purpose 继续用 `DECISION_HOT_TOKEN_LIMIT`（默认 50）。`live_bnb_boll_fade` 不传 `--limit` 时窗口至少 `LIVE_BNB_SCAN_LIMIT`（600），盖住约 518 个 TRADING `*USDT`，避免跌幅排在 51 名之后的破下轨被 `ORDER BY change_5m ASC` 裁掉。显式 `--limit` 仍按传入值截断。K 线后备的 1 小时量优先用 quote volume（USDT），与指标任务一致。决策侧存的 K 线是 `(open_ms, open, high, low, close, base, quote)`，quote 在下标 6。原始 REST JSON 的下标 6 是收盘时间、下标 7 才是 quote，不要混用。某根 quote 缺失（`None`）才退回 base volume。quote 为 0 是真零，不退回 base；整段都是 0 时 `volume_strength` 没有正的均值，该符号不算出来，而不是改用 base 数量。
 
 `race_tech_boll_fade` 仍读 Solana `token_indicators`，不看这两张表。
+
+## 只读观察列（决策侧不计算）
+
+`list_binance_hot_tokens` 的每一行都带这 8 个键：`change_7d`、`volume_7d_avg`、`taker_buy_quote_volume_5m`、`buy_ratio_5m`、`buy_ratio_1h`、`avg_trade_usd_5m`、`trade_size_ratio`、`lower_wick_ratio`。旧表没有其中某一列、SQL 是 NULL、空白或非有限数，读出来都是 `None`。不补 0，不按 24h×7 或残缺窗口现造 7 日，也不在决策侧打开 12 根或 24 小时的计算。读路径不 `INSERT` / `UPDATE` / `ALTER`。
+
+算术在指标任务（`indicators.binance_spot`，另一份变更）里做完再落库。约定：
+
+- `change_7d`、`volume_7d_avg`：本地 7 日已收盘 K 线没有完整覆盖时为 NULL。
+- `taker_buy_quote_volume_5m`：原始 K 线的 taker buy quote（REST 下标 10）。REST 下标 9 是 taker buy base，决策侧不读。`buy_ratio_5m` 由上游用该根 quote 去除。
+- `buy_ratio_1h`：必须是连续 12 根已收盘 5 分钟，且每根的 taker quote 都齐全。少一根或缺一侧就是 NULL，不把残缺的一小时算进去。
+- `avg_trade_usd_5m`：该根 quote volume / trades。`trade_size_ratio` 的 24 小时基准是整段 `sum(quote_volume)/sum(trades)`，窗口要完整；不是先算每根平均再取平均。覆盖不满则为 NULL。
+- `lower_wick_ratio` 这个名字保留。库存公式是 `(close-low)/(high-low)`，即收盘在最高最低之间的位置，不是下影线 `(min(open, close)-low)/(high-low)`。决策侧照原值传出，不改写成下影线。
+
+`tech_boll_fade` 现有的跌幅、量能、下轨和 Entry Zone 门槛都不读这 7 个新值。`trade_size_ratio` 本来就是 Entry Zone 的坐标：NULL 仍当缺列，继续走已有的 `avg_trade_size` / K 线回退；库里的有限数仍是原来的坐标。`INDICATORS_WEIGHT_*` 仍为 0。两臂保持暂停，本读路径不下单。
+
+这些键在热行上。现网 `live_bnb_boll_fade` / `live_bnb_boll_classic` 只跑 `tech_boll_fade_v1`，不会因为观察列而改入场。已经在找 `change_7d` / `volume_7d_avg` 的纸面策略（`lifecycle_momentum`、`cs_mom_1w`、`cs_fade_1w`）如果被排进同一个 purpose，会看到非 NULL 的值。本变更不把那些策略接到币安臂上。
 
 ## 新买单：3M quoteVolume 与当前宇宙（2026-11-06）
 

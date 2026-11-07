@@ -8,10 +8,15 @@ it is the book — an empty or stale result is not filled from DEX rows.
 ``liquidity_usd`` on the returned row is ``quote_volume_24h`` so the existing
 ``DECISION_MIN_LIQ_USD`` floor still has a USD figure. That is not a new score
 and not ``local_score``. ``INDICATORS_WEIGHT_*`` are not read or written.
+
+``OBSERVATION_FIELDS`` are copied when a later indicator build has stored
+them. This module does not calculate those columns and does not write the
+database. See ``OBSERVATION_READ_CONTRACT``.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -80,6 +85,50 @@ _OPTIONAL_COLS = (
     "baseline_trades",
 )
 
+# Nullable observation columns. Upstream writes them; this reader only copies.
+# ``trade_size_ratio`` is also in ``_OPTIONAL_COLS`` so an older reader path
+# still selects it. The shaped row always carries every name below.
+OBSERVATION_FIELDS = (
+    "change_7d",
+    "volume_7d_avg",
+    "taker_buy_quote_volume_5m",
+    "buy_ratio_5m",
+    "buy_ratio_1h",
+    "avg_trade_usd_5m",
+    "trade_size_ratio",
+    "lower_wick_ratio",
+)
+
+OBSERVATION_READ_CONTRACT = """
+Observation columns are nullable pass-throughs. A missing column, NULL, a
+blank, or a non-finite value stays None. This reader does not compute them
+and does not write the database.
+
+change_7d and volume_7d_avg are NULL unless the upstream job has genuine
+complete local 7d closed-bar history. A short history is NULL. Do not scale
+change_24h by 7 or average a partial window.
+
+taker_buy_quote_volume_5m is the raw kline taker-buy quote (Binance REST
+index 10). The base taker field is REST index 9 and is not a reader input.
+buy_ratio_5m is that bar's taker quote over quote volume, derived upstream.
+buy_ratio_1h is NULL unless there are 12 contiguous closed 5m bars and every
+one of them has complete taker quote data. A partial hour is NULL.
+
+avg_trade_usd_5m is the closed 5m bar's quote volume over its trade count.
+trade_size_ratio compares that bar with a 24h baseline. The baseline is
+sum(quote_volume)/sum(trades) over a fully covered window, not the mean of per-bar averages.
+Incomplete coverage is NULL upstream.
+
+lower_wick_ratio keeps the requested field name. The stored formula is
+(close-low)/(high-low). That is the close's location inside the high-low
+range, not the anatomical lower wick (min(open, close)-low)/(high-low).
+This reader does not rewrite a stored value into the anatomical wick.
+
+These fields are not a new entry gate. tech_boll_fade thresholds are
+unchanged. A NULL trade_size_ratio still falls through to the existing
+avg_trade_size / kline path; a stored finite number remains that coordinate.
+"""
+
 
 def _iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -147,11 +196,15 @@ def list_binance_hot_tokens(
 
     Ordering is a scan window, not an entry gate. The strategy still applies
     its own change / volume / band thresholds. Missing table → ``[]``.
+
+    Each ``OBSERVATION_FIELDS`` name is always on the shaped row. Absent
+    columns and NULL stay None. This function does not insert those columns
+    and does not derive a 7d, 12-bar, or trade-size window.
     """
     if not binance_indicators_ready(conn):
         return []
     present = _present_columns(conn)
-    cols = [name for name in (*_READ_COLS, *_OPTIONAL_COLS) if name in present]
+    cols = _readable_columns(present)
     if "symbol" not in cols:
         return []
     chosen = resolve_indicator_sort(
@@ -251,4 +304,43 @@ def _shape_row(raw: dict[str, Any]) -> dict[str, Any] | None:
     for key in ("kline_close_time_ms", *_OPTIONAL_COLS):
         if key in raw and raw.get(key) is not None:
             shaped[key] = raw.get(key)
+    for key in OBSERVATION_FIELDS:
+        if key not in raw:
+            shaped[key] = None
+            continue
+        shaped[key] = _optional_number(raw.get(key))
     return shaped
+
+
+def _readable_columns(present: set[str]) -> list[str]:
+    """SELECT list: known names that exist, observation names included once."""
+    chosen: list[str] = []
+    seen: set[str] = set()
+    for name in (*_READ_COLS, *_OPTIONAL_COLS, *OBSERVATION_FIELDS):
+        if name not in present or name in seen:
+            continue
+        chosen.append(name)
+        seen.add(name)
+    return chosen
+
+
+def _optional_number(value: Any) -> float | int | None:
+    """Finite number, or None. Does not turn a missing value into 0."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if not math.isfinite(float(value)):
+            return None
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        if not math.isfinite(number):
+            return None
+        return number
+    return None
