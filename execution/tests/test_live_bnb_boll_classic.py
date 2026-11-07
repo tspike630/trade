@@ -346,7 +346,7 @@ class ClassicPurposeTests(unittest.TestCase):
                 symbol="BNBUSDT",
             )
         )
-        # The other arm is unchanged, including a buy of the symbol fade holds.
+        # Same-arm helper does not apply fade's row to classic. Cross-arm does.
         self.assertIsNone(
             buy_exposure_block([fade_open], [], purpose=PURPOSE_LIVE_BNB_BOLL_CLASSIC)
         )

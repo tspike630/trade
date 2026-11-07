@@ -698,7 +698,7 @@ class MultiSymbolArmTests(unittest.TestCase):
                 symbol="BNBUSDT",
             )
         )
-        # Existing arm split stays. Same symbol on the other arm is not a new block.
+        # Same-arm helper still ignores the other arm. The cross-arm gate does not.
         self.assertIsNone(
             buy_exposure_block(
                 [held],
