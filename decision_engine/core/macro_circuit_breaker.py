@@ -1,0 +1,328 @@
+"""Pre-trade LSEG macro calendar blackout & cross-asset contagion circuit breaker.
+
+Strictly opt-in via ``DECISION_MACRO_DB`` (or ``DECISION_MACRO_GATE_ENABLED=1``
+pointing at ``data/lseg/lseg_macro.db``). When unwired, returns ``None`` and
+has zero effect on signal emission, paper arms, or ``CELL_LEDGER``.
+
+When wired for live Binance spot purposes (``live_bnb_boll_fade``,
+``live_bnb_boll_classic``), reads ``lseg_macro.db`` in read-only mode
+(``?mode=ro``) and blocks new BUY entries (while never blocking SELL exits)
+under four evidence-backed conditions:
+
+1. ``central_bank_blackout``: High-impact central bank event (FOMC, Powell,
+   ECB/BOJ press conference, minutes) within ``[-15m, +45m]`` of ``now_ms``.
+2. ``macro_rel3_blackout``: Tier-1 (``Relevance = 3``) economic release
+   with a scheduled timestamp within ``[-15m, +30m]`` of ``now_ms``.
+3. ``macro_rel2_auction_blackout``: US Treasury note/bond/bill auction or
+   Tier-2 release within ``[-10m, +20m]`` of ``now_ms``.
+4. ``cross_asset_*``: Real-time 5m cross-asset contagion when fresh LSEG
+   5m bars (age <= 30m) show Nasdaq futures (``NQc1``) 15m drop <= -0.20%,
+   US 2Y yield (``US2YT=RR``) 15m spike >= +3.0 bps, USDJPY (``JPY=``)
+   15m carry unwind <= -0.15%, or CME BTC futures (``BTCc1`` vs ``BTC=``)
+   basis discount < -15.0 bps.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+from urllib.parse import quote
+
+from decision_engine.core.signal_bus import (
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+    PURPOSE_LIVE_BNB_BOLL_FADE,
+)
+
+LIVE_BNB_SPOT_PURPOSES = frozenset(
+    {
+        PURPOSE_LIVE_BNB_BOLL_FADE,
+        PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+    }
+)
+
+_MACRO_DB_ENV = (
+    "DECISION_MACRO_DB",
+    "LSEG_MACRO_DB_PATH",
+)
+
+DEFAULT_CB_BEFORE_MIN = 15
+DEFAULT_CB_AFTER_MIN = 45
+DEFAULT_REL3_BEFORE_MIN = 15
+DEFAULT_REL3_AFTER_MIN = 30
+DEFAULT_REL2_BEFORE_MIN = 10
+DEFAULT_REL2_AFTER_MIN = 20
+
+DEFAULT_NQ_15M_FLOOR_PCT = -0.20
+DEFAULT_US2Y_15M_CAP_BPS = 3.0
+DEFAULT_JPY_15M_FLOOR_PCT = -0.15
+DEFAULT_CME_BASIS_FLOOR_BPS = -15.0
+MAX_CROSS_ASSET_AGE_MS = 30 * 60 * 1000
+
+
+@dataclass(frozen=True)
+class MacroGateStatus:
+    """Read-only evaluation of the macro & cross-asset circuit breaker."""
+
+    configured: bool
+    halt_reason: str | None
+    detail: str | None = None
+    error: str | None = None
+
+    @staticmethod
+    def unwired() -> MacroGateStatus:
+        return MacroGateStatus(False, None, None, None)
+
+    @staticmethod
+    def clear() -> MacroGateStatus:
+        return MacroGateStatus(True, None, None, None)
+
+    @staticmethod
+    def halted(reason: str, detail: str | None = None) -> MacroGateStatus:
+        return MacroGateStatus(True, reason, detail, None)
+
+    @staticmethod
+    def failed(error: str) -> MacroGateStatus:
+        return MacroGateStatus(True, "macro_status_unknown", None, error)
+
+
+def _env_float(env: Mapping[str, str], key: str, default: float) -> float:
+    raw = env.get(key)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def _env_int(env: Mapping[str, str], key: str, default: int) -> int:
+    raw = env.get(key)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def resolve_macro_db_path(environ: Mapping[str, str] | None = None) -> Path | None:
+    """Return configured LSEG macro SQLite path, or ``None`` when disabled."""
+    env = os.environ if environ is None else environ
+    gate_flag = str(env.get("DECISION_MACRO_GATE_ENABLED") or "").strip().lower()
+    if gate_flag in {"0", "false", "no", "off"}:
+        return None
+    for key in _MACRO_DB_ENV:
+        raw = env.get(key)
+        if raw is not None and str(raw).strip():
+            return Path(str(raw).strip()).expanduser()
+    if gate_flag in {"1", "true", "yes", "on"}:
+        repo_root = Path(__file__).resolve().parents[2]
+        return repo_root / "data" / "lseg" / "lseg_macro.db"
+    return None
+
+
+def _ro_uri(path: Path) -> str:
+    return "file:" + quote(path.resolve().as_posix(), safe="/") + "?mode=ro"
+
+
+def _has_tables(conn: sqlite3.Connection, required: tuple[str, ...]) -> str | None:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall()
+    have = {str(r[0]) for r in rows}
+    for t in required:
+        if t not in have:
+            return f"macro_table_missing:{t}"
+    return None
+
+
+def _check_cross_asset(
+    conn: sqlite3.Connection,
+    now_ms: int,
+    env: Mapping[str, str],
+) -> tuple[str | None, str | None]:
+    """Check 5min cross-asset contagion if fresh bars exist within 30m of now_ms."""
+    found = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cross_asset_bars'"
+    ).fetchone()
+    if found is None:
+        return None, None
+
+    min_ts = now_ms - MAX_CROSS_ASSET_AGE_MS
+
+    def _recent_closes(ric: str, limit: int = 4) -> list[tuple[int, float]]:
+        rows = conn.execute(
+            """
+            SELECT utc_ms, close
+            FROM cross_asset_bars
+            WHERE ric = ? AND interval = '5min' AND utc_ms <= ? AND close IS NOT NULL
+            ORDER BY utc_ms DESC
+            LIMIT ?
+            """,
+            (ric, now_ms, limit),
+        ).fetchall()
+        return [(int(r[0]), float(r[1])) for r in rows]
+
+    # 1. NQc1 15m (3-bar) return
+    nq = _recent_closes("NQc1", 4)
+    if len(nq) >= 4 and nq[0][0] >= min_ts and nq[3][1] > 0:
+        nq_ret_pct = ((nq[0][1] - nq[3][1]) / nq[3][1]) * 100.0
+        floor = _env_float(env, "MACRO_NQ_15M_FLOOR_PCT", DEFAULT_NQ_15M_FLOOR_PCT)
+        if nq_ret_pct <= floor:
+            return "cross_asset_nq_dump", f"NQc1_15m={nq_ret_pct:+.3f}%"
+
+    # 2. US2YT=RR 15m yield spike (in bps)
+    us2y = _recent_closes("US2YT=RR", 4)
+    if len(us2y) >= 4 and us2y[0][0] >= min_ts:
+        us2y_bps = (us2y[0][1] - us2y[3][1]) * 100.0
+        cap = _env_float(env, "MACRO_US2Y_15M_CAP_BPS", DEFAULT_US2Y_15M_CAP_BPS)
+        if us2y_bps >= cap:
+            return "cross_asset_us2y_spike", f"US2YT_15m={us2y_bps:+.1f}bps"
+
+    # 3. JPY= 15m drop (Yen surge / carry unwind)
+    jpy = _recent_closes("JPY=", 4)
+    if len(jpy) >= 4 and jpy[0][0] >= min_ts and jpy[3][1] > 0:
+        jpy_ret_pct = ((jpy[0][1] - jpy[3][1]) / jpy[3][1]) * 100.0
+        floor = _env_float(env, "MACRO_JPY_15M_FLOOR_PCT", DEFAULT_JPY_15M_FLOOR_PCT)
+        if jpy_ret_pct <= floor:
+            return "cross_asset_jpy_unwind", f"JPY_15m={jpy_ret_pct:+.3f}%"
+
+    # 4. CME BTC futures basis discount (BTCc1 vs BTC=)
+    btcc1 = _recent_closes("BTCc1", 1)
+    btc_spot = _recent_closes("BTC=", 1)
+    if (
+        btcc1
+        and btc_spot
+        and btcc1[0][0] >= min_ts
+        and btc_spot[0][0] >= min_ts
+        and abs(btcc1[0][0] - btc_spot[0][0]) <= 300_000
+        and btc_spot[0][1] > 0
+    ):
+        basis_bps = ((btcc1[0][1] - btc_spot[0][1]) / btc_spot[0][1]) * 10000.0
+        floor = _env_float(
+            env, "MACRO_CME_BASIS_FLOOR_BPS", DEFAULT_CME_BASIS_FLOOR_BPS
+        )
+        if basis_bps < floor:
+            return "cross_asset_cme_basis_discount", f"CME_basis={basis_bps:+.1f}bps"
+
+    return None, None
+
+
+def evaluate_macro_gate(
+    path: str | Path | None,
+    *,
+    now_ms: int,
+    purpose: str = PURPOSE_LIVE_BNB_BOLL_FADE,
+    environ: Mapping[str, str] | None = None,
+) -> MacroGateStatus:
+    """Evaluate calendar blackouts & cross-asset contagion at ``now_ms``.
+
+    Only live Binance spot purposes (``live_bnb_boll_fade``,
+    ``live_bnb_boll_classic``) are halted unless
+    ``DECISION_MACRO_GATE_ALL_PURPOSES=1`` is set.
+    """
+    if path is None:
+        return MacroGateStatus.unwired()
+    env = os.environ if environ is None else environ
+    all_purposes = str(env.get("DECISION_MACRO_GATE_ALL_PURPOSES") or "").strip() == "1"
+    if not all_purposes and purpose not in LIVE_BNB_SPOT_PURPOSES:
+        return MacroGateStatus.unwired()
+
+    try:
+        uri = _ro_uri(Path(path).expanduser())
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except (OSError, sqlite3.Error) as exc:
+        return MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}")
+
+    try:
+        conn.row_factory = sqlite3.Row
+        missing = _has_tables(conn, ("macro_events", "central_bank_events"))
+        if missing is not None:
+            return MacroGateStatus.failed(missing)
+
+        # 1. Central Bank high-impact window [-15m, +45m]
+        cb_before_ms = _env_int(env, "MACRO_CB_BEFORE_MIN", DEFAULT_CB_BEFORE_MIN) * 60_000
+        cb_after_ms = _env_int(env, "MACRO_CB_AFTER_MIN", DEFAULT_CB_AFTER_MIN) * 60_000
+        cb_row = conn.execute(
+            """
+            SELECT country, event_name, utc_ts
+            FROM central_bank_events
+            WHERE is_high_impact = 1
+              AND local_time_hkt != ''
+              AND utc_ms BETWEEN ? AND ?
+            ORDER BY ABS(utc_ms - ?) ASC
+            LIMIT 1
+            """,
+            (now_ms - cb_after_ms, now_ms + cb_before_ms, now_ms),
+        ).fetchone()
+        if cb_row is not None:
+            detail = f"{cb_row['country']}:{str(cb_row['event_name'])[:60]}@{cb_row['utc_ts']}"
+            return MacroGateStatus.halted("central_bank_blackout", detail)
+
+        # 2. Tier-1 Macro Release (Relevance = 3) window [-15m, +30m]
+        r3_before_ms = _env_int(env, "MACRO_REL3_BEFORE_MIN", DEFAULT_REL3_BEFORE_MIN) * 60_000
+        r3_after_ms = _env_int(env, "MACRO_REL3_AFTER_MIN", DEFAULT_REL3_AFTER_MIN) * 60_000
+        r3_row = conn.execute(
+            """
+            SELECT country, indicator_name, utc_ts
+            FROM macro_events
+            WHERE relevance = 3
+              AND local_time_hkt != ''
+              AND utc_ms BETWEEN ? AND ?
+            ORDER BY ABS(utc_ms - ?) ASC
+            LIMIT 1
+            """,
+            (now_ms - r3_after_ms, now_ms + r3_before_ms, now_ms),
+        ).fetchone()
+        if r3_row is not None:
+            detail = f"{r3_row['country']}:{r3_row['indicator_name']}@{r3_row['utc_ts']}"
+            return MacroGateStatus.halted("macro_rel3_blackout", detail)
+
+        # 3. Tier-2 US Treasury Auction / High-Vol Rel=2 window [-10m, +20m]
+        r2_before_ms = _env_int(env, "MACRO_REL2_BEFORE_MIN", DEFAULT_REL2_BEFORE_MIN) * 60_000
+        r2_after_ms = _env_int(env, "MACRO_REL2_AFTER_MIN", DEFAULT_REL2_AFTER_MIN) * 60_000
+        block_all_rel2 = str(env.get("DECISION_MACRO_BLOCK_ALL_REL2") or "").strip() == "1"
+        if block_all_rel2:
+            r2_row = conn.execute(
+                """
+                SELECT country, indicator_name, utc_ts
+                FROM macro_events
+                WHERE relevance = 2
+                  AND local_time_hkt != ''
+                  AND utc_ms BETWEEN ? AND ?
+                ORDER BY ABS(utc_ms - ?) ASC
+                LIMIT 1
+                """,
+                (now_ms - r2_after_ms, now_ms + r2_before_ms, now_ms),
+            ).fetchone()
+        else:
+            r2_row = conn.execute(
+                """
+                SELECT country, indicator_name, utc_ts
+                FROM macro_events
+                WHERE relevance = 2
+                  AND local_time_hkt != ''
+                  AND (indicator_name LIKE '%Auc%' OR indicator_name LIKE '%PMI%' OR indicator_name LIKE '%Jobless%')
+                  AND utc_ms BETWEEN ? AND ?
+                ORDER BY ABS(utc_ms - ?) ASC
+                LIMIT 1
+                """,
+                (now_ms - r2_after_ms, now_ms + r2_before_ms, now_ms),
+            ).fetchone()
+        if r2_row is not None:
+            detail = f"{r2_row['country']}:{r2_row['indicator_name']}@{r2_row['utc_ts']}"
+            return MacroGateStatus.halted("macro_rel2_auction_blackout", detail)
+
+        # 4. Cross-Asset Contagion Circuit Breakers
+        ca_reason, ca_detail = _check_cross_asset(conn, now_ms, env)
+        if ca_reason is not None:
+            return MacroGateStatus.halted(ca_reason, ca_detail)
+
+        return MacroGateStatus.clear()
+    except sqlite3.Error as exc:
+        return MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}")
+    finally:
+        conn.close()

@@ -1,8 +1,8 @@
 """Pre-accept BUY guards for the decision tick.
 
 Stop distance applies to every purpose that puts a ``stop_price`` on a BUY.
-The protection halt applies only to the two live Binance spot purposes, and
-only once a ledger path is configured. Sells are kept.
+The protection halt and optional LSEG macro circuit breaker apply to the live
+Binance spot purposes. Sells are kept.
 """
 
 from __future__ import annotations
@@ -45,13 +45,16 @@ def apply_live_buy_guards(
     *,
     purpose: str,
     book: ProtectionBook,
+    macro_halt: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Drop BUYs that fail the stop gap or the protection halt.
+    """Drop BUYs that fail the stop gap, protection halt, or macro circuit breaker.
 
     ``protection_halt`` is set only for a purpose-wide block (unprotected
     inventory, an unreadable book, or one-open-per-arm when that flag is
     off). A healthy open that blocks a second BUY of the same symbol is
     counted in ``protection_dropped`` and does not halt the other symbols.
+    ``macro_halt`` blocks new BUYs during configured LSEG macro/cross-asset
+    blackouts while keeping SELL signals intact.
     """
     wide = purpose_halt_reason(purpose, book) if purpose in LIVE_BNB_SPOT_PURPOSES else None
     per_symbol = (
@@ -60,6 +63,7 @@ def apply_live_buy_guards(
     kept: list[dict[str, Any]] = []
     stop_rejected = 0
     protection_dropped = 0
+    macro_dropped = 0
     for signal in signals:
         if str(signal.get("action") or "").lower() != "buy":
             kept.append(signal)
@@ -104,6 +108,15 @@ def apply_live_buy_guards(
                     reason,
                 )
                 continue
+        if macro_halt is not None:
+            macro_dropped += 1
+            log.info(
+                "macro_halt purpose=%s symbol=%s reason=%s",
+                purpose,
+                signal_symbol(signal),
+                macro_halt,
+            )
+            continue
         kept.append(signal)
     if wide is not None and protection_dropped:
         log.warning(
@@ -112,9 +125,19 @@ def apply_live_buy_guards(
             wide,
             protection_dropped,
         )
-    report = {
+    if macro_halt is not None and macro_dropped:
+        log.warning(
+            "macro_halt purpose=%s reason=%s dropped_buys=%s",
+            purpose,
+            macro_halt,
+            macro_dropped,
+        )
+    report: dict[str, Any] = {
         "stop_gap_rejected": stop_rejected,
         "protection_halt": wide,
         "protection_dropped": protection_dropped,
     }
+    if macro_halt is not None or macro_dropped:
+        report["macro_halt"] = macro_halt
+        report["macro_dropped"] = macro_dropped
     return kept, report
