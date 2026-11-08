@@ -700,8 +700,9 @@ def ingest_spot_klines(
     kline_limit: int = DEFAULT_KLINE_LIMIT,
     pause_sec: float = 0.0,
     base_url: str = DEFAULT_BASE,
+    ws_cache: Any | None = None,
 ) -> dict[str, int]:
-    """Fetch public klines for ``symbols`` and write the side tables.
+    """Fetch public klines for ``symbols`` (preferring WebSocket cache when warm) and write side tables.
 
     ``symbols`` must already be the primary universe (or a subset of it).
     This function does not discover listings.
@@ -710,26 +711,76 @@ def ingest_spot_klines(
         raise ValueError(f"interval must be one of {sorted(_INTERVALS)}")
     limit = max(20, min(int(kline_limit), 1000))
     ensure_schema(conn)
-    stats = {"symbols": 0, "klines": 0, "indicators": 0, "failed": 0, "skipped": 0}
+    active_cache = ws_cache
+    if active_cache is None:
+        try:
+            from execution.binance_ws_stream import get_global_ws_cache, ws_stream_enabled
+            if ws_stream_enabled():
+                active_cache = get_global_ws_cache()
+        except ImportError:
+            active_cache = None
+
+    stats = {
+        "symbols": 0,
+        "klines": 0,
+        "indicators": 0,
+        "failed": 0,
+        "skipped": 0,
+        "ws_hits": 0,
+        "rest_fetches": 0,
+    }
     total = len(symbols)
     for index, meta in enumerate(symbols):
-        url = kline_url(meta.symbol, interval=interval, limit=limit, base=base_url)
-        try:
-            payload = fetcher(url)
-        except Exception as exc:  # noqa: BLE001 — one symbol must not abort the universe
-            stats["failed"] += 1
-            log.warning("kline fetch failed symbol=%s err=%s", meta.symbol, exc)
-            continue
-        if not isinstance(payload, list):
-            stats["failed"] += 1
-            log.warning("kline payload not a list symbol=%s", meta.symbol)
-            continue
+        bars: list[SpotKline] = []
+        used_ws = False
         clock_ms = int(time.time() * 1000)
-        bars = [
-            bar
-            for row in payload
-            if (bar := parse_kline_row(row)) is not None and bar.close_time_ms <= clock_ms
-        ]
+
+        if active_cache is not None and callable(getattr(active_cache, "get_closed_klines", None)):
+            cached = active_cache.get_closed_klines(meta.symbol, interval, min_bars=20)
+            if cached:
+                bars = [
+                    SpotKline(
+                        open_time_ms=int(item.open_time_ms),
+                        open=float(item.open),
+                        high=float(item.high),
+                        low=float(item.low),
+                        close=float(item.close),
+                        volume=float(item.volume),
+                        quote_volume=float(item.quote_volume),
+                        close_time_ms=int(item.close_time_ms),
+                        trades=item.trades,
+                        taker_buy_base_volume=item.taker_buy_base_volume,
+                        taker_buy_quote_volume=item.taker_buy_quote_volume,
+                    )
+                    for item in cached
+                    if int(item.close_time_ms) <= clock_ms
+                ]
+                if len(bars) >= 20:
+                    used_ws = True
+                    stats["ws_hits"] += 1
+
+        if not used_ws:
+            url = kline_url(meta.symbol, interval=interval, limit=limit, base=base_url)
+            try:
+                payload = fetcher(url)
+            except Exception as exc:  # noqa: BLE001 — one symbol must not abort the universe
+                stats["failed"] += 1
+                log.warning("kline fetch failed symbol=%s err=%s", meta.symbol, exc)
+                continue
+            if not isinstance(payload, list):
+                stats["failed"] += 1
+                log.warning("kline payload not a list symbol=%s", meta.symbol)
+                continue
+            clock_ms = int(time.time() * 1000)
+            bars = [
+                bar
+                for row in payload
+                if (bar := parse_kline_row(row)) is not None and bar.close_time_ms <= clock_ms
+            ]
+            stats["rest_fetches"] += 1
+            if bars and active_cache is not None and callable(getattr(active_cache, "seed_klines", None)):
+                active_cache.seed_klines(meta.symbol, interval, bars)
+
         if not bars:
             stats["skipped"] += 1
             continue
@@ -745,17 +796,59 @@ def ingest_spot_klines(
         stats["symbols"] += 1
         stats["klines"] += len(bars)
         stats["indicators"] += 1
-        if pause_sec > 0 and index + 1 < total:
+        if not used_ws and pause_sec > 0 and index + 1 < total:
             time.sleep(pause_sec)
     log.info(
-        "binance kline ingest symbols=%s indicators=%s klines=%s failed=%s skipped=%s",
+        "binance kline ingest symbols=%s indicators=%s klines=%s ws_hits=%s rest_fetches=%s failed=%s skipped=%s",
         stats["symbols"],
         stats["indicators"],
         stats["klines"],
+        stats["ws_hits"],
+        stats["rest_fetches"],
         stats["failed"],
         stats["skipped"],
     )
     return stats
+
+
+def bind_ws_kline_close_writer(
+    conn: sqlite3.Connection,
+    symbols: Sequence[SpotSymbol],
+    cache: Any,
+    *,
+    interval: str = DEFAULT_INTERVAL,
+) -> Callable[[str, str, list[Any]], None]:
+    """Register an event-driven callback on ``cache`` that persists factors immediately on bar close."""
+    meta_map = {item.symbol.upper(): item for item in symbols}
+
+    def _on_close(symbol: str, tf: str, ws_bars: list[Any]) -> None:
+        if tf != interval:
+            return
+        meta = meta_map.get(symbol.upper())
+        if meta is None:
+            return
+        bars = [
+            SpotKline(
+                open_time_ms=int(b.open_time_ms),
+                open=float(b.open),
+                high=float(b.high),
+                low=float(b.low),
+                close=float(b.close),
+                volume=float(b.volume),
+                quote_volume=float(b.quote_volume),
+                close_time_ms=int(b.close_time_ms),
+                trades=getattr(b, "trades", None),
+                taker_buy_base_volume=getattr(b, "taker_buy_base_volume", None),
+                taker_buy_quote_volume=getattr(b, "taker_buy_quote_volume", None),
+            )
+            for b in ws_bars
+        ]
+        if len(bars) >= 20:
+            persist_klines_and_factors(conn, meta, bars, interval=interval)
+
+    if callable(getattr(cache, "register_kline_close_callback", None)):
+        cache.register_kline_close_callback(_on_close)
+    return _on_close
 
 
 def filter_universe(

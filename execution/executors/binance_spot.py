@@ -1342,6 +1342,7 @@ class BinanceSpotAdapter:
         reanchor_oco_on_fill: bool | None = None,
         auto_flatten_on_oco_fail: bool | None = None,
         orderbook_gate: bool | None = None,
+        ws_cache: Any | None = None,
     ) -> None:
         self.client = client
         self.kill_switch_path = kill_switch_path
@@ -1357,12 +1358,22 @@ class BinanceSpotAdapter:
         self.reanchor_oco_on_fill = reanchor_oco_on_fill
         self.auto_flatten_on_oco_fail = auto_flatten_on_oco_fail
         self.orderbook_gate = orderbook_gate
+        self.ws_cache = ws_cache
         self.buy_blocks: list[dict[str, Any]] = []
         self.peer_buy_blocks: list[dict[str, Any]] = []
         self.canonical_rows: list[dict[str, Any]] = []
         self._size_plan: dict[str, Any] | None = None
         self._entry_mark: str | None = None
         self._orderbook_metrics: dict[str, Any] | None = None
+        self._mark_telemetry: dict[str, Any] | None = None
+
+    def _active_ws_cache(self) -> Any | None:
+        if self.ws_cache is not None:
+            return self.ws_cache
+        from execution.binance_ws_stream import get_global_ws_cache, ws_stream_enabled
+        if ws_stream_enabled():
+            return get_global_ws_cache()
+        return None
 
     def _reanchor_enabled(self) -> bool:
         if self.reanchor_oco_on_fill is not None:
@@ -1433,11 +1444,21 @@ class BinanceSpotAdapter:
     def _read_entry_mark(
         self, client: Any, symbol: str
     ) -> tuple[str | None, str | None]:
-        """Live last price before a BUY. A missing or bad mark does not use the signal.
+        """Live last price before a BUY. Checks WebSocket L1 cache first, then REST fallback.
 
         No ticker method, a transport error, or a non-positive price is
         ``mark_unavailable``. The live BUY stops before ``new_order``.
         """
+        ws_cache = self._active_ws_cache()
+        if ws_cache is not None and callable(getattr(ws_cache, "get_ticker_price", None)):
+            ws_tick = ws_cache.get_ticker_price(symbol)
+            if isinstance(ws_tick, dict) and _to_decimal(ws_tick.get("price")) is not None:
+                self._mark_telemetry = {
+                    "mark_source": str(ws_tick.get("source") or "ws_l1"),
+                    "mark_ws_age_ms": int(ws_tick.get("ws_age_ms") or 0),
+                }
+                return str(ws_tick["price"]).strip(), None
+
         ticker = getattr(client, "ticker_price", None) if client is not None else None
         if not callable(ticker):
             return None, "mark_unavailable"
@@ -1450,6 +1471,7 @@ class BinanceSpotAdapter:
         mark = payload.get("price") if isinstance(payload, dict) else None
         if _to_decimal(mark) is None:
             return None, "mark_unavailable"
+        self._mark_telemetry = {"mark_source": "rest_fallback"}
         return str(mark).strip(), None
 
     def _repost_band(self, row: dict[str, Any], mark: object) -> tuple[bool, str | None]:
@@ -1929,6 +1951,7 @@ class BinanceSpotAdapter:
         self._size_plan = None
         self._entry_mark = None
         self._orderbook_metrics = None
+        self._mark_telemetry = None
         gates = self._gates()
         purpose = str(sig.get("purpose") or "").strip()
         if not is_live_bnb_spot_purpose(purpose):
@@ -2402,23 +2425,38 @@ class BinanceSpotAdapter:
                 extras.get("order_type", extras.get("binance_order_type"))
             )
             if order_type_now == "MARKET" and self._orderbook_gate_enabled():
-                depth_fn = getattr(client, "order_book", None)
-                if callable(depth_fn):
-                    try:
-                        depth_payload = depth_fn(symbol, limit=20)
-                    except Exception:  # noqa: BLE001
-                        depth_payload = None
-                    if isinstance(depth_payload, dict):
-                        order_map = dict(pairs)
-                        ob_metrics, ob_error = evaluate_orderbook_impact(
-                            depth_payload,
-                            quote_usdt=order_map.get("quoteOrderQty"),
-                            quantity=order_map.get("quantity"),
-                            spread_cap_bps=_to_decimal(extras.get("max_spread_bps")),
-                            impact_cap_bps=_to_decimal(extras.get("max_impact_bps")),
-                        )
-                        self._orderbook_metrics = ob_metrics
-                        if ob_error:
+                depth_payload = None
+                ob_source = "rest_fallback"
+                ob_age_ms: int | None = None
+                ws_cache = self._active_ws_cache()
+                if ws_cache is not None and callable(getattr(ws_cache, "get_order_book", None)):
+                    ws_book = ws_cache.get_order_book(symbol)
+                    if isinstance(ws_book, dict):
+                        depth_payload = ws_book
+                        ob_source = str(ws_book.get("source") or "ws_l2")
+                        ob_age_ms = int(ws_book.get("ws_age_ms") or 0)
+                if depth_payload is None:
+                    depth_fn = getattr(client, "order_book", None)
+                    if callable(depth_fn):
+                        try:
+                            depth_payload = depth_fn(symbol, limit=20)
+                        except Exception:  # noqa: BLE001
+                            depth_payload = None
+                if isinstance(depth_payload, dict):
+                    order_map = dict(pairs)
+                    ob_metrics, ob_error = evaluate_orderbook_impact(
+                        depth_payload,
+                        quote_usdt=order_map.get("quoteOrderQty"),
+                        quantity=order_map.get("quantity"),
+                        spread_cap_bps=_to_decimal(extras.get("max_spread_bps")),
+                        impact_cap_bps=_to_decimal(extras.get("max_impact_bps")),
+                    )
+                    if isinstance(ob_metrics, dict):
+                        ob_metrics["market_data_source"] = ob_source
+                        if ob_age_ms is not None:
+                            ob_metrics["ws_age_ms"] = ob_age_ms
+                    self._orderbook_metrics = ob_metrics
+                    if ob_error:
                             return self._finish(
                                 _result(
                                     ok=False,
@@ -3440,6 +3478,9 @@ class BinanceSpotAdapter:
         ob_metrics = getattr(self, "_orderbook_metrics", None)
         if isinstance(ob_metrics, dict):
             result["orderbook_metrics"] = dict(ob_metrics)
+        mark_tel = getattr(self, "_mark_telemetry", None)
+        if isinstance(mark_tel, dict):
+            result["mark_telemetry"] = dict(mark_tel)
         log.info(
             "binance_spot symbol=%s dry_run=%s ok=%s submitted=%s error=%s",
             result.get("symbol"),

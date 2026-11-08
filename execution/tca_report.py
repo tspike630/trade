@@ -157,6 +157,9 @@ def build_tca_report(
     exchange_error_codes: Counter[str] = Counter()
     orderbook_spreads: list[float] = []
     orderbook_impacts: list[float] = []
+    orderbook_ws_ages_ms: list[float] = []
+    ws_l2_hits = 0
+    rest_fallback_hits = 0
     submitted_count = 0
     executed_count = 0
 
@@ -181,6 +184,14 @@ def build_tca_report(
                 orderbook_spreads.append(sp)
             if imp is not None:
                 orderbook_impacts.append(imp)
+            src = str(ob.get("market_data_source") or "")
+            if src.startswith("ws_"):
+                ws_l2_hits += 1
+                age = _finite(ob.get("ws_age_ms"))
+                if age is not None:
+                    orderbook_ws_ages_ms.append(age)
+            elif src == "rest_fallback":
+                rest_fallback_hits += 1
         did_raw = item.get("decision_log_id")
         if did_raw is not None and str(did_raw).strip().isdigit():
             receipt_by_decision[int(str(did_raw).strip())] = exec_res
@@ -302,6 +313,7 @@ def build_tca_report(
     tp_total = exit_counts.get("take_profit", 0)
     sl_total = exit_counts.get("stop_loss", 0)
     decided_total = tp_total + sl_total
+    ob_source_total = ws_l2_hits + rest_fallback_hits
 
     return {
         "report": "binance_spot_tca",
@@ -320,6 +332,10 @@ def build_tca_report(
         "pre_trade_orderbook": {
             "spread_bps": summarize(orderbook_spreads),
             "impact_bps": summarize(orderbook_impacts),
+            "ws_l2_hits": ws_l2_hits,
+            "rest_fallback_hits": rest_fallback_hits,
+            "ws_hit_rate": round(ws_l2_hits / ob_source_total, 4) if ob_source_total > 0 else None,
+            "ws_age_ms": summarize(orderbook_ws_ages_ms),
         },
         "protection_audit": {
             "oco_working": oco_working_count,

@@ -32,9 +32,12 @@ def fetch_public_klines(
     interval: str = "5m",
     limit: int = 300,
     timeout: float = 8.0,
+    ws_cache: Any | None = None,
 ) -> list[tuple[int, float, float, float, float, float, float | None]]:
     """Closed-bar payload is the caller's job. Returns ``[]`` on any failure.
 
+    Checks the low-latency WebSocket kline cache first when enabled, then
+    falls back to public REST ``/api/v3/klines``.
     Each tuple is ``(open_ms, open, high, low, close, base_volume, quote_volume)``.
     """
     spot = str(symbol or "").strip().upper()
@@ -47,6 +50,31 @@ def fetch_public_klines(
     except (TypeError, ValueError):
         n = 300
     n = min(1000, max(1, n))
+
+    active_cache = ws_cache
+    if active_cache is None:
+        try:
+            from execution.binance_ws_stream import get_global_ws_cache, ws_stream_enabled
+            if ws_stream_enabled():
+                active_cache = get_global_ws_cache()
+        except ImportError:
+            active_cache = None
+    if active_cache is not None and callable(getattr(active_cache, "get_closed_klines", None)):
+        cached = active_cache.get_closed_klines(spot, tf, min_bars=min(20, n))
+        if cached:
+            return [
+                (
+                    int(bar.open_time_ms),
+                    float(bar.open),
+                    float(bar.high),
+                    float(bar.low),
+                    float(bar.close),
+                    float(bar.volume),
+                    float(bar.quote_volume),
+                )
+                for bar in cached[-n:]
+            ]
+
     query = urlencode({"symbol": spot, "interval": tf, "limit": n})
     req = Request(
         f"{PUBLIC_KLINES_URL}?{query}",
