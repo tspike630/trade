@@ -600,6 +600,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "binance_klines", "taker_buy_quote_volume", "REAL")
     _ensure_column(conn, "binance_indicators", "taker_buy_quote_volume", "REAL")
     _ensure_column(conn, "binance_indicators", "taker_buy_ratio", "REAL")
+    _ensure_column(conn, "binance_indicators", "funding_rate", "REAL")
+    _ensure_column(conn, "binance_indicators", "funding_z", "REAL")
+    _ensure_column(conn, "binance_indicators", "open_interest_change_1h", "REAL")
+    _ensure_column(conn, "binance_indicators", "perp_basis_bps", "REAL")
 
 
 def connect_rw(path: Path) -> sqlite3.Connection:

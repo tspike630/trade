@@ -54,12 +54,19 @@ DEFAULT_REL3_BEFORE_MIN = 15
 DEFAULT_REL3_AFTER_MIN = 30
 DEFAULT_REL2_BEFORE_MIN = 10
 DEFAULT_REL2_AFTER_MIN = 20
+DEFAULT_SHOCK_AFTER_MIN = 90
+DEFAULT_INLINE_AFTER_MIN = 5
+DEFAULT_SURPRISE_SHOCK_RATIO = 0.25
+DEFAULT_PREDICTED_SURPRISE_RATIO = 0.15
 
 DEFAULT_NQ_15M_FLOOR_PCT = -0.20
 DEFAULT_US2Y_15M_CAP_BPS = 3.0
 DEFAULT_JPY_15M_FLOOR_PCT = -0.15
 DEFAULT_CME_BASIS_FLOOR_BPS = -15.0
+DEFAULT_MAX_DEALER_SPREAD_BPS = 25.0
+DEFAULT_MIN_QUOTE_IMBALANCE = -0.60
 MAX_CROSS_ASSET_AGE_MS = 30 * 60 * 1000
+_TRUE = frozenset({"1", "true", "yes", "on"})
 
 
 @dataclass(frozen=True)
@@ -108,6 +115,13 @@ def _env_int(env: Mapping[str, str], key: str, default: int) -> int:
         return default
 
 
+def _env_bool(env: Mapping[str, str], key: str) -> bool:
+    raw = env.get(key)
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in _TRUE
+
+
 def resolve_macro_db_path(environ: Mapping[str, str] | None = None) -> Path | None:
     """Return configured LSEG macro SQLite path, or ``None`` when disabled."""
     env = os.environ if environ is None else environ
@@ -137,6 +151,14 @@ def _has_tables(conn: sqlite3.Connection, required: tuple[str, ...]) -> str | No
         if t not in have:
             return f"macro_table_missing:{t}"
     return None
+
+
+def _table_cols(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.Error:
+        return set()
+    return {str(r[1]) for r in rows}
 
 
 def _check_cross_asset(
@@ -208,7 +230,160 @@ def _check_cross_asset(
         if basis_bps < floor:
             return "cross_asset_cme_basis_discount", f"CME_basis={basis_bps:+.1f}bps"
 
+    # 5. Dealer Microstructure Gate: CME/NQ Bid-Ask Spread Blowout & Quote Movement Toxicity
+    if _env_bool(env, "DECISION_MACRO_MICROSTRUCTURE_GATE"):
+        bar_cols = _table_cols(conn, "cross_asset_bars")
+        if {"spread_bps", "quote_imbalance"}.issubset(bar_cols):
+            max_spread = _env_float(
+                env, "MACRO_MAX_DEALER_SPREAD_BPS", DEFAULT_MAX_DEALER_SPREAD_BPS
+            )
+            min_qi = _env_float(
+                env, "MACRO_MIN_QUOTE_IMBALANCE", DEFAULT_MIN_QUOTE_IMBALANCE
+            )
+            for ric in ("BTCc1", "NQc1"):
+                m_row = conn.execute(
+                    """
+                    SELECT utc_ms, spread_bps, quote_imbalance
+                    FROM cross_asset_bars
+                    WHERE ric = ? AND interval = '5min' AND utc_ms <= ? AND utc_ms >= ?
+                    ORDER BY utc_ms DESC
+                    LIMIT 1
+                    """,
+                    (ric, now_ms, min_ts),
+                ).fetchone()
+                if m_row is None:
+                    continue
+                sp = m_row["spread_bps"]
+                qi = m_row["quote_imbalance"]
+                if sp is not None and float(sp) >= max_spread:
+                    return (
+                        "cross_asset_dealer_spread_blowout",
+                        f"{ric}_spread={float(sp):.1f}bps",
+                    )
+                if qi is not None and float(qi) <= min_qi:
+                    return (
+                        "cross_asset_dealer_quote_toxicity",
+                        f"{ric}_quote_imb={float(qi):+.2f}",
+                    )
+
     return None, None
+
+
+def _evaluate_dynamic_surprise(
+    conn: sqlite3.Connection,
+    *,
+    now_ms: int,
+    r3_before_ms: int,
+    r3_after_ms: int,
+    env: Mapping[str, str],
+) -> tuple[str | None, str | None, bool]:
+    """Evaluate SmartEconomics predicted surprise and Out-of-Bounds / In-Line release windows.
+
+    Returns ``(halt_reason, detail, fast_cleared)``.
+    """
+    ev_cols = _table_cols(conn, "macro_events")
+    has_bounds = {"min_forecast", "max_forecast"}.issubset(ev_cols)
+    has_smart = {"reuters_poll", "actual", "surprise", "predicted_surprise"}.issubset(ev_cols)
+    if not has_smart:
+        return None, None, False
+
+    shock_after_ms = _env_int(env, "MACRO_SHOCK_AFTER_MIN", DEFAULT_SHOCK_AFTER_MIN) * 60_000
+    inline_after_ms = _env_int(env, "MACRO_INLINE_AFTER_MIN", DEFAULT_INLINE_AFTER_MIN) * 60_000
+    shock_ratio = _env_float(env, "MACRO_SURPRISE_SHOCK_RATIO", DEFAULT_SURPRISE_SHOCK_RATIO)
+    pred_ratio = _env_float(env, "MACRO_PREDICTED_SURPRISE_RATIO", DEFAULT_PREDICTED_SURPRISE_RATIO)
+
+    select_cols = [
+        "country",
+        "indicator_name",
+        "utc_ts",
+        "utc_ms",
+        "reuters_poll",
+        "actual",
+        "surprise",
+        "predicted_surprise",
+    ]
+    if has_bounds:
+        select_cols.extend(["min_forecast", "max_forecast"])
+
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join(select_cols)}
+        FROM macro_events
+        WHERE relevance = 3
+          AND local_time_hkt != ''
+          AND utc_ms BETWEEN ? AND ?
+        ORDER BY ABS(utc_ms - ?) ASC
+        """,
+        (now_ms - shock_after_ms, now_ms + r3_before_ms, now_ms),
+    ).fetchall()
+
+    for r in rows:
+        ev_ms = int(r["utc_ms"])
+        poll = float(r["reuters_poll"]) if r["reuters_poll"] is not None else None
+        actual = float(r["actual"]) if r["actual"] is not None else None
+        surprise = float(r["surprise"]) if r["surprise"] is not None else None
+        pred_surp = float(r["predicted_surprise"]) if r["predicted_surprise"] is not None else None
+        min_f = float(r["min_forecast"]) if (has_bounds and r["min_forecast"] is not None) else None
+        max_f = float(r["max_forecast"]) if (has_bounds and r["max_forecast"] is not None) else None
+
+        # Pre-release SmartEconomics Predicted Surprise Alert (ev_ms > now_ms)
+        if ev_ms > now_ms:
+            if pred_surp is not None and poll is not None:
+                rel_pred = abs(pred_surp) / max(abs(poll), 0.1)
+                if rel_pred >= pred_ratio:
+                    return (
+                        "macro_predicted_surprise_blackout",
+                        f"{r['country']}:{r['indicator_name']}@pred_surp={pred_surp:+.3g}",
+                        False,
+                    )
+            return (
+                "macro_rel3_blackout",
+                f"{r['country']}:{r['indicator_name']}@{r['utc_ts']}",
+                False,
+            )
+
+        # Post-release (ev_ms <= now_ms): check Out-of-Bounds Shock vs In-Line Fast-Clear
+        elapsed_ms = now_ms - ev_ms
+        out_of_bounds = (
+            actual is not None
+            and min_f is not None
+            and max_f is not None
+            and max_f >= min_f
+            and (actual > max_f or actual < min_f)
+        )
+        large_rel_shock = (
+            surprise is not None
+            and poll is not None
+            and (abs(surprise) / max(abs(poll), 0.1)) >= shock_ratio
+        )
+        if out_of_bounds or large_rel_shock:
+            if elapsed_ms <= shock_after_ms:
+                tag = "out_of_bounds" if out_of_bounds else f"surprise={surprise:+.3g}"
+                return (
+                    "macro_surprise_shock_blackout",
+                    f"{r['country']}:{r['indicator_name']}@{tag}",
+                    False,
+                )
+
+        # Check In-Line Fast-Clear after inline_after_ms (default 5m)
+        if elapsed_ms <= r3_after_ms:
+            is_inline = False
+            if actual is not None and poll is not None:
+                if min_f is not None and max_f is not None and max_f > min_f:
+                    is_inline = (min_f <= actual <= max_f) and (
+                        abs(actual - poll) <= 0.15 * (max_f - min_f)
+                    )
+                else:
+                    is_inline = abs(actual - poll) <= 0.02 * max(abs(poll), 0.1)
+            if is_inline and elapsed_ms > inline_after_ms:
+                return None, None, True
+            return (
+                "macro_rel3_blackout",
+                f"{r['country']}:{r['indicator_name']}@{r['utc_ts']}",
+                False,
+            )
+
+    return None, None, False
 
 
 def evaluate_macro_gate(
@@ -262,21 +437,33 @@ def evaluate_macro_gate(
             detail = f"{cb_row['country']}:{str(cb_row['event_name'])[:60]}@{cb_row['utc_ts']}"
             return MacroGateStatus.halted("central_bank_blackout", detail)
 
-        # 2. Tier-1 Macro Release (Relevance = 3) window [-15m, +30m]
+        # 2. Tier-1 Macro Release (Relevance = 3) window [-15m, +30m] (or dynamic surprise window)
         r3_before_ms = _env_int(env, "MACRO_REL3_BEFORE_MIN", DEFAULT_REL3_BEFORE_MIN) * 60_000
         r3_after_ms = _env_int(env, "MACRO_REL3_AFTER_MIN", DEFAULT_REL3_AFTER_MIN) * 60_000
-        r3_row = conn.execute(
-            """
-            SELECT country, indicator_name, utc_ts
-            FROM macro_events
-            WHERE relevance = 3
-              AND local_time_hkt != ''
-              AND utc_ms BETWEEN ? AND ?
-            ORDER BY ABS(utc_ms - ?) ASC
-            LIMIT 1
-            """,
-            (now_ms - r3_after_ms, now_ms + r3_before_ms, now_ms),
-        ).fetchone()
+        if _env_bool(env, "DECISION_MACRO_SURPRISE_DYNAMIC"):
+            s_reason, s_detail, fast_cleared = _evaluate_dynamic_surprise(
+                conn,
+                now_ms=now_ms,
+                r3_before_ms=r3_before_ms,
+                r3_after_ms=r3_after_ms,
+                env=env,
+            )
+            if s_reason is not None:
+                return MacroGateStatus.halted(s_reason, s_detail)
+            r3_row = None if fast_cleared else None
+        else:
+            r3_row = conn.execute(
+                """
+                SELECT country, indicator_name, utc_ts
+                FROM macro_events
+                WHERE relevance = 3
+                  AND local_time_hkt != ''
+                  AND utc_ms BETWEEN ? AND ?
+                ORDER BY ABS(utc_ms - ?) ASC
+                LIMIT 1
+                """,
+                (now_ms - r3_after_ms, now_ms + r3_before_ms, now_ms),
+            ).fetchone()
         if r3_row is not None:
             detail = f"{r3_row['country']}:{r3_row['indicator_name']}@{r3_row['utc_ts']}"
             return MacroGateStatus.halted("macro_rel3_blackout", detail)

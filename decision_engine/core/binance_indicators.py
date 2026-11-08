@@ -81,6 +81,10 @@ _OPTIONAL_COLS = (
     "bar_trades",
     "baseline_quote_volume",
     "baseline_trades",
+    "funding_rate",
+    "funding_z",
+    "open_interest_change_1h",
+    "perp_basis_bps",
 )
 
 
