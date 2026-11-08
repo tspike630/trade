@@ -11,6 +11,10 @@ from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine.core.perp_microstructure_and_beta_hedge import (
+    compute_portfolio_beta_and_hedge,
+    portfolio_beta_exposure_block,
+)
 from decision_engine.core.portfolio_clusters import cluster_open_exposure_block
 from decision_engine.core.protection_halt import ProtectionBook, purpose_halt_reason
 from decision_engine.core.signal_bus import (
@@ -65,6 +69,7 @@ def apply_live_buy_guards(
     stop_rejected = 0
     protection_dropped = 0
     cluster_dropped = 0
+    beta_dropped = 0
     macro_dropped = 0
     for signal in signals:
         if str(signal.get("action") or "").lower() != "buy":
@@ -124,6 +129,22 @@ def apply_live_buy_guards(
                     cluster_reason,
                 )
                 continue
+            beta_reason = portfolio_beta_exposure_block(
+                list(book.positions),
+                purpose=purpose,
+                symbol=signal_symbol(signal),
+                candidate_size_pct=signal.get("size_pct"),
+                accepted_signals=kept,
+            )
+            if beta_reason is not None:
+                beta_dropped += 1
+                log.info(
+                    "portfolio_beta_halt purpose=%s symbol=%s reason=%s",
+                    purpose,
+                    signal_symbol(signal),
+                    beta_reason,
+                )
+                continue
         if macro_halt is not None:
             macro_dropped += 1
             log.info(
@@ -155,6 +176,14 @@ def apply_live_buy_guards(
     }
     if cluster_dropped:
         report["cluster_dropped"] = cluster_dropped
+    if beta_dropped:
+        report["beta_dropped"] = beta_dropped
+    if per_symbol and (book.positions or kept):
+        report["beta_hedge_plan"] = compute_portfolio_beta_and_hedge(
+            list(book.positions),
+            candidate_signals=kept,
+            purpose=purpose,
+        )
     if macro_halt is not None or macro_dropped:
         report["macro_halt"] = macro_halt
         report["macro_dropped"] = macro_dropped

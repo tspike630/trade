@@ -72,6 +72,9 @@ import os
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
 
+from decision_engine.core.perp_microstructure_and_beta_hedge import (
+    evaluate_perp_microstructure,
+)
 from decision_engine.core.stop_gap import stop_distance_reason
 
 ALPHA_FLOOR = 0.08
@@ -185,6 +188,9 @@ class EntryDecision:
     taker_buy_ratio: float | None = None
     taker_buy_ratio_source: str | None = None
     orderflow_regime: str | None = None
+    funding_rate: float | None = None
+    perp_basis_bps: float | None = None
+    perp_regime: str | None = None
 
 
 def _empty(
@@ -207,6 +213,9 @@ def _empty(
     taker_buy_ratio: float | None = None,
     taker_buy_ratio_source: str | None = None,
     orderflow_regime: str | None = None,
+    funding_rate: float | None = None,
+    perp_basis_bps: float | None = None,
+    perp_regime: str | None = None,
 ) -> EntryDecision:
     return EntryDecision(
         emit=False,
@@ -236,6 +245,9 @@ def _empty(
         taker_buy_ratio=taker_buy_ratio,
         taker_buy_ratio_source=taker_buy_ratio_source,
         orderflow_regime=orderflow_regime,
+        funding_rate=funding_rate,
+        perp_basis_bps=perp_basis_bps,
+        perp_regime=perp_regime,
     )
 
 
@@ -507,6 +519,9 @@ def _emit(
     taker_buy_ratio: float | None = None,
     taker_buy_ratio_source: str | None = None,
     orderflow_regime: str | None = None,
+    funding_rate: float | None = None,
+    perp_basis_bps: float | None = None,
+    perp_regime: str | None = None,
 ) -> EntryDecision:
     return EntryDecision(
         emit=True,
@@ -536,6 +551,9 @@ def _emit(
         taker_buy_ratio=taker_buy_ratio,
         taker_buy_ratio_source=taker_buy_ratio_source,
         orderflow_regime=orderflow_regime,
+        funding_rate=funding_rate,
+        perp_basis_bps=perp_basis_bps,
+        perp_regime=perp_regime,
     )
 
 
@@ -569,6 +587,9 @@ def _limit_or_reject(
             taker_buy_ratio=base.get("taker_buy_ratio"),
             taker_buy_ratio_source=base.get("taker_buy_ratio_source"),
             orderflow_regime=base.get("orderflow_regime"),
+            funding_rate=base.get("funding_rate"),
+            perp_basis_bps=base.get("perp_basis_bps"),
+            perp_regime=base.get("perp_regime"),
         )
 
     if not _gt(price, limit_price) or limit_price <= 0 or stop_price >= limit_price:
@@ -721,6 +742,21 @@ def evaluate_entry_zone(
             orderflow_regime = "absorption_strong"
 
     common["orderflow_regime"] = orderflow_regime
+    perp_verdict = evaluate_perp_microstructure(row, taker_buy_ratio=tbr)
+    common["funding_rate"] = perp_verdict.funding_rate
+    common["perp_basis_bps"] = perp_verdict.perp_basis_bps
+    common["perp_regime"] = perp_verdict.perp_regime
+    if not perp_verdict.allow:
+        return _empty(
+            reason=perp_verdict.reject_reason or "perp_microstructure_rejected",
+            tier=tier,
+            ratio=ratio,
+            zone=(zone_floor, zone_cap) if tier == "large_trade" else (neutral_min, neutral_max),
+            stop_price=stop_price,
+            take_profit_price=take_profit,
+            **common,
+        )
+
     base = {
         "take_profit": take_profit,
         "alpha": alpha,
@@ -736,6 +772,9 @@ def evaluate_entry_zone(
         "taker_buy_ratio": tbr,
         "taker_buy_ratio_source": tbr_source,
         "orderflow_regime": orderflow_regime,
+        "funding_rate": perp_verdict.funding_rate,
+        "perp_basis_bps": perp_verdict.perp_basis_bps,
+        "perp_regime": perp_verdict.perp_regime,
     }
 
     if tier == "large_trade":

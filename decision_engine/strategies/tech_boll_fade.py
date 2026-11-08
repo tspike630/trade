@@ -18,6 +18,9 @@ from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine.core.perp_microstructure_and_beta_hedge import (
+    symbol_beta_vs_btc,
+)
 from decision_engine.core.portfolio_clusters import (
     compute_inverse_vol_size,
     symbol_sector_cluster,
@@ -185,12 +188,20 @@ class TechBollFadeStrategy(BaseStrategy):
                     self.rejected.get(REJECT_BELOW_MIN, 0) + 1
                 )
                 continue
+            sym_str = str(row.get("binance_symbol") or "")
             lift_extra: dict[str, Any] = {
-                "sector_cluster": symbol_sector_cluster(str(row.get("binance_symbol") or "")),
+                "sector_cluster": symbol_sector_cluster(sym_str),
+                "beta_vs_btc": symbol_beta_vs_btc(sym_str),
                 "risk_parity_scalar": vol_sized.risk_parity_scalar,
             }
             if vol_sized.stop_distance_pct is not None:
                 lift_extra["stop_distance_pct"] = vol_sized.stop_distance_pct
+            if decision.funding_rate is not None:
+                lift_extra["funding_rate"] = decision.funding_rate
+            if decision.perp_basis_bps is not None:
+                lift_extra["perp_basis_bps"] = decision.perp_basis_bps
+            if decision.perp_regime is not None:
+                lift_extra["perp_regime"] = decision.perp_regime
             if lifted:
                 lift_extra.update(
                     {
