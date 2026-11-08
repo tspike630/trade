@@ -66,7 +66,8 @@ class CanonicalListTests(unittest.TestCase):
         self.assertEqual(JEV_GATED_STRATEGIES, frozenset({
             "jev_strength_v1", "factor_jev_strength_v1",
             "combined_jev_tech_v1", "factor_combined_jev_tech_v1",
-            "factor_jev_timeexit_v1", "factor_jev_trail_v1", "factor_jev_rsi_and_v1"}))
+            "factor_jev_timeexit_v1", "factor_jev_trail_v1", "factor_jev_rsi_and_v1",
+            "factor_jev_macd_and_v1", "factor_jev_boll_and_v1"}))
 
     def test_all_registered_and_no_jev_combo_left_out(self):
         for sid in JEV_GATED_STRATEGIES:

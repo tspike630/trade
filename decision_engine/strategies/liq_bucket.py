@@ -14,7 +14,7 @@ from typing import Any, Literal
 from logging_setup import get_logger
 
 from decision_engine.strategies.base_strategy import BaseStrategy
-from decision_engine.strategies.entry_sizing import buy_size_fields
+from decision_engine.strategies.entry_sizing import tick_now, buy_size_fields
 from decision_engine.strategies.selfbuilt_momentum_a import evaluate_candidate_a
 
 log = get_logger("decision_engine.liq_bucket")
@@ -76,7 +76,7 @@ class _LiqBucketBase(BaseStrategy):
         self.rejected = {}
         hot = data.get("hot_tokens") or []
         hits = 0
-        now = datetime.now(timezone.utc)
+        now = tick_now(data)
         for row in hot:
             ok, why, extras = evaluate_liq_bucket(row, bucket=self.bucket, now=now)
             if not ok:

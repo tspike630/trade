@@ -392,6 +392,68 @@ class IndicatorDataAdapter:
         ).fetchone()
         return _row_to_dict(row)
 
+    def latest_indicator_history_recorded_at(
+        self,
+        chain_id: str,
+        token_address: str,
+        pair_address: str | None = None,
+    ) -> str | None:
+        """Latest ``indicator_history.recorded_at`` for the token (or pair when not token-keyed).
+
+        When ``token_address`` is a column on ``indicator_history``, only
+        ``(chain_id, token_address)`` is queried — another token's row on a
+        shared pair is never borrowed. Pair lookup is used only when the
+        table has no ``token_address`` column. Blank or NULL values are
+        ignored.
+        """
+        if not self._table_exists("indicator_history"):
+            return None
+        cols = self._table_columns("indicator_history")
+        if "chain_id" not in cols or "recorded_at" not in cols:
+            return None
+        chain = str(chain_id or "").strip()
+        if not chain:
+            return None
+        if "token_address" in cols:
+            token = str(token_address or "").strip()
+            if not token:
+                return None
+            row = self.conn.execute(
+                """
+                SELECT MAX(recorded_at) AS latest
+                FROM indicator_history
+                WHERE chain_id = ?
+                  AND token_address = ?
+                  AND recorded_at IS NOT NULL
+                  AND TRIM(recorded_at) != ''
+                """,
+                (chain, token),
+            ).fetchone()
+        else:
+            pair_col = (
+                "pair_address"
+                if "pair_address" in cols
+                else ("primary_pair_address" if "primary_pair_address" in cols else None)
+            )
+            pair = str(pair_address or "").strip() if pair_address is not None else ""
+            if pair_col is None or not pair:
+                return None
+            row = self.conn.execute(
+                f"""
+                SELECT MAX(recorded_at) AS latest
+                FROM indicator_history
+                WHERE chain_id = ?
+                  AND {pair_col} = ?
+                  AND recorded_at IS NOT NULL
+                  AND TRIM(recorded_at) != ''
+                """,
+                (chain, pair),
+            ).fetchone()
+        if row is None or row["latest"] is None:
+            return None
+        text = str(row["latest"]).strip()
+        return text or None
+
     def get_pair_snapshot(
         self, chain_id: str, pair_address: str
     ) -> dict[str, Any] | None:

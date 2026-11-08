@@ -32,7 +32,7 @@ from typing import Any, Callable
 from logging_setup import get_logger
 
 from decision_engine.strategies.base_strategy import BaseStrategy
-from decision_engine.strategies.entry_sizing import buy_size_fields
+from decision_engine.strategies.entry_sizing import tick_now, buy_size_fields
 from decision_engine.strategies.selfbuilt_momentum_a import evaluate_candidate_a
 from decision_engine.strategies.swing_established import evaluate_swing_established
 from decision_engine.strategies.vol_climax_mcap_band import evaluate_vol_climax_mcap_band
@@ -141,7 +141,7 @@ class PortfolioRiskSleevesStrategy(BaseStrategy):
         self.rejected = {}
         self.sleeve_hits = {"A_vol_climax": 0, "B_swing": 0, "C_selfbuilt": 0}
         hot = data.get("hot_tokens") or []
-        now = datetime.now(timezone.utc)
+        now = tick_now(data)
         claimed: set[str] = set()
         emits = 0
 

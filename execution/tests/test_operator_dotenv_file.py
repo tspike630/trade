@@ -151,7 +151,7 @@ class OperatorDotenvFileTests(unittest.TestCase):
 
     def test_crawler_dotenv_reloads_after_a_clean_child_unless_guarded(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dotenv-fixture-") as tmp:
-            tree = Path(tmp) / "tree"
+            tree = Path(tmp).resolve() / "tree"
             shutil.copytree(ROOT, tree, symlinks=True, ignore=_ignore)
             _flat_runtime(tree)
             self.assertTrue((tree / "config.py").is_file())

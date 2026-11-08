@@ -511,9 +511,25 @@ def quote_volume_24h(klines: Sequence[SpotKline]) -> float | None:
     return total
 
 
-def factors_from_klines(klines: Sequence[SpotKline]) -> dict[str, Any] | None:
+def _closed_klines(
+    klines: Sequence[SpotKline],
+    *,
+    now_ms: int | None = None,
+) -> list[SpotKline]:
+    if now_ms is None:
+        return list(klines)
+    cutoff = int(now_ms)
+    return [bar for bar in klines if int(bar.close_time_ms) <= cutoff]
+
+
+def factors_from_klines(
+    klines: Sequence[SpotKline],
+    *,
+    now_ms: int | None = None,
+) -> dict[str, Any] | None:
     """Same tech_boll family as paper: change_*, volume_strength, BOLL(20, 2σ) on close."""
-    series = price_series_from_klines(klines)
+    closed = _closed_klines(klines, now_ms=now_ms)
+    series = price_series_from_klines(closed)
     if not series:
         return None
     closes = [float(row["price_usd"]) for row in series]
@@ -528,9 +544,9 @@ def factors_from_klines(klines: Sequence[SpotKline]) -> dict[str, Any] | None:
         "change_24h": change_pct(series, INTERVAL_SEC["change_24h"]),
         "volatility_24h": volatility_stdev_returns(series),
         "volume_strength": volume_strength(series),
-        "quote_volume_24h": quote_volume_24h(klines),
+        "quote_volume_24h": quote_volume_24h(closed),
         "sample_count": len(series),
-        "kline_close_time_ms": max(bar.close_time_ms for bar in klines),
+        "kline_close_time_ms": max(bar.close_time_ms for bar in closed),
     }
     out.update(fields)
     return out
@@ -603,13 +619,15 @@ def persist_klines_and_factors(
     *,
     interval: str = DEFAULT_INTERVAL,
     updated_at: str | None = None,
+    now_ms: int | None = None,
 ) -> dict[str, Any] | None:
-    """Write one symbol's klines and tech_boll row. DEX tables are not touched."""
-    factors = factors_from_klines(klines)
+    """Write one symbol's closed klines and tech_boll row. DEX tables are not touched."""
+    closed = _closed_klines(klines, now_ms=now_ms)
+    factors = factors_from_klines(closed)
     if factors is None:
         return None
     now = updated_at or utc_now_iso()
-    upsert_klines(conn, meta.symbol, interval, klines)
+    upsert_klines(conn, meta.symbol, interval, closed)
     stored = {
         "symbol": meta.symbol,
         "base_asset": meta.base_asset,
@@ -659,12 +677,17 @@ def ingest_spot_klines(
             stats["failed"] += 1
             log.warning("kline payload not a list symbol=%s", meta.symbol)
             continue
-        bars = [bar for row in payload if (bar := parse_kline_row(row)) is not None]
+        clock_ms = int(time.time() * 1000)
+        bars = [
+            bar
+            for row in payload
+            if (bar := parse_kline_row(row)) is not None and bar.close_time_ms <= clock_ms
+        ]
         if not bars:
             stats["skipped"] += 1
             continue
         try:
-            stored = persist_klines_and_factors(conn, meta, bars, interval=interval)
+            stored = persist_klines_and_factors(conn, meta, bars, interval=interval, now_ms=clock_ms)
         except sqlite3.Error as exc:
             stats["failed"] += 1
             log.warning("kline write failed symbol=%s err=%s", meta.symbol, exc)

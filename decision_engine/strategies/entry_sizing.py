@@ -160,6 +160,29 @@ def ordinary_size_pct(floor_pct: float, cap: float) -> float:
     return min(floor, ceiling)
 
 
+def tick_now(data: dict[str, Any] | None = None) -> datetime:
+    """Resolve current tick UTC timestamp from ``data['bar_ts']`` (backtest) or wall clock."""
+    if isinstance(data, dict):
+        raw_now = data.get("now")
+        if isinstance(raw_now, datetime):
+            return raw_now if raw_now.tzinfo else raw_now.replace(tzinfo=timezone.utc)
+        bar_ts = data.get("bar_ts")
+        if isinstance(bar_ts, str) and bar_ts.strip():
+            text = bar_ts.strip()
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(text)
+                return (
+                    parsed.astimezone(timezone.utc)
+                    if parsed.tzinfo
+                    else parsed.replace(tzinfo=timezone.utc)
+                )
+            except ValueError:
+                pass
+    return datetime.now(timezone.utc)
+
+
 def resolve_entry_size(
     row: dict[str, Any],
     *,
@@ -170,7 +193,12 @@ def resolve_entry_size(
     """Return thick-pool full size, or the ordinary floor (capped)."""
     th = thresholds if thresholds is not None else thresholds_from_config()
     floor = ordinary_size_pct(floor_pct, th.ordinary_size_pct)
-    when = now or datetime.now(timezone.utc)
+    if now is not None:
+        when = now
+    elif isinstance(row.get("recorded_at"), str) and row.get("recorded_at").strip():
+        when = tick_now({"bar_ts": row.get("recorded_at")})
+    else:
+        when = datetime.now(timezone.utc)
     blockers: list[str] = []
 
     liq = _lookup(row, ("liquidity_usd", "liq_usd"))

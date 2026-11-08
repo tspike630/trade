@@ -146,8 +146,11 @@ class BacktestEngine:
             self.ledger.ensure_account(s.strategy_id)
         self.ledger.commit()
 
+        last_prices: dict[str, float] = {}
         for snap in self.replay.iter_snapshots():
             self.stats["bars"] += 1
+            if snap.prices:
+                last_prices.update(snap.prices)
             data = {
                 "hot_tokens": snap.hot_tokens,
                 "bar_ts": snap.bar_ts,
@@ -292,8 +295,8 @@ class BacktestEngine:
             for p in list(self.ledger.list_open(sid)):
                 # use entry as last resort
                 key = f"{p['chain_id']}|{p['pair_address']}"
-                # last equity mark price unknown — close at entry (flat) with reason eod
-                px = float(p["entry_price"])
+                # close at last known mark price (fall back to entry only if never marked)
+                px = float(last_prices.get(key, p["entry_price"]))
                 # try last known from equity path — not stored; flat close
                 self.ledger.close_position(
                     p["id"], price=px, ts=window.end.strftime("%Y-%m-%dT%H:%M:%SZ"), reason="eod_flat"

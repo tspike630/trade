@@ -26,6 +26,7 @@ from logging_setup import get_logger
 
 from decision_engine.strategies.base_strategy import BaseStrategy
 from decision_engine.strategies.entry_sizing import (
+    tick_now,
     buy_size_fields,
     pool_age_days,
     r3_reject,
@@ -137,7 +138,7 @@ class SelfbuiltMomentumAStrategy(BaseStrategy):
         self.rejected = {}
         hot = data.get("hot_tokens") or []
         hits = 0
-        now = datetime.now(timezone.utc)
+        now = tick_now(data)
         for row in hot:
             ok, why, extras = evaluate_candidate_a(row, now=now)
             if not ok:

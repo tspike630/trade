@@ -37,6 +37,7 @@ rewrite_role() {
 echo "$(ts) decision_watchdog start race_selfbuilt_a (no live_candidate) SIZE_MULT=20" >>"$LOG"
 while true; do
   # PAUSED by Yang 2026-11-05: all paper emitters off; do not restart race_selfbuilt_a.
+  # Reference command: -m decision_engine.run --strategy selfbuilt_momentum_a_v1 --dry-run --interval 60 --purpose race_selfbuilt_a --limit 2000 --token-cooldown-min 60 --position-pct 0.05
   if [[ "${DECISION_ENTRY_IH_SIDEBOOK:-0}" == "1" ]]; then
     ensure_one entry_ih_ge1h \
       'strategy selfbuilt_momentum_a_v1 .*--purpose shadow_entry_ih_ge1h' \

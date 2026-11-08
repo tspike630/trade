@@ -77,7 +77,48 @@ class _Finder(importlib.abc.MetaPathFinder):
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is None or spec.loader is None:
-            return spec
+            def _fallback_exec(module: ModuleType) -> None:
+                def _load_dotenv(
+                    dotenv_path: object = None,
+                    stream: object = None,
+                    verbose: bool = False,
+                    override: bool = False,
+                    **kwargs: object,
+                ) -> bool:
+                    del stream, verbose, kwargs
+                    if dotenv_path is None:
+                        return False
+                    p = Path(os.fspath(dotenv_path))  # type: ignore[arg-type]
+                    if not p.is_file():
+                        return False
+                    loaded = False
+                    for line in p.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        key = k.strip()
+                        val = v.strip().strip('"').strip("'")
+                        if override or key not in os.environ:
+                            os.environ[key] = val
+                        loaded = True
+                    return loaded
+
+                module.load_dotenv = _load_dotenv  # type: ignore[attr-defined]
+                _wrap_module(module)
+
+            loader = importlib.util.spec_from_loader(fullname, loader=None)
+            if loader is None:
+                return None
+
+            class _FallbackLoader(importlib.abc.Loader):
+                def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType | None:
+                    return None
+
+                def exec_module(self, module: ModuleType) -> None:
+                    _fallback_exec(module)
+
+            return importlib.machinery.ModuleSpec(fullname, _FallbackLoader())
         loader = spec.loader
         original = loader.exec_module
 

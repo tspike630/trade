@@ -14,7 +14,7 @@ from typing import Any
 from logging_setup import get_logger
 
 from decision_engine.strategies.base_strategy import BaseStrategy
-from decision_engine.strategies.entry_sizing import buy_size_fields
+from decision_engine.strategies.entry_sizing import tick_now, buy_size_fields
 
 log = get_logger("decision_engine.rel_strength_10d")
 
@@ -69,7 +69,7 @@ class RelStrength10dStrategy(BaseStrategy):
         self._pending.clear()
         self.rejected = {}
         hot = data.get("hot_tokens") or []
-        now = datetime.now(timezone.utc)
+        now = tick_now(data)
         universe: list[dict[str, Any]] = []
         for row in hot:
             liq = _finite(row.get("liquidity_usd"))
