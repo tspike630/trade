@@ -375,17 +375,48 @@ def protective_band_error(
 
 
 def fill_average_price(placed: dict[str, Any] | None) -> str | None:
-    """Average fill from quote spent and base filled. A zero qty is not a price."""
+    """Average fill from quote spent and base filled. A limit price is not a fill.
+
+    ``cummulativeQuoteQty / executedQty`` is the only average. An unfilled
+    order's ``price`` is not used, even when that field is present.
+    """
     if not isinstance(placed, dict):
         return None
     quote = _to_decimal(placed.get("cummulativeQuoteQty"))
     qty = _to_decimal(placed.get("executedQty"))
-    if quote is not None and qty is not None and qty > 0:
-        return _decimal_text(quote / qty)
-    px = _to_decimal(placed.get("price"))
-    if px is not None and px > 0:
-        return _decimal_text(px)
-    return None
+    if quote is None or qty is None or qty <= 0:
+        return None
+    return _decimal_text(quote / qty)
+
+
+# Numerical reference only. Live OCO keeps the signal's absolute stop and
+# take-profit and the one-tick stop limit. These percents are not applied,
+# and a stop-limit price is not a guaranteed sell. The 0.2% fee figure is not
+# a substitute for the commission on the fill.
+REFERENCE_TP_PCT = Decimal("10")
+REFERENCE_SL_PCT = Decimal("5")
+REFERENCE_SL_LIMIT_BUFFER_PCT = Decimal("0.3")
+REFERENCE_FEE_BUFFER_PCT = Decimal("0.2")
+
+
+def reference_protection_prices(avg_fill: str) -> dict[str, str] | None:
+    """Illustration of 10% / 5% / 0.3% on an average fill. Not used for orders."""
+    avg = _to_decimal(avg_fill)
+    if avg is None:
+        return None
+    take_profit = avg * (Decimal(1) + REFERENCE_TP_PCT / Decimal(100))
+    stop = avg * (Decimal(1) - REFERENCE_SL_PCT / Decimal(100))
+    limit = stop - (avg * REFERENCE_SL_LIMIT_BUFFER_PCT / Decimal(100))
+    if limit <= 0 or not (stop < avg < take_profit):
+        return None
+    return {
+        "entry": _decimal_text(avg),
+        "take_profit_price": _decimal_text(take_profit),
+        "stop_price": _decimal_text(stop),
+        "stop_limit_price": _decimal_text(limit),
+        "fee_buffer_pct": _decimal_text(REFERENCE_FEE_BUFFER_PCT),
+        "applied_to_live_orders": "no",
+    }
 
 
 def build_spot_oco(
@@ -657,11 +688,18 @@ def resolve_entry_size(
         return extras, "entry_notional_below_min", plan
     plan["quote_usdt"] = quote_text
     order_type = str(extras.get("order_type") or extras.get("binance_order_type") or "MARKET").strip().upper()
+    if order_type == "MAKER":
+        order_type = "LIMIT_MAKER"
     sized = dict(extras)
-    if order_type == "LIMIT":
+    if order_type in {"LIMIT", "LIMIT_MAKER"}:
         price = _to_decimal(extras.get("limit_price"))
         if price is None:
             price = _to_decimal(extras.get("price"))
+        if price is None and order_type == "LIMIT_MAKER":
+            sized["quote_order_qty"] = quote_text
+            plan["order_type"] = "LIMIT_MAKER"
+            plan["needs_book_price"] = True
+            return sized, None, plan
         if price is None:
             return extras, "missing_limit_price", plan
         qty = sent_quote / price
@@ -671,7 +709,7 @@ def resolve_entry_size(
         if qty_text is None:
             return extras, "entry_not_viable:below_min_qty", plan
         sized["quantity"] = qty_text
-        plan["order_type"] = "LIMIT"
+        plan["order_type"] = order_type
         plan["needs_lot_floor"] = True
         return sized, None, plan
     if order_type not in {"MARKET", ""}:

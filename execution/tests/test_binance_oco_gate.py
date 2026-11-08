@@ -55,6 +55,7 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
 from execution.executors.binance_spot_protect import (  # noqa: E402
     ENTRY_MIN_NOTIONAL_USDT,
     build_spot_oco,
+    reference_protection_prices,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
 from execution.ledger import ExecutionLedger  # noqa: E402
@@ -373,6 +374,83 @@ class ConsumerGateTests(unittest.TestCase):
         assert kept is not None
         self.assertEqual(kept["entry_price"], "48.08")
         self.assertEqual(kept["status"], "oco_filled")
+
+    def test_real_fill_keeps_signal_band_and_current_oco_names(self) -> None:
+        """executedQty 1 and cumQuote 100 average to 100. Signal 110/95 is not rewritten.
+
+        The 0.3% reference stop limit is 94.70. The live list uses the existing
+        one-tick buffer, 94.99 on a 0.01 tick, and does not copy the reference.
+        Legacy price/stopPrice/stopLimitPrice names are not the OCO contract.
+        """
+        reference = reference_protection_prices("100")
+        self.assertEqual(reference["take_profit_price"], "110")
+        self.assertEqual(reference["stop_price"], "95")
+        self.assertEqual(Decimal(reference["stop_limit_price"]), Decimal("94.70"))
+
+        class _Fill(_Client):
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_order", signed_query, api_key))
+                return {
+                    "orderId": "77",
+                    "status": "FILLED",
+                    "executedQty": "1",
+                    "cummulativeQuoteQty": "100",
+                    "price": "90",
+                    "symbol": "BNBUSDT",
+                }
+
+        client = _Fill()
+        sig = _buy(9100)
+        sig["extras"] = dict(sig["extras"])
+        sig["extras"]["price_usd"] = "100"
+        sig["extras"]["stop_price"] = "95"
+        sig["extras"]["take_profit_price"] = "110"
+        sig["extras"]["quote_order_qty"] = "100"
+        adapter = self._adapter(client)
+        with mock.patch.dict(os.environ, _env(self.root)):
+            covered = adapter.execute(sig)
+        self.assertEqual(covered["executed"], 1, covered)
+        self.assertTrue(covered["consumer_allowed"])
+        self.assertEqual(covered["arm_position"]["entry_price"], "100")
+        self.assertEqual(covered["exit_plan"]["stop_price"], "95")
+        self.assertEqual(covered["exit_plan"]["take_profit_price"], "110")
+        oco = parse_qs(next(call[1] for call in client.calls if call[0] == "new_oco"))
+        self.assertEqual(oco["aboveType"], ["LIMIT_MAKER"])
+        self.assertEqual(oco["abovePrice"], ["110"])
+        self.assertEqual(oco["belowType"], ["STOP_LOSS_LIMIT"])
+        self.assertEqual(oco["belowStopPrice"], ["95"])
+        self.assertEqual(oco["belowPrice"], ["94.99"])
+        self.assertNotEqual(oco["belowPrice"], [reference["stop_limit_price"]])
+        self.assertEqual(oco["belowTimeInForce"], ["GTC"])
+        self.assertNotIn("aboveTimeInForce", oco)
+        for legacy in ("price", "stopPrice", "stopLimitPrice"):
+            self.assertNotIn(legacy, oco)
+        self.assertEqual(oco["orderListId"] if "orderListId" in oco else ["sent-by-response"], ["sent-by-response"])
+        self.assertEqual(covered["oco_fields"]["oco_order_list_id"], "42")
+
+        class _Naked(_Fill):
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_oco", signed_query, api_key))
+                raise BinanceRequestError(400, code=-1013, message="Filter failure")
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("get_order_list", signed_query, api_key))
+                raise BinanceRequestError(500, message="ocorequery")
+
+        naked_client = _Naked()
+        naked = self._adapter(naked_client)
+        failed_sig = _buy(9101)
+        failed_sig["extras"] = dict(sig["extras"])
+        with mock.patch.dict(os.environ, _env(self.root)):
+            missed = naked.execute(failed_sig)
+        self.assertEqual(missed["executed"], 0)
+        self.assertFalse(missed["consumer_allowed"])
+        self.assertEqual(missed["filled_qty"], "1")
+        self.assertEqual(missed["arm_position"]["entry_price"], "100")
+        self.assertEqual(missed["arm_position"]["status"], "oco_failed")
+        self.assertTrue(str(missed["error"]).startswith("oco_rejected:"))
+        self.assertEqual(len([call for call in naked_client.calls if call[0] == "new_order"]), 1)
+        self.assertEqual(len([call for call in naked_client.calls if call[0] == "new_oco"]), 1)
 
     def test_kill_blocks_only_the_new_buy(self) -> None:
         kill = self.root / "LIVE_TRADING_DISABLED"
