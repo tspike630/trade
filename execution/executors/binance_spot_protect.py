@@ -35,9 +35,12 @@ from execution.executors.binance_spot import (
 
 BLOCK_SELL_ENV = "BINANCE_SPOT_BLOCK_SELL_ON_KILL"
 FEE_BPS_ENV = "BINANCE_SPOT_TAKER_FEE_BPS"
+REANCHOR_OCO_ENV = "BINANCE_SPOT_REANCHOR_OCO_ON_FILL"
+AUTO_FLATTEN_ENV = "BINANCE_SPOT_AUTO_FLATTEN_ON_OCO_FAIL"
 ENTRY_MIN_NOTIONAL_USDT = Decimal("20")
 BOOK_ENV = "BINANCE_SPOT_BOOK_USDT"
 DEFAULT_TAKER_FEE_BPS = Decimal("10")
+MIN_REANCHOR_STOP_GAP = Decimal("0.005")
 OCO_PATH = "/api/v3/orderList/oco"
 ORDER_LIST_PATH = "/api/v3/orderList"
 
@@ -46,6 +49,7 @@ PROTECTION_PENDING = "oco_pending"
 PROTECTION_EXCHANGE = "exchange_oco"
 PROTECTION_FALLBACK = "loop_fallback"
 PROTECTION_DUST = "dust_abandon"
+PROTECTION_AUTO_FLATTEN = "auto_flatten"
 
 # listOrderStatus / listStatusType values that mean the list is still live.
 _OCO_WORKING = frozenset({"EXECUTING", "EXEC_STARTED"})
@@ -58,6 +62,25 @@ def block_sell_on_kill() -> bool:
     if raw is None:
         return False
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def reanchor_oco_on_fill_enabled() -> bool:
+    raw = os.environ.get(REANCHOR_OCO_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def auto_flatten_on_oco_fail_enabled() -> bool:
+    raw = os.environ.get(AUTO_FLATTEN_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def flatten_client_order_id(decision_id: object) -> str | None:
+    """Deterministic client order id for an emergency naked-position flatten sell."""
+    return _client_piece("bnbfade-fl-", decision_id)
 
 
 def taker_fee_rate() -> Decimal | None:
@@ -372,6 +395,78 @@ def protective_band_error(
         mark=mark,
     )
     return error
+
+
+def reanchor_oco_prices_to_fill(
+    *,
+    signal_entry_price: object,
+    stop_price: str,
+    take_profit_price: str,
+    fill_price: object,
+    mark: object,
+    filters: list[Any],
+) -> tuple[dict[str, str] | None, str | None]:
+    """Re-anchor OCO stop (and TP if crossed) to the actual fill/mark price.
+
+    Preserves the signal's relative stop distance (floored at 50 bps) below
+    ``min(fill_price, mark)`` so entry slippage does not leave a filled BUY
+    unprotectable due to ``oco_price_restriction``.
+    """
+    tick = _tick_size(filters)
+    if tick is None:
+        return None, "oco_missing_tick"
+    tick_n = _to_decimal(tick)
+    stop_n = _to_decimal(stop_price)
+    tp_n = _to_decimal(take_profit_price)
+    sig_entry_n = _to_decimal(signal_entry_price)
+    fill_n = _to_decimal(fill_price)
+    mark_n = _to_decimal(mark)
+    if tick_n is None or stop_n is None or tp_n is None:
+        return None, "oco_prices_crossed"
+    anchors = [p for p in (fill_n, mark_n) if p is not None and p > 0]
+    if not anchors:
+        return None, "mark_unavailable"
+    ref_low = min(anchors)
+    ref_high = max(anchors)
+
+    if sig_entry_n is not None and sig_entry_n > stop_n > 0:
+        orig_sl_gap = (sig_entry_n - stop_n) / sig_entry_n
+    else:
+        orig_sl_gap = MIN_REANCHOR_STOP_GAP
+    sl_gap = max(orig_sl_gap, MIN_REANCHOR_STOP_GAP)
+
+    new_stop = _align(ref_low * (Decimal("1") - sl_gap), tick_n, ROUND_DOWN)
+    if new_stop >= ref_low:
+        new_stop = ref_low - tick_n * Decimal("2")
+    if new_stop <= 0:
+        return None, "oco_prices_crossed"
+
+    new_tp = _align(tp_n, tick_n, ROUND_DOWN)
+    if new_tp <= ref_high:
+        if sig_entry_n is not None and tp_n > sig_entry_n > 0:
+            orig_tp_gap = (tp_n - sig_entry_n) / sig_entry_n
+        else:
+            orig_tp_gap = Decimal("0.01")
+        tp_gap = max(orig_tp_gap, MIN_REANCHOR_STOP_GAP)
+        new_tp = _align(ref_high * (Decimal("1") + tp_gap), tick_n, ROUND_DOWN)
+        if new_tp <= ref_high:
+            new_tp = ref_high + tick_n * Decimal("2")
+
+    new_stop_str = _decimal_text(new_stop)
+    new_tp_str = _decimal_text(new_tp)
+    for candidate in anchors:
+        err = protective_band_error(
+            stop_price=new_stop_str,
+            take_profit_price=new_tp_str,
+            mark=candidate,
+            filters=filters,
+        )
+        if err is not None:
+            return None, err
+    return {
+        "stop_price": new_stop_str,
+        "take_profit_price": new_tp_str,
+    }, None
 
 
 def fill_average_price(placed: dict[str, Any] | None) -> str | None:
