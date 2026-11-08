@@ -1,13 +1,18 @@
-"""Tests for Milestone 19: LSEG SmartEconomics Surprise / Dealer Microstructure Gate & Funding Z-Score Pipeline."""
+"""Tests for Milestone 19 & 20: LSEG SmartEconomics Surprise / Dealer Microstructure Gate & Funding Z-Score Pipeline."""
 
 from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+_CRAWLER_DIR = str(Path(__file__).resolve().parents[2] / "crawler")
+if _CRAWLER_DIR not in sys.path:
+    sys.path.insert(0, _CRAWLER_DIR)
 
 from crawler.indicators.binance_spot import ensure_schema, upsert_indicator
 from decision_engine.core.binance_indicators import list_binance_hot_tokens
@@ -167,6 +172,31 @@ class TestLsegMicrostructureAndFundingZGap(unittest.TestCase):
             )
             self.assertEqual(status.halt_reason, "cross_asset_dealer_quote_toxicity")
             self.assertIn("BTCc1_quote_imb=-0.75", str(status.detail))
+
+    def test_lseg_hyg_credit_dealer_spread_blowout_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "lseg_macro.db"
+            conn = _create_macro_test_db(db_path)
+            bar_ms = 1_760_000_000_000
+            conn.execute(
+                """
+                INSERT INTO cross_asset_bars (
+                    ric, interval, utc_ts, utc_ms, close, spread_bps, quote_imbalance
+                ) VALUES ('HYG.P', '5min', '2025-10-10T12:00:00Z', ?, 78.5, 42.0, 0.0)
+                """,
+                (bar_ms,),
+            )
+            conn.commit()
+            conn.close()
+
+            status = evaluate_macro_gate(
+                db_path,
+                now_ms=bar_ms + 60_000,
+                purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                environ={"DECISION_MACRO_MICROSTRUCTURE_GATE": "1"},
+            )
+            self.assertEqual(status.halt_reason, "cross_asset_dealer_spread_blowout")
+            self.assertIn("HYG.P_spread=42.0bps", str(status.detail))
 
     def test_funding_z_fade_pipeline_from_binance_indicators_and_series(self) -> None:
         # 1) Compute funding_z from a historical funding rate sequence with a deep negative tail

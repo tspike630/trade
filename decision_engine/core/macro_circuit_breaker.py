@@ -63,8 +63,10 @@ DEFAULT_NQ_15M_FLOOR_PCT = -0.20
 DEFAULT_US2Y_15M_CAP_BPS = 3.0
 DEFAULT_JPY_15M_FLOOR_PCT = -0.15
 DEFAULT_CME_BASIS_FLOOR_BPS = -15.0
-DEFAULT_MAX_DEALER_SPREAD_BPS = 25.0
+DEFAULT_MAX_DEALER_SPREAD_BPS = 20.0
+DEFAULT_MAX_HYG_SPREAD_BPS = 35.0
 DEFAULT_MIN_QUOTE_IMBALANCE = -0.60
+DEFAULT_MIN_NQ_QUOTE_IMBALANCE = -0.10
 MAX_CROSS_ASSET_AGE_MS = 30 * 60 * 1000
 _TRUE = frozenset({"1", "true", "yes", "on"})
 
@@ -230,17 +232,23 @@ def _check_cross_asset(
         if basis_bps < floor:
             return "cross_asset_cme_basis_discount", f"CME_basis={basis_bps:+.1f}bps"
 
-    # 5. Dealer Microstructure Gate: CME/NQ Bid-Ask Spread Blowout & Quote Movement Toxicity
+    # 5. Dealer Microstructure Gate: CME/NQ/HYG Bid-Ask Spread Blowout & Quote Movement Toxicity
     if _env_bool(env, "DECISION_MACRO_MICROSTRUCTURE_GATE"):
         bar_cols = _table_cols(conn, "cross_asset_bars")
         if {"spread_bps", "quote_imbalance"}.issubset(bar_cols):
             max_spread = _env_float(
                 env, "MACRO_MAX_DEALER_SPREAD_BPS", DEFAULT_MAX_DEALER_SPREAD_BPS
             )
+            max_hyg_spread = _env_float(
+                env, "MACRO_MAX_HYG_SPREAD_BPS", DEFAULT_MAX_HYG_SPREAD_BPS
+            )
             min_qi = _env_float(
                 env, "MACRO_MIN_QUOTE_IMBALANCE", DEFAULT_MIN_QUOTE_IMBALANCE
             )
-            for ric in ("BTCc1", "NQc1"):
+            min_nq_qi = _env_float(
+                env, "MACRO_MIN_NQ_QUOTE_IMBALANCE", DEFAULT_MIN_NQ_QUOTE_IMBALANCE
+            )
+            for ric in ("BTCc1", "NQc1", "HYG.P"):
                 m_row = conn.execute(
                     """
                     SELECT utc_ms, spread_bps, quote_imbalance
@@ -255,12 +263,18 @@ def _check_cross_asset(
                     continue
                 sp = m_row["spread_bps"]
                 qi = m_row["quote_imbalance"]
-                if sp is not None and float(sp) >= max_spread:
+                sp_cap = max_hyg_spread if ric == "HYG.P" else max_spread
+                if sp is not None and float(sp) >= sp_cap:
                     return (
                         "cross_asset_dealer_spread_blowout",
                         f"{ric}_spread={float(sp):.1f}bps",
                     )
-                if qi is not None and float(qi) <= min_qi:
+                qi_floor = (
+                    min_nq_qi
+                    if (ric == "NQc1" and "MACRO_MIN_QUOTE_IMBALANCE" not in env)
+                    else min_qi
+                )
+                if qi is not None and float(qi) <= qi_floor:
                     return (
                         "cross_asset_dealer_quote_toxicity",
                         f"{ric}_quote_imb={float(qi):+.2f}",
