@@ -11,6 +11,11 @@ from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine.core.drawdown_and_kelly_budget import (
+    PodRiskBudgetResult,
+    drawdown_kelly_gate_enabled,
+    evaluate_pod_drawdown_and_kelly,
+)
 from decision_engine.core.perp_microstructure_and_beta_hedge import (
     compute_portfolio_beta_and_hedge,
     portfolio_beta_exposure_block,
@@ -22,6 +27,7 @@ from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_FADE,
 )
 from decision_engine.core.stop_gap import buy_stop_gap_reason
+from decision_engine.strategies.live_bnb_size_floor import lift_size_pct_for_entry_min
 from execution.executors.binance_spot_gate import buy_exposure_block
 
 log = get_logger("decision_engine.live_buy_guards")
@@ -51,8 +57,9 @@ def apply_live_buy_guards(
     purpose: str,
     book: ProtectionBook,
     macro_halt: str | None = None,
+    pod_risk_gate: bool | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Drop BUYs that fail the stop gap, protection halt, cluster cap, or macro circuit breaker.
+    """Drop BUYs that fail the stop gap, protection halt, cluster cap, drawdown/Kelly gate, or macro circuit breaker.
 
     ``protection_halt`` is set only for a purpose-wide block (unprotected
     inventory, an unreadable book, or one-open-per-arm when that flag is
@@ -65,11 +72,20 @@ def apply_live_buy_guards(
     per_symbol = (
         purpose in LIVE_BNB_SPOT_PURPOSES and book.configured and book.error is None and wide is None
     )
+    use_pod_gate = drawdown_kelly_gate_enabled() if pod_risk_gate is None else bool(pod_risk_gate)
+    pod_budget: PodRiskBudgetResult | None = None
+    if per_symbol and use_pod_gate:
+        pod_budget = evaluate_pod_drawdown_and_kelly(
+            list(book.positions),
+            purpose=purpose,
+        )
+
     kept: list[dict[str, Any]] = []
     stop_rejected = 0
     protection_dropped = 0
     cluster_dropped = 0
     beta_dropped = 0
+    drawdown_dropped = 0
     macro_dropped = 0
     for signal in signals:
         if str(signal.get("action") or "").lower() != "buy":
@@ -97,6 +113,17 @@ def apply_live_buy_guards(
                 purpose,
                 signal_symbol(signal),
                 wide,
+            )
+            continue
+        if pod_budget is not None and not pod_budget.allow_buy:
+            drawdown_dropped += 1
+            log.info(
+                "pod_drawdown_halt purpose=%s symbol=%s reason=%s dd=%.4f streak=%s",
+                purpose,
+                signal_symbol(signal),
+                pod_budget.halt_reason,
+                pod_budget.current_drawdown_pct,
+                pod_budget.consecutive_losses,
             )
             continue
         if per_symbol:
@@ -129,6 +156,20 @@ def apply_live_buy_guards(
                     cluster_reason,
                 )
                 continue
+            if pod_budget is not None and pod_budget.closed_trades_count > 0:
+                raw_sz = signal.get("size_pct")
+                if isinstance(raw_sz, (int, float)) and not isinstance(raw_sz, bool) and raw_sz > 0:
+                    scaled_sz = min(1.0, max(0.005, float(raw_sz) * pod_budget.risk_budget_multiplier))
+                    scaled_sz, _ = lift_size_pct_for_entry_min(scaled_sz)
+                    signal = dict(signal)
+                    signal["size_pct_before_pod_budget"] = float(raw_sz)
+                    signal["size_pct"] = round(scaled_sz, 6)
+                    signal["pod_risk_multiplier"] = round(pod_budget.risk_budget_multiplier, 4)
+                    signal["pod_drawdown_pct"] = round(pod_budget.current_drawdown_pct, 6)
+                    signal["pod_rolling_sharpe"] = (
+                        None if pod_budget.rolling_sharpe is None else round(pod_budget.rolling_sharpe, 4)
+                    )
+                    signal["pod_risk_regime"] = pod_budget.regime
             beta_reason = portfolio_beta_exposure_block(
                 list(book.positions),
                 purpose=purpose,
@@ -178,6 +219,11 @@ def apply_live_buy_guards(
         report["cluster_dropped"] = cluster_dropped
     if beta_dropped:
         report["beta_dropped"] = beta_dropped
+    if drawdown_dropped or (pod_budget is not None and not pod_budget.allow_buy):
+        report["drawdown_halt"] = None if pod_budget is None else pod_budget.halt_reason
+        report["drawdown_dropped"] = drawdown_dropped
+    if pod_budget is not None:
+        report["pod_risk_budget"] = pod_budget.to_dict()
     if per_symbol and (book.positions or kept):
         report["beta_hedge_plan"] = compute_portfolio_beta_and_hedge(
             list(book.positions),
