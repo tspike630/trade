@@ -72,6 +72,10 @@ import os
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
 
+from decision_engine.core.multi_horizon_and_xs_regime import (
+    compute_composite_alpha_score,
+    evaluate_multi_horizon_regime,
+)
 from decision_engine.core.perp_microstructure_and_beta_hedge import (
     evaluate_perp_microstructure,
 )
@@ -191,6 +195,10 @@ class EntryDecision:
     funding_rate: float | None = None
     perp_basis_bps: float | None = None
     perp_regime: str | None = None
+    boll_bandwidth_pct: float | None = None
+    xs_rel_1h: float | None = None
+    horizon_regime: str | None = None
+    composite_alpha_score: float | None = None
 
 
 def _empty(
@@ -216,6 +224,10 @@ def _empty(
     funding_rate: float | None = None,
     perp_basis_bps: float | None = None,
     perp_regime: str | None = None,
+    boll_bandwidth_pct: float | None = None,
+    xs_rel_1h: float | None = None,
+    horizon_regime: str | None = None,
+    composite_alpha_score: float | None = None,
 ) -> EntryDecision:
     return EntryDecision(
         emit=False,
@@ -248,6 +260,10 @@ def _empty(
         funding_rate=funding_rate,
         perp_basis_bps=perp_basis_bps,
         perp_regime=perp_regime,
+        boll_bandwidth_pct=boll_bandwidth_pct,
+        xs_rel_1h=xs_rel_1h,
+        horizon_regime=horizon_regime,
+        composite_alpha_score=composite_alpha_score,
     )
 
 
@@ -522,6 +538,10 @@ def _emit(
     funding_rate: float | None = None,
     perp_basis_bps: float | None = None,
     perp_regime: str | None = None,
+    boll_bandwidth_pct: float | None = None,
+    xs_rel_1h: float | None = None,
+    horizon_regime: str | None = None,
+    composite_alpha_score: float | None = None,
 ) -> EntryDecision:
     return EntryDecision(
         emit=True,
@@ -554,6 +574,10 @@ def _emit(
         funding_rate=funding_rate,
         perp_basis_bps=perp_basis_bps,
         perp_regime=perp_regime,
+        boll_bandwidth_pct=boll_bandwidth_pct,
+        xs_rel_1h=xs_rel_1h,
+        horizon_regime=horizon_regime,
+        composite_alpha_score=composite_alpha_score,
     )
 
 
@@ -564,6 +588,7 @@ def _limit_or_reject(
     stop_price: float,
     mid: float,
     base: dict[str, Any],
+    row: dict[str, Any] | None = None,
 ) -> EntryDecision:
     """Resting bid at ``L+0.20*S``. A limit at or above ``P`` would take, so it is not sent."""
 
@@ -590,6 +615,9 @@ def _limit_or_reject(
             funding_rate=base.get("funding_rate"),
             perp_basis_bps=base.get("perp_basis_bps"),
             perp_regime=base.get("perp_regime"),
+            boll_bandwidth_pct=base.get("boll_bandwidth_pct"),
+            xs_rel_1h=base.get("xs_rel_1h"),
+            horizon_regime=base.get("horizon_regime"),
         )
 
     if not _gt(price, limit_price) or limit_price <= 0 or stop_price >= limit_price:
@@ -600,6 +628,12 @@ def _limit_or_reject(
     if stop_distance_reason(limit_price, stop_price):
         return _refused("stop_too_close_to_entry")
     chosen_type: OrderType = "LIMIT_MAKER" if post_only_limit_enabled() else "LIMIT"
+    alpha_score = compute_composite_alpha_score(
+        row or {},
+        odds=odds,
+        trade_size_ratio=base.get("ratio"),
+        taker_buy_ratio=base.get("taker_buy_ratio"),
+    )
     return _emit(
         tier="neutral",
         entry_reason="neutral_limit",
@@ -608,6 +642,7 @@ def _limit_or_reject(
         stop_price=stop_price,
         multiplier=0.5,
         size_note="half_planned_size_no_inverse_stop_width_sizer",
+        composite_alpha_score=alpha_score,
         **base,
     )
 
@@ -757,6 +792,23 @@ def evaluate_entry_zone(
             **common,
         )
 
+    mh_verdict = evaluate_multi_horizon_regime(row)
+    common["boll_bandwidth_pct"] = mh_verdict.boll_bandwidth_pct
+    common["xs_rel_1h"] = mh_verdict.xs_rel_1h
+    common["horizon_regime"] = mh_verdict.horizon_regime
+    if not mh_verdict.allow:
+        return _empty(
+            reason=mh_verdict.reject_reason or "multi_horizon_rejected",
+            tier=tier,
+            ratio=ratio,
+            zone=(zone_floor, zone_cap) if tier == "large_trade" else (neutral_min, neutral_max),
+            stop_price=stop_price,
+            take_profit_price=take_profit,
+            **common,
+        )
+    if mh_verdict.downgrade_to_neutral and tier == "large_trade":
+        tier = "neutral"
+
     base = {
         "take_profit": take_profit,
         "alpha": alpha,
@@ -775,6 +827,9 @@ def evaluate_entry_zone(
         "funding_rate": perp_verdict.funding_rate,
         "perp_basis_bps": perp_verdict.perp_basis_bps,
         "perp_regime": perp_verdict.perp_regime,
+        "boll_bandwidth_pct": mh_verdict.boll_bandwidth_pct,
+        "xs_rel_1h": mh_verdict.xs_rel_1h,
+        "horizon_regime": mh_verdict.horizon_regime,
     }
 
     if tier == "large_trade":
@@ -840,6 +895,12 @@ def evaluate_entry_zone(
                 take_profit_price=take_profit,
                 **common,
             )
+        alpha_score = compute_composite_alpha_score(
+            row,
+            odds=odds,
+            trade_size_ratio=ratio,
+            taker_buy_ratio=tbr,
+        )
         return _emit(
             tier="large_trade",
             entry_reason="large_trade_market",
@@ -850,6 +911,7 @@ def evaluate_entry_zone(
             zone_max=zone_cap,
             multiplier=1.0,
             size_note="planned_single_name_size",
+            composite_alpha_score=alpha_score,
             **base,
         )
 
@@ -884,6 +946,12 @@ def evaluate_entry_zone(
                         take_profit_price=take_profit,
                         **common,
                     )
+                alpha_score = compute_composite_alpha_score(
+                    row,
+                    odds=odds,
+                    trade_size_ratio=ratio,
+                    taker_buy_ratio=tbr,
+                )
                 return _emit(
                     tier="neutral",
                     entry_reason="neutral_market",
@@ -892,6 +960,7 @@ def evaluate_entry_zone(
                     stop_price=stop_price,
                     multiplier=0.5,
                     size_note="half_planned_size_no_inverse_stop_width_sizer",
+                    composite_alpha_score=alpha_score,
                     **neutral_base,
                 )
             if _gt(price, limit_price):
@@ -901,6 +970,7 @@ def evaluate_entry_zone(
                     stop_price=stop_price,
                     mid=mid,
                     base=neutral_base,
+                    row=row,
                 )
             return _empty(
                 reason="odds_below_min",
@@ -918,6 +988,7 @@ def evaluate_entry_zone(
                 stop_price=stop_price,
                 mid=mid,
                 base=neutral_base,
+                row=row,
             )
         return _empty(
             reason="neutral_below_band",

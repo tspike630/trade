@@ -45,6 +45,9 @@ from decision_engine import config as de_config
 from decision_engine.core.binance_indicators import binance_indicators_fresh_sec
 from decision_engine.core.bnb_native import load_trading_usdt_symbols
 from decision_engine.core.bnb_spot_map import classify_listed_symbol, default_listing_db_paths
+from decision_engine.core.multi_horizon_and_xs_regime import (
+    multi_horizon_regime_enabled,
+)
 from decision_engine.core.portfolio_clusters import (
     cluster_cap_enabled,
     cluster_exposure_key,
@@ -561,15 +564,18 @@ def stamp_turnover(signals: list[dict[str, Any]], hot: list[dict[str, Any]]) -> 
                 sig[key] = row.get(key)
 
 
-def _rank_key(sig: dict[str, Any]) -> tuple[bool, float, float, str]:
+def _rank_key(sig: dict[str, Any]) -> tuple[bool, float, float, float, str]:
+    alpha_score, alpha_bad = _finite_quote(sig.get("composite_alpha_score"))
+    if alpha_bad or not multi_horizon_regime_enabled():
+        alpha_score = None
     strength, invalid = _finite_quote(sig.get("volume_strength"))
     if invalid:
         strength = None
     turnover, _bad = _finite_quote(sig.get("quote_turnover_24h_usdt"))
     spot = _symbol_of(sig) or ""
     if strength is None:
-        return (True, 0.0, -(turnover or 0.0), spot)
-    return (False, -strength, -(turnover or 0.0), spot)
+        return (True, -(alpha_score or 0.0), 0.0, -(turnover or 0.0), spot)
+    return (False, -(alpha_score or 0.0), -strength, -(turnover or 0.0), spot)
 
 
 def _buy_still_valid(sig: dict[str, Any], *, now_ms: int, window_ms: int, floor: float) -> str | None:

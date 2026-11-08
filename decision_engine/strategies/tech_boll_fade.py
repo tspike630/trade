@@ -18,6 +18,10 @@ from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine.core.multi_horizon_and_xs_regime import (
+    multi_horizon_regime_enabled,
+    stamp_cross_sectional_metrics,
+)
 from decision_engine.core.perp_microstructure_and_beta_hedge import (
     symbol_beta_vs_btc,
 )
@@ -109,6 +113,8 @@ class TechBollFadeStrategy(BaseStrategy):
         self._pending.clear()
         self.rejected = {}
         hot = data.get("hot_tokens") or []
+        if multi_horizon_regime_enabled() and isinstance(hot, list) and hot:
+            hot, _xs_ctx = stamp_cross_sectional_metrics(hot)
         hits = 0
         book_warned = False
         for row in hot:
@@ -202,6 +208,14 @@ class TechBollFadeStrategy(BaseStrategy):
                 lift_extra["perp_basis_bps"] = decision.perp_basis_bps
             if decision.perp_regime is not None:
                 lift_extra["perp_regime"] = decision.perp_regime
+            if decision.boll_bandwidth_pct is not None:
+                lift_extra["boll_bandwidth_pct"] = decision.boll_bandwidth_pct
+            if decision.xs_rel_1h is not None:
+                lift_extra["xs_rel_1h"] = decision.xs_rel_1h
+            if decision.horizon_regime and decision.horizon_regime != "disabled":
+                lift_extra["horizon_regime"] = decision.horizon_regime
+            if decision.composite_alpha_score is not None:
+                lift_extra["composite_alpha_score"] = decision.composite_alpha_score
             if lifted:
                 lift_extra.update(
                     {
