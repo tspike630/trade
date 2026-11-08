@@ -753,7 +753,7 @@ def resolve_entry_size(
     plan["quote_usdt"] = quote_text
     order_type = str(extras.get("order_type") or extras.get("binance_order_type") or "MARKET").strip().upper()
     sized = dict(extras)
-    if order_type == "LIMIT":
+    if order_type in {"LIMIT", "LIMIT_MAKER"}:
         price = _to_decimal(extras.get("limit_price"))
         if price is None:
             price = _to_decimal(extras.get("price"))
@@ -766,7 +766,7 @@ def resolve_entry_size(
         if qty_text is None:
             return extras, "entry_not_viable:below_min_qty", plan
         sized["quantity"] = qty_text
-        plan["order_type"] = "LIMIT"
+        plan["order_type"] = order_type
         plan["needs_lot_floor"] = True
         return sized, None, plan
     if order_type not in {"MARKET", ""}:
@@ -927,3 +927,137 @@ def evaluate_orderbook_impact(
     if impact_bps > i_cap:
         return metrics, "orderbook_impact_too_high"
     return metrics, None
+
+
+POST_ONLY_LIMIT_ENV = "BINANCE_SPOT_POST_ONLY_LIMIT"
+SOR_MAKER_FALLBACK_ENV = "BINANCE_SPOT_SOR_MAKER_FALLBACK"
+ENTRY_TTL_SEC_ENV = "BINANCE_SPOT_ENTRY_TTL_SEC"
+DEFAULT_ENTRY_TTL_SEC = 180
+
+
+def post_only_limit_enabled() -> bool:
+    raw = os.environ.get(POST_ONLY_LIMIT_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def sor_maker_fallback_enabled() -> bool:
+    raw = os.environ.get(SOR_MAKER_FALLBACK_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def entry_ttl_sec() -> int:
+    raw = os.environ.get(ENTRY_TTL_SEC_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_ENTRY_TTL_SEC
+    try:
+        val = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_ENTRY_TTL_SEC
+    return max(5, val)
+
+
+def peg_maker_buy_price(
+    limit_price: object,
+    *,
+    best_bid: object = None,
+    best_ask: object = None,
+    mark: object = None,
+    stop_price: object = None,
+    take_profit_price: object = None,
+    filters: list[Any],
+) -> tuple[str | None, bool, str | None]:
+    """Clamp a BUY ``LIMIT_MAKER`` price below ``best_ask`` so it rests as Maker.
+
+    Returns ``(pegged_price_str, was_clamped, error)``.
+    """
+    tick = _tick_size(filters)
+    if tick is None:
+        return None, False, "oco_missing_tick"
+    tick_n = _to_decimal(tick)
+    limit_n = _to_decimal(limit_price)
+    if tick_n is None or limit_n is None:
+        return None, False, "missing_limit_price"
+    aligned = _align(limit_n, tick_n, ROUND_DOWN)
+    if aligned <= 0:
+        return None, False, "invalid_limit_price"
+
+    bid_n = _to_decimal(best_bid)
+    ask_n = _to_decimal(best_ask)
+    mark_n = _to_decimal(mark)
+    ceiling = ask_n if ask_n is not None else mark_n
+
+    was_clamped = False
+    chosen = aligned
+    if ceiling is not None and chosen >= ceiling:
+        if bid_n is not None and bid_n < ceiling:
+            candidate = _align(bid_n, tick_n, ROUND_DOWN)
+        else:
+            candidate = _align(ceiling - tick_n, tick_n, ROUND_DOWN)
+        if candidate <= 0:
+            return None, False, "maker_peg_below_zero"
+        chosen = candidate
+        was_clamped = True
+
+    stop_n = _to_decimal(stop_price)
+    tp_n = _to_decimal(take_profit_price)
+    if stop_n is not None and chosen <= stop_n:
+        return None, was_clamped, "maker_peg_crossed_stop"
+    if tp_n is not None and chosen >= tp_n:
+        return None, was_clamped, "maker_peg_crossed_tp"
+    return _decimal_text(chosen), was_clamped, None
+
+
+def sor_maker_fallback_spec(
+    *,
+    quote_usdt: object,
+    best_bid: object,
+    best_ask: object,
+    stop_price: object,
+    take_profit_price: object,
+    filters: list[Any],
+) -> tuple[dict[str, str] | None, str | None]:
+    """Convert a blocked ``MARKET`` BUY into a passive ``LIMIT_MAKER`` order at ``best_bid``."""
+    q_n = _to_decimal(quote_usdt)
+    bid_n = _to_decimal(best_bid)
+    if q_n is None or bid_n is None:
+        return None, "sor_maker_missing_quote_or_bid"
+    pegged_px, _clamped, peg_err = peg_maker_buy_price(
+        bid_n,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        stop_price=stop_price,
+        take_profit_price=take_profit_price,
+        filters=filters,
+    )
+    if peg_err or pegged_px is None:
+        return None, peg_err or "sor_maker_peg_failed"
+    px_n = _to_decimal(pegged_px)
+    lot, step = _limit_lot(filters)
+    if px_n is None or lot is None or step is None:
+        return None, "oco_missing_lot_filter"
+    fee = taker_fee_rate() or Decimal("0")
+    raw_qty = q_n / px_n
+    floored_qty = floor_base_qty(_decimal_text(raw_qty), step)
+    floored_n = _to_decimal(floored_qty) if floored_qty is not None else None
+    min_qty = _to_decimal(lot.get("minQty"))
+    if floored_qty is None or floored_n is None or (min_qty is not None and floored_n < min_qty):
+        return None, "entry_not_viable:below_min_qty"
+    net_n = floored_n * (Decimal("1") - fee)
+    net_floored = floor_base_qty(_decimal_text(net_n), step) if net_n > 0 else None
+    if net_floored is None or (min_qty is not None and (_to_decimal(net_floored) or Decimal("0")) < min_qty):
+        return None, "entry_not_viable:below_min_qty"
+    notion = floored_n * px_n
+    min_notional = _min_notional(filters)
+    if notion < ENTRY_MIN_NOTIONAL_USDT:
+        return None, "entry_notional_below_min"
+    if min_notional is not None and notion < min_notional:
+        return None, "entry_not_viable:below_min_notional"
+    return {
+        "order_type": "LIMIT_MAKER",
+        "price": pegged_px,
+        "quantity": floored_qty,
+    }, None

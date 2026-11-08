@@ -85,7 +85,7 @@ _NOT_A_BASE = frozenset(
     {"USDT", "USD", "USDC", "FDUSD", "BUSD", "TUSD", "DAI", "USDP"}
 )
 _DECIMAL = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d+)?$")
-_OrderType = Literal["MARKET", "LIMIT"]
+_OrderType = Literal["MARKET", "LIMIT", "LIMIT_MAKER"]
 _Side = Literal["BUY", "SELL"]
 
 Opener = Callable[[urllib.request.Request, float], tuple[int, bytes]]
@@ -394,6 +394,8 @@ def _parse_order_type(raw: object) -> _OrderType | None:
         return "MARKET"
     if text == "LIMIT":
         return "LIMIT"
+    if text == "LIMIT_MAKER":
+        return "LIMIT_MAKER"
     return None
 
 
@@ -470,7 +472,7 @@ def build_exit_plan(
     order_type = _parse_order_type(extras.get("order_type", extras.get("binance_order_type")))
     if order_type is None:
         return None, "invalid_order_type"
-    if order_type == "LIMIT":
+    if order_type in ("LIMIT", "LIMIT_MAKER"):
         entry_raw, price_error = _chosen_limit_raw(extras)
         if price_error:
             return None, price_error
@@ -819,7 +821,7 @@ def _entry_intent(
     order: dict[str, str] | None,
 ) -> dict[str, Any]:
     limit_raw, _error = _chosen_limit_raw(extras)
-    limit_text = _format_positive(limit_raw) if order_type == "LIMIT" else None
+    limit_text = _format_positive(limit_raw) if order_type in ("LIMIT", "LIMIT_MAKER") else None
     return {
         "side": side,
         "order_type": order_type,
@@ -993,6 +995,18 @@ class BinanceSpotHttpClient:
         status, body = self._opener(request, self.timeout)
         return _decode_ok(status, body, secrets=(api_key,))
 
+    def cancel_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"{self.base_url}{SPOT_PATH}?{signed_query}",
+            method="DELETE",
+            headers={
+                "User-Agent": "trade-binance-spot",
+                "X-MBX-APIKEY": api_key,
+            },
+        )
+        status, body = self._opener(request, self.timeout)
+        return _decode_ok(status, body, secrets=(api_key,))
+
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{self.base_url}{OCO_PATH}",
@@ -1145,7 +1159,7 @@ def _order_pairs(
         else:
             unexpected_side: never = side
             return None, f"invalid_side:{unexpected_side}"
-    elif order_type == "LIMIT":
+    elif order_type in ("LIMIT", "LIMIT_MAKER"):
         if quote_qty:
             return None, "limit_rejects_quote_order_qty"
         if not quantity:
@@ -1155,9 +1169,10 @@ def _order_pairs(
         sent_qty = floor_decimal_places(quantity)
         if sent_qty is None:
             return None, "invalid_order_qty"
+        if order_type == "LIMIT":
+            pairs.append(("timeInForce", "GTC"))
         pairs.extend(
             (
-                ("timeInForce", "GTC"),
                 ("quantity", sent_qty),
                 ("price", price),
             )
@@ -1246,10 +1261,15 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     dust_detail,
     entry_notional_floor_error,
     entry_viability_error,
+    entry_ttl_sec,
     evaluate_orderbook_impact,
     fill_average_price,
     flatten_client_order_id,
     orderbook_gate_enabled,
+    peg_maker_buy_price,
+    post_only_limit_enabled,
+    sor_maker_fallback_enabled,
+    sor_maker_fallback_spec,
     protective_band_error,
     is_request_timeout,
     ENTRY_MIN_NOTIONAL_USDT,
@@ -1343,6 +1363,9 @@ class BinanceSpotAdapter:
         auto_flatten_on_oco_fail: bool | None = None,
         orderbook_gate: bool | None = None,
         ws_cache: Any | None = None,
+        post_only_limit: bool | None = None,
+        sor_maker_fallback: bool | None = None,
+        entry_ttl_sec: int | None = None,
     ) -> None:
         self.client = client
         self.kill_switch_path = kill_switch_path
@@ -1359,6 +1382,9 @@ class BinanceSpotAdapter:
         self.auto_flatten_on_oco_fail = auto_flatten_on_oco_fail
         self.orderbook_gate = orderbook_gate
         self.ws_cache = ws_cache
+        self.post_only_limit = post_only_limit
+        self.sor_maker_fallback = sor_maker_fallback
+        self.entry_ttl_sec = entry_ttl_sec
         self.buy_blocks: list[dict[str, Any]] = []
         self.peer_buy_blocks: list[dict[str, Any]] = []
         self.canonical_rows: list[dict[str, Any]] = []
@@ -1389,6 +1415,21 @@ class BinanceSpotAdapter:
         if self.orderbook_gate is not None:
             return bool(self.orderbook_gate)
         return orderbook_gate_enabled()
+
+    def _post_only_limit_enabled(self) -> bool:
+        if self.post_only_limit is not None:
+            return bool(self.post_only_limit)
+        return post_only_limit_enabled()
+
+    def _sor_maker_fallback_enabled(self) -> bool:
+        if self.sor_maker_fallback is not None:
+            return bool(self.sor_maker_fallback)
+        return sor_maker_fallback_enabled()
+
+    def _entry_ttl_sec(self) -> int:
+        if self.entry_ttl_sec is not None:
+            return max(5, int(self.entry_ttl_sec))
+        return entry_ttl_sec()
 
     def _credentials(self) -> tuple[str, str]:
         key = (self.api_key if self.api_key is not None else _env_secret(API_KEY_ENV)).strip()
@@ -2424,6 +2465,87 @@ class BinanceSpotAdapter:
             order_type_now = _parse_order_type(
                 extras.get("order_type", extras.get("binance_order_type"))
             )
+            if order_type_now == "LIMIT" and (
+                self._post_only_limit_enabled() or extras.get("post_only") is True
+            ):
+                extras = dict(extras)
+                extras["order_type"] = "LIMIT_MAKER"
+                order_type_now = "LIMIT_MAKER"
+
+            if order_type_now == "LIMIT_MAKER":
+                best_bid_px = None
+                best_ask_px = None
+                ws_cache = self._active_ws_cache()
+                if ws_cache is not None and callable(getattr(ws_cache, "get_ticker_price", None)):
+                    ws_tick = ws_cache.get_ticker_price(symbol)
+                    if isinstance(ws_tick, dict):
+                        best_bid_px = ws_tick.get("best_bid")
+                        best_ask_px = ws_tick.get("best_ask")
+                if best_ask_px is None and callable(getattr(client, "order_book", None)):
+                    try:
+                        d_snap = client.order_book(symbol, limit=5)
+                        if isinstance(d_snap, dict):
+                            bids_l = d_snap.get("bids") or []
+                            asks_l = d_snap.get("asks") or []
+                            if bids_l and isinstance(bids_l[0], (list, tuple)):
+                                best_bid_px = bids_l[0][0]
+                            if asks_l and isinstance(asks_l[0], (list, tuple)):
+                                best_ask_px = asks_l[0][0]
+                    except Exception:  # noqa: BLE001
+                        pass
+                raw_lim, _ = _chosen_limit_raw(extras)
+                filters = _symbol_filters(info, symbol) or []
+                pegged_px, was_clamped, peg_err = peg_maker_buy_price(
+                    raw_lim,
+                    best_bid=best_bid_px,
+                    best_ask=best_ask_px,
+                    mark=self._entry_mark,
+                    stop_price=plan.get("stop_price"),
+                    take_profit_price=plan.get("take_profit_price"),
+                    filters=filters,
+                )
+                if peg_err or pegged_px is None:
+                    return self._finish(
+                        _result(
+                            ok=False,
+                            dry_run=False,
+                            executed=0,
+                            submitted=False,
+                            error=peg_err or "maker_peg_failed",
+                            symbol=symbol,
+                            order=None,
+                            exchange_order_id=None,
+                            gates=gates,
+                            exit_plan=plan,
+                            consumer_allowed=False,
+                        )
+                    )
+                extras = dict(extras)
+                extras["order_type"] = "LIMIT_MAKER"
+                extras["limit_price"] = pegged_px
+                if extras.get("price") not in (None, ""):
+                    extras["price"] = pegged_px
+                plan = dict(plan)
+                plan["entry_price"] = pegged_px
+                if was_clamped:
+                    plan["maker_pegged"] = True
+                pairs, qty_error = self._preview_pairs(sig, extras, symbol)
+                if qty_error or pairs is None:
+                    return self._finish(
+                        _result(
+                            ok=False,
+                            dry_run=False,
+                            executed=0,
+                            submitted=False,
+                            error=qty_error or "missing_order_qty",
+                            symbol=symbol,
+                            order=None,
+                            exchange_order_id=None,
+                            gates=gates,
+                            exit_plan=plan,
+                        )
+                    )
+
             if order_type_now == "MARKET" and self._orderbook_gate_enabled():
                 depth_payload = None
                 ob_source = "rest_fallback"
@@ -2457,6 +2579,36 @@ class BinanceSpotAdapter:
                             ob_metrics["ws_age_ms"] = ob_age_ms
                     self._orderbook_metrics = ob_metrics
                     if ob_error:
+                        sor_converted = False
+                        if self._sor_maker_fallback_enabled() and isinstance(ob_metrics, dict):
+                            filters = _symbol_filters(info, symbol) or []
+                            sor_spec, _sor_err = sor_maker_fallback_spec(
+                                quote_usdt=order_map.get("quoteOrderQty"),
+                                best_bid=ob_metrics.get("best_bid"),
+                                best_ask=ob_metrics.get("best_ask"),
+                                stop_price=plan.get("stop_price"),
+                                take_profit_price=plan.get("take_profit_price"),
+                                filters=filters,
+                            )
+                            if sor_spec is not None:
+                                extras = dict(extras)
+                                extras.pop("quote_order_qty", None)
+                                extras.pop("quoteOrderQty", None)
+                                extras["order_type"] = "LIMIT_MAKER"
+                                extras["limit_price"] = sor_spec["price"]
+                                extras[\"quantity\"] = sor_spec["quantity"]
+                                new_pairs, new_err = self._preview_pairs(sig, extras, symbol)
+                                if new_pairs is not None and new_err is None:
+                                    pairs = new_pairs
+                                    plan = dict(plan)
+                                    plan["entry_price"] = sor_spec["price"]
+                                    plan["sor_routed"] = "limit_maker_at_best_bid"
+                                    ob_metrics["sor_routed"] = "limit_maker_at_best_bid"
+                                    ob_metrics["sor_original_block"] = ob_error
+                                    ob_metrics["sor_maker_price"] = sor_spec["price"]
+                                    ob_metrics["sor_maker_quantity"] = sor_spec["quantity"]
+                                    sor_converted = True
+                        if not sor_converted:
                             return self._finish(
                                 _result(
                                     ok=False,
@@ -2594,11 +2746,11 @@ class BinanceSpotAdapter:
         if price_error:
             return None, price_error
         has_qty = any(value not in (None, "") for value in (raw_quote, raw_qty))
-        if order_type == "LIMIT" and _format_positive(limit_raw) is None:
+        if order_type in ("LIMIT", "LIMIT_MAKER") and _format_positive(limit_raw) is None:
             if limit_raw in (None, ""):
                 return None, "missing_limit_price"
             return None, "invalid_limit_price"
-        if order_type == "LIMIT" and not has_qty:
+        if order_type in ("LIMIT", "LIMIT_MAKER") and not has_qty:
             # Price is an intent. Base size is still size_pct, not a fake quantity.
             return None, None
         if not has_qty:
@@ -2877,6 +3029,8 @@ class BinanceSpotAdapter:
             )
         status = str(row.get("status") or "")
         if status == "qty_unconfirmed":
+            if row.get("reconcile_resting_entry") is True:
+                return self.reconcile_resting_entry(row, mark=mark, persist=persist)
             return self._coverage(
                 row,
                 book="unchanged",
@@ -3086,6 +3240,136 @@ class BinanceSpotAdapter:
             submitted=False,
             error=str(row.get("last_error") or "native_oco_unverified"),
             protection=PROTECTION_PENDING,
+        )
+
+    def reconcile_resting_entry(
+        self,
+        position: dict[str, Any],
+        *,
+        mark: object = None,
+        now_ms: int | None = None,
+        ttl_sec: int | None = None,
+        persist: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+    ) -> dict[str, Any]:
+        """Reconcile a resting ``LIMIT`` / ``LIMIT_MAKER`` entry order.
+
+        - If ``FILLED`` on Binance: adopts fill quantity and price, then places native OCO.
+        - If expired past ``ttl_sec`` (default 180s): cancels the order via ``DELETE /api/v3/order``.
+          If ``executedQty == 0``, marks ``closed_canceled``; if partially filled, arms native OCO
+          for the filled portion.
+        """
+        row = dict(position)
+
+        def save(fields: dict[str, Any]) -> None:
+            if persist is None:
+                row.update(fields)
+                return
+            saved = persist(fields)
+            if isinstance(saved, dict):
+                row.clear()
+                row.update(saved)
+            else:
+                row.update(fields)
+
+        gates = self._gates()
+        if not gates.get("live_enabled"):
+            return self._coverage(row, book="unchanged", submitted=False, error="binance_spot_live_disabled")
+        symbol = str(row.get("symbol") or "")
+        entry_order_id = str(row.get("entry_order_id") or "").strip()
+        if not is_spot_usdt_symbol(symbol) or not entry_order_id:
+            return self._coverage(row, book="unchanged", submitted=False, error="missing_entry_order_id")
+        key, secret = self._credentials()
+        if not key or not secret:
+            return self._coverage(row, book="unchanged", submitted=False, error="missing_api_credentials")
+        client = self._trade_client()
+        lookup = getattr(client, "get_order", None) if client is not None else None
+        if not callable(lookup):
+            return self._coverage(row, book="unchanged", submitted=False, error="entry_requery_unsupported")
+        clock_now = int(self.clock_ms()) if now_ms is None else int(now_ms)
+        q_pairs = [
+            ("symbol", symbol),
+            ("orderId", entry_order_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(clock_now)),
+        ]
+        try:
+            order_payload = lookup(sign_query(q_pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            return self._coverage(row, book="unchanged", submitted=False, error=_public_error(exc, key, secret))
+        if not isinstance(order_payload, dict):
+            return self._coverage(row, book="unchanged", submitted=False, error="entry_requery_failed")
+
+        ord_status = str(order_payload.get("status") or "").upper()
+        filled_qty = sellable_base_qty(order_payload, symbol) or filled_base_qty(order_payload)
+        avg_px = fill_average_price(order_payload)
+
+        if ord_status == "FILLED" and filled_qty:
+            upd: dict[str, Any] = {
+                "status": "open",
+                "quantity": filled_qty,
+            }
+            if avg_px:
+                upd["entry_price"] = avg_px
+            save(upd)
+            ref_mark = mark if _to_decimal(mark) is not None else (avg_px or row.get("entry_price"))
+            return self.maintain_held_position(row, ref_mark, persist=persist)
+
+        created_ms = _finite_number(row.get("created_at_ms", order_payload.get("time")))
+        limit_ttl_sec = self._entry_ttl_sec() if ttl_sec is None else max(5, int(ttl_sec))
+        expired = created_ms is not None and (clock_now - int(created_ms)) >= limit_ttl_sec * 1000
+
+        if ord_status in {"NEW", "PARTIALLY_FILLED"} and expired:
+            cancel_fn = getattr(client, "cancel_order", None)
+            if callable(cancel_fn):
+                c_pairs = [
+                    ("symbol", symbol),
+                    ("orderId", entry_order_id),
+                    ("recvWindow", RECV_WINDOW_MS),
+                    ("timestamp", str(clock_now)),
+                ]
+                try:
+                    canceled = cancel_fn(sign_query(c_pairs, secret), api_key=key)
+                    if isinstance(canceled, dict):
+                        filled_qty = sellable_base_qty(canceled, symbol) or filled_base_qty(canceled) or filled_qty
+                        avg_px = fill_average_price(canceled) or avg_px
+                except Exception as exc:  # noqa: BLE001
+                    if isinstance(exc, AssertionError):
+                        raise
+                    return self._coverage(row, book="unchanged", submitted=False, error=_public_error(exc, key, secret))
+            if filled_qty:
+                upd_part: dict[str, Any] = {
+                    "status": "open",
+                    "quantity": filled_qty,
+                }
+                if avg_px:
+                    upd_part["entry_price"] = avg_px
+                save(upd_part)
+                ref_mark = mark if _to_decimal(mark) is not None else (avg_px or row.get("entry_price"))
+                return self.maintain_held_position(row, ref_mark, persist=persist)
+            save(
+                {
+                    "status": "closed_canceled",
+                    "exit_reason": "entry_ttl_expired",
+                    "last_error": "entry_ttl_expired",
+                }
+            )
+            return self._coverage(
+                row,
+                book="closed_canceled",
+                submitted=True,
+                ok=True,
+                error=None,
+                reason="entry_ttl_expired",
+            )
+
+        return self._coverage(
+            row,
+            book="entry_resting",
+            submitted=False,
+            ok=True,
+            error=None,
         )
 
     def _oco_failed(

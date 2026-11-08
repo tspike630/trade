@@ -92,7 +92,7 @@ _DAY_MS = 24 * 60 * 60 * 1000
 _TRUE = frozenset({"1", "true", "yes", "on"})
 
 Tier = Literal["large_trade", "neutral", "retail_crowded"]
-OrderType = Literal["MARKET", "LIMIT"]
+OrderType = Literal["MARKET", "LIMIT", "LIMIT_MAKER"]
 
 RULE_VERSION = "live_bnb_entry_zone_v2_2026-11-06"
 
@@ -100,6 +100,11 @@ RULE_VERSION = "live_bnb_entry_zone_v2_2026-11-06"
 def require_taker_buy_ratio_enabled() -> bool:
     """When ``LIVE_BNB_REQUIRE_TAKER_BUY_RATIO=1``, missing taker_buy_ratio fails closed."""
     return os.environ.get("LIVE_BNB_REQUIRE_TAKER_BUY_RATIO", "").strip().lower() in _TRUE
+
+
+def post_only_limit_enabled() -> bool:
+    """When ``LIVE_BNB_POST_ONLY_LIMIT=1``, neutral limit orders emit as ``LIMIT_MAKER``."""
+    return os.environ.get("LIVE_BNB_POST_ONLY_LIMIT", "").strip().lower() in _TRUE
 
 
 def _finite(value: Any) -> float | None:
@@ -573,10 +578,11 @@ def _limit_or_reject(
         return _refused("neutral_limit_not_executable")
     if stop_distance_reason(limit_price, stop_price):
         return _refused("stop_too_close_to_entry")
+    chosen_type: OrderType = "LIMIT_MAKER" if post_only_limit_enabled() else "LIMIT"
     return _emit(
         tier="neutral",
         entry_reason="neutral_limit",
-        order_type="LIMIT",
+        order_type=chosen_type,
         limit_price=limit_price,
         stop_price=stop_price,
         multiplier=0.5,
