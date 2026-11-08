@@ -786,3 +786,144 @@ def tracked_exit(position: dict[str, Any]) -> bool:
     if isinstance(row_id, str) and row_id.strip().isdigit():
         return int(row_id.strip()) > 0
     return False
+
+
+ORDERBOOK_GATE_ENV = "BINANCE_SPOT_ORDERBOOK_GATE"
+MAX_SPREAD_BPS_ENV = "BINANCE_SPOT_MAX_SPREAD_BPS"
+MAX_IMPACT_BPS_ENV = "BINANCE_SPOT_MAX_IMPACT_BPS"
+DEFAULT_MAX_SPREAD_BPS = Decimal("35")
+DEFAULT_MAX_IMPACT_BPS = Decimal("50")
+
+
+def orderbook_gate_enabled() -> bool:
+    raw = os.environ.get(ORDERBOOK_GATE_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def max_spread_bps() -> Decimal:
+    val = _to_decimal(os.environ.get(MAX_SPREAD_BPS_ENV))
+    if val is None or val <= 0:
+        return DEFAULT_MAX_SPREAD_BPS
+    return val
+
+
+def max_impact_bps() -> Decimal:
+    val = _to_decimal(os.environ.get(MAX_IMPACT_BPS_ENV))
+    if val is None or val <= 0:
+        return DEFAULT_MAX_IMPACT_BPS
+    return val
+
+
+def _parse_book_levels(raw: object) -> list[tuple[Decimal, Decimal]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[tuple[Decimal, Decimal]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        px = _to_decimal(item[0])
+        qty = _to_decimal(item[1])
+        if px is not None and qty is not None and px > 0 and qty > 0:
+            out.append((px, qty))
+    return out
+
+
+def evaluate_orderbook_impact(
+    depth: object,
+    *,
+    quote_usdt: object = None,
+    quantity: object = None,
+    spread_cap_bps: Decimal | None = None,
+    impact_cap_bps: Decimal | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Evaluate L2 orderbook spread, top-5 imbalance (OBI), and market-buy VWAP impact.
+
+    Returns ``(metrics, error)``. When ``error`` is non-None, a market BUY
+    should be refused before ``new_order`` is sent.
+    """
+    if not isinstance(depth, dict):
+        return None, "orderbook_unavailable"
+    bids = sorted(_parse_book_levels(depth.get("bids")), key=lambda x: x[0], reverse=True)
+    asks = sorted(_parse_book_levels(depth.get("asks")), key=lambda x: x[0])
+    if not bids or not asks:
+        return None, "orderbook_empty"
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    if best_ask <= best_bid:
+        return None, "orderbook_crossed"
+    mid = (best_bid + best_ask) / Decimal("2")
+    spread_bps = ((best_ask - best_bid) / mid) * Decimal("10000")
+
+    bid_5 = sum((px * qty for px, qty in bids[:5]), Decimal("0"))
+    ask_5 = sum((px * qty for px, qty in asks[:5]), Decimal("0"))
+    total_5 = bid_5 + ask_5
+    obi_5 = float((bid_5 - ask_5) / total_5) if total_5 > 0 else 0.0
+
+    s_cap = max_spread_bps() if spread_cap_bps is None else spread_cap_bps
+    i_cap = max_impact_bps() if impact_cap_bps is None else impact_cap_bps
+
+    target_quote = _to_decimal(quote_usdt)
+    target_qty = _to_decimal(quantity)
+
+    vwap = best_ask
+    impact_bps = ((best_ask - mid) / mid) * Decimal("10000")
+    depth_covered = True
+
+    if target_quote is not None and target_quote > 0:
+        rem_quote = target_quote
+        acc_qty = Decimal("0")
+        acc_quote = Decimal("0")
+        for px, qty in asks:
+            lvl_quote = px * qty
+            if lvl_quote >= rem_quote:
+                take_qty = rem_quote / px
+                acc_qty += take_qty
+                acc_quote += rem_quote
+                rem_quote = Decimal("0")
+                break
+            acc_qty += qty
+            acc_quote += lvl_quote
+            rem_quote -= lvl_quote
+        if rem_quote > Decimal("0.00000001") or acc_qty <= 0:
+            depth_covered = False
+        else:
+            vwap = acc_quote / acc_qty
+            impact_bps = ((vwap - mid) / mid) * Decimal("10000")
+    elif target_qty is not None and target_qty > 0:
+        rem_qty = target_qty
+        acc_qty = Decimal("0")
+        acc_quote = Decimal("0")
+        for px, qty in asks:
+            if qty >= rem_qty:
+                acc_qty += rem_qty
+                acc_quote += rem_qty * px
+                rem_qty = Decimal("0")
+                break
+            acc_qty += qty
+            acc_quote += qty * px
+            rem_qty -= qty
+        if rem_qty > Decimal("0.00000001") or acc_qty <= 0:
+            depth_covered = False
+        else:
+            vwap = acc_quote / acc_qty
+            impact_bps = ((vwap - mid) / mid) * Decimal("10000")
+
+    metrics: dict[str, Any] = {
+        "best_bid": _decimal_text(best_bid),
+        "best_ask": _decimal_text(best_ask),
+        "mid_price": _decimal_text(mid),
+        "spread_bps": round(float(spread_bps), 4),
+        "expected_vwap": _decimal_text(vwap),
+        "impact_bps": round(float(impact_bps), 4),
+        "obi_top5": round(obi_5, 4),
+        "depth_covered": depth_covered,
+    }
+    if not depth_covered:
+        return metrics, "orderbook_depth_insufficient"
+    if spread_bps > s_cap:
+        return metrics, "orderbook_spread_too_wide"
+    if impact_bps > i_cap:
+        return metrics, "orderbook_impact_too_high"
+    return metrics, None

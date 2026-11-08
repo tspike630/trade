@@ -967,6 +967,20 @@ class BinanceSpotHttpClient:
         status, body = self._opener(request, self.timeout)
         return _decode_ok(status, body)
 
+    def order_book(self, symbol: str, *, limit: int = 20) -> dict[str, Any]:
+        query = urllib.parse.urlencode(
+            (("symbol", symbol), ("limit", str(int(limit)))),
+            quote_via=urllib.parse.quote,
+            safe="",
+        )
+        request = urllib.request.Request(
+            f"{self.base_url}/api/v3/depth?{query}",
+            method="GET",
+            headers={"User-Agent": "trade-binance-spot"},
+        )
+        status, body = self._opener(request, self.timeout)
+        return _decode_ok(status, body)
+
     def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{self.base_url}{SPOT_PATH}?{signed_query}",
@@ -1232,8 +1246,10 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     dust_detail,
     entry_notional_floor_error,
     entry_viability_error,
+    evaluate_orderbook_impact,
     fill_average_price,
     flatten_client_order_id,
+    orderbook_gate_enabled,
     protective_band_error,
     is_request_timeout,
     ENTRY_MIN_NOTIONAL_USDT,
@@ -1325,6 +1341,7 @@ class BinanceSpotAdapter:
         allow_rest_http: bool = False,
         reanchor_oco_on_fill: bool | None = None,
         auto_flatten_on_oco_fail: bool | None = None,
+        orderbook_gate: bool | None = None,
     ) -> None:
         self.client = client
         self.kill_switch_path = kill_switch_path
@@ -1339,11 +1356,13 @@ class BinanceSpotAdapter:
         self.allow_rest_http = bool(allow_rest_http)
         self.reanchor_oco_on_fill = reanchor_oco_on_fill
         self.auto_flatten_on_oco_fail = auto_flatten_on_oco_fail
+        self.orderbook_gate = orderbook_gate
         self.buy_blocks: list[dict[str, Any]] = []
         self.peer_buy_blocks: list[dict[str, Any]] = []
         self.canonical_rows: list[dict[str, Any]] = []
         self._size_plan: dict[str, Any] | None = None
         self._entry_mark: str | None = None
+        self._orderbook_metrics: dict[str, Any] | None = None
 
     def _reanchor_enabled(self) -> bool:
         if self.reanchor_oco_on_fill is not None:
@@ -1354,6 +1373,11 @@ class BinanceSpotAdapter:
         if self.auto_flatten_on_oco_fail is not None:
             return bool(self.auto_flatten_on_oco_fail)
         return auto_flatten_on_oco_fail_enabled()
+
+    def _orderbook_gate_enabled(self) -> bool:
+        if self.orderbook_gate is not None:
+            return bool(self.orderbook_gate)
+        return orderbook_gate_enabled()
 
     def _credentials(self) -> tuple[str, str]:
         key = (self.api_key if self.api_key is not None else _env_secret(API_KEY_ENV)).strip()
@@ -1904,6 +1928,7 @@ class BinanceSpotAdapter:
     def execute(self, sig: dict[str, Any]) -> dict[str, Any]:
         self._size_plan = None
         self._entry_mark = None
+        self._orderbook_metrics = None
         gates = self._gates()
         purpose = str(sig.get("purpose") or "").strip()
         if not is_live_bnb_spot_purpose(purpose):
@@ -2373,6 +2398,42 @@ class BinanceSpotAdapter:
                             consumer_allowed=False,
                         )
                     )
+            order_type_now = _parse_order_type(
+                extras.get("order_type", extras.get("binance_order_type"))
+            )
+            if order_type_now == "MARKET" and self._orderbook_gate_enabled():
+                depth_fn = getattr(client, "order_book", None)
+                if callable(depth_fn):
+                    try:
+                        depth_payload = depth_fn(symbol, limit=20)
+                    except Exception:  # noqa: BLE001
+                        depth_payload = None
+                    if isinstance(depth_payload, dict):
+                        order_map = dict(pairs)
+                        ob_metrics, ob_error = evaluate_orderbook_impact(
+                            depth_payload,
+                            quote_usdt=order_map.get("quoteOrderQty"),
+                            quantity=order_map.get("quantity"),
+                            spread_cap_bps=_to_decimal(extras.get("max_spread_bps")),
+                            impact_cap_bps=_to_decimal(extras.get("max_impact_bps")),
+                        )
+                        self._orderbook_metrics = ob_metrics
+                        if ob_error:
+                            return self._finish(
+                                _result(
+                                    ok=False,
+                                    dry_run=False,
+                                    executed=0,
+                                    submitted=False,
+                                    error=ob_error,
+                                    symbol=symbol,
+                                    order=None,
+                                    exchange_order_id=None,
+                                    gates=gates,
+                                    exit_plan=plan,
+                                    consumer_allowed=False,
+                                )
+                            )
 
         signed = sign_query(pairs, secret)
         try:
@@ -3376,6 +3437,9 @@ class BinanceSpotAdapter:
                 for key, value in plan.items()
                 if key != "needs_lot_floor"
             }
+        ob_metrics = getattr(self, "_orderbook_metrics", None)
+        if isinstance(ob_metrics, dict):
+            result["orderbook_metrics"] = dict(ob_metrics)
         log.info(
             "binance_spot symbol=%s dry_run=%s ok=%s submitted=%s error=%s",
             result.get("symbol"),
