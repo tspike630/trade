@@ -94,6 +94,8 @@ _INDICATOR_COLS = (
     "boll_mid",
     "boll_lower",
     "quote_volume_24h",
+    "taker_buy_quote_volume",
+    "taker_buy_ratio",
     "sample_count",
     "kline_close_time_ms",
     "tier",
@@ -128,6 +130,8 @@ class SpotKline:
     quote_volume: float
     close_time_ms: int
     trades: int | None = None
+    taker_buy_base_volume: float | None = None
+    taker_buy_quote_volume: float | None = None
 
 
 def repo_root() -> Path:
@@ -449,6 +453,16 @@ def parse_kline_row(raw: Any) -> SpotKline | None:
             trades = int(raw[8])
         except (TypeError, ValueError):
             trades = None
+    taker_buy_base: float | None = None
+    if len(raw) > 9 and raw[9] not in (None, ""):
+        parsed_tb = _float_or_none(raw[9])
+        if parsed_tb is not None and parsed_tb >= 0:
+            taker_buy_base = parsed_tb
+    taker_buy_quote: float | None = None
+    if len(raw) > 10 and raw[10] not in (None, ""):
+        parsed_tq = _float_or_none(raw[10])
+        if parsed_tq is not None and parsed_tq >= 0:
+            taker_buy_quote = parsed_tq
     return SpotKline(
         open_time_ms=open_time,
         open=op,
@@ -459,7 +473,22 @@ def parse_kline_row(raw: Any) -> SpotKline | None:
         quote_volume=quote,
         close_time_ms=close_time,
         trades=trades,
+        taker_buy_base_volume=taker_buy_base,
+        taker_buy_quote_volume=taker_buy_quote,
     )
+
+
+def taker_buy_ratio_from_kline(bar: SpotKline) -> float | None:
+    """Active taker-buy notional share in ``[0, 1]`` for one kline bar."""
+    if bar.taker_buy_quote_volume is not None and bar.quote_volume > 0:
+        ratio = bar.taker_buy_quote_volume / bar.quote_volume
+        if 0.0 <= ratio <= 1.0 + 1e-6:
+            return min(1.0, max(0.0, ratio))
+    if bar.taker_buy_base_volume is not None and bar.volume > 0:
+        ratio = bar.taker_buy_base_volume / bar.volume
+        if 0.0 <= ratio <= 1.0 + 1e-6:
+            return min(1.0, max(0.0, ratio))
+    return None
 
 
 def _iso_ms(ms: int) -> str:
@@ -532,6 +561,7 @@ def factors_from_klines(
     series = price_series_from_klines(closed)
     if not series:
         return None
+    last_bar = max(closed, key=lambda bar: (bar.close_time_ms, bar.open_time_ms))
     closes = [float(row["price_usd"]) for row in series]
     lib = compute_pandas_ta(closes)
     fields, _fresh = apply_library_fields(None, lib)
@@ -545,17 +575,31 @@ def factors_from_klines(
         "volatility_24h": volatility_stdev_returns(series),
         "volume_strength": volume_strength(series),
         "quote_volume_24h": quote_volume_24h(closed),
+        "taker_buy_quote_volume": last_bar.taker_buy_quote_volume,
+        "taker_buy_ratio": taker_buy_ratio_from_kline(last_bar),
         "sample_count": len(series),
-        "kline_close_time_ms": max(bar.close_time_ms for bar in closed),
+        "kline_close_time_ms": last_bar.close_time_ms,
     }
     out.update(fields)
     return out
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
+    present = {
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in present:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create binance_* tables. Does not migrate token_indicators."""
     script = _SQL_PATH.read_text(encoding="utf-8")
     conn.executescript(script)
+    _ensure_column(conn, "binance_klines", "taker_buy_base_volume", "REAL")
+    _ensure_column(conn, "binance_klines", "taker_buy_quote_volume", "REAL")
+    _ensure_column(conn, "binance_indicators", "taker_buy_quote_volume", "REAL")
+    _ensure_column(conn, "binance_indicators", "taker_buy_ratio", "REAL")
 
 
 def connect_rw(path: Path) -> sqlite3.Connection:
@@ -587,6 +631,8 @@ def upsert_klines(
             bar.quote_volume,
             bar.close_time_ms,
             bar.trades,
+            bar.taker_buy_base_volume,
+            bar.taker_buy_quote_volume,
         )
         for bar in klines
     ]
@@ -594,8 +640,9 @@ def upsert_klines(
         """
         INSERT OR REPLACE INTO binance_klines (
             symbol, interval, open_time_ms, open, high, low, close,
-            volume, quote_volume, close_time_ms, trades
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            volume, quote_volume, close_time_ms, trades,
+            taker_buy_base_volume, taker_buy_quote_volume
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )

@@ -125,6 +125,15 @@ class TechBollFadeStrategy(BaseStrategy):
                         decision.alpha,
                         decision.deep_zone_price,
                     )
+                elif reason == "orderflow_toxic_sell_dump":
+                    log.info(
+                        "orderflow_toxic_sell_dump symbol=%s taker_buy_ratio=%s "
+                        "trade_size_ratio=%s alpha=%s",
+                        row.get("binance_symbol"),
+                        decision.taker_buy_ratio,
+                        decision.trade_size_ratio,
+                        decision.alpha,
+                    )
                 continue
             sized = buy_size_fields(row, floor_pct=self.position_pct)
             multiplier = float(decision.position_size_multiplier or 1.0)
@@ -168,6 +177,10 @@ class TechBollFadeStrategy(BaseStrategy):
                     size_pct,
                     multiplier,
                 )
+            if decision.taker_buy_ratio is not None:
+                lift_extra["taker_buy_ratio"] = decision.taker_buy_ratio
+                lift_extra["taker_buy_ratio_source"] = decision.taker_buy_ratio_source
+                lift_extra["orderflow_regime"] = decision.orderflow_regime
             hits += 1
             order_type = decision.order_type or "MARKET"
             self.buy(

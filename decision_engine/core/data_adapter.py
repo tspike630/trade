@@ -50,6 +50,8 @@ _INDICATOR_COLS = (
     # scan does not see them. Present only when a row already carries them.
     "kline_low",
     "trade_size_ratio",
+    "taker_buy_ratio",
+    "taker_buy_quote_volume",
 )
 
 _BOLL_COLS = ("boll_upper", "boll_mid", "boll_lower")

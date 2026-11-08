@@ -30,6 +30,7 @@ from decision_engine.core.bnb_native import (
 from decision_engine.core.bnb_spot_map import classify_listed_symbol
 from decision_engine.strategies.live_bnb_entry_zone import (
     ZoneBar,
+    taker_buy_ratio_from_bar,
     trade_size_ratio_from_bars,
 )
 
@@ -97,13 +98,25 @@ def _read_table(
     close_col = _pick(cols, ("close", "c"))
     if symbol_col is None or open_col is None or low_col is None or close_col is None:
         return {}
+    vol_col = _pick(cols, ("volume", "base_volume", "v"))
     quote_col = _pick(cols, ("quote_volume", "quoteVolume", "q"))
     trades_col = _pick(cols, ("trades", "number_of_trades", "n"))
+    taker_base_col = _pick(cols, ("taker_buy_base_volume", "takerBuyBaseVolume", "V"))
+    taker_quote_col = _pick(cols, ("taker_buy_quote_volume", "takerBuyQuoteVolume", "Q"))
     close_time_col = _pick(cols, ("close_time_ms", "close_time"))
     interval_col = _pick(cols, ("interval", "timeframe"))
     exchange_col = "exchange" if "exchange" in cols else None
     selected = [symbol_col, open_col, low_col, close_col]
-    for extra in (quote_col, trades_col, close_time_col, interval_col, exchange_col):
+    for extra in (
+        vol_col,
+        quote_col,
+        trades_col,
+        taker_base_col,
+        taker_quote_col,
+        close_time_col,
+        interval_col,
+        exchange_col,
+    ):
         if extra is not None and extra not in selected:
             selected.append(extra)
     sql = f"SELECT {', '.join(selected)} FROM {table}"
@@ -134,8 +147,11 @@ def _read_table(
             close_ms = int(close_ms_raw) if close_ms_raw is not None else opened + KLINE_MS
         else:
             close_ms = opened + KLINE_MS
+        vol = _finite(row.get(vol_col)) if vol_col is not None else None
         quote = _finite(row.get(quote_col)) if quote_col is not None else None
         trades = _finite(row.get(trades_col)) if trades_col is not None else None
+        taker_base = _finite(row.get(taker_base_col)) if taker_base_col is not None else None
+        taker_quote = _finite(row.get(taker_quote_col)) if taker_quote_col is not None else None
         buckets.setdefault(spot, {})[opened] = ZoneBar(
             open_ms=opened,
             close_ms=close_ms,
@@ -143,6 +159,9 @@ def _read_table(
             close=close,
             quote_volume=quote,
             trades=trades,
+            volume=vol,
+            taker_buy_base_volume=taker_base,
+            taker_buy_quote_volume=taker_quote,
         )
     return buckets
 
@@ -249,6 +268,11 @@ def attach_live_entry_coordinates(
             mid = boll_mid_from_closes([item.close for item in window])
             if mid is not None:
                 row["boll_mid"] = mid
+        if _finite(row.get("taker_buy_ratio")) is None:
+            tbr, tbr_source = taker_buy_ratio_from_bar(bar)
+            if tbr is not None:
+                row["taker_buy_ratio"] = tbr
+                row["taker_buy_ratio_source"] = tbr_source
         if _finite(row.get("trade_size_ratio")) is not None:
             continue
         if (

@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS binance_klines (
     quote_volume REAL,
     close_time_ms INTEGER NOT NULL,
     trades INTEGER,
+    taker_buy_base_volume REAL,
+    taker_buy_quote_volume REAL,
     PRIMARY KEY (symbol, interval, open_time_ms)
 );
 
@@ -43,6 +45,8 @@ CREATE TABLE IF NOT EXISTS binance_indicators (
     boll_mid REAL,
     boll_lower REAL,
     quote_volume_24h REAL,
+    taker_buy_quote_volume REAL,
+    taker_buy_ratio REAL,
     sample_count INTEGER,
     kline_close_time_ms INTEGER,
     tier TEXT,

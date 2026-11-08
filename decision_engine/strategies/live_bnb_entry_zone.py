@@ -39,6 +39,20 @@ Tiers (``ratio >= 1.3`` large, ``0.85 <= ratio < 1.3`` neutral, else crowded):
 3. retail_crowded: no market buy. This round does not rest the deep bid at
    ``L - 0.5*S``. That price is recorded for audit only.
 
+Orderflow Toxicity Overlay (``taker_buy_ratio = taker_buy_quote_volume / quote_volume``):
+
+- When ``taker_buy_ratio`` is present (or derived from bar volumes):
+  - ``taker_buy_ratio < MIN_TAKER_BUY_RATIO`` (0.30): one-sided aggressive
+    market sell dump (> 70% taker sell volume) → rejected with
+    ``reject_reason="orderflow_toxic_sell_dump"`` (``orderflow_regime="toxic_sell_dump"``).
+  - ``0.30 <= taker_buy_ratio < LARGE_MIN_TAKER_BUY_RATIO`` (0.42) on a
+    ``large_trade`` bar: large trade size is still dominated by aggressive
+    selling rather than active buyer absorption → downgraded from ``1.0x``
+    ``large_trade`` market to ``0.5x`` ``neutral`` rules
+    (``orderflow_regime="absorption_weak_downgraded"``).
+  - ``taker_buy_ratio >= 0.42``: active buyer absorption confirmed
+    (``orderflow_regime="absorption_strong"``).
+
 No fee or tick haircut is applied to 0.08 / 0.40 / 0.12 / 0.28 / 1.5 / 2.5.
 Comparisons use a 1e-9 absolute tolerance so a boundary built as
 ``L + alpha*S`` is not rejected by binary noise. The tolerance is not a
@@ -54,6 +68,7 @@ floor or at/above ``M`` does not get a market buy.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
 
@@ -68,15 +83,23 @@ LARGE_MIN_RATIO = 1.3
 NEUTRAL_MIN_RATIO = 0.85
 LARGE_MIN_ODDS = 1.5
 NEUTRAL_MIN_ODDS = 2.5
+MIN_TAKER_BUY_RATIO = 0.30
+LARGE_MIN_TAKER_BUY_RATIO = 0.42
 STOP_SPAN_FRAC = 0.1
 DEEP_SPAN_FRAC = 0.5
 _CMP_EPS = 1e-9
 _DAY_MS = 24 * 60 * 60 * 1000
+_TRUE = frozenset({"1", "true", "yes", "on"})
 
 Tier = Literal["large_trade", "neutral", "retail_crowded"]
 OrderType = Literal["MARKET", "LIMIT"]
 
 RULE_VERSION = "live_bnb_entry_zone_v2_2026-11-06"
+
+
+def require_taker_buy_ratio_enabled() -> bool:
+    """When ``LIVE_BNB_REQUIRE_TAKER_BUY_RATIO=1``, missing taker_buy_ratio fails closed."""
+    return os.environ.get("LIVE_BNB_REQUIRE_TAKER_BUY_RATIO", "").strip().lower() in _TRUE
 
 
 def _finite(value: Any) -> float | None:
@@ -123,6 +146,9 @@ class ZoneBar:
     close: float
     quote_volume: float | None
     trades: float | None
+    volume: float | None = None
+    taker_buy_base_volume: float | None = None
+    taker_buy_quote_volume: float | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +177,9 @@ class EntryDecision:
     legacy_change_5m_pass: bool | None
     legacy_volume_strength_pass: bool | None
     legacy_boll_lower_break: bool | None
+    taker_buy_ratio: float | None = None
+    taker_buy_ratio_source: str | None = None
+    orderflow_regime: str | None = None
 
 
 def _empty(
@@ -170,6 +199,9 @@ def _empty(
     zone: tuple[float | None, float | None] = (None, None),
     stop_price: float | None = None,
     take_profit_price: float | None = None,
+    taker_buy_ratio: float | None = None,
+    taker_buy_ratio_source: str | None = None,
+    orderflow_regime: str | None = None,
 ) -> EntryDecision:
     return EntryDecision(
         emit=False,
@@ -196,6 +228,9 @@ def _empty(
         legacy_change_5m_pass=legacy[0],
         legacy_volume_strength_pass=legacy[1],
         legacy_boll_lower_break=legacy[2],
+        taker_buy_ratio=taker_buy_ratio,
+        taker_buy_ratio_source=taker_buy_ratio_source,
+        orderflow_regime=orderflow_regime,
     )
 
 
@@ -206,6 +241,82 @@ def reward_risk(mid: float, entry: float, stop: float) -> float | None:
     if risk <= _CMP_EPS or reward <= _CMP_EPS:
         return None
     return reward / risk
+
+
+def taker_buy_ratio_from_bar(bar: ZoneBar) -> tuple[float | None, str | None]:
+    """Compute active taker-buy volume share in ``[0, 1]`` from a ``ZoneBar``."""
+    if (
+        bar.taker_buy_quote_volume is not None
+        and bar.quote_volume is not None
+        and bar.quote_volume > 0
+    ):
+        if bar.taker_buy_quote_volume < 0:
+            return None, None
+        ratio = bar.taker_buy_quote_volume / bar.quote_volume
+        if ratio <= 1.0 + 1e-6:
+            return min(1.0, max(0.0, ratio)), "kline_taker_buy_quote"
+        return None, None
+    if (
+        bar.taker_buy_base_volume is not None
+        and bar.volume is not None
+        and bar.volume > 0
+    ):
+        if bar.taker_buy_base_volume < 0:
+            return None, None
+        ratio = bar.taker_buy_base_volume / bar.volume
+        if ratio <= 1.0 + 1e-6:
+            return min(1.0, max(0.0, ratio)), "kline_taker_buy_base"
+        return None, None
+    return None, None
+
+
+def resolve_taker_buy_ratio(
+    row: dict[str, Any],
+) -> tuple[float | None, str | None, str | None]:
+    """``(taker_buy_ratio, source, error)``.
+
+    Direct ``taker_buy_ratio`` wins when present. Falls back to current-bar
+    ``taker_buy_quote_volume / quote_volume``, then ``taker_buy_base_volume / volume``,
+    then the last element of ``entry_zone_bars``. Out-of-range values (< 0 or > 1)
+    return ``error="taker_buy_ratio_invalid"``.
+    """
+    if "taker_buy_ratio" in row and row.get("taker_buy_ratio") is not None:
+        direct = _finite(row.get("taker_buy_ratio"))
+        if direct is None or direct < 0.0 or direct > 1.0 + 1e-6:
+            return None, None, "taker_buy_ratio_invalid"
+        src = str(row.get("taker_buy_ratio_source") or "taker_buy_ratio")
+        return min(1.0, max(0.0, direct)), src, None
+
+    tb_quote = _first(row, ("taker_buy_quote_volume", "bar_taker_buy_quote_volume"))
+    bar_quote = _first(row, ("bar_quote_volume", "quote_volume"))
+    if tb_quote is not None:
+        if tb_quote < 0.0:
+            return None, None, "taker_buy_ratio_invalid"
+        if bar_quote is not None and bar_quote > 0.0:
+            ratio = tb_quote / bar_quote
+            if ratio > 1.0 + 1e-6:
+                return None, None, "taker_buy_ratio_invalid"
+            return min(1.0, max(0.0, ratio)), "kline_taker_buy_quote", None
+
+    tb_base = _first(row, ("taker_buy_base_volume", "bar_taker_buy_base_volume"))
+    bar_vol = _first(row, ("bar_volume", "volume"))
+    if tb_base is not None:
+        if tb_base < 0.0:
+            return None, None, "taker_buy_ratio_invalid"
+        if bar_vol is not None and bar_vol > 0.0:
+            ratio = tb_base / bar_vol
+            if ratio > 1.0 + 1e-6:
+                return None, None, "taker_buy_ratio_invalid"
+            return min(1.0, max(0.0, ratio)), "kline_taker_buy_base", None
+
+    bars = row.get("entry_zone_bars")
+    if isinstance(bars, Sequence) and not isinstance(bars, (str, bytes)):
+        parsed = [item for item in bars if isinstance(item, ZoneBar)]
+        if parsed:
+            tbr, src = taker_buy_ratio_from_bar(parsed[-1])
+            if tbr is not None:
+                return tbr, src, None
+    return None, None, None
 
 
 def _sum_quote_trades(bars: Sequence[ZoneBar]) -> tuple[float, float] | None:
@@ -388,6 +499,9 @@ def _emit(
     size_note: str,
     deep: float,
     legacy: tuple[bool | None, bool | None, bool | None],
+    taker_buy_ratio: float | None = None,
+    taker_buy_ratio_source: str | None = None,
+    orderflow_regime: str | None = None,
 ) -> EntryDecision:
     return EntryDecision(
         emit=True,
@@ -414,6 +528,9 @@ def _emit(
         legacy_change_5m_pass=legacy[0],
         legacy_volume_strength_pass=legacy[1],
         legacy_boll_lower_break=legacy[2],
+        taker_buy_ratio=taker_buy_ratio,
+        taker_buy_ratio_source=taker_buy_ratio_source,
+        orderflow_regime=orderflow_regime,
     )
 
 
@@ -444,6 +561,9 @@ def _limit_or_reject(
             legacy=base["legacy"],
             ratio_source=base["ratio_source"],
             baseline_bars=base["baseline_bars"],
+            taker_buy_ratio=base.get("taker_buy_ratio"),
+            taker_buy_ratio_source=base.get("taker_buy_ratio_source"),
+            orderflow_regime=base.get("orderflow_regime"),
         )
 
     if not _gt(price, limit_price) or limit_price <= 0 or stop_price >= limit_price:
@@ -528,6 +648,7 @@ def evaluate_entry_zone(
         )
 
     ratio, ratio_source, ratio_error = resolve_trade_size_ratio(row)
+    tbr, tbr_source, tbr_error = resolve_taker_buy_ratio(row)
     baseline_raw = row.get("trade_size_baseline_bars")
     baseline_bars = int(baseline_raw) if isinstance(baseline_raw, int) else None
     common = {
@@ -540,11 +661,17 @@ def evaluate_entry_zone(
         "legacy": legacy,
         "ratio_source": ratio_source,
         "baseline_bars": baseline_bars,
+        "taker_buy_ratio": tbr,
+        "taker_buy_ratio_source": tbr_source,
     }
     if ratio_error:
         return _empty(reason=ratio_error, ratio=None, **common)
     if ratio is None:
         return _empty(reason="trade_size_ratio_missing", ratio=None, **common)
+    if tbr_error:
+        return _empty(reason=tbr_error, ratio=ratio, **common)
+    if tbr is None and require_taker_buy_ratio_enabled():
+        return _empty(reason="taker_buy_ratio_missing", ratio=ratio, **common)
 
     tier = _tier(ratio)
     stop_price = _stop(low, span)
@@ -555,6 +682,39 @@ def evaluate_entry_zone(
     neutral_max = _level(low, span, NEUTRAL_ALPHA_MAX)
     limit_price = _level(low, span, NEUTRAL_LIMIT_ALPHA)
 
+    if tier == "retail_crowded":
+        return _empty(
+            reason="retail_crowded_skip",
+            tier=tier,
+            ratio=ratio,
+            zone=(zone_floor, zone_cap),
+            stop_price=stop_price,
+            take_profit_price=take_profit,
+            **common,
+        )
+
+    orderflow_regime: str | None = None
+    if tbr is not None:
+        if not _gte(tbr, MIN_TAKER_BUY_RATIO):
+            return _empty(
+                reason="orderflow_toxic_sell_dump",
+                tier=tier,
+                ratio=ratio,
+                zone=(zone_floor, zone_cap) if tier == "large_trade" else (neutral_min, neutral_max),
+                stop_price=stop_price,
+                take_profit_price=take_profit,
+                orderflow_regime="toxic_sell_dump",
+                **common,
+            )
+        if tier == "large_trade" and not _gte(tbr, LARGE_MIN_TAKER_BUY_RATIO):
+            # Large trade size with weak taker-buy share (< 42%) means aggressive
+            # sellers still dominate; downgrade from 1.0x market to 0.5x neutral rules.
+            tier = "neutral"
+            orderflow_regime = "absorption_weak_downgraded"
+        else:
+            orderflow_regime = "absorption_strong"
+
+    common["orderflow_regime"] = orderflow_regime
     base = {
         "take_profit": take_profit,
         "alpha": alpha,
@@ -567,18 +727,10 @@ def evaluate_entry_zone(
         "baseline_bars": baseline_bars,
         "deep": deep,
         "legacy": legacy,
+        "taker_buy_ratio": tbr,
+        "taker_buy_ratio_source": tbr_source,
+        "orderflow_regime": orderflow_regime,
     }
-
-    if tier == "retail_crowded":
-        return _empty(
-            reason="retail_crowded_skip",
-            tier=tier,
-            ratio=ratio,
-            zone=(zone_floor, zone_cap),
-            stop_price=stop_price,
-            take_profit_price=take_profit,
-            **common,
-        )
 
     if tier == "large_trade":
         zone = (zone_floor, zone_cap)
