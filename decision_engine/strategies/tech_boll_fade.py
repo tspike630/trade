@@ -18,6 +18,10 @@ from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine.core.portfolio_clusters import (
+    compute_inverse_vol_size,
+    symbol_sector_cluster,
+)
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
@@ -136,8 +140,26 @@ class TechBollFadeStrategy(BaseStrategy):
                     )
                 continue
             sized = buy_size_fields(row, floor_pct=self.position_pct)
-            multiplier = float(decision.position_size_multiplier or 1.0)
-            size_pct = float(sized["size_pct"]) * multiplier
+            tier_multiplier = float(decision.position_size_multiplier or 1.0)
+            entry_ref = (
+                decision.limit_price
+                if decision.order_type == "LIMIT" and decision.limit_price is not None
+                else decision.price
+            )
+            vol_sized = compute_inverse_vol_size(
+                float(sized["size_pct"]),
+                tier_multiplier=tier_multiplier,
+                entry_price=entry_ref,
+                stop_price=decision.stop_price,
+                volatility_24h=_finite(row.get("volatility_24h")),
+            )
+            size_pct = vol_sized.size_pct
+            multiplier = vol_sized.effective_multiplier
+            size_note = (
+                vol_sized.position_size_note
+                if vol_sized.applied and vol_sized.position_size_note
+                else decision.position_size_note
+            )
             if not 0.0 < size_pct <= 1.0:
                 self.rejected["size_pct_invalid"] = (
                     self.rejected.get("size_pct_invalid", 0) + 1
@@ -163,13 +185,20 @@ class TechBollFadeStrategy(BaseStrategy):
                     self.rejected.get(REJECT_BELOW_MIN, 0) + 1
                 )
                 continue
-            lift_extra: dict[str, Any] = {}
+            lift_extra: dict[str, Any] = {
+                "sector_cluster": symbol_sector_cluster(str(row.get("binance_symbol") or "")),
+                "risk_parity_scalar": vol_sized.risk_parity_scalar,
+            }
+            if vol_sized.stop_distance_pct is not None:
+                lift_extra["stop_distance_pct"] = vol_sized.stop_distance_pct
             if lifted:
-                lift_extra = {
-                    "size_pct_before_min_notional": size_before_floor,
-                    "min_notional_lift": True,
-                    "min_notional_usdt": format(ENTRY_MIN_NOTIONAL_USDT, "f"),
-                }
+                lift_extra.update(
+                    {
+                        "size_pct_before_min_notional": size_before_floor,
+                        "min_notional_lift": True,
+                        "min_notional_usdt": format(ENTRY_MIN_NOTIONAL_USDT, "f"),
+                    }
+                )
                 log.info(
                     "entry_min_notional_lift symbol=%s size_pct=%s -> %s multiplier=%s",
                     row.get("binance_symbol"),
@@ -210,7 +239,7 @@ class TechBollFadeStrategy(BaseStrategy):
                 order_type=order_type,
                 limit_price=decision.limit_price,
                 position_size_multiplier=multiplier,
-                position_size_note=decision.position_size_note,
+                position_size_note=size_note,
                 entry_reason=decision.entry_reason,
                 crowding_tier=decision.tier,
                 deep_zone_price=decision.deep_zone_price,

@@ -11,6 +11,7 @@ from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine.core.portfolio_clusters import cluster_open_exposure_block
 from decision_engine.core.protection_halt import ProtectionBook, purpose_halt_reason
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
@@ -47,7 +48,7 @@ def apply_live_buy_guards(
     book: ProtectionBook,
     macro_halt: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Drop BUYs that fail the stop gap, protection halt, or macro circuit breaker.
+    """Drop BUYs that fail the stop gap, protection halt, cluster cap, or macro circuit breaker.
 
     ``protection_halt`` is set only for a purpose-wide block (unprotected
     inventory, an unreadable book, or one-open-per-arm when that flag is
@@ -63,6 +64,7 @@ def apply_live_buy_guards(
     kept: list[dict[str, Any]] = []
     stop_rejected = 0
     protection_dropped = 0
+    cluster_dropped = 0
     macro_dropped = 0
     for signal in signals:
         if str(signal.get("action") or "").lower() != "buy":
@@ -108,6 +110,20 @@ def apply_live_buy_guards(
                     reason,
                 )
                 continue
+            cluster_reason = cluster_open_exposure_block(
+                list(book.positions),
+                purpose=purpose,
+                symbol=signal_symbol(signal),
+            )
+            if cluster_reason is not None:
+                cluster_dropped += 1
+                log.info(
+                    "cluster_exposure_halt purpose=%s symbol=%s reason=%s",
+                    purpose,
+                    signal_symbol(signal),
+                    cluster_reason,
+                )
+                continue
         if macro_halt is not None:
             macro_dropped += 1
             log.info(
@@ -137,6 +153,8 @@ def apply_live_buy_guards(
         "protection_halt": wide,
         "protection_dropped": protection_dropped,
     }
+    if cluster_dropped:
+        report["cluster_dropped"] = cluster_dropped
     if macro_halt is not None or macro_dropped:
         report["macro_halt"] = macro_halt
         report["macro_dropped"] = macro_dropped
