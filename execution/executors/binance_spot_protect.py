@@ -119,28 +119,30 @@ def protective_order_block(gates: dict[str, Any]) -> str | None:
     return None
 
 
-def _client_piece(prefix: str, raw: object) -> str | None:
+def _client_piece(prefix: str, raw: object, *, ratchet_seq: int = 0) -> str | None:
     if isinstance(raw, bool) or raw is None:
         return None
     text = str(raw).strip()
     if not text.isdigit():
         return None
-    client_id = f"{prefix}{text}"
+    seq = int(ratchet_seq) if isinstance(ratchet_seq, int) and not isinstance(ratchet_seq, bool) else 0
+    suffix = f"-r{seq}" if seq > 0 else ""
+    client_id = f"{prefix}{text}{suffix}"
     if len(client_id) > 36:
         return None
     return client_id
 
 
-def oco_list_client_id(decision_id: object) -> str | None:
-    return _client_piece("bnbfade-ol-", decision_id)
+def oco_list_client_id(decision_id: object, *, ratchet_seq: int = 0) -> str | None:
+    return _client_piece("bnbfade-ol-", decision_id, ratchet_seq=ratchet_seq)
 
 
-def oco_above_client_id(decision_id: object) -> str | None:
-    return _client_piece("bnbfade-tp-", decision_id)
+def oco_above_client_id(decision_id: object, *, ratchet_seq: int = 0) -> str | None:
+    return _client_piece("bnbfade-tp-", decision_id, ratchet_seq=ratchet_seq)
 
 
-def oco_below_client_id(decision_id: object) -> str | None:
-    return _client_piece("bnbfade-sl-", decision_id)
+def oco_below_client_id(decision_id: object, *, ratchet_seq: int = 0) -> str | None:
+    return _client_piece("bnbfade-sl-", decision_id, ratchet_seq=ratchet_seq)
 
 
 def reference_price(extras: dict[str, Any]) -> Decimal | None:
@@ -493,14 +495,15 @@ def build_spot_oco(
     filters: list[Any],
     mark: object,
     timestamp_ms: int,
+    ratchet_seq: int = 0,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Form body for ``POST /api/v3/orderList/oco``. No network.
 
     Returns ``(spec, error)``. ``spec["pairs"]`` is the unsigned form.
     """
-    list_id = oco_list_client_id(decision_id)
-    above_id = oco_above_client_id(decision_id)
-    below_id = oco_below_client_id(decision_id)
+    list_id = oco_list_client_id(decision_id, ratchet_seq=ratchet_seq)
+    above_id = oco_above_client_id(decision_id, ratchet_seq=ratchet_seq)
+    below_id = oco_below_client_id(decision_id, ratchet_seq=ratchet_seq)
     if list_id is None or above_id is None or below_id is None:
         return None, "invalid_oco_client_id"
     lot, step = _limit_lot(filters)
@@ -1061,3 +1064,118 @@ def sor_maker_fallback_spec(
         "price": pegged_px,
         "quantity": floored_qty,
     }, None
+
+
+TRAILING_RATCHET_ENV = "BINANCE_SPOT_TRAILING_RATCHET"
+RATCHET_TRIGGER_PCT_ENV = "BINANCE_SPOT_RATCHET_TRIGGER_PCT"
+BREAKEVEN_BUFFER_BPS_ENV = "BINANCE_SPOT_BREAKEVEN_BUFFER_BPS"
+TRAILING_DIST_PCT_ENV = "BINANCE_SPOT_TRAILING_DIST_PCT"
+MAX_HOLD_SEC_ENV = "BINANCE_SPOT_MAX_HOLD_SEC"
+DEFAULT_RATCHET_TRIGGER_PCT = Decimal("0.60")
+DEFAULT_BREAKEVEN_BUFFER_BPS = Decimal("25")
+DEFAULT_TRAILING_DIST_PCT = Decimal("0.015")
+PROTECTION_TIME_STOP = "time_stop_exit"
+
+
+def trailing_ratchet_enabled() -> bool:
+    raw = os.environ.get(TRAILING_RATCHET_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def max_hold_sec() -> int:
+    raw = os.environ.get(MAX_HOLD_SEC_ENV)
+    if raw is None or not str(raw).strip():
+        return 0
+    try:
+        val = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, val)
+
+
+def compute_ratcheted_stop_price(
+    row: dict[str, Any],
+    *,
+    mark: object,
+    filters: list[Any],
+    trigger_pct: Decimal | None = None,
+    breakeven_buffer_bps: Decimal | None = None,
+    trail_dist_pct: Decimal | None = None,
+) -> tuple[str | None, str | None]:
+    """Compute a ratcheted stop-loss price when mark progresses toward take-profit.
+
+    - Triggers only when unrealized progress ``(mark - entry) / (tp - entry) >= trigger_pct``
+      (default 0.60).
+    - Sets candidate stop to ``max(entry * (1 + breakeven_buffer), mark * (1 - trail_dist))``
+      floored to ``tickSize``.
+    - Requires the new stop to improve on the current ``stop_price`` by at least 2 ticks
+      and to pass ``protective_band_error`` against ``mark``.
+    Returns ``(new_stop_price_str, ratchet_reason)`` or ``(None, None)``.
+    """
+    tick = _tick_size(filters)
+    if tick is None:
+        return None, None
+    tick_n = _to_decimal(tick)
+    entry = _to_decimal(row.get("entry_price") or row.get("signal_entry_price"))
+    cur_stop = _to_decimal(row.get("stop_price"))
+    tp = _to_decimal(row.get("take_profit_price"))
+    mark_n = _to_decimal(mark)
+    if (
+        tick_n is None
+        or entry is None
+        or cur_stop is None
+        or tp is None
+        or mark_n is None
+    ):
+        return None, None
+    if tp <= entry or mark_n <= entry or mark_n >= tp:
+        return None, None
+
+    progress = (mark_n - entry) / (tp - entry)
+    trig = (
+        trigger_pct
+        if trigger_pct is not None
+        else (_to_decimal(os.environ.get(RATCHET_TRIGGER_PCT_ENV)) or DEFAULT_RATCHET_TRIGGER_PCT)
+    )
+    if progress < trig:
+        return None, None
+
+    be_bps = (
+        breakeven_buffer_bps
+        if breakeven_buffer_bps is not None
+        else (_to_decimal(os.environ.get(BREAKEVEN_BUFFER_BPS_ENV)) or DEFAULT_BREAKEVEN_BUFFER_BPS)
+    )
+    trail_pct = (
+        trail_dist_pct
+        if trail_dist_pct is not None
+        else (_to_decimal(os.environ.get(TRAILING_DIST_PCT_ENV)) or DEFAULT_TRAILING_DIST_PCT)
+    )
+
+    be_stop = entry * (Decimal("1") + be_bps / Decimal("10000"))
+    trail_stop = mark_n * (Decimal("1") - trail_pct)
+    if trail_stop > be_stop:
+        raw_target = trail_stop
+        reason = "trailing_profit_ratchet"
+    else:
+        raw_target = be_stop
+        reason = "breakeven_ratchet"
+
+    aligned_stop = _align(raw_target, tick_n, ROUND_DOWN)
+    max_allowed = _align(mark_n - tick_n * Decimal("2"), tick_n, ROUND_DOWN)
+    if aligned_stop > max_allowed:
+        aligned_stop = max_allowed
+    if aligned_stop < cur_stop + tick_n * Decimal("2"):
+        return None, None
+
+    stop_str = _decimal_text(aligned_stop)
+    tp_str = _decimal_text(tp)
+    if protective_band_error(
+        stop_price=stop_str,
+        take_profit_price=tp_str,
+        mark=mark_n,
+        filters=filters,
+    ) is not None:
+        return None, None
+    return stop_str, reason
