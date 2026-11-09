@@ -2632,7 +2632,7 @@ class BinanceSpotAdapter:
                                 extras.pop("quoteOrderQty", None)
                                 extras["order_type"] = "LIMIT_MAKER"
                                 extras["limit_price"] = sor_spec["price"]
-                                extras[\"quantity\"] = sor_spec["quantity"]
+                                extras["quantity"] = sor_spec["quantity"]
                                 new_pairs, new_err = self._preview_pairs(sig, extras, symbol)
                                 if new_pairs is not None and new_err is None:
                                     pairs = new_pairs

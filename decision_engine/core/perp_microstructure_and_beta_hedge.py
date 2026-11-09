@@ -176,11 +176,14 @@ def evaluate_perp_microstructure(
     max_venue_dislocation_bps = _finite(row.get("max_venue_dislocation_bps"))
     raw_unlock = row.get("in_unlock_blackout")
     in_unlock_blackout = bool(int(raw_unlock)) if isinstance(raw_unlock, (int, float, bool)) else False
+    nvda_1h = _finite(row.get("nvda_1h_ret_pct"))
+    smh_1h = _finite(row.get("smh_1h_ret_pct"))
+    cot_regime = str(row.get("cot_regime") or "").strip().lower()
 
     has_any_signal = any(
         x is not None
-        for x in (funding_rate, funding_z, basis_bps, whale_div, dvol_z, max_venue_dislocation_bps)
-    ) or bool(gamma_regime) or bool(liq_cascade) or in_unlock_blackout
+        for x in (funding_rate, funding_z, basis_bps, whale_div, dvol_z, max_venue_dislocation_bps, nvda_1h, smh_1h)
+    ) or bool(gamma_regime) or bool(liq_cascade) or in_unlock_blackout or (cot_regime not in ("", "neutral"))
 
     if not has_any_signal:
         if require_perp_filter_enabled():
@@ -227,7 +230,18 @@ def evaluate_perp_microstructure(
             perp_basis_bps=basis_bps,
         )
 
-    # 0C. Active Perpetual Long Liquidation Waterfall (Category 6 OI Flush + Price Dump)
+    # 0C. AI Semiconductor Lead-Lag Dump Gate (NVDA.O or SMH.O 1h drop <= -2.0% blocks AI token dip-buying)
+    if (nvda_1h is not None and nvda_1h <= -2.0) or (smh_1h is not None and smh_1h <= -2.0):
+        return PerpMicrostructureVerdict(
+            allow=False,
+            reject_reason="ai_equity_nvda_smh_dump",
+            perp_regime="ai_semiconductor_dump",
+            funding_rate=funding_rate,
+            funding_z=funding_z,
+            perp_basis_bps=basis_bps,
+        )
+
+    # 0D. Active Perpetual Long Liquidation Waterfall (Category 6 OI Flush + Price Dump)
     if liq_cascade == "long_liquidation_waterfall":
         return PerpMicrostructureVerdict(
             allow=False,
@@ -321,6 +335,22 @@ def evaluate_perp_microstructure(
             allow=True,
             reject_reason=None,
             perp_regime="whale_accumulation_favorable",
+            funding_rate=funding_rate,
+            funding_z=funding_z,
+            perp_basis_bps=basis_bps,
+            size_readjustment_multiplier=1.15,
+        )
+
+    # 7. CityU CFTC COT Institutional Squeeze or NVDA/SMH AI Breakout Boost
+    if (
+        cot_regime == "cot_institutional_squeeze_favorable"
+        or (nvda_1h is not None and nvda_1h >= 1.20)
+        or (smh_1h is not None and smh_1h >= 1.20)
+    ):
+        return PerpMicrostructureVerdict(
+            allow=True,
+            reject_reason=None,
+            perp_regime="cityu_institutional_bullish_lead",
             funding_rate=funding_rate,
             funding_z=funding_z,
             perp_basis_bps=basis_bps,

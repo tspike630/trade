@@ -280,6 +280,57 @@ def _check_cross_asset(
                         f"{ric}_quote_imb={float(qi):+.2f}",
                     )
 
+    # 6. CityU V2 Gates (opt-in via DECISION_MACRO_CITYU_V2_GATE=1):
+    #    CME Term Structure (BTCc2 vs BTCc1), JPY 25D Risk Reversal (JPY1MRR=),
+    #    Systematic Vol-Control Unwind (SVOL.P), and Treasury Vol (.MOVE)
+    if _env_bool(env, "DECISION_MACRO_CITYU_V2_GATE"):
+        btcc2 = _recent_closes("BTCc2", 1)
+        if (
+            btcc1
+            and btcc2
+            and btcc1[0][0] >= min_ts
+            and btcc2[0][0] >= min_ts
+            and abs(btcc1[0][0] - btcc2[0][0]) <= 300_000
+            and btcc1[0][1] > 0
+        ):
+            term_bps = ((btcc2[0][1] - btcc1[0][1]) / btcc1[0][1]) * 10000.0
+            term_floor = _env_float(env, "MACRO_CME_TERM_FLOOR_BPS", -15.0)
+            if term_bps < term_floor:
+                return (
+                    "cross_asset_cme_term_backwardation",
+                    f"BTCc2_vs_BTCc1={term_bps:+.1f}bps",
+                )
+
+        jpy_rr = _recent_closes("JPY1MRR=", 4)
+        if len(jpy_rr) >= 4 and jpy_rr[0][0] >= min_ts:
+            rr_chg = jpy_rr[0][1] - jpy_rr[3][1]
+            rr_floor = _env_float(env, "MACRO_JPY_RR_15M_FLOOR", -0.25)
+            if rr_chg <= rr_floor:
+                return (
+                    "cross_asset_jpy_rr_skew_crash",
+                    f"JPY1MRR_15m={rr_chg:+.3f}",
+                )
+
+        svol = _recent_closes("SVOL.P", 4)
+        if len(svol) >= 4 and svol[0][0] >= min_ts and svol[3][1] > 0:
+            svol_ret_pct = ((svol[0][1] - svol[3][1]) / svol[3][1]) * 100.0
+            svol_floor = _env_float(env, "MACRO_SVOL_15M_FLOOR_PCT", -0.45)
+            if svol_ret_pct <= svol_floor:
+                return (
+                    "cross_asset_vol_control_unwind",
+                    f"SVOL_15m={svol_ret_pct:+.3f}%",
+                )
+
+        move_idx = _recent_closes(".MOVE", 4)
+        if len(move_idx) >= 4 and move_idx[0][0] >= min_ts and move_idx[3][1] > 0:
+            move_ret_pct = ((move_idx[0][1] - move_idx[3][1]) / move_idx[3][1]) * 100.0
+            move_cap = _env_float(env, "MACRO_MOVE_15M_CAP_PCT", 2.50)
+            if move_ret_pct >= move_cap:
+                return (
+                    "cross_asset_move_vol_spike",
+                    f"MOVE_15m={move_ret_pct:+.3f}%",
+                )
+
     return None, None
 
 

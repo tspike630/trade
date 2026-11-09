@@ -153,8 +153,12 @@ class DecisionEngine:
                 from decision_engine.core.perp_microstructure_and_beta_hedge import (
                     attach_counterparty_context,
                 )
+                from decision_engine.core.cityu_institutional_alpha import (
+                    attach_cityu_institutional_context,
+                )
 
                 hot = attach_counterparty_context(hot)
+                hot = attach_cityu_institutional_context(hot, now_ms=now_ms)
         scanned = len(hot)
         if bnb_spot:
             # Floor and universe membership. The 600-name scan is already loaded;
