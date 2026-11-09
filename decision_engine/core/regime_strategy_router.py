@@ -330,10 +330,84 @@ def apply_five_state_regime_router(
         out_sig["enable_trailing_ratchet"] = decision.enable_trailing_ratchet
         out_sig["require_perp_beta_hedge"] = decision.require_perp_beta_hedge
 
+        state_id_map = {
+            REGIME_1_POSITIVE_GAMMA_PINNED: 1,
+            REGIME_2_SHORT_SQUEEZE_BREAKOUT: 2,
+            REGIME_3_CROSS_ASSET_BULL_PULLBACK: 3,
+            REGIME_4_CROWDED_LONG_DEFENSIVE: 4,
+            REGIME_5_CRISIS_LIQUIDATION_HALT: 5,
+        }
+        state_id = state_id_map.get(decision.regime, 1)
+        ratchet_info = compute_optimal_ratchet_target_pct(
+            state_id=state_id,
+            unrealized_gain_pct=float(_finite(base_row.get("unrealized_gain_pct")) or 0.0),
+            oco_stop_above_breakeven=bool(base_row.get("oco_stop_above_breakeven", False)),
+            oco_stop_locked_stage2_profit=bool(base_row.get("oco_stop_locked_stage2_profit", False)),
+        )
+        out_sig["optimal_pyramid_stage"] = ratchet_info["pyramid_stage"]
+        out_sig["optimal_base_position_pct"] = ratchet_info["base_position_pct"]
+        out_sig["optimal_target_cumulative_pct"] = ratchet_info["target_cumulative_pct"]
+        out_sig["optimal_pyramid_ceiling_pct"] = ratchet_info["pyramid_ceiling_pct"]
+
         cur_size = _finite(out_sig.get("size_pct"))
-        if cur_size is not None and cur_size > 0 and decision.size_multiplier != 1.0:
-            out_sig["size_pct"] = round(max(0.01, min(0.15, cur_size * decision.size_multiplier)), 6)
+        if bool(base_row.get("use_optimal_kelly_matrix", False)):
+            out_sig["size_pct"] = round(float(ratchet_info["target_cumulative_pct"]), 6)
+        elif cur_size is not None and cur_size > 0 and decision.size_multiplier != 1.0:
+            out_sig["size_pct"] = round(max(0.01, min(0.95, cur_size * decision.size_multiplier)), 6)
 
         accepted.append(out_sig)
 
     return accepted, regime_counts
+
+
+# === Monte Carlo Optimal Kelly + 3-Stage Zero-Risk OCO Ratchet Matrix ===
+OPTIMAL_FIVE_STATE_BASE_PCT = {
+    1: 0.185,  # State 1: 18.5% Full-Kelly Mean Reversion
+    2: 0.350,  # State 2: 35.0% Base -> 70.0% Stage 2 -> 95.0% Stage 3 Squeeze Pyramid
+    3: 0.300,  # State 3: 30.0% Base -> 60.0% Stage 2 -> 85.0% Stage 3 Tech Bull Pyramid
+    4: 0.050,  # State 4: 5.0% Deep-Wick Fade + 50% Perp Beta Hedge
+    5: 0.000,  # State 5: 0.0% Spot + 100% Perp Beta Lock
+}
+
+OPTIMAL_FIVE_STATE_PYRAMID_MAX_PCT = {
+    1: 0.185,
+    2: 0.950,
+    3: 0.850,
+    4: 0.050,
+    5: 0.000,
+}
+
+
+def compute_optimal_ratchet_target_pct(
+    state_id: int,
+    unrealized_gain_pct: float = 0.0,
+    oco_stop_above_breakeven: bool = False,
+    oco_stop_locked_stage2_profit: bool = False,
+) -> dict[str, float | int]:
+    """Returns base and ratchet-unlocked cumulative position pct for the 5-State Router."""
+    base_pct = OPTIMAL_FIVE_STATE_BASE_PCT.get(state_id, 0.185)
+    max_pct = OPTIMAL_FIVE_STATE_PYRAMID_MAX_PCT.get(state_id, 0.185)
+    target_pct = base_pct
+    stage = 1 if base_pct > 0 else 0
+
+    if state_id == 2:
+        if oco_stop_above_breakeven and unrealized_gain_pct >= 1.20:
+            stage = 2
+            target_pct = 0.700
+        if oco_stop_above_breakeven and oco_stop_locked_stage2_profit and unrealized_gain_pct >= 2.20:
+            stage = 3
+            target_pct = 0.950
+    elif state_id == 3:
+        if oco_stop_above_breakeven and unrealized_gain_pct >= 1.20:
+            stage = 2
+            target_pct = 0.600
+        if oco_stop_above_breakeven and oco_stop_locked_stage2_profit and unrealized_gain_pct >= 2.20:
+            stage = 3
+            target_pct = 0.850
+
+    return {
+        "pyramid_stage": stage,
+        "base_position_pct": base_pct,
+        "target_cumulative_pct": min(max_pct, target_pct),
+        "pyramid_ceiling_pct": max_pct,
+    }

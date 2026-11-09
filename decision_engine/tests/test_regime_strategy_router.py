@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 from decision_engine.core.regime_strategy_router import (
+    compute_optimal_ratchet_target_pct,
     REGIME_1_POSITIVE_GAMMA_PINNED,
     REGIME_2_SHORT_SQUEEZE_BREAKOUT,
     REGIME_3_CROSS_ASSET_BULL_PULLBACK,
@@ -105,6 +106,32 @@ class TestFiveStateRegimeRouter(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["action"], "sell")
         self.assertEqual(counts[REGIME_5_CRISIS_LIQUIDATION_HALT], 1)
+
+
+
+    def test_optimal_kelly_three_stage_ratchet_pyramid(self) -> None:
+        # State 1: 18.5% fixed Kelly base, no pyramiding
+        s1 = compute_optimal_ratchet_target_pct(1, unrealized_gain_pct=2.5, oco_stop_above_breakeven=True, oco_stop_locked_stage2_profit=True)
+        self.assertEqual(s1["pyramid_stage"], 1)
+        self.assertAlmostEqual(s1["target_cumulative_pct"], 0.185, places=3)
+
+        # State 2: 35% -> 70% -> 95% as OCO ratchet locks break-even and stage-2 profit
+        s2_stage1 = compute_optimal_ratchet_target_pct(2, unrealized_gain_pct=0.5, oco_stop_above_breakeven=False)
+        self.assertEqual(s2_stage1["pyramid_stage"], 1)
+        self.assertAlmostEqual(s2_stage1["target_cumulative_pct"], 0.350, places=3)
+
+        s2_stage2 = compute_optimal_ratchet_target_pct(2, unrealized_gain_pct=1.35, oco_stop_above_breakeven=True)
+        self.assertEqual(s2_stage2["pyramid_stage"], 2)
+        self.assertAlmostEqual(s2_stage2["target_cumulative_pct"], 0.700, places=3)
+
+        s2_stage3 = compute_optimal_ratchet_target_pct(2, unrealized_gain_pct=2.40, oco_stop_above_breakeven=True, oco_stop_locked_stage2_profit=True)
+        self.assertEqual(s2_stage3["pyramid_stage"], 3)
+        self.assertAlmostEqual(s2_stage3["target_cumulative_pct"], 0.950, places=3)
+
+        # State 3: 30% -> 60% -> 85%
+        s3_stage3 = compute_optimal_ratchet_target_pct(3, unrealized_gain_pct=2.50, oco_stop_above_breakeven=True, oco_stop_locked_stage2_profit=True)
+        self.assertEqual(s3_stage3["pyramid_stage"], 3)
+        self.assertAlmostEqual(s3_stage3["target_cumulative_pct"], 0.850, places=3)
 
 
 if __name__ == "__main__":
