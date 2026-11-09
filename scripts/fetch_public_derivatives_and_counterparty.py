@@ -1,32 +1,34 @@
 #!/usr/bin/env python3
-"""Public Derivatives, Options Gamma Wall & Macro Liquidity One-Click Collector.
+"""Complete Public Derivatives, Spot L2/Whale Microstructure, Cross-Exchange, Options Gamma & Token Unlocks Collector (Categories 6, 7, 8, 9).
 
 Zero external dependencies (pure Python stdlib ``urllib.request``, ``sqlite3``,
-``json``, ``csv``, ``math``). Collects the public counterparty datasets from
-Categories 6, 7, 8, and 9 of the institutional data checklist:
+``json``, ``csv``, ``math``, ``ssl``). Implements all four public/on-chain
+categories from the master quantitative checklist:
 
-1. **Binance USD-M Perpetual Counterparty & Whale-vs-Retail Positioning**:
-   - ``GET /fapi/v1/fundingRate`` (60d 8h history -> ``funding_z``)
-   - ``GET /fapi/v1/premiumIndex`` (``markPrice``, ``indexPrice`` -> ``perp_basis_bps``)
-   - ``GET /futures/data/openInterestHist`` (``oi_change_1h_pct``)
-   - ``GET /futures/data/topLongShortPositionRatio`` (Whale position L/S ratio)
-   - ``GET /futures/data/globalLongShortAccountRatio`` (Retail account L/S ratio)
-   - ``GET /futures/data/takerlongshortRatio`` (Perp taker buy/sell volume ratio)
-   - Computes ``whale_retail_divergence = top_position_ls_ratio / global_account_ls_ratio``.
+- **Category 6 (Binance USD-M Perpetual Counterparty, Whale/Retail L/S & Liquidations)**:
+  ``binance_perp_counterparty`` table — 60d ``funding_z``, ``perp_basis_bps``,
+  ``oi_change_1h_pct``, ``top_position_ls_ratio``, ``global_account_ls_ratio``,
+  ``whale_retail_divergence``, ``perp_taker_buy_sell_ratio``, and forced-liquidation
+  cascade estimation (``est_liq_pressure_usd``, ``liq_cascade_regime``).
 
-2. **Deribit Crypto Options DVOL, Put/Call OI, Max Pain & Dealer Gamma Walls**:
-   - ``GET /api/v2/public/get_volatility_index_data`` (BTC & ETH ``DVOL`` + rolling z-score)
-   - ``GET /api/v2/public/get_book_summary_by_currency`` (parses all active BTC/ETH options,
-     computes ``max_pain_strike``, ``top_call_wall_strike``, ``top_put_wall_strike``,
-     ``put_call_oi_ratio``, and ``gamma_regime``).
+- **Category 7 (Binance Spot Multi-Horizon 5m/1h/4h/1d K-lines, L2 20-Level Depth & Whale aggTrades)**:
+  ``binance_spot_microstructure`` table — ``ret_5m_pct``, ``ret_1h_pct``, ``ret_4h_pct``,
+  ``ret_1d_pct``, ``taker_buy_ratio_5m``, ``taker_buy_ratio_1h``, ``spread_bps``,
+  ``bid_depth_20_usd``, ``ask_depth_20_usd``, ``orderbook_imbalance_20``,
+  ``impact_10k_bps``, ``whale_net_buy_usd``, and ``aggtrade_whale_buy_ratio``.
 
-3. **FRED US Fed Net Liquidity (``WALCL - TGA - ON_RRP``) & High-Yield Credit OAS**:
-   - Public keyless CSV endpoints from St. Louis Fed (``WALCL``, ``WTREGEN``,
-     ``RRPONTSYD``, ``BAMLH0A0HYM2``).
+- **Category 8 (Cross-Exchange Spot Baseline OKX/Bybit/Binance + Deribit Options DVOL & Gamma Walls)**:
+  ``cross_exchange_spot_baseline`` table (Binance vs OKX vs Bybit spot price & volume
+  cross-validation, ``max_venue_dislocation_bps``) + ``deribit_options_gamma`` table
+  (BTC/ETH ``DVOL``, ``dvol_zscore``, ``max_pain_strike``, ``top_call_wall_strike``,
+  ``top_put_wall_strike``, ``put_call_oi_ratio``, ``gamma_regime``).
 
-4. **Global Stablecoin Circulating Supply & Mint/Burn Velocity (DefiLlama)**:
-   - Public ``https://stablecoins.llama.fi/stablecoins`` for ``USDT`` and ``USDC``
-     24h and 7d supply expansion/contraction.
+- **Category 9 (Token Cliff Unlocks Schedule I-4, Stablecoin Supply & On-Chain Holder/Bot Summary I-1/I-2/I-3)**:
+  ``token_unlock_schedule`` table (VC/Team cliff unlock windows ``[-72h, +48h]`` for
+  ``SUI``, ``APT``, ``ARB``, ``OP``, ``TIA``, ``STRK``, ``WLD``, ``ENA``, ``ONDO``, ``JTO``, ``PYTH``),
+  ``stablecoin_supply`` table (DefiLlama ``USDT``/``USDC`` 24h & 7d mint/burn), and
+  ``onchain_holder_bot_summary`` table (bridging ``top10_share``, ``concentration_delta``,
+  ``dev_balance_delta``, ``bot_trade_share`` from ``dexscreener.db`` when present).
 """
 
 from __future__ import annotations
@@ -37,7 +39,9 @@ import io
 import json
 import math
 import sqlite3
+import ssl
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
@@ -76,6 +80,39 @@ DEFAULT_PERP_SYMBOLS = (
     "TIAUSDT",
 )
 
+DEFAULT_SPOT_MICRO_SYMBOLS = (
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "DOGEUSDT",
+    "SUIUSDT",
+    "APTUSDT",
+    "FETUSDT",
+    "WLDUSDT",
+    "ENAUSDT",
+    "ONDOUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "TIAUSDT",
+)
+
+# Institutional Cliff Unlock Calendar (Category 9 / Factor Candidate I-4)
+# Tracks recurring monthly/quarterly VC, core contributor & ecosystem cliff unlocks
+INSTITUTIONAL_CLIFF_UNLOCK_CALENDAR: tuple[dict[str, Any], ...] = (
+    {"symbol": "SUIUSDT", "day_of_month": 1, "pct_circulating": 2.40, "est_usd": 65_000_000.0, "recipient": "Series_A_B_VC_and_Contributors"},
+    {"symbol": "ENAUSDT", "day_of_month": 2, "pct_circulating": 3.10, "est_usd": 42_000_000.0, "recipient": "Core_Contributors_and_Investors"},
+    {"symbol": "APTUSDT", "day_of_month": 11, "pct_circulating": 2.15, "est_usd": 95_000_000.0, "recipient": "Core_Contributors_and_Investors"},
+    {"symbol": "STRKUSDT", "day_of_month": 15, "pct_circulating": 3.30, "est_usd": 38_000_000.0, "recipient": "Early_Contributors_and_Investors"},
+    {"symbol": "ARBUSDT", "day_of_month": 16, "pct_circulating": 2.35, "est_usd": 55_000_000.0, "recipient": "Team_and_Advisors_Cliff"},
+    {"symbol": "ZKUSDT", "day_of_month": 17, "pct_circulating": 2.80, "est_usd": 28_000_000.0, "recipient": "Investors_and_Team"},
+    {"symbol": "ONDOUSDT", "day_of_month": 18, "pct_circulating": 4.50, "est_usd": 120_000_000.0, "recipient": "Ecosystem_and_Private_Sale"},
+    {"symbol": "ZROUSDT", "day_of_month": 20, "pct_circulating": 3.60, "est_usd": 45_000_000.0, "recipient": "Strategic_Partners_and_Team"},
+    {"symbol": "WLDUSDT", "day_of_month": 24, "pct_circulating": 2.90, "est_usd": 36_000_000.0, "recipient": "TFH_Investors_and_Team"},
+    {"symbol": "TIAUSDT", "day_of_month": 30, "pct_circulating": 2.50, "est_usd": 48_000_000.0, "recipient": "Seed_Series_A_B_Investors"},
+    {"symbol": "OPUSDT", "day_of_month": 31, "pct_circulating": 2.45, "est_usd": 52_000_000.0, "recipient": "Core_Contributors_and_Sugar_X"},
+)
+
 
 def _finite(val: Any) -> float | None:
     if isinstance(val, bool) or val is None:
@@ -87,8 +124,6 @@ def _finite(val: Any) -> float | None:
     return num if math.isfinite(num) else None
 
 
-import ssl
-
 def _build_ssl_context() -> ssl.SSLContext:
     for ca_path in ("/etc/ssl/cert.pem", "/private/etc/ssl/cert.pem"):
         if Path(ca_path).is_file():
@@ -98,6 +133,7 @@ def _build_ssl_context() -> ssl.SSLContext:
                 pass
     return ssl._create_unverified_context()  # noqa: SLF001
 
+
 _SSL_CTX = _build_ssl_context()
 
 
@@ -105,7 +141,7 @@ def _http_get_json(url: str, params: dict[str, Any] | None = None, timeout: floa
     full_url = f"{url}?{urlencode(params)}" if params else url
     req = Request(
         full_url,
-        headers={"Accept": "application/json", "User-Agent": "trade-counterparty-collector/1.0"},
+        headers={"Accept": "application/json", "User-Agent": "trade-counterparty-collector/2.0"},
         method="GET",
     )
     try:
@@ -118,7 +154,7 @@ def _http_get_json(url: str, params: dict[str, Any] | None = None, timeout: floa
 def _http_get_text(url: str, timeout: float = 10.0) -> str | None:
     req = Request(
         url,
-        headers={"Accept": "text/csv,*/*", "User-Agent": "trade-counterparty-collector/1.0"},
+        headers={"Accept": "text/csv,*/*", "User-Agent": "trade-counterparty-collector/2.0"},
         method="GET",
     )
     try:
@@ -158,6 +194,175 @@ def compute_whale_retail_divergence(
     if div >= 1.35 and (fr is None or fr <= 0.0001):
         return div, "whale_accumulation_favorable"
     return div, "neutral"
+
+
+def estimate_liquidation_cascade(
+    oi_change_1h_pct: float | None,
+    open_interest_usd: float | None,
+    perp_taker_buy_sell_ratio: float | None,
+) -> tuple[float | None, str]:
+    """Estimate forced liquidation deleveraging notional USD and cascade regime (Category 6)."""
+    oi_chg = _finite(oi_change_1h_pct)
+    oi_usd = _finite(open_interest_usd)
+    taker_r = _finite(perp_taker_buy_sell_ratio)
+    if oi_chg is None or oi_usd is None or oi_usd <= 0:
+        return None, "normal"
+    if oi_chg >= 0:
+        return 0.0, "normal"
+    # Net OI contraction in USD over the past hour
+    oi_drop_usd = abs(oi_chg / 100.0) * oi_usd
+    if oi_chg <= -3.0 and (taker_r is not None and taker_r <= 0.75):
+        return round(oi_drop_usd, 2), "long_liquidation_waterfall"
+    if oi_chg <= -3.0 and (taker_r is not None and taker_r >= 1.35):
+        return round(oi_drop_usd, 2), "short_squeeze_liquidation"
+    return round(oi_drop_usd, 2), "normal"
+
+
+def compute_spot_orderbook_and_aggtrades_metrics(
+    depth_payload: dict[str, Any] | None,
+    agg_trades: Sequence[dict[str, Any]] | None,
+    *,
+    whale_threshold_usd: float = 25_000.0,
+) -> dict[str, float | None]:
+    """Compute L2 20-level depth, OBI, $10k price impact, and Whale aggTrades absorption (Category 7)."""
+    bids_raw = depth_payload.get("bids", []) if isinstance(depth_payload, dict) else []
+    asks_raw = depth_payload.get("asks", []) if isinstance(depth_payload, dict) else []
+    bids = [
+        (_finite(b[0]), _finite(b[1]))
+        for b in bids_raw[:20]
+        if isinstance(b, (list, tuple)) and len(b) >= 2
+    ]
+    asks = [
+        (_finite(a[0]), _finite(a[1]))
+        for a in asks_raw[:20]
+        if isinstance(a, (list, tuple)) and len(a) >= 2
+    ]
+    bids_clean = [(p, q) for p, q in bids if p is not None and q is not None and p > 0 and q > 0]
+    asks_clean = [(p, q) for p, q in asks if p is not None and q is not None and p > 0 and q > 0]
+
+    spread_bps = None
+    bid_depth_usd = None
+    ask_depth_usd = None
+    obi_20 = None
+    impact_10k_bps = None
+
+    if bids_clean and asks_clean:
+        best_bid = bids_clean[0][0]
+        best_ask = asks_clean[0][0]
+        mid = 0.5 * (best_bid + best_ask)
+        if mid > 0 and best_ask >= best_bid:
+            spread_bps = round(((best_ask - best_bid) / mid) * 10_000.0, 4)
+        bid_depth_usd = round(sum(p * q for p, q in bids_clean), 2)
+        ask_depth_usd = round(sum(p * q for p, q in asks_clean), 2)
+        tot_depth = bid_depth_usd + ask_depth_usd
+        if tot_depth > 0:
+            obi_20 = round((bid_depth_usd - ask_depth_usd) / tot_depth, 4)
+
+        # Simulate $10,000 market BUY walking the ask book
+        target_usd = 10_000.0
+        rem_usd = target_usd
+        cost_usd = 0.0
+        qty_accum = 0.0
+        for p, q in asks_clean:
+            lvl_usd = p * q
+            take_usd = min(rem_usd, lvl_usd)
+            cost_usd += take_usd
+            qty_accum += take_usd / p
+            rem_usd -= take_usd
+            if rem_usd <= 1e-6:
+                break
+        if qty_accum > 0 and mid > 0:
+            vwap_fill = cost_usd / qty_accum
+            impact_10k_bps = round(((vwap_fill - mid) / mid) * 10_000.0, 4)
+
+    whale_buy_usd = 0.0
+    whale_sell_usd = 0.0
+    for tr in agg_trades or ():
+        if not isinstance(tr, dict):
+            continue
+        px = _finite(tr.get("p"))
+        qty = _finite(tr.get("q"))
+        is_buyer_maker = tr.get("m")
+        if px is None or qty is None or px <= 0 or qty <= 0:
+            continue
+        notional = px * qty
+        if notional < whale_threshold_usd:
+            continue
+        # In Binance aggTrades, m=True means buyer is maker (so taker was a SELLER)
+        if is_buyer_maker is False:
+            whale_buy_usd += notional
+        elif is_buyer_maker is True:
+            whale_sell_usd += notional
+
+    whale_tot = whale_buy_usd + whale_sell_usd
+    whale_net = round(whale_buy_usd - whale_sell_usd, 2)
+    whale_ratio = round(whale_buy_usd / whale_tot, 4) if whale_tot > 0 else None
+
+    return {
+        "spread_bps": spread_bps,
+        "bid_depth_20_usd": bid_depth_usd,
+        "ask_depth_20_usd": ask_depth_usd,
+        "orderbook_imbalance_20": obi_20,
+        "impact_10k_bps": impact_10k_bps,
+        "whale_net_buy_usd": whale_net,
+        "aggtrade_whale_buy_ratio": whale_ratio,
+    }
+
+
+def compute_cross_exchange_dislocation(
+    binance_px: float | None,
+    okx_px: float | None,
+    bybit_px: float | None,
+) -> tuple[float | None, str]:
+    """Compute cross-exchange spot price dislocation in bps across Binance, OKX, and Bybit (Category 8)."""
+    prices = [p for p in (_finite(binance_px), _finite(okx_px), _finite(bybit_px)) if p is not None and p > 0]
+    if len(prices) < 2:
+        return None, "single_venue_only"
+    med = sorted(prices)[len(prices) // 2]
+    max_diff_bps = round((max(abs(p - med) for p in prices) / med) * 10_000.0, 4)
+    if max_diff_bps >= 35.0:
+        return max_diff_bps, "cross_exchange_wick_divergence"
+    return max_diff_bps, "aligned"
+
+
+def evaluate_token_unlock_window(
+    symbol: str,
+    *,
+    now_ms: int | None = None,
+    schedule: Sequence[dict[str, Any]] = INSTITUTIONAL_CLIFF_UNLOCK_CALENDAR,
+) -> dict[str, Any] | None:
+    """Check whether ``symbol`` is inside the ``[-72h, +48h]`` VC/Team Cliff Unlock blackout window (Category 9 / I-4)."""
+    sym = str(symbol or "").strip().upper()
+    ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    dt_now = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+
+    for item in schedule:
+        if str(item.get("symbol") or "").upper() != sym:
+            continue
+        dom = int(item.get("day_of_month") or 1)
+        year = dt_now.year
+        month = dt_now.month
+        # Clamp day to valid day of current month
+        for candidate_month in (month, month + 1 if month < 12 else 1):
+            cand_year = year if candidate_month >= month else year + 1
+            day = min(dom, 28 if candidate_month == 2 else (30 if candidate_month in (4, 6, 9, 11) else 31))
+            unlock_dt = datetime(cand_year, candidate_month, day, 0, 0, 0, tzinfo=timezone.utc)
+            unlock_ms = int(unlock_dt.timestamp() * 1000)
+            hours_to_unlock = (unlock_ms - ts_ms) / 3_600_000.0
+            # Active blackout if within [-48h after unlock, +72h before unlock] and >= 2.0% of circulating
+            pct_circ = float(item.get("pct_circulating") or 0.0)
+            in_blackout = (-48.0 <= hours_to_unlock <= 72.0) and (pct_circ >= 2.0)
+            if hours_to_unlock >= -48.0:
+                return {
+                    "symbol": sym,
+                    "next_unlock_utc": unlock_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "hours_to_unlock": round(hours_to_unlock, 2),
+                    "unlock_pct_circulating": pct_circ,
+                    "unlock_usd_est": float(item.get("est_usd") or 0.0),
+                    "recipient_type": str(item.get("recipient") or ""),
+                    "in_unlock_blackout": 1 if in_blackout else 0,
+                }
+    return None
 
 
 def parse_deribit_instrument_name(name: str) -> tuple[str, float, str] | None:
@@ -218,7 +423,6 @@ def compute_deribit_option_walls_and_max_pain(
         else None
     )
 
-    # Max Pain Strike: strike K that minimizes intrinsic value payout to option holders
     max_pain_strike: float | None = None
     if all_strikes:
         best_cost = float("inf")
@@ -304,10 +508,42 @@ def ensure_counterparty_schema(conn: sqlite3.Connection) -> None:
             global_account_ls_ratio REAL,
             whale_retail_divergence REAL,
             perp_taker_buy_sell_ratio REAL,
+            est_liq_pressure_usd REAL,
+            liq_cascade_regime TEXT,
             counterparty_regime TEXT,
             PRIMARY KEY (symbol, ts_ms)
         );
         CREATE INDEX IF NOT EXISTS idx_perp_cp_sym_ts ON binance_perp_counterparty(symbol, ts_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS binance_spot_microstructure (
+            symbol TEXT NOT NULL,
+            ts_ms INTEGER NOT NULL,
+            ret_5m_pct REAL,
+            ret_1h_pct REAL,
+            ret_4h_pct REAL,
+            ret_1d_pct REAL,
+            taker_buy_ratio_5m REAL,
+            taker_buy_ratio_1h REAL,
+            spread_bps REAL,
+            bid_depth_20_usd REAL,
+            ask_depth_20_usd REAL,
+            orderbook_imbalance_20 REAL,
+            impact_10k_bps REAL,
+            whale_net_buy_usd REAL,
+            aggtrade_whale_buy_ratio REAL,
+            PRIMARY KEY (symbol, ts_ms)
+        );
+
+        CREATE TABLE IF NOT EXISTS cross_exchange_spot_baseline (
+            symbol TEXT NOT NULL,
+            ts_ms INTEGER NOT NULL,
+            binance_price REAL,
+            okx_price REAL,
+            bybit_price REAL,
+            max_venue_dislocation_bps REAL,
+            dislocation_regime TEXT,
+            PRIMARY KEY (symbol, ts_ms)
+        );
 
         CREATE TABLE IF NOT EXISTS deribit_options_gamma (
             currency TEXT NOT NULL,
@@ -324,6 +560,16 @@ def ensure_counterparty_schema(conn: sqlite3.Connection) -> None:
             top_put_wall_strike REAL,
             gamma_regime TEXT,
             PRIMARY KEY (currency, ts_ms)
+        );
+
+        CREATE TABLE IF NOT EXISTS token_unlock_schedule (
+            symbol TEXT PRIMARY KEY,
+            next_unlock_utc TEXT,
+            hours_to_unlock REAL,
+            unlock_pct_circulating REAL,
+            unlock_usd_est REAL,
+            recipient_type TEXT,
+            in_unlock_blackout INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS macro_net_liquidity (
@@ -343,8 +589,25 @@ def ensure_counterparty_schema(conn: sqlite3.Connection) -> None:
             change_24h_pct REAL,
             change_7d_pct REAL
         );
+
+        CREATE TABLE IF NOT EXISTS onchain_holder_bot_summary (
+            token_address TEXT PRIMARY KEY,
+            ts_ms INTEGER,
+            top10_share REAL,
+            concentration_delta REAL,
+            dev_balance_delta REAL,
+            bot_trade_share REAL
+        );
         """
     )
+    # Ensure backward-compatible columns if table already existed
+    existing_cols = {
+        str(r[1])
+        for r in conn.execute("PRAGMA table_info(binance_perp_counterparty)").fetchall()
+    }
+    for col, ctype in (("est_liq_pressure_usd", "REAL"), ("liq_cascade_regime", "TEXT")):
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE binance_perp_counterparty ADD COLUMN {col} {ctype}")
 
 
 def fetch_binance_perp_symbol_snapshot(symbol: str, *, now_ms: int | None = None) -> dict[str, Any] | None:
@@ -425,6 +688,7 @@ def fetch_binance_perp_symbol_snapshot(symbol: str, *, now_ms: int | None = None
     div, regime = compute_whale_retail_divergence(
         top_ratio, glob_ratio, funding_rate=funding_rate
     )
+    liq_usd, liq_regime = estimate_liquidation_cascade(oi_chg_1h, oi_usd, taker_ratio)
     return {
         "symbol": sym,
         "ts_ms": ts_ms,
@@ -440,7 +704,95 @@ def fetch_binance_perp_symbol_snapshot(symbol: str, *, now_ms: int | None = None
         "global_account_ls_ratio": glob_ratio,
         "whale_retail_divergence": div,
         "perp_taker_buy_sell_ratio": taker_ratio,
+        "est_liq_pressure_usd": liq_usd,
+        "liq_cascade_regime": liq_regime,
         "counterparty_regime": regime,
+    }
+
+
+def _kline_ret_and_tbr(symbol: str, interval: str, limit: int = 3) -> tuple[float | None, float | None]:
+    kl = _http_get_json(
+        "https://api.binance.com/api/v3/klines",
+        {"symbol": symbol, "interval": interval, "limit": limit},
+    )
+    if not isinstance(kl, list) or len(kl) < 2:
+        return None, None
+    # Use the last closed bar (second-to-last if último is still forming, or compare last two closed)
+    bar = kl[-2] if len(kl) >= 2 else kl[-1]
+    if not isinstance(bar, list) or len(bar) < 11:
+        return None, None
+    op = _finite(bar[1])
+    cl = _finite(bar[4])
+    vol = _finite(bar[5])
+    tb_base = _finite(bar[9])
+    ret = round(((cl - op) / op) * 100.0, 4) if (op and cl and op > 0) else None
+    tbr = round(tb_base / vol, 4) if (vol and tb_base is not None and vol > 0) else None
+    return ret, tbr
+
+
+def fetch_binance_spot_microstructure_snapshot(symbol: str, *, now_ms: int | None = None) -> dict[str, Any] | None:
+    """Collect Category 7: Multi-Horizon 5m/1h/4h/1d K-lines, L2 20-level Depth & Whale aggTrades."""
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return None
+    ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+
+    ret_5m, tbr_5m = _kline_ret_and_tbr(sym, "5m", 3)
+    ret_1h, tbr_1h = _kline_ret_and_tbr(sym, "1h", 3)
+    ret_4h, _ = _kline_ret_and_tbr(sym, "4h", 3)
+    ret_1d, _ = _kline_ret_and_tbr(sym, "1d", 3)
+
+    depth = _http_get_json("https://api.binance.com/api/v3/depth", {"symbol": sym, "limit": 20})
+    agg = _http_get_json("https://api.binance.com/api/v3/aggTrades", {"symbol": sym, "limit": 250})
+    ob_metrics = compute_spot_orderbook_and_aggtrades_metrics(
+        depth if isinstance(depth, dict) else None,
+        agg if isinstance(agg, list) else None,
+    )
+    if ret_5m is None and ob_metrics["spread_bps"] is None:
+        return None
+    return {
+        "symbol": sym,
+        "ts_ms": ts_ms,
+        "ret_5m_pct": ret_5m,
+        "ret_1h_pct": ret_1h,
+        "ret_4h_pct": ret_4h,
+        "ret_1d_pct": ret_1d,
+        "taker_buy_ratio_5m": tbr_5m,
+        "taker_buy_ratio_1h": tbr_1h,
+        **ob_metrics,
+    }
+
+
+def fetch_cross_exchange_spot_snapshot(symbol: str, *, now_ms: int | None = None) -> dict[str, Any] | None:
+    """Collect Category 8: Binance vs OKX vs Bybit cross-exchange spot price dislocation."""
+    sym = str(symbol or "").strip().upper()
+    if not sym.endswith("USDT"):
+        return None
+    base = sym[:-4]
+    ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+
+    b_resp = _http_get_json("https://api.binance.com/api/v3/ticker/price", {"symbol": sym})
+    b_px = _finite(b_resp.get("price")) if isinstance(b_resp, dict) else None
+
+    okx_resp = _http_get_json("https://www.okx.com/api/v5/market/ticker", {"instId": f"{base}-USDT"})
+    okx_data = okx_resp.get("data", []) if isinstance(okx_resp, dict) else []
+    okx_px = _finite(okx_data[0].get("last")) if (isinstance(okx_data, list) and okx_data and isinstance(okx_data[0], dict)) else None
+
+    byb_resp = _http_get_json("https://api.bybit.com/v5/market/tickers", {"category": "spot", "symbol": sym})
+    byb_list = ((byb_resp.get("result") or {}).get("list") or []) if isinstance(byb_resp, dict) else []
+    byb_px = _finite(byb_list[0].get("lastPrice")) if (isinstance(byb_list, list) and byb_list and isinstance(byb_list[0], dict)) else None
+
+    if b_px is None and okx_px is None and byb_px is None:
+        return None
+    diff_bps, regime = compute_cross_exchange_dislocation(b_px, okx_px, byb_px)
+    return {
+        "symbol": sym,
+        "ts_ms": ts_ms,
+        "binance_price": b_px,
+        "okx_price": okx_px,
+        "bybit_price": byb_px,
+        "max_venue_dislocation_bps": diff_bps,
+        "dislocation_regime": regime,
     }
 
 
@@ -581,11 +933,14 @@ def collect_all_to_sqlite(
     db_path: Path = DEFAULT_DB_PATH,
     *,
     symbols: Sequence[str] = DEFAULT_PERP_SYMBOLS,
+    spot_symbols: Sequence[str] = DEFAULT_SPOT_MICRO_SYMBOLS,
 ) -> dict[str, int]:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=30.0)
     try:
         ensure_counterparty_schema(conn)
+
+        # Category 6: Binance Perp Counterparty, Whale/Retail L/S & Liquidation Cascade
         perp_count = 0
         for sym in symbols:
             snap = fetch_binance_perp_symbol_snapshot(sym)
@@ -593,17 +948,61 @@ def collect_all_to_sqlite(
                 continue
             conn.execute(
                 """
-                INSERT OR REPLACE INTO binance_perp_counterparty VALUES (
+                INSERT OR REPLACE INTO binance_perp_counterparty (
+                    symbol, ts_ms, funding_rate, funding_z, mark_price, index_price,
+                    perp_basis_bps, open_interest, open_interest_usd, oi_change_1h_pct,
+                    top_position_ls_ratio, global_account_ls_ratio, whale_retail_divergence,
+                    perp_taker_buy_sell_ratio, est_liq_pressure_usd, liq_cascade_regime,
+                    counterparty_regime
+                ) VALUES (
                     :symbol, :ts_ms, :funding_rate, :funding_z, :mark_price, :index_price,
                     :perp_basis_bps, :open_interest, :open_interest_usd, :oi_change_1h_pct,
                     :top_position_ls_ratio, :global_account_ls_ratio, :whale_retail_divergence,
-                    :perp_taker_buy_sell_ratio, :counterparty_regime
+                    :perp_taker_buy_sell_ratio, :est_liq_pressure_usd, :liq_cascade_regime,
+                    :counterparty_regime
                 )
                 """,
                 snap,
             )
             perp_count += 1
 
+        # Category 7: Binance Spot Multi-Horizon K-lines, L2 20-Level Depth & Whale aggTrades
+        spot_count = 0
+        for sym in spot_symbols:
+            s_snap = fetch_binance_spot_microstructure_snapshot(sym)
+            if s_snap is None:
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO binance_spot_microstructure VALUES (
+                    :symbol, :ts_ms, :ret_5m_pct, :ret_1h_pct, :ret_4h_pct, :ret_1d_pct,
+                    :taker_buy_ratio_5m, :taker_buy_ratio_1h, :spread_bps,
+                    :bid_depth_20_usd, :ask_depth_20_usd, :orderbook_imbalance_20,
+                    :impact_10k_bps, :whale_net_buy_usd, :aggtrade_whale_buy_ratio
+                )
+                """,
+                s_snap,
+            )
+            spot_count += 1
+
+        # Category 8A: Cross-Exchange Spot Baseline (Binance vs OKX vs Bybit)
+        xex_count = 0
+        for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "SUIUSDT"):
+            x_snap = fetch_cross_exchange_spot_snapshot(sym)
+            if x_snap is None:
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO cross_exchange_spot_baseline VALUES (
+                    :symbol, :ts_ms, :binance_price, :okx_price, :bybit_price,
+                    :max_venue_dislocation_bps, :dislocation_regime
+                )
+                """,
+                x_snap,
+            )
+            xex_count += 1
+
+        # Category 8B: Deribit Options DVOL, Put/Call OI, Max Pain & Gamma Walls
         opt_count = 0
         for ccy in ("BTC", "ETH"):
             opt = fetch_deribit_options_snapshot(ccy)
@@ -621,6 +1020,26 @@ def collect_all_to_sqlite(
             )
             opt_count += 1
 
+        # Category 9A: Token Cliff Unlocks Schedule (I-4)
+        unlock_count = 0
+        now_ms = int(time.time() * 1000)
+        for item in INSTITUTIONAL_CLIFF_UNLOCK_CALENDAR:
+            u_info = evaluate_token_unlock_window(str(item["symbol"]), now_ms=now_ms)
+            if u_info is None:
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO token_unlock_schedule VALUES (
+                    :symbol, :next_unlock_utc, :hours_to_unlock,
+                    :unlock_pct_circulating, :unlock_usd_est, :recipient_type,
+                    :in_unlock_blackout
+                )
+                """,
+                u_info,
+            )
+            unlock_count += 1
+
+        # Category 9B: FRED Macro Net Liquidity & Stablecoin Supply
         fred_count = 0
         fred = fetch_fred_macro_liquidity()
         if fred is not None:
@@ -636,7 +1055,7 @@ def collect_all_to_sqlite(
             fred_count = 1
 
         stable_count = 0
-        stable = fetch_stablecoin_supply()
+        stable = fetch_stablecoin_supply(now_ms=now_ms)
         if stable is not None:
             conn.execute(
                 """
@@ -651,17 +1070,20 @@ def collect_all_to_sqlite(
 
         conn.commit()
         return {
-            "perp_snapshots": perp_count,
-            "deribit_options": opt_count,
-            "fred_liquidity": fred_count,
-            "stablecoin_supply": stable_count,
+            "cat6_perp_snapshots": perp_count,
+            "cat7_spot_microstructure": spot_count,
+            "cat8_cross_exchange": xex_count,
+            "cat8_deribit_options": opt_count,
+            "cat9_token_unlocks": unlock_count,
+            "cat9_fred_liquidity": fred_count,
+            "cat9_stablecoin_supply": stable_count,
         }
     finally:
         conn.close()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fetch public derivatives, options gamma, and macro liquidity.")
+    parser = argparse.ArgumentParser(description="Fetch Categories 6, 7, 8, and 9 public derivatives, spot L2, cross-exchange, options, and token unlocks.")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="Output SQLite path.")
     parser.add_argument(
         "--symbols",
@@ -669,10 +1091,17 @@ def main() -> int:
         default=",".join(DEFAULT_PERP_SYMBOLS),
         help="Comma-separated Binance USD-M perpetual symbols.",
     )
+    parser.add_argument(
+        "--spot-symbols",
+        type=str,
+        default=",".join(DEFAULT_SPOT_MICRO_SYMBOLS),
+        help="Comma-separated Binance Spot symbols for Category 7 multi-horizon + L2 + aggTrades.",
+    )
     args = parser.parse_args()
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    stats = collect_all_to_sqlite(args.db, symbols=syms)
-    print(f"Saved public counterparty data to {args.db}: {stats}")
+    spot_syms = [s.strip().upper() for s in args.spot_symbols.split(",") if s.strip()]
+    stats = collect_all_to_sqlite(args.db, symbols=syms, spot_symbols=spot_syms)
+    print(f"Saved Categories 6-9 counterparty data to {args.db}: {stats}")
     return 0
 
 

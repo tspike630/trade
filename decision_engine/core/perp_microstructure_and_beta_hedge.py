@@ -7,8 +7,16 @@ derivatives-aware, market-neutral statistical arbitrage desk:
    - Inspects USD-M perpetual ``funding_rate`` (8h rate), ``funding_z`` (rolling z-score),
      ``perp_basis_bps`` (``(perp_mark - index_price) / index_price * 10_000``),
      Whale-vs-Retail Long/Short divergence (``top_position_ls_ratio`` vs
-     ``global_account_ls_ratio``), and Deribit Options Gamma/DVOL regime
+     ``global_account_ls_ratio``), forced liquidation cascade (``liq_cascade_regime``),
+     cross-exchange spot price dislocation (``max_venue_dislocation_bps``),
+     token cliff unlock blackout (``in_unlock_blackout``), and Deribit Options Gamma/DVOL regime
      (``gamma_regime``, ``dvol_zscore``).
+   - Blocks 5m spot dip-buying during VC/Team cliff unlock windows (`[-72h, +48h]`
+     -> ``token_unlock_cliff_blackout``).
+   - Blocks spot buying when single-venue flash-wick manipulation diverges from
+     OKX/Bybit spot median by `>= 35 bps` (``cross_exchange_wick_dislocation``).
+   - Blocks spot buying during active long liquidation waterfalls
+     (``perp_long_liquidation_waterfall``).
    - Blocks 5m spot dip-buying when perpetual longs are overcrowded and actively
      cascading (`funding_rate > MAX_CROWDED_FUNDING_RATE` = +0.05%/8h or
      `funding_z > 2.5` -> ``perp_long_crowded_cascade``).
@@ -164,11 +172,15 @@ def evaluate_perp_microstructure(
 
     gamma_regime = str(row.get("gamma_regime") or "").strip().lower()
     dvol_z = _finite(row.get("dvol_zscore"))
+    liq_cascade = str(row.get("liq_cascade_regime") or "").strip().lower()
+    max_venue_dislocation_bps = _finite(row.get("max_venue_dislocation_bps"))
+    raw_unlock = row.get("in_unlock_blackout")
+    in_unlock_blackout = bool(int(raw_unlock)) if isinstance(raw_unlock, (int, float, bool)) else False
 
     has_any_signal = any(
         x is not None
-        for x in (funding_rate, funding_z, basis_bps, whale_div, dvol_z)
-    ) or bool(gamma_regime)
+        for x in (funding_rate, funding_z, basis_bps, whale_div, dvol_z, max_venue_dislocation_bps)
+    ) or bool(gamma_regime) or bool(liq_cascade) or in_unlock_blackout
 
     if not has_any_signal:
         if require_perp_filter_enabled():
@@ -192,6 +204,39 @@ def evaluate_perp_microstructure(
     max_funding = _env_float(MAX_CROWDED_FUNDING_ENV, DEFAULT_MAX_CROWDED_FUNDING_RATE)
     max_z = _env_float(MAX_FUNDING_Z_ENV, DEFAULT_MAX_FUNDING_Z)
     min_basis = _env_float(MIN_PERP_BASIS_BPS_ENV, DEFAULT_MIN_PERP_BASIS_BPS)
+
+    # 0A. Token Cliff Unlock Blackout (Category 9 / I-4 [-72h, +48h] VC/Team dump risk)
+    if in_unlock_blackout:
+        return PerpMicrostructureVerdict(
+            allow=False,
+            reject_reason="token_unlock_cliff_blackout",
+            perp_regime="unlock_cliff_blackout",
+            funding_rate=funding_rate,
+            funding_z=funding_z,
+            perp_basis_bps=basis_bps,
+        )
+
+    # 0B. Cross-Exchange Spot Dislocation / Single-Venue Flash Wick (Category 8A >= 35 bps)
+    if max_venue_dislocation_bps is not None and max_venue_dislocation_bps >= 35.0:
+        return PerpMicrostructureVerdict(
+            allow=False,
+            reject_reason="cross_exchange_wick_dislocation",
+            perp_regime="venue_dislocation_manipulation",
+            funding_rate=funding_rate,
+            funding_z=funding_z,
+            perp_basis_bps=basis_bps,
+        )
+
+    # 0C. Active Perpetual Long Liquidation Waterfall (Category 6 OI Flush + Price Dump)
+    if liq_cascade == "long_liquidation_waterfall":
+        return PerpMicrostructureVerdict(
+            allow=False,
+            reject_reason="perp_long_liquidation_waterfall",
+            perp_regime="long_liquidation_waterfall",
+            funding_rate=funding_rate,
+            funding_z=funding_z,
+            perp_basis_bps=basis_bps,
+        )
 
     # 1. Overcrowded perpetual longs cascading into spot
     if funding_rate is not None and funding_rate > max_funding:
@@ -251,11 +296,14 @@ def evaluate_perp_microstructure(
             perp_basis_bps=basis_bps,
         )
 
-    # 5. Crowded short squeeze fuel (deeply negative funding + strong spot buyer absorption)
+    # 5. Crowded short squeeze fuel (deeply negative funding or short liquidation cascade)
     if (
-        funding_rate is not None
-        and funding_rate <= DEFAULT_SHORT_SQUEEZE_FUNDING_RATE
-        and (tbr is None or tbr >= 0.45)
+        (
+            funding_rate is not None
+            and funding_rate <= DEFAULT_SHORT_SQUEEZE_FUNDING_RATE
+            and (tbr is None or tbr >= 0.45)
+        )
+        or liq_cascade == "short_liquidation_squeeze"
     ):
         return PerpMicrostructureVerdict(
             allow=True,
