@@ -236,13 +236,42 @@ def evaluate_five_state_regime(
         or (smh_1h is not None and smh_1h >= 1.20)
     )
     if is_bull_trend:
-        # In a broad bull trend, avoid weak laggards (bottom 35% of cross-sectional rank)
+        # 4. 看板块地位: In a broad bull trend, avoid weak laggards (bottom 35% of cross-sectional rank)
         if xs_rank_1h is not None and xs_rank_1h < 0.35:
             return RegimeRoutingDecision(
                 regime=REGIME_3_CROSS_ASSET_BULL_PULLBACK,
                 playbook="xs_leader_pullback_laggard_skip",
                 allow_buy=False,
                 reject_reason="regime3_bull_trend_laggard_skip",
+                size_multiplier=0.0,
+                tp_multiplier=1.0,
+                enable_trailing_ratchet=False,
+                require_perp_beta_hedge=False,
+                recommended_order_type="NONE",
+            )
+        # 2. 看封板/承接质量: Reject bull-trap breakouts with thin L2 bid support & weak taker buy flow
+        obi_top5 = _finite(row.get("obi_top5") or row.get("spot_obi_top5"))
+        taker_buy = _finite(row.get("taker_buy_ratio") or row.get("spot_taker_buy_ratio"))
+        if obi_top5 is not None and obi_top5 <= -0.25 and (taker_buy is None or taker_buy <= 0.45):
+            return RegimeRoutingDecision(
+                regime=REGIME_3_CROSS_ASSET_BULL_PULLBACK,
+                playbook="xs_leader_thin_book_reject",
+                allow_buy=False,
+                reject_reason="regime3_thin_bid_book_trap",
+                size_multiplier=0.0,
+                tp_multiplier=1.0,
+                enable_trailing_ratchet=False,
+                require_perp_beta_hedge=False,
+                recommended_order_type="NONE",
+            )
+        # 3. 看换手量能: Reject climax blow-off volume when whales are distributing into retail
+        vol_z = _finite(row.get("volume_z") or row.get("vol_z_1h"))
+        if vol_z is not None and vol_z >= 3.8 and whale_div is not None and whale_div <= 0.65:
+            return RegimeRoutingDecision(
+                regime=REGIME_3_CROSS_ASSET_BULL_PULLBACK,
+                playbook="xs_leader_climax_volume_reject",
+                allow_buy=False,
+                reject_reason="regime3_climax_volume_distribution_trap",
                 size_multiplier=0.0,
                 tp_multiplier=1.0,
                 enable_trailing_ratchet=False,

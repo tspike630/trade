@@ -134,5 +134,36 @@ class TestFiveStateRegimeRouter(unittest.TestCase):
         self.assertAlmostEqual(s3_stage3["target_cumulative_pct"], 0.850, places=3)
 
 
+
+    def test_state_3_anti_mug_kill_book_and_volume_checks(self) -> None:
+        # Thin L2 bid book + weak taker buy -> rejected (看封板质量防炸板闷杀)
+        dec_thin = evaluate_five_state_regime(
+            {
+                "symbol": "SOLUSDT",
+                "nvda_1h_ret_pct": 1.60,
+                "xs_breadth_1h": 0.75,
+                "xs_rank_pct_1h": 0.85,
+                "obi_top5": -0.32,
+                "taker_buy_ratio": 0.41,
+            }
+        )
+        self.assertFalse(dec_thin.allow_buy)
+        self.assertEqual(dec_thin.reject_reason, "regime3_thin_bid_book_trap")
+
+        # Climax volume blow-off + whale distribution -> rejected (看换手量能防巨量出货闷杀)
+        dec_climax = evaluate_five_state_regime(
+            {
+                "symbol": "SOLUSDT",
+                "nvda_1h_ret_pct": 1.60,
+                "xs_breadth_1h": 0.75,
+                "xs_rank_pct_1h": 0.85,
+                "volume_z": 4.2,
+                "whale_retail_divergence": 0.55,
+            }
+        )
+        self.assertFalse(dec_climax.allow_buy)
+        self.assertEqual(dec_climax.reject_reason, "regime3_climax_volume_distribution_trap")
+
+
 if __name__ == "__main__":
     unittest.main()
