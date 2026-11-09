@@ -3,17 +3,26 @@ r"""Perpetual Futures Microstructure Filter & Portfolio Beta-Neutral Hedge Engin
 Bridges the gap between a Spot-only directional book and an institutional
 derivatives-aware, market-neutral statistical arbitrage desk:
 
-1. **Perpetual Futures Microstructure Filter (`evaluate_perp_microstructure`)**:
+1. **Perpetual Futures & Options Counterparty Microstructure Filter (`evaluate_perp_microstructure`)**:
    - Inspects USD-M perpetual ``funding_rate`` (8h rate), ``funding_z`` (rolling z-score),
-     and ``perp_basis_bps`` (``(perp_mark - index_price) / index_price * 10_000``).
+     ``perp_basis_bps`` (``(perp_mark - index_price) / index_price * 10_000``),
+     Whale-vs-Retail Long/Short divergence (``top_position_ls_ratio`` vs
+     ``global_account_ls_ratio``), and Deribit Options Gamma/DVOL regime
+     (``gamma_regime``, ``dvol_zscore``).
    - Blocks 5m spot dip-buying when perpetual longs are overcrowded and actively
      cascading (`funding_rate > MAX_CROWDED_FUNDING_RATE` = +0.05%/8h or
      `funding_z > 2.5` -> ``perp_long_crowded_cascade``).
    - Blocks spot buying when perpetuals trade at an extreme toxic discount
      (`perp_basis_bps < -80 bps`) without buyer absorption (`taker_buy_ratio < 0.42`
      -> ``perp_toxic_discount_dump``).
-   - Identifies crowded-short squeeze setups (`funding_rate <= -0.03%/8h` with
-     `taker_buy_ratio >= 0.45` -> ``perp_regime="short_squeeze_favorable"``).
+   - Blocks spot buying when retail accounts are overwhelmingly long while top
+     whale positions are net short (``global_account_ls_ratio >= 2.20`` and
+     ``whale_retail_divergence <= 0.45`` -> ``perp_retail_long_trap``).
+   - Blocks spot buying during options dealer negative-gamma volatility spikes
+     (``gamma_regime == 'negative_gamma_slippery'`` and ``dvol_zscore >= 2.0``
+     -> ``options_negative_gamma_crash``).
+   - Identifies crowded-short squeeze or whale accumulation setups
+     (``short_squeeze_favorable`` / ``whale_accumulation_favorable``).
 
 2. **Portfolio Beta Budget & BTC/ETH Delta-Neutral Hedge Sizer (`compute_portfolio_beta_and_hedge`)**:
    - Assigns empirical BTC Beta ($\beta_i$) per asset and sector cluster.
@@ -136,7 +145,7 @@ def evaluate_perp_microstructure(
     *,
     taker_buy_ratio: float | None = None,
 ) -> PerpMicrostructureVerdict:
-    """Evaluate perpetual futures funding crowding and mark-index basis dislocation."""
+    """Evaluate perpetual futures funding crowding, Whale/Retail L/S divergence, and Options Gamma."""
     funding_rate = _finite(row.get("funding_rate", row.get("lastFundingRate")))
     funding_z = _finite(row.get("funding_z", row.get("jev_funding_z")))
     basis_bps = _finite(row.get("perp_basis_bps"))
@@ -147,7 +156,21 @@ def evaluate_perp_microstructure(
         if mark_px is not None and index_px is not None and index_px > 0:
             basis_bps = ((mark_px - index_px) / index_px) * 10_000.0
 
-    if funding_rate is None and funding_z is None and basis_bps is None:
+    top_ls = _finite(row.get("top_position_ls_ratio"))
+    glob_ls = _finite(row.get("global_account_ls_ratio"))
+    whale_div = _finite(row.get("whale_retail_divergence"))
+    if whale_div is None and top_ls is not None and glob_ls is not None and glob_ls > 0:
+        whale_div = top_ls / glob_ls
+
+    gamma_regime = str(row.get("gamma_regime") or "").strip().lower()
+    dvol_z = _finite(row.get("dvol_zscore"))
+
+    has_any_signal = any(
+        x is not None
+        for x in (funding_rate, funding_z, basis_bps, whale_div, dvol_z)
+    ) or bool(gamma_regime)
+
+    if not has_any_signal:
         if require_perp_filter_enabled():
             return PerpMicrostructureVerdict(
                 allow=False,
@@ -203,7 +226,32 @@ def evaluate_perp_microstructure(
                 perp_basis_bps=basis_bps,
             )
 
-    # 3. Crowded short squeeze fuel (deeply negative funding + strong spot buyer absorption)
+    # 3. Retail Long Trap vs Whale Short Divergence (Counterparty Stop-Hunt Risk)
+    if (
+        (glob_ls is not None and glob_ls >= 2.20 and (top_ls is not None and top_ls <= 0.95))
+        or (glob_ls is not None and glob_ls >= 2.20 and whale_div is not None and whale_div <= 0.45)
+    ):
+        return PerpMicrostructureVerdict(
+            allow=False,
+            reject_reason="perp_retail_long_trap",
+            perp_regime="retail_long_trap_cascade",
+            funding_rate=funding_rate,
+            funding_z=funding_z,
+            perp_basis_bps=basis_bps,
+        )
+
+    # 4. Options Dealer Negative-Gamma Slippery Zone + DVOL Spike
+    if gamma_regime == "negative_gamma_slippery" and dvol_z is not None and dvol_z >= 2.0:
+        return PerpMicrostructureVerdict(
+            allow=False,
+            reject_reason="options_negative_gamma_crash",
+            perp_regime="negative_gamma_crash",
+            funding_rate=funding_rate,
+            funding_z=funding_z,
+            perp_basis_bps=basis_bps,
+        )
+
+    # 5. Crowded short squeeze fuel (deeply negative funding + strong spot buyer absorption)
     if (
         funding_rate is not None
         and funding_rate <= DEFAULT_SHORT_SQUEEZE_FUNDING_RATE
@@ -213,6 +261,18 @@ def evaluate_perp_microstructure(
             allow=True,
             reject_reason=None,
             perp_regime="short_squeeze_favorable",
+            funding_rate=funding_rate,
+            funding_z=funding_z,
+            perp_basis_bps=basis_bps,
+            size_readjustment_multiplier=1.15,
+        )
+
+    # 6. Whale Accumulation Divergence (Whales heavily long relative to retail + non-crowded funding)
+    if whale_div is not None and whale_div >= 1.35 and (funding_rate is None or funding_rate <= 0.0001):
+        return PerpMicrostructureVerdict(
+            allow=True,
+            reject_reason=None,
+            perp_regime="whale_accumulation_favorable",
             funding_rate=funding_rate,
             funding_z=funding_z,
             perp_basis_bps=basis_bps,
