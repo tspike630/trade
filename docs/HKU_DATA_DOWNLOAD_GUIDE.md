@@ -1,21 +1,6 @@
-# 香港大学（HKU）全量金融与量化对手盘数据下载「零基础小白操作总指南」（全平台 32 表终极单文档版）
-
-> **致港大同学**：非常感谢帮忙！这份指南专为**香港大学（HKU）**编写，汇总了港大图书馆与经管学院（K.K. Leung 梁銶琚楼）拥有的 **4 大顶级金融终端与数据库（① 港大图书馆 WRDS、② 经管学院 Bloomberg Lab 彭博终端、③ 港大 LSEG Workspace / Datastream、④ 经管学院 Wind 万得终端）** 中我们需要的 **全部 32 张核心数据表**。
->
-> **操作方式任选其一**：
-> * **方式 A（全自动脚本，最省事，共 10 分钟）**：直接复制本文档 **第六部分** 内嵌的 Python 脚本保存为 `fetch_hku_master.py`，在电脑上跑一行命令即可自动下完全部数据。
-> * **方式 B（零代码小白点选 + 粘贴现成 Excel 公式，共 25 分钟）**：完全不用懂金融或编程，照着下面每一步复制粘贴代码或公式即可。
-
-## 一、港大可下载的 4 大平台、32 张全量数据总表（一表看全）
-
-| 港大平台名称 | 所在位置 / 登录方式 | 必下数据表（共 32 张全量表） | 核心字段与对手盘用途 |
-| :--- | :--- | :--- | :--- |
-| **1. 港大图书馆 WRDS（沃顿研究数据服务）** | **宿舍/图书馆直连**<br>（连 `HKU` Wi-Fi 或 VPN 登录 `wrds-www.wharton.upenn.edu`） | **表 1**：NYSE Daily TAQ 毫秒级盘口微观结构日度指标库（`wrds_taq_iid`）<br>**表 2**：NYSE Daily TAQ 美股开盘/收盘集合竞价与大单逐笔抽样（`ctm` / `cqm`）<br>**表 3**：OptionMetrics IvyDB US 标准化隐含波动率曲面（`vsurfd`：10/30/60/91/182 天）<br>**表 4**：OptionMetrics 标准平价远期期权与希腊字母（`stdopd`：Delta/Gamma/Vega/Theta）<br>**表 5**：OptionMetrics 个股/ETF 期权每日总持仓与看跌/看涨比（`opprcd` / `opvold`）<br>**表 6**：OptionMetrics 零息无风险收益率曲线（`zerocd`）<br>**表 7**：RavenPack 毫秒级全球机构新闻情绪与事件冲击库（`ravenpack_dj` + `web`）<br>**表 8**：FINRA TRACE Enhanced 场外可转债/公司债机构暗盘逐笔成交（`trace_enhanced`）<br>**表 9**：Markit Securities Finance（`msf`）机构融券借贷费率、利用率与逼空指标<br>**表 10**：Compustat 官方空头持仓量与回补天数（`comp.sec_shortint`）<br>**表 11**：Thomson / LSEG 13F 华尔街对冲基金季度持仓明细（`tfn.s34`）<br>**表 12**：Thomson 共同基金与 ETF 底层持仓明细（`tfn.s12`）<br>**表 13**：美国 SEC Form 4 高管与内部人买卖流水（`tfn.table1`）<br>**表 14**：CRSP 美股现货 ETF/概念股日频盘口（`crsp.dsf`）与美国国债全期限库（`crsp.tfz_dly`）<br>**表 15**：CBOE 官方波动率与偏度指数历史库（`cboe.cboe`） | 穿透美股毫秒级价格冲击（Kyle's Lambda）、可转债套利对冲基金（交易 `MSTR`/`COIN`/`MARA` 可转债并做空 BTC 对冲 Delta）、融券逼空费率、顶级量化基金（Millennium/Citadel/Jane Street）13F 增减持、以及 40,000+ 信源毫秒级新闻情绪 |
-| **2. 经管学院 Bloomberg Lab（彭博终端）** | **梁銶琚楼（K.K. Leung Building）彭博机房** | **表 16**：美股+港股 18 只加密 ETF 价格与**盘中 5m 实时参考净值（iNAV）**（`TRADE`/`BID`/`ASK` 三套 5m K 线）<br>**表 17**：彭博加密现货、银河指数（`BGCI`/`BGDI`）与 CME 期货近月/次月/微型合约期限结构（`5m`/`1h`/`1d`）<br>**表 18**：13 只加密概念/矿企股 + 7 只 AI 算力龙头 + 9 只华尔街 CTA/风险平价/做空波动率 ETF（`5m`/`1h`/`1d`）<br>**表 19**：全球 14 个跨资产波动率指数 + 11 个外汇/黄金 25D 风险逆转偏度 + `IBIT`/`MSTR`/`COIN` 期权偏度与 Gamma 持仓<br>**表 20**：彭博/高盛/芝加哥联储 8 大金融条件指数（FCI）+ 彭博/花旗 8 大经济惊奇指数（CESI/ECSURP）<br>**表 21**：美元回购利率（SOFR/EFFR/OBFR/FRA-OIS）、TIPS 实际利率、交叉货币基差互换（`JYBS3`/`EUBS3`）与北美 CDX 信用违约互换（`CDX HY`/`CDX IG`）<br>**表 22**：彭博 `ECO` 宏观经济日历（含彭博调查中位数、均值、最高、最低、预测标准差与惊奇值）<br>**表 23**：CFTC COT 期货分类持仓报告（CME BTC/ETH/NQ/ES/JPY/美债的对冲基金 vs 资管 vs 做市商净仓位） | 彭博独有 **15 秒/5 分钟级 ETF 实时净值 `IBITIV`/`ETHAIV`**（直接算穿 AP 套利盘实时申赎抛压）、分离式 `BID`/`ASK`/`TRADE` 盘口 K 线、以及北美高收益债 `CDX HY` 与金融条件指数 `BFCIUS`/`GSUSFCI` |
-| **3. 港大 LSEG Workspace / Datastream** | **港大图书馆 / 经管学院金融实验室** | **表 24**：71 个跨资产标的 `5min`/`1h`/`1d` K 线与做市商盘口跳动字段（`BID`, `ASK`, `BIDSIZE`, `ASKSIZE`, `BID_NUMMOV`, `ASK_NUMMOV`, `VWAP`, `OPINT_1`, `BLKVOLUM`）<br>**表 25**：LSEG Lipper 美股/全球 ETF 每日净申赎资金流（`TR.FundNetFlows`）与日频 NAV<br>**表 26**：LSEG StarMine 量化模型每日评分（`StarMineShortSqueeze` 逼空分、`StarMineARM` 分析师修正、`StarMineSmartHoldings`、`StarMineCombinedAlpha`）<br>**表 27**：LSEG `ECOCAL` 经济日历（含 **`SmartEconomics®`** 智能加权预测、**`Predicted Surprise`** 预测惊奇值、`Min`/`Max`/`Count`）与四大央行日程<br>**表 28**：LSEG Datastream 全球 M2 货币供应、各国央行资产负债表与主权 CDS 历史序列 | 补充 LSEG 独有的做市商报价跳动次数（`BID_NUMMOV`/`ASK_NUMMOV`）、大宗交易量（`BLKVOLUM`）、`SmartEconomics` 事前预测惊奇与 `StarMine` 1–100 逼空评分 |
-| **4. 经管学院 Wind（万得金融终端）** | **经管学院机房** | **表 29**：香港 6 只现货比特币/以太坊 ETF（港币+美元 12 个柜台）`5min` K 线、盘中 IOPV 与每日份额申赎<br>**表 30**：港股 Web3 与持币上市公司（`0863.HK`、`1611.HK`、`0434.HK`、`1357.HK`）行情与港股通资金流<br>**表 31**：亚洲盘离岸人民币（`CNH HIBOR`）、港元（`HKD HIBOR`）、金管局总结余、在岸 `DR007` 与央行逆回购每日净投放<br>**表 32**：亚太早盘风险情绪指数（恒生科技 `HSTECH.HI`、日经 225、韩国 `KOSPI 200`、A50 期货 `5min` K 线） | 填补北京时间 `08:00–16:00`（美股休市期间）亚洲机构加密 ETF 申赎、离岸人民币/港元资金面抽水与韩国/亚太早盘情绪空白 |
-
-## 二、第一站：港大图书馆 WRDS 数据库（表 1 ~ 表 15，宿舍连校园网即可下）
+# 
+## 
+第一站：港大图书馆 WRDS 数据库（表 1 ~ 表 15，宿舍连校园网即可下
 
 **登录步骤**：连上港大 Wi-Fi（或 VPN）➔ 打开 `https://wrds-www.wharton.upenn.edu/` ➔ 用港大邮箱登录。
 * **最省事方式（3 分钟下完 15 张表）**：直接复制本文档 **第六部分** 的 Python 脚本保存为 `fetch_hku_master.py`，在自己电脑上运行 `python fetch_hku_master.py --mode wrds --wrds-user 你的WRDS账号` 即可全自动生成全部 CSV！

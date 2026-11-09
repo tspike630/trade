@@ -541,3 +541,92 @@ def portfolio_beta_exposure_block(
             f"{projected_beta_pct:.4f}>{cap:.4f}"
         )
     return None
+
+
+PUBLIC_DERIVATIVES_DB_ENV = "PUBLIC_DERIVATIVES_DB_PATH"
+
+
+def resolve_public_derivatives_db_path():
+    from pathlib import Path
+    raw = os.environ.get(PUBLIC_DERIVATIVES_DB_ENV, "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path(__file__).resolve().parents[2] / "data" / "counterparty" / "public_derivatives.db"
+
+
+def attach_counterparty_context(rows, *, db_path=None):
+    """Enrich candidate rows in-place from ``public_derivatives.db`` (Categories 6, 8, 9)."""
+    if not rows:
+        return rows
+    from pathlib import Path
+    import sqlite3
+    target = Path(db_path).expanduser() if db_path is not None else resolve_public_derivatives_db_path()
+    if not target.is_file():
+        return rows
+    try:
+        conn = sqlite3.connect(f"file:{target.resolve().as_posix()}?mode=ro", uri=True, timeout=3.0)
+        conn.row_factory = sqlite3.Row
+    except (OSError, sqlite3.Error):
+        return rows
+    try:
+        tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type=\"table\"").fetchall()}
+        perp_by_sym = {}
+        if "binance_perp_counterparty" in tables:
+            for r in conn.execute("""
+                SELECT p.* FROM binance_perp_counterparty p
+                INNER JOIN (
+                    SELECT symbol, MAX(ts_ms) AS max_ts FROM binance_perp_counterparty GROUP BY symbol
+                ) latest ON p.symbol = latest.symbol AND p.ts_ms = latest.max_ts
+            """).fetchall():
+                perp_by_sym[str(r["symbol"]).upper()] = r
+        disloc_by_sym = {}
+        if "cross_exchange_spot_baseline" in tables:
+            for r in conn.execute("""
+                SELECT c.symbol, c.max_venue_dislocation_bps FROM cross_exchange_spot_baseline c
+                INNER JOIN (
+                    SELECT symbol, MAX(ts_ms) AS max_ts FROM cross_exchange_spot_baseline GROUP BY symbol
+                ) latest ON c.symbol = latest.symbol AND c.ts_ms = latest.max_ts
+            """).fetchall():
+                val = _finite(r["max_venue_dislocation_bps"])
+                if val is not None:
+                    disloc_by_sym[str(r["symbol"]).upper()] = val
+        unlock_by_sym = {}
+        if "token_unlock_schedule" in tables:
+            for r in conn.execute("SELECT symbol, in_unlock_blackout FROM token_unlock_schedule").fetchall():
+                unlock_by_sym[str(r["symbol"]).upper()] = int(r["in_unlock_blackout"] or 0)
+        btc_gamma_regime = None
+        btc_dvol_z = None
+        if "deribit_options_gamma" in tables:
+            opt_row = conn.execute("""
+                SELECT gamma_regime, dvol_zscore FROM deribit_options_gamma
+                WHERE currency = "BTC" ORDER BY ts_ms DESC LIMIT 1
+            """).fetchone()
+            if opt_row is not None:
+                btc_gamma_regime = str(opt_row["gamma_regime"] or "") or None
+                btc_dvol_z = _finite(opt_row["dvol_zscore"])
+        for row in rows:
+            sym = str(row.get("binance_symbol") or row.get("token_address") or "").strip().upper()
+            if not sym:
+                continue
+            p_row = perp_by_sym.get(sym)
+            if p_row is not None:
+                for col in (
+                    "funding_rate", "funding_z", "perp_basis_bps",
+                    "top_position_ls_ratio", "global_account_ls_ratio",
+                    "whale_retail_divergence", "liq_cascade_regime",
+                ):
+                    if row.get(col) is None and col in p_row.keys() and p_row[col] is not None:
+                        row[col] = p_row[col]
+            if row.get("max_venue_dislocation_bps") is None and sym in disloc_by_sym:
+                row["max_venue_dislocation_bps"] = disloc_by_sym[sym]
+            if row.get("in_unlock_blackout") is None and sym in unlock_by_sym:
+                row["in_unlock_blackout"] = unlock_by_sym[sym]
+            if row.get("gamma_regime") is None and btc_gamma_regime is not None:
+                row["gamma_regime"] = btc_gamma_regime
+            if row.get("dvol_zscore") is None and btc_dvol_z is not None:
+                row["dvol_zscore"] = btc_dvol_z
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return rows
