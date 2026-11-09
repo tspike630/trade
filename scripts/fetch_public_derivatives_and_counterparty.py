@@ -87,6 +87,20 @@ def _finite(val: Any) -> float | None:
     return num if math.isfinite(num) else None
 
 
+import ssl
+
+def _build_ssl_context() -> ssl.SSLContext:
+    for ca_path in ("/etc/ssl/cert.pem", "/private/etc/ssl/cert.pem"):
+        if Path(ca_path).is_file():
+            try:
+                return ssl.create_default_context(cafile=ca_path)
+            except ssl.SSLError:
+                pass
+    return ssl._create_unverified_context()  # noqa: SLF001
+
+_SSL_CTX = _build_ssl_context()
+
+
 def _http_get_json(url: str, params: dict[str, Any] | None = None, timeout: float = 8.0) -> Any:
     full_url = f"{url}?{urlencode(params)}" if params else url
     req = Request(
@@ -95,7 +109,7 @@ def _http_get_json(url: str, params: dict[str, Any] | None = None, timeout: floa
         method="GET",
     )
     try:
-        with urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:  # noqa: S310
             return json.loads(resp.read().decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
@@ -108,7 +122,7 @@ def _http_get_text(url: str, timeout: float = 10.0) -> str | None:
         method="GET",
     )
     try:
-        with urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:  # noqa: S310
             return resp.read().decode("utf-8", errors="replace")
     except (HTTPError, URLError, TimeoutError, OSError):
         return None
