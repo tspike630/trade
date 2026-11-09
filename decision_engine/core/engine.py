@@ -247,6 +247,15 @@ class DecisionEngine:
         )
         top_report: dict[str, Any] | None = None
         if bnb_spot:
+            from decision_engine.core.regime_strategy_router import (
+                apply_five_state_regime_router,
+            )
+
+            passed, _ = apply_five_state_regime_router(
+                passed,
+                hot,
+                macro_halt=macro_halt,
+            )
             passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
         emitted = self.bus.publish_many(passed)
         log.info(
