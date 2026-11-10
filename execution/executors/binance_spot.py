@@ -43,7 +43,7 @@ import urllib.error
 from datetime import datetime, timezone
 import urllib.parse
 import urllib.request
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -1605,7 +1605,8 @@ class BinanceSpotAdapter:
                     and isinstance(asks[0], (list, tuple))
                 ):
                     fresh = self._fresh_bbo(
-                        {"best_bid": bids[0][0], "best_ask": asks[0][0]}
+                        {"best_bid": bids[0][0], "best_ask": asks[0][0]},
+                        require_age=False,
                     )
                     if isinstance(fresh, tuple):
                         return fresh[0], fresh[1], None
@@ -1616,22 +1617,44 @@ class BinanceSpotAdapter:
         return None, None, "maker_book_unavailable"
 
     @staticmethod
-    def _ws_age_ok(payload: dict) -> bool:
-        """Same 2500 ms window as a book quote. A missing age is not stale."""
-        age = payload.get("ws_age_ms")
-        if age is None:
-            return True
+    def _ws_age_ms(payload: dict) -> int | None:
+        """Milliseconds of a proved-fresh websocket quote, or None.
+
+        A missing, blank, non-numeric, non-finite, boolean, negative, or
+        over-age value is not proof that the quote is fresh. Callers then
+        use REST. This does not raise.
+        """
+        if "ws_age_ms" not in payload:
+            return None
+        age = payload["ws_age_ms"]
+        if isinstance(age, bool) or age is None:
+            return None
         try:
-            age_ms = int(age)
-        except (TypeError, ValueError):
-            return False
-        return 0 <= age_ms <= default_max_age_ms()
+            if isinstance(age, str):
+                text = age.strip()
+                if not text:
+                    return None
+                number = Decimal(text)
+            elif isinstance(age, Decimal):
+                number = age
+            elif isinstance(age, (int, float)):
+                number = Decimal(str(age))
+            else:
+                return None
+            if not number.is_finite() or number != number.to_integral_value():
+                return None
+            age_ms = int(number)
+        except (ArithmeticError, ValueError, TypeError, InvalidOperation):
+            return None
+        if age_ms < 0 or age_ms > default_max_age_ms():
+            return None
+        return age_ms
 
     @staticmethod
-    def _fresh_bbo(payload: object) -> tuple[str, str] | str | None:
+    def _fresh_bbo(payload: object, *, require_age: bool = True) -> tuple[str, str] | str | None:
         if not isinstance(payload, dict):
             return None
-        if not BinanceSpotAdapter._ws_age_ok(payload):
+        if require_age and BinanceSpotAdapter._ws_age_ms(payload) is None:
             return None
         bid = _to_decimal(payload.get("best_bid"))
         ask = _to_decimal(payload.get("best_ask"))
@@ -1652,15 +1675,11 @@ class BinanceSpotAdapter:
         ws_cache = self._active_ws_cache()
         if ws_cache is not None and callable(getattr(ws_cache, "get_ticker_price", None)):
             ws_tick = ws_cache.get_ticker_price(symbol)
-            if (
-                isinstance(ws_tick, dict)
-                and _to_decimal(ws_tick.get("price")) is not None
-                and self._ws_age_ok(ws_tick)
-            ):
-                age = ws_tick.get("ws_age_ms")
+            age_ms = self._ws_age_ms(ws_tick) if isinstance(ws_tick, dict) else None
+            if isinstance(ws_tick, dict) and age_ms is not None and _to_decimal(ws_tick.get("price")) is not None:
                 self._mark_telemetry = {
                     "mark_source": str(ws_tick.get("source") or "ws_l1"),
-                    "mark_ws_age_ms": 0 if age is None else int(age),
+                    "mark_ws_age_ms": age_ms,
                 }
                 return str(ws_tick["price"]).strip(), None
 

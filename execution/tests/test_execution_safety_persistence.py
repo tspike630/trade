@@ -1254,10 +1254,10 @@ class PersistenceSafetyTests(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(mark, "100.55")
 
-        missing_age = self._maker_adapter(client, _Mark("100.20", None))
+        missing_age = self._maker_adapter(client, _Mark("100.25", None))
         mark, err = missing_age._read_entry_mark(client, "BNBUSDT")
         self.assertIsNone(err)
-        self.assertEqual(mark, "100.20")
+        self.assertEqual(mark, "100.55")
 
         invalid = self._maker_adapter(client, _Mark("90", "stale"))
         mark, err = invalid._read_entry_mark(client, "BNBUSDT")
@@ -1286,6 +1286,123 @@ class PersistenceSafetyTests(unittest.TestCase):
         self.assertEqual(refused["error"], "mark_unavailable")
         self.assertEqual(refused["submitted"], False)
         self.assertEqual(len(client.orders), 1)
+
+    def test_unproved_ws_age_uses_rest_for_mark_and_book(self) -> None:
+        os.environ["BINANCE_SPOT_WS_MAX_AGE_MS"] = "2500"
+        accepted = (0, 1, 2500, "0", "2500", "2500.0", " 1500 ")
+        rejected = (
+            None,
+            "",
+            "nan",
+            "inf",
+            "-inf",
+            "NaN",
+            "Infinity",
+            "stale",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            False,
+            -1,
+            10**18,
+            2501,
+            "-5",
+            "2500.5",
+        )
+        for age in accepted:
+            payload = {"ws_age_ms": age}
+            try:
+                got = BinanceSpotAdapter._ws_age_ms(payload)
+            except Exception as exc:  # noqa: BLE001
+                self.fail(f"accepted age {age!r} raised {type(exc).__name__}: {exc}")
+            self.assertIsNotNone(got, age)
+            self.assertLessEqual(got, 2500)
+        missing_key: dict[str, object] = {}
+        self.assertIsNone(BinanceSpotAdapter._ws_age_ms(missing_key))
+        for age in rejected:
+            payload = {"ws_age_ms": age}
+            try:
+                got = BinanceSpotAdapter._ws_age_ms(payload)
+            except Exception as exc:  # noqa: BLE001
+                self.fail(f"rejected age {age!r} raised {type(exc).__name__}: {exc}")
+            self.assertIsNone(got, age)
+
+        client = _Exchange()
+        client.ticker_price = lambda symbol: {"symbol": symbol, "price": "100.55"}  # type: ignore[method-assign]
+        client.order_book = lambda symbol, limit=5: {  # type: ignore[method-assign]
+            "bids": [["100.50", "4"]],
+            "asks": [["100.60", "4"]],
+        }
+
+        class _Book:
+            def __init__(self, age: object, *, present: bool = True) -> None:
+                self.age = age
+                self.present = present
+
+            def get_ticker_price(self, symbol: str) -> dict[str, object]:
+                payload: dict[str, object] = {
+                    "price": "100.25",
+                    "best_bid": "100.20",
+                    "best_ask": "100.30",
+                    "source": "ws_l1",
+                }
+                if self.present:
+                    payload["ws_age_ms"] = self.age
+                return payload
+
+        for age, present in ((None, False), (None, True), ("stale", True), (float("inf"), True), (2501, True)):
+            adapter = self._maker_adapter(client, _Book(age, present=present))
+            mark, err = adapter._read_entry_mark(client, "BNBUSDT")
+            self.assertIsNone(err, age)
+            self.assertEqual(mark, "100.55", age)
+            bid, ask, book_err = adapter._maker_top_of_book(client, "BNBUSDT")
+            self.assertIsNone(book_err, age)
+            self.assertEqual(Decimal(bid or "0"), Decimal("100.50"))
+            self.assertEqual(Decimal(ask or "0"), Decimal("100.60"))
+
+        result = self._maker_adapter(client, _Book(None, present=False)).execute(
+            self._buy(
+                {
+                    "recommended_order_type": "LIMIT_MAKER",
+                    "price": "100.80",
+                    "price_usd": "100.8",
+                    "stop_price": "99",
+                    "take_profit_price": "120",
+                    "wall_mid_price": "88.88",
+                },
+                77,
+            )
+        )
+        self.assertEqual(result["error"], "maker_entry_resting", result)
+        form = parse_qs(client.orders[-1])
+        self.assertEqual(form.get("type"), ["LIMIT_MAKER"])
+        self.assertEqual(Decimal(form["price"][0]), Decimal("100.50"))
+        self.assertNotIn("88.88", client.orders[-1])
+        self.assertNotIn("100.20", client.orders[-1])
+
+        def _down(symbol: str, limit: int = 5) -> dict[str, str]:
+            raise TimeoutError("rest down")
+
+        client.ticker_price = _down  # type: ignore[method-assign]
+        client.order_book = _down  # type: ignore[method-assign]
+        before = len(client.orders)
+        refused = self._maker_adapter(client, _Book(None, present=False)).execute(
+            self._buy(
+                {
+                    "recommended_order_type": "LIMIT_MAKER",
+                    "order_type": "MARKET",
+                    "price": "100.80",
+                    "stop_price": "99",
+                    "take_profit_price": "120",
+                },
+                78,
+            )
+        )
+        self.assertEqual(refused["submitted"], False)
+        self.assertIn(refused["error"], {"mark_unavailable", "maker_book_unavailable"})
+        self.assertEqual(len(client.orders), before)
+        self.assertNotEqual(refused["error"], "maker_entry_resting")
 
     def test_crossed_or_missing_book_does_not_invent_a_maker_price(self) -> None:
         crossed = _Exchange()
