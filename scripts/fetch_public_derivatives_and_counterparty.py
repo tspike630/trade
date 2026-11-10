@@ -52,6 +52,7 @@ import sqlite3
 import ssl
 import struct
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -487,7 +488,8 @@ def classify_depth_event(last_update_id: int, event: Any) -> tuple[str, int | No
         return "ignore", None
     if event_ms <= 0:
         return "ignore", None
-    if final_id < int(last_update_id):
+    # Official rule: drop events whose final update id is already in the snapshot.
+    if final_id <= int(last_update_id):
         return "older", None
     if first_id <= int(last_update_id) + 1 <= final_id:
         return "match", event_ms
@@ -643,6 +645,94 @@ def _default_depth_events(symbol: str, timeout: float) -> Iterator[dict[str, Any
 
 
 _DEPTH_EVENT_ITER: Callable[[str, float], Iterable[dict[str, Any]]] = _default_depth_events
+
+
+def depth_sync_decision(last_update_id: int, events: Sequence[Any]) -> tuple[str, int | None]:
+    """Walk buffered diff events in arrival order.
+
+    The first event that is not already contained in the snapshot decides.
+    A later event must not be used to paper over ``U > lastUpdateId+1``.
+    """
+    for event in events:
+        kind, event_ms = classify_depth_event(last_update_id, event)
+        if kind == "ignore" or kind == "older":
+            continue
+        if kind == "match":
+            return "match", event_ms
+        return "gap", None
+    return "pending", None
+
+
+def fetch_depth_snapshot(symbol: str) -> dict[str, Any] | None:
+    payload = _http_get_json(
+        "https://api.binance.com/api/v3/depth",
+        {"symbol": symbol, "limit": 20},
+    )
+    if isinstance(payload, dict) and "bids" in payload and payload.get("lastUpdateId") is not None:
+        return payload
+    return None
+
+
+def sync_depth_book(
+    symbol: str,
+    *,
+    timeout: float = 3.0,
+    max_snapshots: int = 3,
+) -> tuple[dict[str, Any] | None, int | None, str | None]:
+    """Open the diff stream, then take a REST snapshot. A gap loads a new snapshot.
+
+    Binance requires the stream to be buffering before ``GET /api/v3/depth``.
+    If the first live event has ``U > lastUpdateId+1``, later events do not
+    repair that snapshot. The next attempt must request depth again.
+    """
+    sink: list[Any] = []
+    started = threading.Event()
+
+    def _consume() -> None:
+        try:
+            iterable = _DEPTH_EVENT_ITER(symbol, timeout)
+        except Exception as exc:  # noqa: BLE001
+            sink.append({"__stream_error__": type(exc).__name__})
+            return
+        finally:
+            started.set()
+        try:
+            for event in iterable:
+                sink.append(event)
+        except Exception as exc:  # noqa: BLE001
+            sink.append({"__stream_error__": type(exc).__name__})
+
+    worker = threading.Thread(target=_consume, name=f"depth-{symbol}", daemon=True)
+    worker.start()
+    book: dict[str, Any] | None = None
+    try:
+        if not started.wait(2.0):
+            return None, None, "obi_top5_source_ts_unavailable:stream_start"
+        for _attempt in range(max_snapshots):
+            book = fetch_depth_snapshot(symbol)
+            if book is None:
+                return None, None, "depth_missing"
+            last_id = int(book["lastUpdateId"])
+            deadline = time.monotonic() + max(0.05, float(timeout))
+            status = "pending"
+            event_ms: int | None = None
+            while True:
+                status, event_ms = depth_sync_decision(last_id, list(sink))
+                if status != "pending":
+                    break
+                if any(isinstance(item, dict) and item.get("__stream_error__") for item in sink):
+                    return book, None, "obi_top5_source_ts_unavailable:stream"
+                if time.monotonic() >= deadline:
+                    status = "missing"
+                    break
+                time.sleep(0.01)
+            if status == "match":
+                return book, event_ms, None
+            if status != "gap":
+                return book, None, "obi_top5_source_ts_missing"
+        return book, None, "obi_top5_source_ts_gap"
+    finally:
+        worker.join(timeout=0.2)
 
 
 def capture_depth_source_ts(
@@ -1274,57 +1364,11 @@ def _kline_ret_and_tbr(
     return ret, tbr, int(close_ts) if close_ts is not None else None
 
 
-def _publish_spot_top5(
-    symbol: str,
-    depth: Any,
-    metrics: dict[str, Any],
-) -> tuple[int | None, int | None]:
-    """Return ``(book_update_id, source_ts_ms)`` and clear untimed top-5 values."""
-    endpoint = "https://api.binance.com/api/v3/depth"
-    if metrics.get("obi_top5_error"):
-        record_fetch_error(
-            category="spot_obi_top5",
-            symbol=symbol,
-            endpoint=endpoint,
-            message=str(metrics["obi_top5_error"]),
-            error_code=str(metrics["obi_top5_error"]),
-        )
-        return None, None
-    update_id = _finite(depth.get("lastUpdateId")) if isinstance(depth, dict) else None
-    if update_id is None:
-        metrics["obi_top5"] = None
-        metrics["obi_top5_error"] = "obi_top5_update_id_missing"
-        record_fetch_error(
-            category="spot_obi_top5",
-            symbol=symbol,
-            endpoint=endpoint,
-            message="obi_top5_update_id_missing",
-            error_code="obi_top5_update_id_missing",
-        )
-        return None, None
-    book_id = int(update_id)
-    source_ts: int | None = None
-    source_err: str | None = None
-    for _attempt in range(2):
-        source_ts, source_err = capture_depth_source_ts(symbol, book_id)
-        if source_ts is not None or source_err != "obi_top5_source_ts_gap":
-            break
-        _SLEEP(HTTP_BACKOFF_BASE_SEC)
-    if source_ts is None:
-        metrics["obi_top5"] = None
-        metrics["bid_depth_5_usd"] = None
-        metrics["ask_depth_5_usd"] = None
-        metrics["obi_top5_error"] = source_err or "obi_top5_source_ts_missing"
-        record_fetch_error(
-            category="spot_obi_top5",
-            symbol=symbol,
-            endpoint=spot_depth_ws_url(symbol),
-            message=str(metrics["obi_top5_error"]),
-            error_code=str(metrics["obi_top5_error"]),
-        )
-        return book_id, None
-    metrics["obi_top5_error"] = None
-    return book_id, source_ts
+def _clear_unpublished_top5(metrics: dict[str, Any], error: str) -> None:
+    metrics["obi_top5"] = None
+    metrics["bid_depth_5_usd"] = None
+    metrics["ask_depth_5_usd"] = None
+    metrics["obi_top5_error"] = error
 
 
 def fetch_binance_spot_microstructure_snapshot(symbol: str, *, now_ms: int | None = None) -> dict[str, Any] | None:
@@ -1344,22 +1388,41 @@ def fetch_binance_spot_microstructure_snapshot(symbol: str, *, now_ms: int | Non
     ret_1d, _, _close_1d = _kline_ret_and_tbr(sym, "1d", 3)
 
     depth_url = "https://api.binance.com/api/v3/depth"
-    depth = _http_get_json(depth_url, {"symbol": sym, "limit": 20})
+    # Stream first, then the REST snapshot. aggTrades stays after the sync so
+    # it cannot open a U gap in front of the snapshot.
+    depth_book, book_ts, sync_err = sync_depth_book(sym)
     agg = _http_get_json("https://api.binance.com/api/v3/aggTrades", {"symbol": sym, "limit": 250})
-    depth_book = depth if isinstance(depth, dict) and "bids" in depth else None
     ob_metrics = compute_spot_orderbook_and_aggtrades_metrics(
-        depth_book,
+        depth_book if isinstance(depth_book, dict) else None,
         agg if isinstance(agg, list) else None,
     )
-    if depth_book is None:
-        ob_metrics["obi_top5"] = None
-        ob_metrics["bid_depth_5_usd"] = None
-        ob_metrics["ask_depth_5_usd"] = None
-        ob_metrics["obi_top5_error"] = "depth_missing"
+    if not isinstance(depth_book, dict):
+        _clear_unpublished_top5(ob_metrics, "depth_missing")
         _fail_from_last("spot", sym, depth_url, "depth_missing")
         book_id, book_ts = None, None
+    elif ob_metrics.get("obi_top5_error"):
+        record_fetch_error(
+            category="spot_obi_top5",
+            symbol=sym,
+            endpoint=depth_url,
+            message=str(ob_metrics["obi_top5_error"]),
+            error_code=str(ob_metrics["obi_top5_error"]),
+        )
+        book_id, book_ts = None, None
+    elif book_ts is None:
+        _clear_unpublished_top5(ob_metrics, sync_err or "obi_top5_source_ts_missing")
+        record_fetch_error(
+            category="spot_obi_top5",
+            symbol=sym,
+            endpoint=spot_depth_ws_url(sym),
+            message=str(ob_metrics["obi_top5_error"]),
+            error_code=str(ob_metrics["obi_top5_error"]),
+        )
+        book_id = _finite(depth_book.get("lastUpdateId"))
+        book_id = int(book_id) if book_id is not None else None
     else:
-        book_id, book_ts = _publish_spot_top5(sym, depth_book, ob_metrics)
+        ob_metrics["obi_top5_error"] = None
+        book_id = int(depth_book["lastUpdateId"])
     if ret_5m is None and ob_metrics["spread_bps"] is None and book_ts is None:
         _fail_from_last("spot", sym, depth_url, "spot_snapshot_missing")
         return None
@@ -2026,7 +2089,9 @@ def run_collection(
             elapsed = max(0.0, _CLOCK() - started)
             pause = max(0.0, pause_base - elapsed)
             if last != 0:
-                pause = max(pause, min(HTTP_BACKOFF_CAP_SEC, HTTP_BACKOFF_BASE_SEC * (2 ** min(rounds, 4))))
+                # Added on top of the interval. max(interval, backoff) never
+                # grows while the interval is 300s and the backoff stays under 8s.
+                pause += min(HTTP_BACKOFF_CAP_SEC, HTTP_BACKOFF_BASE_SEC * (2 ** min(rounds, 4)))
             sleeper(pause)
     finally:
         lock.close()

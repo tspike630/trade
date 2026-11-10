@@ -332,6 +332,91 @@ class PublicFeedCollectorTest(unittest.TestCase):
         self.assertIsNone(feed._http_get_json("https://example.test/premium"))
         self.assertEqual(self.sleeps, [])
 
+    def test_loop_failure_backoff_grows_when_interval_is_300(self) -> None:
+        calls = {"n": 0}
+
+        def collect(db, **kwargs):
+            del db, kwargs
+            calls["n"] += 1
+            return {"errors": [{"fails_round": True, "message": "round failed"}]}
+
+        sleeps: list[float] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            code = feed.run_collection(
+                Path(tmp) / "public_derivatives.db",
+                symbols=["ETHUSDT"],
+                spot_symbols=[],
+                loop=True,
+                interval=300,
+                max_rounds=3,
+                collect=collect,
+                sleep=sleeps.append,
+            )
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(code, feed.PARTIAL_EXIT)
+        self.assertGreaterEqual(len(sleeps), 2)
+        self.assertGreater(sleeps[0], 300.0)
+        self.assertGreater(sleeps[1], sleeps[0])
+
+    def test_depth_gap_refetches_snapshot_before_publishing_top5(self) -> None:
+        """A later diff event must not cover U > lastUpdateId+1. Re-GET depth."""
+        stale = {
+            "lastUpdateId": 100,
+            "bids": [["10", "5"]] * 5,
+            "asks": [["11", "1"]] * 5,
+        }
+        fresh = {
+            "lastUpdateId": 419,
+            "bids": [["10", "1"]] * 5,
+            "asks": [["11", "5"]] * 5,
+        }
+        order: list[str] = []
+        depth_calls = {"n": 0}
+
+        def exchange(url, params, timeout, accept):
+            del params, timeout, accept
+            if "/api/v3/depth" in url:
+                order.append("depth")
+                depth_calls["n"] += 1
+                body = fresh if depth_calls["n"] >= 2 else stale
+                return (200, json.dumps(body).encode(), None, None, False)
+            if "aggTrades" in url:
+                order.append("aggTrades")
+                return (200, b"[]", None, None, False)
+            if "/api/v3/klines" in url:
+                return (200, json.dumps(_bars()).encode(), None, None, False)
+            return (200, b"{}", None, None, False)
+
+        def events(symbol, timeout):
+            del symbol, timeout
+            order.append("stream")
+            return [
+                {"U": 400, "u": 430, "E": 5555},
+                {"U": 101, "u": 200, "E": 9999},
+            ]
+
+        feed._HTTP_EXCHANGE = exchange
+        feed._DEPTH_EVENT_ITER = events
+        snap = feed.fetch_binance_spot_microstructure_snapshot("PEPEUSDT")
+        self.assertIsNotNone(snap)
+        assert snap is not None
+        expected = feed.compute_spot_orderbook_and_aggtrades_metrics(fresh, [])
+        self.assertEqual(snap["obi_top5_source_ts_ms"], 5555)
+        self.assertEqual(snap["book_update_id"], 419)
+        self.assertAlmostEqual(snap["obi_top5"], expected["obi_top5"])
+        self.assertNotEqual(snap["obi_top5"], feed.compute_spot_orderbook_and_aggtrades_metrics(stale, [])["obi_top5"])
+        self.assertGreaterEqual(depth_calls["n"], 2)
+        self.assertLess(order.index("stream"), order.index("depth"))
+        self.assertGreater(order.index("aggTrades"), order.index("depth"))
+        decision = feed.depth_sync_decision(
+            100,
+            [
+                {"U": 400, "u": 430, "E": 5555},
+                {"U": 101, "u": 200, "E": 9999},
+            ],
+        )
+        self.assertEqual(decision, ("gap", None))
+
     def test_loop_continues_after_a_round_crash(self) -> None:
         calls = {"n": 0}
 
