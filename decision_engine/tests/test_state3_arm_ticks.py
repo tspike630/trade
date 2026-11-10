@@ -241,6 +241,75 @@ class BothArmTickTests(unittest.TestCase):
         self.assertEqual(squeezed["quote_order_qty"], "24")
 
 
+class CollectorDoesNotSupplyState3FieldsTests(unittest.TestCase):
+    def test_spot_microstructure_imbalance_20_does_not_reject_the_tick(self) -> None:
+        """The collector stores a 20-level imbalance, not ``obi_top5`` or ``volume_z``.
+
+        A full fade tick must keep the buy. Renaming that column would invent
+        a top-5 book the table does not contain.
+        """
+        now_ms = int(time.time() * 1000)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            book = root / "public_derivatives.db"
+            conn = sqlite3.connect(book)
+            conn.execute(
+                """
+                CREATE TABLE binance_spot_microstructure (
+                    symbol TEXT NOT NULL,
+                    ts_ms INTEGER NOT NULL,
+                    ret_5m_pct REAL,
+                    ret_1h_pct REAL,
+                    ret_4h_pct REAL,
+                    ret_1d_pct REAL,
+                    taker_buy_ratio_5m REAL,
+                    taker_buy_ratio_1h REAL,
+                    spread_bps REAL,
+                    bid_depth_20_usd REAL,
+                    ask_depth_20_usd REAL,
+                    orderbook_imbalance_20 REAL,
+                    impact_10k_bps REAL,
+                    whale_net_buy_usd REAL,
+                    aggtrade_whale_buy_ratio REAL,
+                    PRIMARY KEY (symbol, ts_ms)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO binance_spot_microstructure (
+                    symbol, ts_ms, orderbook_imbalance_20, taker_buy_ratio_5m
+                ) VALUES ('FADEUSDT', ?, -0.90, 0.10)
+                """,
+                (now_ms,),
+            )
+            conn.commit()
+            conn.close()
+            fade_db = root / "fade.db"
+            _seed(fade_db, _zone_row())
+            old_db = os.environ.get("PUBLIC_DERIVATIVES_DB_PATH")
+            os.environ["PUBLIC_DERIVATIVES_DB_PATH"] = str(book)
+            try:
+                payload = _tick(fade_db, PURPOSE_LIVE_BNB_BOLL_FADE)
+            finally:
+                if old_db is None:
+                    os.environ.pop("PUBLIC_DERIVATIVES_DB_PATH", None)
+                else:
+                    os.environ["PUBLIC_DERIVATIVES_DB_PATH"] = old_db
+            self.assertEqual(payload["emitted"], 1)
+            raw = json.loads(_written(fade_db, PURPOSE_LIVE_BNB_BOLL_FADE)[0]["raw_json"])
+            extras = raw.get("extras") or {}
+            self.assertNotIn("obi_top5", extras)
+            self.assertNotIn("spot_obi_top5", extras)
+            self.assertNotIn("volume_z", extras)
+            self.assertNotIn("vol_z_1h", extras)
+            self.assertNotIn("orderbook_imbalance_20", extras)
+            self.assertNotEqual(extras.get("market_regime"), "cross_asset_momentum_pullback")
+            reason = str(raw.get("reason") or "")
+            self.assertNotIn("regime3_thin_bid_book_trap", reason)
+            self.assertNotIn("regime3_climax_volume_distribution_trap", reason)
+
+
 class StateRoutingTests(unittest.TestCase):
     def test_state3_doc_thresholds_and_missing_fields(self) -> None:
         thin = evaluate_five_state_regime(_bull(obi_top5=-0.25, taker_buy_ratio=0.80))
