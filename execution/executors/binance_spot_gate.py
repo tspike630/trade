@@ -82,7 +82,7 @@ SINGLE_LEG_ORDER_TYPES = frozenset(
     }
 )
 _OCO_WORKING = frozenset({"EXECUTING", "EXEC_STARTED"})
-_TERMINAL_POSITION = frozenset({"closed", "closed_dust", "oco_filled"})
+_TERMINAL_POSITION = frozenset({"closed", "closed_dust", "oco_filled", "closed_canceled"})
 _ABOVE_LEG = frozenset({"LIMIT_MAKER", "TAKE_PROFIT_LIMIT"})
 _BELOW_LEG = frozenset({"STOP_LOSS_LIMIT"})
 
@@ -423,9 +423,28 @@ def funding_block(free: object, minimum: object, planned: object = None) -> str 
 
 
 def row_quote_usdt(row: object) -> Decimal | None:
-    """Quote already taken by one spot row. Missing price or qty is unknown."""
+    """Quote already taken by one spot row. Missing price or qty is unknown.
+
+    A resting maker keeps the unfilled base reserved at its limit price and
+    the filled base at the fill average. A terminal row is not reserved here;
+    the caller skips those statuses.
+    """
     if not isinstance(row, dict):
         return None
+    if str(row.get("status") or "") in {"maker_resting", "maker_cancel_unknown"}:
+        order_qty = _decimal_text(row.get("entry_order_qty"))
+        limit_px = _decimal_text(row.get("entry_limit_price"))
+        if order_qty is None or limit_px is None:
+            return None
+        filled = _decimal_text(row.get("quantity"))
+        outstanding = Decimal(order_qty) - (Decimal(filled) if filled is not None else Decimal(0))
+        if outstanding < 0:
+            outstanding = Decimal(0)
+        quote = outstanding * Decimal(limit_px)
+        entry = _decimal_text(row.get("entry_price"))
+        if filled is not None and entry is not None:
+            quote += Decimal(filled) * Decimal(entry)
+        return quote
     qty = _decimal_text(row.get("quantity"))
     price = _decimal_text(row.get("entry_price"))
     if qty is None or price is None:
@@ -669,6 +688,10 @@ def buy_exposure_block(
             continue
         if status == "qty_unconfirmed":
             return "parent_fill_incomplete"
+        if status in {"maker_resting", "maker_cancel_unknown"}:
+            return "maker_resting_blocks_buy"
+        if status == "time_stop_unknown":
+            return "time_stop_unconfirmed_blocks_buy"
         if status in {"oco_failed", "oco_unknown"}:
             return "oco_failed_blocks_buy"
         if status == "open":

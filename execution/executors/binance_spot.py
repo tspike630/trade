@@ -40,6 +40,7 @@ import os
 import re
 import time
 import urllib.error
+from datetime import datetime, timezone
 import urllib.parse
 import urllib.request
 from decimal import ROUND_DOWN, Decimal
@@ -386,6 +387,14 @@ def _positive_decimal(raw: object) -> str | None:
     return text
 
 
+def _maker_entry_lifecycle_ready(client: Any) -> bool:
+    """A resting buy can be submitted only when the fill can be canceled and protected."""
+    return all(
+        callable(getattr(client, name, None))
+        for name in ("get_order", "cancel_order", "new_oco")
+    )
+
+
 def _parse_order_type(raw: object) -> _OrderType | None:
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return "MARKET"
@@ -397,6 +406,21 @@ def _parse_order_type(raw: object) -> _OrderType | None:
     if text == "LIMIT_MAKER":
         return "LIMIT_MAKER"
     return None
+
+
+def _row_epoch_ms(row: dict[str, Any]) -> int | None:
+    """Entry clock in milliseconds. Ledger ``created_at`` is the restart fallback."""
+    direct = _finite_number(row.get("created_at_ms"))
+    if direct is not None and direct > 0:
+        return int(direct)
+    text = row.get("created_at")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        parsed = datetime.strptime(text.strip(), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return int(parsed.timestamp() * 1000)
 
 
 def _finite_number(raw: object) -> float | None:
@@ -1714,56 +1738,76 @@ class BinanceSpotAdapter:
                 exchange_error=exchange_error,
             )
         signed = sign_query(pairs, secret)
+        existing = self._lookup_exit_order(client, symbol, client_id, key, secret)
+        if existing is not None:
+            return self._settle_reduce_sell(
+                row,
+                save,
+                existing,
+                client_id,
+                reason="oco_failed_auto_flatten",
+                protection=PROTECTION_AUTO_FLATTEN,
+                error_prefix=f"oco_failed_auto_flattened:{oco_error}",
+                exchange_error=exchange_error,
+            )
+        if str(row.get("last_error") or "").startswith("flatten_submit_unknown"):
+            return self._oco_failed(
+                row,
+                save,
+                f"{oco_error}|flatten_submit_unknown",
+                exchange_error=exchange_error,
+            )
         try:
             placed = client.new_order(signed, api_key=key)
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, AssertionError):
                 raise
+            looked = self._exit_lookup_state(client, symbol, client_id, key, secret)
             recovered = self._lookup_exit_order(client, symbol, client_id, key, secret)
-            if recovered is None:
-                sell_err = _public_error(exc, key, secret)
+            sell_err = _public_error(exc, key, secret)
+            if recovered is not None:
+                placed = recovered
+            elif callable(getattr(client, "get_order", None)) and looked == "unknown":
+                save(
+                    {
+                        "status": "oco_failed",
+                        "protection": PROTECTION_PENDING,
+                        "exit_client_order_id": client_id,
+                        "last_error": "flatten_submit_unknown",
+                    }
+                )
+                return self._coverage(
+                    row,
+                    book="oco_failed",
+                    submitted=False,
+                    error=f"{oco_error}|flatten_submit_unknown:{sell_err}",
+                    protection=PROTECTION_PENDING,
+                    exchange_error=exchange_error,
+                )
+            else:
                 return self._oco_failed(
                     row,
                     save,
                     f"{oco_error}|flatten_failed:{sell_err}",
                     exchange_error=exchange_error,
                 )
-            placed = recovered
-        order_id = _exit_order_accepted(placed) if isinstance(placed, dict) else None
-        if order_id is None:
+        if not isinstance(placed, dict):
             return self._oco_failed(
                 row,
                 save,
                 f"{oco_error}|flatten_rejected",
                 exchange_error=exchange_error,
             )
-        flat_err = f"oco_failed_auto_flattened:{oco_error}"
-        save(
-            {
-                "status": "closed",
-                "protection": PROTECTION_AUTO_FLATTEN,
-                "quantity": sized,
-                "exit_order_id": order_id,
-                "exit_reason": "oco_failed_auto_flatten",
-                "exit_client_order_id": client_id,
-                "last_error": flat_err,
-            }
-        )
-        out = self._coverage(
+        return self._settle_reduce_sell(
             row,
-            book="closed",
-            submitted=True,
-            ok=False,
-            error=flat_err,
-            protection=PROTECTION_AUTO_FLATTEN,
+            save,
+            placed,
+            client_id,
             reason="oco_failed_auto_flatten",
-            order=dict(pairs),
-            quantity=sized,
+            protection=PROTECTION_AUTO_FLATTEN,
+            error_prefix=f"oco_failed_auto_flattened:{oco_error}",
             exchange_error=exchange_error,
         )
-        out["exchange_order_id"] = order_id
-        out["exit_client_order_id"] = client_id
-        return out
 
     def _buy_with_native_oco(
         self,
@@ -2022,6 +2066,91 @@ class BinanceSpotAdapter:
             exchange_error=exch_err,
             consumer_allowed=False,
             **common,
+        )
+
+    def _resting_maker_ack(
+        self,
+        sig: dict[str, Any],
+        *,
+        plan: dict[str, Any] | None,
+        gates: dict[str, Any],
+        intent: dict[str, Any] | None,
+        pairs: list[tuple[str, str]],
+        order_id: str,
+        placed: dict[str, Any],
+        symbol: str,
+    ) -> dict[str, Any]:
+        """Record a live post-only entry that is not a protected buy yet.
+
+        OCO waits until the entry is terminal. Until then the original order
+        quantity stays reserved and the row blocks another buy. A zero-fill
+        cancel is ``closed_canceled`` and does not keep the lock.
+        """
+        order = dict(pairs)
+        filled = sellable_base_qty(placed, symbol) or filled_base_qty(placed)
+        ack = str(placed.get("status") or "").upper()
+        terminal = ack in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"}
+        if plan is None:
+            return _result(
+                ok=False,
+                dry_run=False,
+                executed=0,
+                submitted=True,
+                error="maker_entry_missing_exit_plan",
+                symbol=symbol,
+                order=order,
+                exchange_order_id=order_id,
+                gates=gates,
+                intent=intent,
+                consumer_allowed=False,
+            )
+        if terminal and not filled:
+            return _result(
+                ok=False,
+                dry_run=False,
+                executed=0,
+                submitted=True,
+                error="maker_entry_not_filled",
+                symbol=symbol,
+                order=order,
+                exchange_order_id=order_id,
+                gates=gates,
+                intent=intent,
+                exit_plan=plan,
+                consumer_allowed=False,
+            )
+        avg = fill_average_price(placed)
+        arm: dict[str, Any] = {
+            "decision_log_id": int(str(sig.get("decision_log_id")).strip()),
+            "symbol": symbol,
+            "quantity": filled,
+            "entry_order_qty": order.get("quantity"),
+            "entry_limit_price": order.get("price"),
+            "entry_price": avg or order.get("price"),
+            "entry_order_id": order_id,
+            "stop_price": plan["stop_price"],
+            "take_profit_price": plan["take_profit_price"],
+            "status": "maker_resting",
+            "protection": "maker_resting",
+            "purpose": str(sig.get("purpose") or "").strip() or PURPOSE_LIVE_BNB_BOLL_FADE,
+            "created_at_ms": str(int(self.clock_ms())),
+        }
+        return _result(
+            ok=False,
+            dry_run=False,
+            executed=0,
+            submitted=True,
+            error="maker_entry_resting",
+            symbol=symbol,
+            order=order,
+            exchange_order_id=order_id,
+            gates=gates,
+            intent=intent,
+            exit_plan=plan,
+            filled_qty=filled,
+            sellable_qty=filled,
+            arm_position=arm,
+            consumer_allowed=False,
         )
 
     def execute(self, sig: dict[str, Any]) -> dict[str, Any]:
@@ -2661,6 +2790,24 @@ class BinanceSpotAdapter:
                                 )
                             )
 
+        posted = {key_name: value for key_name, value in pairs}
+        if posted.get("side") == "BUY" and posted.get("type") == "LIMIT_MAKER":
+            if not _maker_entry_lifecycle_ready(client):
+                return self._finish(
+                    _result(
+                        ok=False,
+                        dry_run=False,
+                        executed=0,
+                        submitted=False,
+                        error="maker_lifecycle_unsupported",
+                        symbol=symbol,
+                        order=None,
+                        exchange_order_id=None,
+                        gates=gates,
+                        exit_plan=plan,
+                        consumer_allowed=False,
+                    )
+                )
         signed = sign_query(pairs, secret)
         try:
             placed = client.new_order(signed, api_key=key)
@@ -2723,6 +2870,20 @@ class BinanceSpotAdapter:
             )
         filled = filled_base_qty(placed)
         sellable = sellable_base_qty(placed, symbol) or filled
+        ack_status = str(placed.get("status") or "").upper()
+        if side_now == "BUY" and order_type == "LIMIT_MAKER" and ack_status != "FILLED":
+            return self._finish(
+                self._resting_maker_ack(
+                    sig,
+                    plan=plan if isinstance(plan, dict) else None,
+                    gates=gates,
+                    intent=intent,
+                    pairs=pairs,
+                    order_id=str(order_id),
+                    placed=placed,
+                    symbol=symbol,
+                )
+            )
         if side_now == "BUY":
             return self._finish(
                 self._buy_with_native_oco(
@@ -3064,9 +3225,11 @@ class BinanceSpotAdapter:
                 submitted=False,
             )
         status = str(row.get("status") or "")
+        if status in {"maker_resting", "maker_cancel_unknown"} or row.get("reconcile_resting_entry") is True:
+            return self.reconcile_resting_entry(row, mark=mark, persist=persist)
+        if status == "time_stop_unknown":
+            return self._resume_time_stop(row, mark=mark, save=save)
         if status == "qty_unconfirmed":
-            if row.get("reconcile_resting_entry") is True:
-                return self.reconcile_resting_entry(row, mark=mark, persist=persist)
             return self._coverage(
                 row,
                 book="unchanged",
@@ -3090,7 +3253,7 @@ class BinanceSpotAdapter:
         }:
             recon = self._reconcile_oco(row)
             state = str(recon.get("state") or "")
-            if state == "working":
+            if state in {"working", "partial_working"}:
                 if native_oco_verified(_recon_payload(recon))[0] is None:
                     save(
                         {
@@ -3106,10 +3269,20 @@ class BinanceSpotAdapter:
                         error="native_oco_unverified",
                         protection=PROTECTION_PENDING,
                     )
+                if self._account_oco_execution(row, recon, save) == "closed":
+                    return self._coverage(
+                        row,
+                        book="oco_filled",
+                        submitted=False,
+                        ok=True,
+                        protection=PROTECTION_EXCHANGE,
+                        error=None,
+                        reason=recon.get("exit_reason"),
+                    )
                 save(self._oco_working_fields(row, recon))
                 hold_limit_sec = self._effective_max_hold_sec(row)
                 if hold_limit_sec > 0:
-                    created_ms = _finite_number(row.get("created_at_ms"))
+                    created_ms = _row_epoch_ms(row)
                     now_ms = int(self.clock_ms())
                     if created_ms is not None and (now_ms - int(created_ms)) >= hold_limit_sec * 1000:
                         ts_out = self._time_stop_working_oco(row, mark=mark, save=save)
@@ -3206,7 +3379,17 @@ class BinanceSpotAdapter:
                     )
                 retry_place = True
             if state in {"unfilled", "partial"}:
-                remainder = recon.get("remainder_qty") or row.get("quantity")
+                if self._account_oco_execution(row, recon, save) == "closed":
+                    return self._coverage(
+                        row,
+                        book="oco_filled",
+                        submitted=False,
+                        ok=True,
+                        protection=PROTECTION_EXCHANGE,
+                        error=None,
+                        reason=recon.get("exit_reason"),
+                    )
+                remainder = row.get("quantity")
                 detail = (
                     "oco_partial_remainder" if state == "partial" else "oco_terminal_unfilled"
                 )
@@ -3290,6 +3473,151 @@ class BinanceSpotAdapter:
             protection=PROTECTION_PENDING,
         )
 
+    def _adopt_terminal_entry(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        payload: dict[str, Any],
+        mark: object,
+        persist: Callable[[dict[str, Any]], dict[str, Any] | None] | None,
+        filled_qty: str | None,
+        avg_px: str | None,
+    ) -> dict[str, Any]:
+        """OCO only the base the entry order actually filled. Zero is terminal."""
+        status = str(payload.get("status") or "").upper()
+        if status == "FILLED" or (
+            status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"}
+            and filled_qty
+        ):
+            if not filled_qty:
+                save(
+                    {
+                        "status": "maker_cancel_unknown",
+                        "last_error": "maker_fill_unconfirmed",
+                    }
+                )
+                return self._coverage(
+                    row,
+                    book="maker_cancel_unknown",
+                    submitted=False,
+                    error="maker_fill_unconfirmed",
+                    protection="maker_resting",
+                )
+            upd: dict[str, Any] = {"status": "open", "quantity": filled_qty}
+            if avg_px:
+                upd["entry_price"] = avg_px
+            save(upd)
+            ref_mark = mark if _to_decimal(mark) is not None else (avg_px or row.get("entry_price"))
+            return self.maintain_held_position(row, ref_mark, persist=persist)
+        save(
+            {
+                "status": "closed_canceled",
+                "exit_reason": "entry_ttl_expired",
+                "last_error": "entry_ttl_expired",
+            }
+        )
+        return self._coverage(
+            row,
+            book="closed_canceled",
+            submitted=True,
+            ok=True,
+            error=None,
+            reason="entry_ttl_expired",
+        )
+
+    def _cancel_resting_entry(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        lookup: Any,
+        symbol: str,
+        entry_order_id: str,
+        key: str,
+        secret: str,
+        mark: object,
+        persist: Callable[[dict[str, Any]], dict[str, Any] | None] | None,
+        clock_now: int,
+    ) -> dict[str, Any]:
+        """Cancel the open remainder, then read the fill once more before any OCO."""
+        client = self._trade_client()
+        cancel_fn = getattr(client, "cancel_order", None) if client is not None else None
+        save(
+            {
+                "status": "maker_cancel_unknown",
+                "last_error": "maker_cancel_pending",
+            }
+        )
+        if not callable(cancel_fn):
+            save({"last_error": "maker_cancel_unsupported"})
+            return self._coverage(
+                row,
+                book="maker_cancel_unknown",
+                submitted=False,
+                error="maker_cancel_unsupported",
+                protection="maker_resting",
+            )
+        pairs = [
+            ("symbol", symbol),
+            ("orderId", entry_order_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(clock_now)),
+        ]
+        try:
+            cancel_fn(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            save({"last_error": "maker_cancel_unknown"})
+            return self._coverage(
+                row,
+                book="maker_cancel_unknown",
+                submitted=False,
+                error="maker_cancel_unknown",
+                protection="maker_resting",
+            )
+        try:
+            fresh = lookup(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            save({"last_error": "maker_cancel_unknown"})
+            return self._coverage(
+                row,
+                book="maker_cancel_unknown",
+                submitted=False,
+                error="maker_cancel_unknown",
+                protection="maker_resting",
+            )
+        if not isinstance(fresh, dict):
+            save({"last_error": "maker_cancel_unknown"})
+            return self._coverage(
+                row,
+                book="maker_cancel_unknown",
+                submitted=False,
+                error="maker_cancel_unknown",
+                protection="maker_resting",
+            )
+        fresh_status = str(fresh.get("status") or "").upper()
+        if fresh_status in {"NEW", "PARTIALLY_FILLED", "PENDING_NEW"}:
+            save({"last_error": "maker_cancel_unknown"})
+            return self._coverage(
+                row,
+                book="maker_cancel_unknown",
+                submitted=False,
+                error="maker_cancel_unknown",
+                protection="maker_resting",
+            )
+        filled_qty = sellable_base_qty(fresh, symbol) or filled_base_qty(fresh)
+        return self._adopt_terminal_entry(
+            row,
+            save,
+            fresh,
+            mark,
+            persist,
+            filled_qty,
+            fill_average_price(fresh),
+        )
+
     def reconcile_resting_entry(
         self,
         position: dict[str, Any],
@@ -3301,10 +3629,11 @@ class BinanceSpotAdapter:
     ) -> dict[str, Any]:
         """Reconcile a resting ``LIMIT`` / ``LIMIT_MAKER`` entry order.
 
-        - If ``FILLED`` on Binance: adopts fill quantity and price, then places native OCO.
-        - If expired past ``ttl_sec`` (default 180s): cancels the order via ``DELETE /api/v3/order``.
-          If ``executedQty == 0``, marks ``closed_canceled``; if partially filled, arms native OCO
-          for the filled portion.
+        A partial fill cancels the open remainder on that tick. The confirming
+        read, not the cancel body, is the sellable quantity. Native OCO covers
+        only that quantity. A cancel or read that does not finish stays
+        ``maker_cancel_unknown``: the quote stays reserved and no OCO is sent.
+        A zero-fill order is canceled only after ``ttl_sec`` (default 180s).
         """
         row = dict(position)
 
@@ -3352,64 +3681,40 @@ class BinanceSpotAdapter:
         ord_status = str(order_payload.get("status") or "").upper()
         filled_qty = sellable_base_qty(order_payload, symbol) or filled_base_qty(order_payload)
         avg_px = fill_average_price(order_payload)
-
-        if ord_status == "FILLED" and filled_qty:
-            upd: dict[str, Any] = {
-                "status": "open",
-                "quantity": filled_qty,
-            }
-            if avg_px:
-                upd["entry_price"] = avg_px
-            save(upd)
-            ref_mark = mark if _to_decimal(mark) is not None else (avg_px or row.get("entry_price"))
-            return self.maintain_held_position(row, ref_mark, persist=persist)
-
-        created_ms = _finite_number(row.get("created_at_ms", order_payload.get("time")))
+        created_ms = _row_epoch_ms(row)
+        if created_ms is None:
+            created_ms = _finite_number(order_payload.get("time"))
+            created_ms = None if created_ms is None else int(created_ms)
         limit_ttl_sec = self._entry_ttl_sec() if ttl_sec is None else max(5, int(ttl_sec))
         expired = created_ms is not None and (clock_now - int(created_ms)) >= limit_ttl_sec * 1000
 
-        if ord_status in {"NEW", "PARTIALLY_FILLED"} and expired:
-            cancel_fn = getattr(client, "cancel_order", None)
-            if callable(cancel_fn):
-                c_pairs = [
-                    ("symbol", symbol),
-                    ("orderId", entry_order_id),
-                    ("recvWindow", RECV_WINDOW_MS),
-                    ("timestamp", str(clock_now)),
-                ]
-                try:
-                    canceled = cancel_fn(sign_query(c_pairs, secret), api_key=key)
-                    if isinstance(canceled, dict):
-                        filled_qty = sellable_base_qty(canceled, symbol) or filled_base_qty(canceled) or filled_qty
-                        avg_px = fill_average_price(canceled) or avg_px
-                except Exception as exc:  # noqa: BLE001
-                    if isinstance(exc, AssertionError):
-                        raise
-                    return self._coverage(row, book="unchanged", submitted=False, error=_public_error(exc, key, secret))
-            if filled_qty:
-                upd_part: dict[str, Any] = {
-                    "status": "open",
-                    "quantity": filled_qty,
-                }
-                if avg_px:
-                    upd_part["entry_price"] = avg_px
-                save(upd_part)
-                ref_mark = mark if _to_decimal(mark) is not None else (avg_px or row.get("entry_price"))
-                return self.maintain_held_position(row, ref_mark, persist=persist)
-            save(
-                {
-                    "status": "closed_canceled",
-                    "exit_reason": "entry_ttl_expired",
-                    "last_error": "entry_ttl_expired",
-                }
-            )
-            return self._coverage(
+        terminal = ord_status in {
+            "FILLED",
+            "CANCELED",
+            "CANCELLED",
+            "EXPIRED",
+            "REJECTED",
+            "EXPIRED_IN_MATCH",
+        }
+        # A partial fill is inventory. Cancel the resting remainder immediately
+        # and protect only the quantity the next read still shows. Do not wait
+        # out the TTL with an unprotected fill.
+        if ord_status == "PARTIALLY_FILLED" or (ord_status in {"NEW", "PARTIALLY_FILLED"} and expired):
+            return self._cancel_resting_entry(
                 row,
-                book="closed_canceled",
-                submitted=True,
-                ok=True,
-                error=None,
-                reason="entry_ttl_expired",
+                save,
+                lookup,
+                symbol,
+                entry_order_id,
+                key,
+                secret,
+                mark,
+                persist,
+                clock_now,
+            )
+        if terminal:
+            return self._adopt_terminal_entry(
+                row, save, order_payload, mark, persist, filled_qty, avg_px
             )
 
         return self._coverage(
@@ -3493,18 +3798,123 @@ class BinanceSpotAdapter:
         mark: object,
         save: Callable[[dict[str, Any]], None],
     ) -> dict[str, Any] | None:
-        """Cancel a time-expired working OCO and exit via reduce-only market sell."""
-        canceled, cancel_err = self._cancel_working_oco(row)
-        if cancel_err or canceled is None:
+        """Hand a held row to the idempotent time-stop seller.
+
+        The unknown state is stored before the market POST. A later tick must
+        not place another OCO while that sell is unresolved.
+        """
+        client_id = row.get("exit_client_order_id") or exit_client_order_id(
+            row.get("decision_log_id")
+        )
+        if client_id is None:
             return None
-        classified = classify_oco(canceled, held_qty=str(row.get("quantity") or ""))
-        if classified.get("state") == "filled":
+        save(
+            {
+                "status": "time_stop_unknown",
+                "protection": PROTECTION_TIME_STOP,
+                "exit_reason": "time_stop_max_hold",
+                "exit_client_order_id": client_id,
+                "last_error": "time_stop_pending",
+            }
+        )
+        return self._resume_time_stop(row, mark=mark, save=save)
+
+    def _resume_time_stop(
+        self,
+        row: dict[str, Any],
+        *,
+        mark: object,
+        save: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        """Finish one max-hold sell. Never opens a new OCO from this state."""
+        client_id = str(row.get("exit_client_order_id") or "")
+        symbol = str(row.get("symbol") or "")
+        key, secret = self._credentials()
+        client = self._trade_client()
+        if not client_id or not is_spot_usdt_symbol(symbol) or not key or not secret or client is None:
+            return self._coverage(
+                row,
+                book="time_stop_unknown",
+                submitted=False,
+                error="time_stop_submit_unknown",
+                protection=PROTECTION_TIME_STOP,
+                reason="time_stop_max_hold",
+            )
+        first_attempt = str(row.get("last_error") or "") == "time_stop_pending"
+        found = self._lookup_exit_order(client, symbol, client_id, key, secret)
+        if found is not None:
+            return self._close_time_stop(row, save, found, client_id, None)
+        looked = self._exit_lookup_state(client, symbol, client_id, key, secret)
+        if looked == "unknown" and not first_attempt:
+            save({"last_error": "time_stop_submit_unknown"})
+            return self._coverage(
+                row,
+                book="time_stop_unknown",
+                submitted=False,
+                error="time_stop_submit_unknown",
+                protection=PROTECTION_TIME_STOP,
+                reason="time_stop_max_hold",
+            )
+        recon = self._reconcile_oco(row)
+        state = str(recon.get("state") or "")
+        if state in {"working", "partial_working"}:
+            canceled, cancel_err = self._cancel_working_oco(row)
+            if cancel_err or canceled is None:
+                save({"last_error": cancel_err or "time_stop_cancel_unconfirmed"})
+                return self._coverage(
+                    row,
+                    book="time_stop_unknown",
+                    submitted=False,
+                    error=cancel_err or "time_stop_cancel_unconfirmed",
+                    protection=PROTECTION_TIME_STOP,
+                    reason="time_stop_max_hold",
+                )
+            classified = classify_oco(canceled, held_qty=str(row.get("quantity") or ""))
+            if self._account_oco_execution(row, classified, save) == "closed" or classified.get("state") == "filled":
+                save(
+                    {
+                        "status": "oco_filled",
+                        "protection": PROTECTION_EXCHANGE,
+                        "exit_reason": classified.get("exit_reason"),
+                        "oco_list_status": classified.get("list_status"),
+                        "last_error": None,
+                    }
+                )
+                return self._coverage(
+                    row,
+                    book="oco_filled",
+                    submitted=False,
+                    ok=True,
+                    protection=PROTECTION_EXCHANGE,
+                    error=None,
+                    reason=classified.get("exit_reason"),
+                )
+            if classified.get("state") not in {"unfilled", "partial", "absent"}:
+                save({"last_error": "time_stop_cancel_unconfirmed"})
+                return self._coverage(
+                    row,
+                    book="time_stop_unknown",
+                    submitted=False,
+                    error="time_stop_cancel_unconfirmed",
+                    protection=PROTECTION_TIME_STOP,
+                    reason="time_stop_max_hold",
+                )
+        elif state in {"requery_failed", "unknown", ""}:
+            save({"last_error": str(recon.get("error") or "time_stop_list_unknown")})
+            return self._coverage(
+                row,
+                book="time_stop_unknown",
+                submitted=False,
+                error=str(recon.get("error") or "time_stop_list_unknown"),
+                protection=PROTECTION_TIME_STOP,
+                reason="time_stop_max_hold",
+            )
+        elif state == "filled":
             save(
                 {
                     "status": "oco_filled",
                     "protection": PROTECTION_EXCHANGE,
-                    "exit_reason": classified.get("exit_reason"),
-                    "oco_list_status": classified.get("list_status"),
+                    "exit_reason": recon.get("exit_reason"),
                     "last_error": None,
                 }
             )
@@ -3515,23 +3925,55 @@ class BinanceSpotAdapter:
                 ok=True,
                 protection=PROTECTION_EXCHANGE,
                 error=None,
-                reason=classified.get("exit_reason"),
+                reason=recon.get("exit_reason"),
             )
+        return self._submit_time_stop_sell(row, mark, save, client_id)
+
+    def _submit_time_stop_sell(
+        self,
+        row: dict[str, Any],
+        mark: object,
+        save: Callable[[dict[str, Any]], None],
+        client_id: str,
+    ) -> dict[str, Any]:
         gates = self._gates()
         symbol = str(row.get("symbol") or "")
-        qty = _positive_decimal(classified.get("remainder_qty") or row.get("quantity"))
-        client_id = exit_client_order_id(row.get("decision_log_id"))
+        qty = _positive_decimal(row.get("quantity"))
         key, secret = self._credentials()
         client = self._trade_client()
-        if not is_spot_usdt_symbol(symbol) or qty is None or client_id is None or not key or not secret or client is None:
-            return None
+        if qty is None or client is None or not key or not secret:
+            save({"last_error": "time_stop_submit_unknown"})
+            return self._coverage(
+                row,
+                book="time_stop_unknown",
+                submitted=False,
+                error="time_stop_submit_unknown",
+                protection=PROTECTION_TIME_STOP,
+                reason="time_stop_max_hold",
+            )
         info, info_err = self._load_symbol_info(row, gates)
         if info_err or not isinstance(info, dict):
-            return None
+            save({"last_error": info_err or "time_stop_submit_unknown"})
+            return self._coverage(
+                row,
+                book="time_stop_unknown",
+                submitted=False,
+                error=info_err or "time_stop_submit_unknown",
+                protection=PROTECTION_TIME_STOP,
+                reason="time_stop_max_hold",
+            )
         ref_mark = mark if _to_decimal(mark) is not None else row.get("entry_price")
         sized, size_err = size_exit_quantity(info, symbol, qty, ref_mark)
         if size_err or sized is None:
-            return None
+            save({"last_error": size_err or "time_stop_submit_unknown"})
+            return self._coverage(
+                row,
+                book="time_stop_unknown",
+                submitted=False,
+                error=size_err or "time_stop_submit_unknown",
+                protection=PROTECTION_TIME_STOP,
+                reason="time_stop_max_hold",
+            )
         pairs, qty_err = _order_pairs(
             symbol=symbol,
             side="SELL",
@@ -3541,42 +3983,232 @@ class BinanceSpotAdapter:
             timestamp_ms=int(self.clock_ms()),
         )
         if qty_err or pairs is None:
-            return None
+            save({"last_error": qty_err or "time_stop_submit_unknown"})
+            return self._coverage(
+                row,
+                book="time_stop_unknown",
+                submitted=False,
+                error=qty_err or "time_stop_submit_unknown",
+                protection=PROTECTION_TIME_STOP,
+                reason="time_stop_max_hold",
+            )
         try:
             placed = client.new_order(sign_query(pairs, secret), api_key=key)
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, AssertionError):
                 raise
-            return None
-        order_id = _exit_order_accepted(placed) if isinstance(placed, dict) else None
-        if order_id is None:
-            return None
+            found = self._lookup_exit_order(client, symbol, client_id, key, secret)
+            if found is None:
+                save({"last_error": "time_stop_submit_unknown"})
+                return self._coverage(
+                    row,
+                    book="time_stop_unknown",
+                    submitted=False,
+                    error="time_stop_submit_unknown",
+                    protection=PROTECTION_TIME_STOP,
+                    reason="time_stop_max_hold",
+                    order=dict(pairs),
+                    quantity=sized,
+                )
+            placed = found
+        return self._settle_reduce_sell(
+            row,
+            save,
+            placed if isinstance(placed, dict) else {},
+            client_id,
+            reason="time_stop_max_hold",
+            protection=PROTECTION_TIME_STOP,
+            error_prefix="time_stop_max_hold",
+            order=dict(pairs),
+        )
+
+    def _account_oco_execution(
+        self,
+        row: dict[str, Any],
+        recon: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+    ) -> str:
+        """Persist the unsold remainder of one OCO. A repeated read subtracts nothing new."""
+        executed = _to_decimal(recon.get("executed_qty")) or Decimal("0")
+        held = _to_decimal(row.get("quantity")) or Decimal("0")
+        accounted = _to_decimal(row.get("exit_filled_qty")) or Decimal("0")
+        if executed < accounted:
+            accounted = Decimal("0")
+        delta = executed - accounted
+        if delta <= 0:
+            if executed != (_to_decimal(row.get("exit_filled_qty")) or Decimal("0")):
+                save({"exit_filled_qty": _decimal_text(executed) if executed > 0 else "0"})
+            return "open"
+        remainder = held - delta
+        if remainder <= Decimal("0.00000001"):
+            save(
+                {
+                    "status": "oco_filled",
+                    "protection": PROTECTION_EXCHANGE,
+                    "exit_reason": recon.get("exit_reason"),
+                    "exit_filled_qty": _decimal_text(executed),
+                    "oco_list_status": recon.get("list_status"),
+                    "last_error": None,
+                }
+            )
+            return "closed"
         save(
             {
-                "status": "closed",
-                "protection": PROTECTION_TIME_STOP,
-                "quantity": sized,
-                "exit_order_id": order_id,
-                "exit_reason": "time_stop_max_hold",
-                "exit_client_order_id": client_id,
-                "oco_list_status": "ALL_DONE",
-                "last_error": None,
+                "quantity": _decimal_text(remainder),
+                "exit_filled_qty": _decimal_text(executed),
             }
         )
-        out = self._coverage(
-            row,
-            book="closed",
-            submitted=True,
-            ok=True,
-            error=None,
-            protection=PROTECTION_TIME_STOP,
-            reason="time_stop_max_hold",
-            order=dict(pairs),
-            quantity=sized,
+        return "open"
+
+    def _settle_reduce_sell(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        placed: dict[str, Any],
+        client_id: str,
+        *,
+        reason: str,
+        protection: str,
+        error_prefix: str,
+        order: dict[str, str] | None = None,
+        exchange_error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Close only a sell that filled the whole remaining qty. A zero or partial fill stays open."""
+        order_id = _exit_order_accepted(placed)
+        if order_id is None:
+            book = "time_stop_unknown" if reason == "time_stop_max_hold" else "oco_failed"
+            save({"last_error": f"{error_prefix}_unconfirmed", "exit_client_order_id": client_id})
+            return self._coverage(
+                row,
+                book=book,
+                submitted=False,
+                error=f"{error_prefix}_unconfirmed",
+                protection=protection,
+                reason=reason,
+                order=order,
+                exchange_error=exchange_error,
+            )
+        held = _to_decimal(row.get("quantity")) or Decimal("0")
+        executed = _to_decimal(placed.get("executedQty")) or Decimal("0")
+        orig = _to_decimal(placed.get("origQty") or placed.get("origQuantity"))
+        prior_id = str(row.get("exit_order_id") or "")
+        accounted = (
+            _to_decimal(row.get("exit_filled_qty")) or Decimal("0")
+            if prior_id == str(order_id)
+            else Decimal("0")
         )
-        out["exchange_order_id"] = order_id
-        out["exit_client_order_id"] = client_id
-        return out
+        if orig is not None:
+            remainder = orig - executed
+        else:
+            delta = executed - accounted
+            if delta < 0:
+                delta = Decimal("0")
+            remainder = held - delta
+        full = executed > 0 and remainder <= Decimal("0.00000001")
+        if full:
+            sold = _decimal_text(executed)
+            save(
+                {
+                    "status": "closed",
+                    "protection": protection,
+                    "quantity": sold,
+                    "exit_order_id": order_id,
+                    "exit_reason": reason,
+                    "exit_client_order_id": client_id,
+                    "exit_filled_qty": sold,
+                    "oco_list_status": "ALL_DONE",
+                    "last_error": None if reason == "time_stop_max_hold" else error_prefix,
+                }
+            )
+            out = self._coverage(
+                row,
+                book="closed",
+                submitted=True,
+                ok=reason == "time_stop_max_hold",
+                error=None if reason == "time_stop_max_hold" else error_prefix,
+                protection=protection,
+                reason=reason,
+                order=order,
+                quantity=sold,
+                exchange_error=exchange_error,
+            )
+            out["exchange_order_id"] = order_id
+            out["exit_client_order_id"] = client_id
+            return out
+        kept = _decimal_text(held if remainder < 0 else remainder)
+        book = "time_stop_unknown" if reason == "time_stop_max_hold" else "oco_failed"
+        open_protection = PROTECTION_TIME_STOP if reason == "time_stop_max_hold" else PROTECTION_PENDING
+        save(
+            {
+                "status": book,
+                "protection": open_protection,
+                "quantity": kept,
+                "exit_order_id": order_id,
+                "exit_client_order_id": client_id,
+                "exit_filled_qty": _decimal_text(executed) if executed > 0 else "0",
+                "last_error": "time_stop_sell_open" if reason == "time_stop_max_hold" else "flatten_sell_open",
+            }
+        )
+        return self._coverage(
+            row,
+            book=book,
+            submitted=False,
+            error="time_stop_sell_open" if reason == "time_stop_max_hold" else "flatten_sell_open",
+            protection=protection,
+            reason=reason,
+            order=order,
+            quantity=kept,
+            exchange_error=exchange_error,
+        )
+
+    def _close_time_stop(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        placed: dict[str, Any],
+        client_id: str,
+        order: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        return self._settle_reduce_sell(
+            row,
+            save,
+            placed,
+            client_id,
+            reason="time_stop_max_hold",
+            protection=PROTECTION_TIME_STOP,
+            error_prefix="time_stop_max_hold",
+            order=order,
+        )
+
+    def _exit_lookup_state(
+        self,
+        client: Any,
+        symbol: str,
+        client_id: str,
+        key: str,
+        secret: str,
+    ) -> str:
+        """``found``, ``absent``, or ``unknown``. Unknown must not place another order."""
+        lookup = getattr(client, "get_order", None)
+        if not callable(lookup):
+            return "unknown"
+        pairs = [
+            ("symbol", symbol),
+            ("origClientOrderId", client_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            placed = lookup(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            if isinstance(exc, BinanceRequestError) and single_order_absent(exc):
+                return "absent"
+            return "unknown"
+        if isinstance(placed, dict) and _exit_order_accepted(placed) is not None:
+            return "found"
+        return "unknown"
 
     def _maybe_ratchet_working_oco(
         self,
@@ -3604,7 +4236,7 @@ class BinanceSpotAdapter:
         if cancel_err or canceled is None:
             return None
         classified = classify_oco(canceled, held_qty=str(row.get("quantity") or ""))
-        if classified.get("state") == "filled":
+        if self._account_oco_execution(row, classified, save) == "closed" or classified.get("state") == "filled":
             save(
                 {
                     "status": "oco_filled",
@@ -3622,6 +4254,15 @@ class BinanceSpotAdapter:
                 protection=PROTECTION_EXCHANGE,
                 error=None,
                 reason=classified.get("exit_reason"),
+            )
+        if classified.get("state") not in {"unfilled", "partial", "absent"}:
+            save({"last_error": "oco_cancel_unconfirmed"})
+            return self._coverage(
+                row,
+                book="oco_unknown",
+                submitted=False,
+                error="oco_cancel_unconfirmed",
+                protection=PROTECTION_PENDING,
             )
         prev_stop = str(row.get("stop_price") or "")
         next_seq = int(row.get("oco_ratchet_count") or 0) + 1
@@ -3713,6 +4354,9 @@ class BinanceSpotAdapter:
                 "status": "oco_unknown",
                 "protection": PROTECTION_PENDING,
                 "oco_list_client_id": spec["list_client_id"],
+                "oco_order_list_id": "",
+                "oco_above_order_id": "",
+                "oco_below_order_id": "",
                 "oco_above_client_id": spec["above_client_id"],
                 "oco_below_client_id": spec["below_client_id"],
                 "quantity": spec["quantity"],
@@ -3769,7 +4413,39 @@ class BinanceSpotAdapter:
             )
         verified, verify_error = native_oco_verified(placed)
         if verified is None:
-            return self._oco_failed(row, save, verify_error or "native_oco_unverified")
+            # A 200 body that does not prove the list can still be the live list.
+            # Flatten only after a later requery says it is gone.
+            found = self._reconcile_oco(row)
+            found_state = str(found.get("state") or "")
+            if (
+                found_state in {"working", "partial_working"}
+                and native_oco_verified(_recon_payload(found))[0] is not None
+            ):
+                save(self._oco_working_fields(row, found))
+                return self._coverage(
+                    row,
+                    book="oco_working",
+                    submitted=True,
+                    ok=True,
+                    protection=PROTECTION_EXCHANGE,
+                    error=None,
+                )
+            if found_state == "absent":
+                return self._oco_failed(row, save, verify_error or "native_oco_unverified")
+            save(
+                {
+                    "status": "oco_unknown",
+                    "protection": PROTECTION_PENDING,
+                    "last_error": verify_error or "native_oco_unverified",
+                }
+            )
+            return self._coverage(
+                row,
+                book="oco_unknown",
+                submitted=False,
+                error=verify_error or "native_oco_unverified",
+                protection=PROTECTION_PENDING,
+            )
         classified = classify_oco(placed, held_qty=str(spec["quantity"]))
         if classified.get("state") not in {"working", "partial_working", "filled"}:
             return self._oco_failed(
