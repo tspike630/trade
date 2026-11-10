@@ -45,7 +45,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Sequence
+from typing import Any, Never, Sequence
+
+from decision_engine.core.news_shock_gate import (
+    NewsReadSnapshot,
+    NewsRouteEffect,
+    OnchainCalibration,
+    evaluate_news_overlay,
+    observation_for_passthrough,
+)
 
 REGIME_1_POSITIVE_GAMMA_PINNED = "positive_gamma_mean_reversion"
 REGIME_2_SHORT_SQUEEZE_BREAKOUT = "short_squeeze_breakout"
@@ -309,11 +317,93 @@ def evaluate_five_state_regime(
     )
 
 
+def _decision_after_news(decision: RegimeRoutingDecision, effect: NewsRouteEffect, keyword: object) -> RegimeRoutingDecision:
+    """Apply a news overlay without reopening a buy the regime already closed."""
+    if effect is NewsRouteEffect.KEEP:
+        return decision
+    if effect is NewsRouteEffect.CRISIS_HALT:
+        label = str(keyword or "crisis")
+        return RegimeRoutingDecision(
+            regime=REGIME_5_CRISIS_LIQUIDATION_HALT,
+            playbook="cash_halt",
+            allow_buy=False,
+            reject_reason=f"news_crisis:{label}",
+            size_multiplier=0.0,
+            tp_multiplier=1.0,
+            enable_trailing_ratchet=False,
+            require_perp_beta_hedge=True,
+            recommended_order_type="NONE",
+        )
+    if effect is NewsRouteEffect.HAWKISH_DEFENSIVE:
+        return RegimeRoutingDecision(
+            regime=REGIME_4_CROWDED_LONG_DEFENSIVE,
+            playbook="news_hawkish_defensive_fade",
+            allow_buy=True,
+            reject_reason=None,
+            size_multiplier=0.55,
+            tp_multiplier=0.80,
+            enable_trailing_ratchet=False,
+            require_perp_beta_hedge=True,
+            recommended_order_type="LIMIT_MAKER",
+        )
+    if effect is NewsRouteEffect.DIVERGENT_REJECT:
+        return RegimeRoutingDecision(
+            regime=REGIME_3_CROSS_ASSET_BULL_PULLBACK,
+            playbook="xs_leader_news_divergent_reject",
+            allow_buy=False,
+            reject_reason="news_onchain_divergent",
+            size_multiplier=0.0,
+            tp_multiplier=1.0,
+            enable_trailing_ratchet=False,
+            require_perp_beta_hedge=False,
+            recommended_order_type="NONE",
+        )
+    unreachable: Never = effect
+    raise AssertionError(unreachable)
+
+
+def _rerank_state3_leaders(
+    accepted: list[dict[str, Any]],
+    weight: float | None,
+) -> list[dict[str, Any]]:
+    """Reorder already-accepted state-3 buys. Does not add a name or change size."""
+    if weight is None:
+        return accepted
+    indexes = [
+        index
+        for index, sig in enumerate(accepted)
+        if str(sig.get("action") or "").strip().lower() == "buy"
+        and sig.get("market_regime") == REGIME_3_CROSS_ASSET_BULL_PULLBACK
+    ]
+    for index in indexes:
+        sig = accepted[index]
+        if sig.get("news_onchain_status") == "aligned":
+            sig["news_aligned_rank"] = "applied"
+            sig["news_aligned_rank_weight"] = weight
+    if len(indexes) < 2:
+        return accepted
+    group = [accepted[index] for index in indexes]
+
+    def _key(sig: dict[str, Any]) -> float:
+        base = _finite(sig.get("xs_rank_pct_1h")) or 0.0
+        extra = weight if sig.get("news_onchain_status") == "aligned" else 0.0
+        return base + extra
+
+    ordered = sorted(group, key=_key, reverse=True)
+    out = list(accepted)
+    for index, sig in zip(indexes, ordered):
+        out[index] = sig
+    return out
+
+
 def apply_five_state_regime_router(
     candidates: Sequence[dict[str, Any]],
     hot_rows: Sequence[dict[str, Any]],
     *,
     macro_halt: str | None = None,
+    news_snapshot: NewsReadSnapshot | None = None,
+    onchain_calibration: OnchainCalibration | None = None,
+    aligned_rank_weight: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Route candidate signals through the 5-State Market Regime Router.
 
@@ -323,6 +413,8 @@ def apply_five_state_regime_router(
     - Scales ``size_pct`` by ``decision.size_multiplier`` when the signal was not already
       scaled by the same regime.
     - Filters out BUY signals rejected by their regime playbook (while never blocking SELLs).
+    - When ``news_snapshot`` is set, uses that one snapshot for every symbol. It does
+      not open the news database again. ``aligned_rank_weight`` defaults to off.
     """
     by_sym: dict[str, dict[str, Any]] = {}
     for r in hot_rows:
@@ -341,7 +433,12 @@ def apply_five_state_regime_router(
             continue
         action = str(sig.get("action") or "").strip().lower()
         if action != "buy":
-            accepted.append(sig)
+            if news_snapshot is None:
+                accepted.append(sig)
+            else:
+                stamped = dict(sig)
+                stamped.update(observation_for_passthrough(news_snapshot))
+                accepted.append(stamped)
             continue
 
         sym = str(sig.get("binance_symbol") or sig.get("token_address") or "").strip().upper()
@@ -349,12 +446,33 @@ def apply_five_state_regime_router(
         base_row.update(sig)
 
         decision = evaluate_five_state_regime(base_row, macro_halt=macro_halt)
+        news_meta: dict[str, Any] | None = None
+        if news_snapshot is not None:
+            overlay = evaluate_news_overlay(
+                regime=decision.regime,
+                allow_buy=decision.allow_buy,
+                snapshot=news_snapshot,
+                row=base_row,
+                calibration=onchain_calibration,
+            )
+            decision = _decision_after_news(
+                decision,
+                overlay.effect,
+                overlay.meta.get("news_shock_keyword"),
+            )
+            news_meta = overlay.meta
         regime_counts[decision.regime] = regime_counts.get(decision.regime, 0) + 1
 
         if not decision.allow_buy:
             continue
 
         out_sig = dict(sig)
+        if out_sig.get("xs_rank_pct_1h") is None and base_row.get("xs_rank_pct_1h") is not None:
+            out_sig["xs_rank_pct_1h"] = base_row.get("xs_rank_pct_1h")
+        if news_meta is not None:
+            out_sig.update(news_meta)
+            if news_meta.get("news_shock_applied"):
+                out_sig["recommended_order_type"] = decision.recommended_order_type
         out_sig["market_regime"] = decision.regime
         out_sig["regime_playbook"] = decision.playbook
         out_sig["regime_size_multiplier"] = decision.size_multiplier
@@ -389,6 +507,7 @@ def apply_five_state_regime_router(
 
         accepted.append(out_sig)
 
+    accepted = _rerank_state3_leaders(accepted, aligned_rank_weight if news_snapshot is not None else None)
     return accepted, regime_counts
 
 
