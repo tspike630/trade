@@ -6,9 +6,12 @@ the ledger drops. No live HTTP.
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -31,6 +34,12 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     row_quote_usdt,
 )
 from execution.executors.binance_spot_protect import PROTECTION_EXCHANGE  # noqa: E402
+from decision_engine.core.data_adapter import IndicatorDataAdapter  # noqa: E402
+from decision_engine.core.engine import DecisionEngine  # noqa: E402
+from decision_engine.core.risk_manager import RiskManager  # noqa: E402
+from decision_engine.core.signal_bus import SignalBus  # noqa: E402
+from decision_engine.strategies import get_strategy  # noqa: E402
+from decision_engine.tests.test_published_signal_contract import _seed_state3  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
 from execution.ledger import ExecutionLedger  # noqa: E402
 
@@ -861,15 +870,15 @@ class PersistenceSafetyTests(unittest.TestCase):
         explicit = adapter.execute(
             self._buy(
                 {
-                    "order_type": "MARKET",
+                    "order_type": "LIMIT",
                     "recommended_order_type": "LIMIT_MAKER",
-                    "quote_order_qty": "20",
+                    "price": "99.90",
                 },
                 71,
-                limit=False,
             )
         )
-        self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["MARKET"])
+        self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["LIMIT"])
+        self.assertEqual(parse_qs(client.orders[-1]).get("timeInForce"), ["GTC"])
         self.assertNotEqual(explicit["error"], "maker_entry_resting")
 
         none = adapter.execute(
@@ -913,6 +922,107 @@ class PersistenceSafetyTests(unittest.TestCase):
         )
         self.assertEqual(carried["error"], "maker_entry_resting")
         self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["LIMIT_MAKER"])
+
+    def test_published_state3_signal_posts_limit_maker_without_network(self) -> None:
+        now_ms = int(time.time() * 1000)
+        db = self.root / "decision.db"
+        book = self.root / "public_derivatives.db"
+        _seed_state3(db, book, now_ms)
+        saved = {
+            key: os.environ.get(key)
+            for key in (
+                "PUBLIC_DERIVATIVES_DB_PATH",
+                "NEWS_EVENTS_DB_PATH",
+                "LIVE_BNB_FACTOR_SOURCE",
+                "BINANCE_SPOT_BOOK_USDT",
+            )
+        }
+        os.environ["PUBLIC_DERIVATIVES_DB_PATH"] = str(book)
+        os.environ["NEWS_EVENTS_DB_PATH"] = str(self.root / "missing-news.db")
+        os.environ.pop("LIVE_BNB_FACTOR_SOURCE", None)
+        os.environ.pop("BINANCE_SPOT_BOOK_USDT", None)
+        indicator = IndicatorDataAdapter(db)
+        bus = SignalBus(db, purpose=PURPOSE_LIVE_BNB_BOLL_FADE)
+        try:
+            payload = DecisionEngine(
+                indicator,
+                bus,
+                [get_strategy("tech_boll_fade_v1")],
+                risk=RiskManager(cooldown_sec=0),
+            ).tick()
+        finally:
+            bus.close()
+            indicator.close()
+        self.assertEqual(payload["emitted"], 1)
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        stored = conn.execute(
+            "SELECT action, size_pct, raw_json FROM decision_log ORDER BY id"
+        ).fetchone()
+        conn.close()
+        assert stored is not None
+        raw = json.loads(stored["raw_json"])
+        extras = dict(raw["extras"])
+        self.assertEqual(stored["action"], "buy")
+        self.assertFalse(extras.get("news_shock_applied"))
+        self.assertEqual(extras["recommended_order_type"], "LIMIT_MAKER")
+        self.assertEqual(extras["order_type"], "MARKET")
+        self.assertEqual(extras["obi_top5"], -0.10)
+        self.assertEqual(extras["obi_top5_source_ts_ms"], now_ms)
+        self.assertNotIn("orderbook_imbalance_20", extras)
+        self.assertLess(extras["volume_z"], 3.8)
+        os.environ["BINANCE_SPOT_BOOK_USDT"] = "1000"
+        client = _Exchange()
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: now_ms,
+            account_snapshot=_BOUND,
+            production_book=REST_BOOK,
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
+            post_only_limit=False,
+        )
+        result = adapter.execute(
+            {
+                "decision_log_id": int(stored["id"]) if "id" in stored.keys() else 80,
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "mode": "live_stub",
+                "action": stored["action"],
+                "token_address": "FADEUSDT",
+                "size_pct": stored["size_pct"],
+                "extras": extras,
+            }
+        )
+        self.assertEqual(result["error"], "maker_entry_resting", result)
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(client.ocos, [])
+        form = {key: values[0] for key, values in parse_qs(client.orders[0]).items()}
+        form.pop("signature", None)
+        self.assertEqual(form.get("symbol"), "FADEUSDT")
+        self.assertEqual(form.get("side"), "BUY")
+        self.assertEqual(form.get("type"), "LIMIT_MAKER")
+        self.assertNotIn("timeInForce", form)
+        self.assertNotIn("orderbook_imbalance_20", form)
+        self.assertNotIn("-0.55", client.orders[0])
+        self.assertTrue(form.get("quantity"))
+        self.assertTrue(form.get("price"))
+        artifact = {
+            "news_shock_applied": extras.get("news_shock_applied"),
+            "obi_top5": extras.get("obi_top5"),
+            "obi_top5_source_ts_ms": extras.get("obi_top5_source_ts_ms"),
+            "volume_z": extras.get("volume_z"),
+            "order": {key: form[key] for key in ("symbol", "side", "type", "quantity", "price") if key in form},
+        }
+        out = self.root / "state3_order.json"
+        out.write_text(json.dumps(artifact, sort_keys=True), encoding="utf-8")
+        self.assertEqual(artifact["order"]["type"], "LIMIT_MAKER")
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def _held_qty(self, ledger: ExecutionLedger, qty: str, decision_id: int = 61) -> tuple[int, BinanceSpotAdapter, _Exchange]:
         row = self._held(ledger, decision_id)

@@ -396,17 +396,29 @@ def _maker_entry_lifecycle_ready(client: Any) -> bool:
 
 
 def _apply_recommended_order_type(extras: dict[str, Any], action: object) -> dict[str, Any]:
-    """Use a decision's LIMIT_MAKER stamp only when the order did not name a type."""
+    """Apply the published recommendation over the strategy's default market type.
+
+    ``LIMIT`` already chosen on the signal stays. ``NONE`` and a missing
+    recommendation leave the signal's own type, which defaults to market.
+    A recommendation that needs a limit and has none uses ``price_usd``.
+    """
     if str(action or "").strip().lower() != "buy":
         return extras
-    explicit = extras.get("order_type", extras.get("binance_order_type"))
-    if explicit is not None and not (isinstance(explicit, str) and not str(explicit).strip()):
-        return extras
     recommended = str(extras.get("recommended_order_type") or "").strip().upper()
-    if recommended not in {"LIMIT", "LIMIT_MAKER"}:
+    if recommended in {"", "NONE"} or recommended not in {"LIMIT", "LIMIT_MAKER"}:
+        return extras
+    explicit = extras.get("order_type", extras.get("binance_order_type"))
+    explicit_text = "" if explicit is None else str(explicit).strip().upper()
+    if explicit_text == "LIMIT":
         return extras
     copied = dict(extras)
     copied["order_type"] = recommended
+    chosen, _price_error = _chosen_limit_raw(copied)
+    if chosen in (None, ""):
+        for key in ("price_usd", "entry_price"):
+            if _format_positive(extras.get(key)):
+                copied["price"] = extras.get(key)
+                break
     return copied
 
 
