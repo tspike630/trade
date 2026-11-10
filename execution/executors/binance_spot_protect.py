@@ -477,12 +477,9 @@ def fill_average_price(placed: dict[str, Any] | None) -> str | None:
         return None
     quote = _to_decimal(placed.get("cummulativeQuoteQty"))
     qty = _to_decimal(placed.get("executedQty"))
-    if quote is not None and qty is not None and qty > 0:
-        return _decimal_text(quote / qty)
-    px = _to_decimal(placed.get("price"))
-    if px is not None and px > 0:
-        return _decimal_text(px)
-    return None
+    if quote is None or qty is None or qty <= 0:
+        return None
+    return _decimal_text(quote / qty)
 
 
 def build_spot_oco(
