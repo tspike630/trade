@@ -36,7 +36,7 @@
 | :--- | :--- | :--- | :--- |
 | `data/lseg/lseg_macro.db` | ~171 MB (`836,474` 行) | `cross_asset_bars` (63 个 LSEG 跨资产 RIC + CBOE 波动率), `macro_events` (56,933 条 SmartEconomics 日历), `central_bank_events` (555 条央行日程) | `scripts/ingest_cityu_usb_all.py` / `scripts/fetch_cityu_lseg_incremental.py` |
 | `data/cityu/cityu_institutional.db` | ~613 MB (`8,397,225` 行) | `wrds_optionmetrics_vsurfd` (372万行期权曲面), `wrds_crsp_treasuries` (360万行美债), `wrds_13f_holdings` (46万行13F机构持仓), `wrds_trace_convertible_bonds`, `lseg_cftc_cot_positioning`, `lseg_short_interest_daily`, `orbis_bank_liquidity_risk` 等 19 张表 | `scripts/ingest_cityu_usb_all.py` |
-| `data/counterparty/public_derivatives.db` | 实时滚动更新 | `binance_perp_counterparty`, `binance_spot_microstructure`, `cross_exchange_spot_baseline`, `deribit_options_gamma`, `token_unlock_schedule`, `macro_net_liquidity`, `stablecoin_supply`, `onchain_holder_bot_summary` (共 8 张表) | `scripts/fetch_public_derivatives_and_counterparty.py --loop --interval 300` |
+| `data/counterparty/public_derivatives.db` | 实时滚动更新 | `binance_perp_counterparty`, `binance_spot_microstructure`（`orderbook_imbalance_20` 仍是前 20 档；`obi_top5` 是排序后前 5 档 price×qty，且只带覆盖该 `lastUpdateId` 的深度事件时间）, `cross_exchange_spot_baseline`, `deribit_options_gamma`, `token_unlock_schedule`, `macro_net_liquidity`, `stablecoin_supply`, `onchain_holder_bot_summary`, `collector_fetch_errors` | `scripts/fetch_public_derivatives_and_counterparty.py --loop --interval 300 --db data/counterparty/public_derivatives.db` |
 
 ## 3. 关键环境变量与开关
 
@@ -51,8 +51,12 @@
 # 1. 运行全部 355 项单元测试
 python3 -m unittest discover -s decision_engine/tests -p "test_*.py"
 
-# 2. 启动公开衍生品与对手盘数据后台守护采集（每 5 分钟刷新）
-python3 scripts/fetch_public_derivatives_and_counterparty.py --loop --interval 300
+# 2. 公开衍生品与对手盘。默认单次；请求到的标的有缺失时退出码 2，锁被占用时退出码 3。
+#    --loop 单轮失败不退出。PEPE 的 USD-M 合约是 1000PEPEUSDT，不是 PEPEUSDT。
+#    行时间用交易所事件时间，不用本机刷新时间。不读私钥、不下单。
+#    运行时没有这份脚本时，先用 crawler 组件同步；systemd 模板不自动安装：
+#    deploy/public-derivatives-collector.service
+python3 scripts/fetch_public_derivatives_and_counterparty.py --loop --interval 300 --db data/counterparty/public_derivatives.db
 
 # 3. 查看全量 785MB 城大数据集实证归因报告
 cat docs/CITYU_FULL_DATASET_BACKTEST_2026-11-09.md

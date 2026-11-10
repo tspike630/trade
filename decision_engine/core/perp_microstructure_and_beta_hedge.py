@@ -575,6 +575,11 @@ def portfolio_beta_exposure_block(
 
 PUBLIC_DERIVATIVES_DB_ENV = "PUBLIC_DERIVATIVES_DB_PATH"
 
+# USD-M lists 1000PEPEUSDT, not PEPEUSDT. Funding, basis bps, and long/short
+# ratios on that contract are the PEPE perpetual. Mark and index prices are
+# 1000x and are not copied onto the strategy row.
+PERP_VENUE_ALIAS_FOR_STRATEGY = {"PEPEUSDT": "1000PEPEUSDT"}
+
 
 def resolve_public_derivatives_db_path():
     from pathlib import Path
@@ -602,13 +607,48 @@ def attach_counterparty_context(rows, *, db_path=None):
         tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type=\"table\"").fetchall()}
         perp_by_sym = {}
         if "binance_perp_counterparty" in tables:
+            direct = {}
             for r in conn.execute("""
                 SELECT p.* FROM binance_perp_counterparty p
                 INNER JOIN (
                     SELECT symbol, MAX(ts_ms) AS max_ts FROM binance_perp_counterparty GROUP BY symbol
                 ) latest ON p.symbol = latest.symbol AND p.ts_ms = latest.max_ts
             """).fetchall():
-                perp_by_sym[str(r["symbol"]).upper()] = r
+                direct[str(r["symbol"]).upper()] = r
+            perp_by_sym.update(direct)
+            for strategy_symbol, venue_symbol in PERP_VENUE_ALIAS_FOR_STRATEGY.items():
+                if strategy_symbol not in perp_by_sym and venue_symbol in direct:
+                    perp_by_sym[strategy_symbol] = direct[venue_symbol]
+            if direct and "strategy_symbol" in direct[next(iter(direct))].keys():
+                for venue_symbol, r in direct.items():
+                    strategy_symbol = str(r["strategy_symbol"] or "").strip().upper()
+                    if strategy_symbol and strategy_symbol not in perp_by_sym and strategy_symbol != venue_symbol:
+                        perp_by_sym[strategy_symbol] = r
+        obi_by_sym = {}
+        if "binance_spot_microstructure" in tables:
+            spot_cols = {
+                str(col[1])
+                for col in conn.execute("PRAGMA table_info(binance_spot_microstructure)").fetchall()
+            }
+            if "obi_top5" in spot_cols and "obi_top5_source_ts_ms" in spot_cols:
+                error_sql = ""
+                if "obi_top5_error" in spot_cols:
+                    error_sql = "AND (s.obi_top5_error IS NULL OR s.obi_top5_error = '')"
+                for r in conn.execute(
+                    f"""
+                    SELECT s.symbol, s.obi_top5, s.obi_top5_source_ts_ms
+                    FROM binance_spot_microstructure s
+                    INNER JOIN (
+                        SELECT symbol, MAX(obi_top5_source_ts_ms) AS max_ts
+                        FROM binance_spot_microstructure
+                        WHERE obi_top5 IS NOT NULL AND obi_top5_source_ts_ms IS NOT NULL
+                        GROUP BY symbol
+                    ) latest ON s.symbol = latest.symbol AND s.obi_top5_source_ts_ms = latest.max_ts
+                    WHERE s.obi_top5 IS NOT NULL AND s.obi_top5_source_ts_ms IS NOT NULL
+                    {error_sql}
+                    """
+                ).fetchall():
+                    obi_by_sym[str(r["symbol"]).upper()] = r
         disloc_by_sym = {}
         if "cross_exchange_spot_baseline" in tables:
             for r in conn.execute("""
@@ -655,6 +695,15 @@ def attach_counterparty_context(rows, *, db_path=None):
                 row["gamma_regime"] = btc_gamma_regime
             if row.get("dvol_zscore") is None and btc_dvol_z is not None:
                 row["dvol_zscore"] = btc_dvol_z
+            # obi_top5 does not read or write volume_z / vol_z_1h. Regime 3
+            # evaluates those on their own. The decision-engine kline path
+            # owns that writer. Do not overwrite an obi already present, and
+            # do not touch taker_buy_ratio (owned by the kline order-flow feed).
+            if _finite(row.get("obi_top5")) is None and _finite(row.get("spot_obi_top5")) is None:
+                obi_row = obi_by_sym.get(sym)
+                if obi_row is not None and _finite(obi_row["obi_top5"]) is not None:
+                    row["obi_top5"] = obi_row["obi_top5"]
+                    row["obi_top5_source_ts_ms"] = obi_row["obi_top5_source_ts_ms"]
     except sqlite3.Error:
         pass
     finally:

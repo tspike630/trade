@@ -118,6 +118,12 @@ plan() {
       if [[ ! -e "$t" ]]; then ADD+=("$t"); SRC_MAP["$t"]="$f"
       elif ! cmp -s "$f" "$t"; then OVR+=("$t"); SRC_MAP["$t"]="$f"; fi
     done
+    local collector="$WT/scripts/fetch_public_derivatives_and_counterparty.py"
+    if [[ -f "$collector" ]]; then
+      local t="$DEPLOY_ROOT/scripts/fetch_public_derivatives_and_counterparty.py"
+      if [[ ! -e "$t" ]]; then ADD+=("$t"); SRC_MAP["$t"]="$collector"
+      elif ! cmp -s "$collector" "$t"; then OVR+=("$t"); SRC_MAP["$t"]="$collector"; fi
+    fi
   fi
 }
 
