@@ -332,8 +332,31 @@ class StorageAndTickTests(unittest.TestCase):
             _insert_klines(allow_conn, "FADEUSDT", shifted_allow)
             reject_conn.close()
             allow_conn.close()
-            rejected = self._tick(reject_db)
-            allowed = self._tick(allow_db)
+            deriv = root / "deriv.db"
+            deriv_conn = sqlite3.connect(deriv)
+            deriv_conn.execute(
+                """
+                CREATE TABLE binance_perp_counterparty (
+                    symbol TEXT, ts_ms INTEGER, whale_retail_divergence REAL
+                )
+                """
+            )
+            deriv_conn.execute(
+                "INSERT INTO binance_perp_counterparty VALUES ('FADEUSDT', ?, 0.55)",
+                (wall,),
+            )
+            deriv_conn.commit()
+            deriv_conn.close()
+            old_deriv = os.environ.get("PUBLIC_DERIVATIVES_DB_PATH")
+            os.environ["PUBLIC_DERIVATIVES_DB_PATH"] = str(deriv)
+            try:
+                rejected = self._tick(reject_db)
+                allowed = self._tick(allow_db)
+            finally:
+                if old_deriv is None:
+                    os.environ.pop("PUBLIC_DERIVATIVES_DB_PATH", None)
+                else:
+                    os.environ["PUBLIC_DERIVATIVES_DB_PATH"] = old_deriv
             self.assertEqual(rejected["emitted"], 0)
             self.assertEqual(allowed["emitted"], 1)
             saved_conn = sqlite3.connect(allow_db)

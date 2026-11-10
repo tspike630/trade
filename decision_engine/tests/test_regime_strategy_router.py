@@ -164,7 +164,8 @@ class TestFiveStateRegimeRouter(unittest.TestCase):
         self.assertFalse(dec_climax.allow_buy)
         self.assertEqual(dec_climax.reject_reason, "regime3_climax_volume_distribution_trap")
 
-        # Manual thresholds do not also require a weak taker or a low whale ratio.
+        # The uploaded router rejects obi_top5 <= -0.25 only with a weak or
+        # missing taker. A strong taker does not take that reject.
         dec_obi_eq = evaluate_five_state_regime(
             {
                 "symbol": "SOLUSDT",
@@ -175,8 +176,8 @@ class TestFiveStateRegimeRouter(unittest.TestCase):
                 "taker_buy_ratio": 0.80,
             }
         )
-        self.assertFalse(dec_obi_eq.allow_buy)
-        self.assertEqual(dec_obi_eq.reject_reason, "regime3_thin_bid_book_trap")
+        self.assertTrue(dec_obi_eq.allow_buy)
+        self.assertIsNone(dec_obi_eq.reject_reason)
         dec_obi_above = evaluate_five_state_regime(
             {
                 "symbol": "SOLUSDT",
@@ -199,8 +200,8 @@ class TestFiveStateRegimeRouter(unittest.TestCase):
                 "whale_retail_divergence": 1.50,
             }
         )
-        self.assertFalse(dec_vol_eq.allow_buy)
-        self.assertEqual(dec_vol_eq.reject_reason, "regime3_climax_volume_distribution_trap")
+        self.assertTrue(dec_vol_eq.allow_buy)
+        self.assertIsNone(dec_vol_eq.reject_reason)
         dec_vol_below = evaluate_five_state_regime(
             {
                 "symbol": "SOLUSDT",

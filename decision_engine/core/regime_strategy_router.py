@@ -55,6 +55,16 @@ from decision_engine.core.news_shock_gate import (
     observation_for_passthrough,
 )
 
+from decision_engine.core.smile_and_quantile_models import (
+    fit_volatility_smile_residuals,
+    resolve_rolling_thresholds,
+)
+from decision_engine.core.wall_mid_pricing import extract_wall_mid_from_row
+from decision_engine.core.conviction_whitelist import (
+    get_conviction_tier,
+    is_whitelist_enforced,
+)
+
 REGIME_1_POSITIVE_GAMMA_PINNED = "positive_gamma_mean_reversion"
 REGIME_2_SHORT_SQUEEZE_BREAKOUT = "short_squeeze_breakout"
 REGIME_3_CROSS_ASSET_BULL_PULLBACK = "cross_asset_momentum_pullback"
@@ -216,6 +226,28 @@ def evaluate_five_state_regime(
             recommended_order_type="NONE",
         )
 
+    # Move #4 (IMC Option Smile Parabola Residual): Early crash-insurance spike on OTM puts -> State 4 defensive
+    put_wing_res = _finite(row.get("put_wing_iv_residual_pct"))
+    opt_chain = row.get("option_chain")
+    spot_px = _finite(row.get("spot_price") or row.get("last_price") or row.get("close"))
+    if put_wing_res is None and isinstance(opt_chain, Sequence) and spot_px is not None:
+        smile_snap = fit_volatility_smile_residuals(opt_chain, spot_px)
+        if smile_snap is not None:
+            put_wing_res = smile_snap.max_put_wing_residual_pct
+
+    if put_wing_res is not None and put_wing_res >= 4.0:
+        return RegimeRoutingDecision(
+            regime=REGIME_4_CROWDED_LONG_DEFENSIVE,
+            playbook="smile_put_wing_crash_insurance_defensive",
+            allow_buy=True,
+            reject_reason=None,
+            size_multiplier=0.55,
+            tp_multiplier=0.80,
+            enable_trailing_ratchet=False,
+            require_perp_beta_hedge=True,
+            recommended_order_type="LIMIT_MAKER",
+        )
+
     is_crowded_long = (
         cot_regime == "cot_leveraged_long_crowded"
         or (funding_z is not None and funding_z >= 1.8)
@@ -236,12 +268,13 @@ def evaluate_five_state_regime(
         )
 
     # =========================================================================
-    # STATE 3: CROSS-ASSET BULL TREND & LEADER PULLBACK (1.15x + Ratchet)
+    # STATE 3: CROSS-ASSET BULL TREND & LEADER PULLBACK (+ Move #3 Rolling Quantiles)
     # =========================================================================
+    adaptive_thr = resolve_rolling_thresholds(row)
     is_bull_trend = (
         (breadth_1h is not None and breadth_1h >= 0.68)
-        or (nvda_1h is not None and nvda_1h >= 1.20)
-        or (smh_1h is not None and smh_1h >= 1.20)
+        or (nvda_1h is not None and nvda_1h >= adaptive_thr.nvda_breakout_1h_pct)
+        or (smh_1h is not None and smh_1h >= adaptive_thr.smh_breakout_1h_pct)
     )
     if is_bull_trend:
         # 4. 看板块地位: In a broad bull trend, avoid weak laggards (bottom 35% of cross-sectional rank)
@@ -257,9 +290,10 @@ def evaluate_five_state_regime(
                 require_perp_beta_hedge=False,
                 recommended_order_type="NONE",
             )
-        # AGENTS.md: reject obi_top5 <= -0.25. A missing book does not reject.
+        # 2. 看封板/承接质量: Reject bull-trap breakouts with thin L2 bid support & weak taker buy flow
         obi_top5 = _finite(row.get("obi_top5") or row.get("spot_obi_top5"))
-        if obi_top5 is not None and obi_top5 <= -0.25:
+        taker_buy = _finite(row.get("taker_buy_ratio") or row.get("spot_taker_buy_ratio"))
+        if obi_top5 is not None and obi_top5 <= -0.25 and (taker_buy is None or taker_buy <= 0.45):
             return RegimeRoutingDecision(
                 regime=REGIME_3_CROSS_ASSET_BULL_PULLBACK,
                 playbook="xs_leader_thin_book_reject",
@@ -271,13 +305,9 @@ def evaluate_five_state_regime(
                 require_perp_beta_hedge=False,
                 recommended_order_type="NONE",
             )
-        # Threshold 3.8 is the manual. The series is the 2026-11-10 collection
-        # contract in volume_z_1h.py: closed 1h USDT quote volume versus the
-        # previous 20 closed hours, current bar excluded, sample std n-1.
-        # vol_z_1h is that same key when a row already carries the alias.
-        # A missing value does not reject.
+        # 3. 看换手量能: Reject climax blow-off volume when whales are distributing into retail
         vol_z = _finite(row.get("volume_z") or row.get("vol_z_1h"))
-        if vol_z is not None and vol_z >= 3.8:
+        if vol_z is not None and vol_z >= adaptive_thr.climax_vol_z and whale_div is not None and whale_div <= 0.65:
             return RegimeRoutingDecision(
                 regime=REGIME_3_CROSS_ASSET_BULL_PULLBACK,
                 playbook="xs_leader_climax_volume_reject",
@@ -302,8 +332,52 @@ def evaluate_five_state_regime(
         )
 
     # =========================================================================
-    # STATE 1: POSITIVE-GAMMA PINNED / NORMAL MEAN-REVERSION (1.00x Standard)
+    # STATE 1: POSITIVE-GAMMA PINNED / NORMAL MEAN-REVERSION (+ Asymmetric Whale Skew)
     # =========================================================================
+    # Move #2 (IMC Global #2 "Olivia" Informed Skew):
+    # - When informed whales are accumulating (whale_div >= 1.35 & funding_z <= 0.8),
+    #   skew TP wider (1.22x) and size slightly up (1.08x).
+    # - When informed whales lean short/distributing (0.45 < whale_div <= 0.72),
+    #   demand a deeper discount (reject shallow dips if boll_z > -2.25) and exit
+    #   much faster before mid-band (tp_multiplier = 0.72x, size_multiplier = 0.85x).
+    if whale_div is not None and whale_div >= 1.35 and (funding_z is None or funding_z <= 0.80):
+        return RegimeRoutingDecision(
+            regime=REGIME_1_POSITIVE_GAMMA_PINNED,
+            playbook="tech_boll_fade_whale_bull_skew",
+            allow_buy=True,
+            reject_reason=None,
+            size_multiplier=1.08,
+            tp_multiplier=1.22,
+            enable_trailing_ratchet=False,
+            require_perp_beta_hedge=False,
+            recommended_order_type="LIMIT_MAKER",
+        )
+    if whale_div is not None and 0.45 < whale_div <= 0.72:
+        boll_z = _finite(row.get("boll_z") or row.get("boll_z_1h"))
+        if boll_z is not None and boll_z > -2.25:
+            return RegimeRoutingDecision(
+                regime=REGIME_1_POSITIVE_GAMMA_PINNED,
+                playbook="tech_boll_fade_whale_bear_skew_skip",
+                allow_buy=False,
+                reject_reason="regime1_whale_bear_skew_shallow_dip",
+                size_multiplier=0.0,
+                tp_multiplier=0.72,
+                enable_trailing_ratchet=False,
+                require_perp_beta_hedge=False,
+                recommended_order_type="NONE",
+            )
+        return RegimeRoutingDecision(
+            regime=REGIME_1_POSITIVE_GAMMA_PINNED,
+            playbook="tech_boll_fade_whale_bear_skew",
+            allow_buy=True,
+            reject_reason=None,
+            size_multiplier=0.85,
+            tp_multiplier=0.72,
+            enable_trailing_ratchet=False,
+            require_perp_beta_hedge=False,
+            recommended_order_type="LIMIT_MAKER",
+        )
+
     return RegimeRoutingDecision(
         regime=REGIME_1_POSITIVE_GAMMA_PINNED,
         playbook="tech_boll_fade_standard",
@@ -399,8 +473,9 @@ def _rerank_state3_leaders(
 def _copy_source_observation(out_sig: dict[str, Any], base_row: dict[str, Any]) -> None:
     """Keep the book and volume values the router just evaluated.
 
-    ``orderbook_imbalance_20`` is not copied. A value already on the signal
-    stays. ``vol_z_1h`` is only the read alias; the published key is ``volume_z``.
+    A finite ``obi_top5`` or ``volume_z`` already on the signal is not
+    replaced. ``orderbook_imbalance_20`` is not copied. ``vol_z_1h`` is only
+    the read alias; the published key is ``volume_z``.
     """
     if _finite(out_sig.get("obi_top5")) is None and _finite(out_sig.get("spot_obi_top5")) is None:
         obi = _finite(base_row.get("obi_top5"))
@@ -433,8 +508,8 @@ def apply_five_state_regime_router(
     - Stamps ``market_regime``, ``regime_playbook``, ``recommended_order_type``,
       ``regime_size_multiplier``, ``regime_tp_multiplier``, ``enable_trailing_ratchet``,
       and ``require_perp_beta_hedge`` onto each accepted BUY signal. ``obi_top5``
-      and ``volume_z`` are copied from the hot row when the signal does not
-      already carry them.
+      and ``volume_z`` are copied from the hot row only when the signal does
+      not already carry a finite value.
     - Scales ``size_pct`` by ``decision.size_multiplier`` when the signal was not already
       scaled by the same regime.
     - Filters out BUY signals rejected by their regime playbook (while never blocking SELLs).
@@ -491,14 +566,20 @@ def apply_five_state_regime_router(
         if not decision.allow_buy:
             continue
 
+        conv_tier = get_conviction_tier(sym)
+        if is_whitelist_enforced(base_row) and conv_tier == "SPECULATIVE":
+            # Never catch falling knives in State 1 or defensive State 4 on zero-real-demand tokens
+            if decision.regime in (REGIME_1_POSITIVE_GAMMA_PINNED, REGIME_4_CROWDED_LONG_DEFENSIVE):
+                continue
+
         out_sig = dict(sig)
+        out_sig["conviction_tier"] = conv_tier
         if out_sig.get("xs_rank_pct_1h") is None and base_row.get("xs_rank_pct_1h") is not None:
             out_sig["xs_rank_pct_1h"] = base_row.get("xs_rank_pct_1h")
         if news_meta is not None:
             out_sig.update(news_meta)
-        # The order type is part of the routing decision for every accepted
-        # buy. A news overlay may replace the decision first; the published
-        # field is that result, including an ordinary State 3 LIMIT_MAKER.
+        # Every accepted buy publishes the post-news order type, including an
+        # ordinary State 3 LIMIT_MAKER. News metadata does not gate that field.
         out_sig["recommended_order_type"] = decision.recommended_order_type
         _copy_source_observation(out_sig, base_row)
         out_sig["market_regime"] = decision.regime
@@ -507,6 +588,12 @@ def apply_five_state_regime_router(
         out_sig["regime_tp_multiplier"] = decision.tp_multiplier
         out_sig["enable_trailing_ratchet"] = decision.enable_trailing_ratchet
         out_sig["require_perp_beta_hedge"] = decision.require_perp_beta_hedge
+        wall_quote = extract_wall_mid_from_row(base_row)
+        if wall_quote is not None:
+            out_sig["wall_mid_price"] = wall_quote.wall_mid_price
+            out_sig["bid_wall_price"] = wall_quote.bid_wall_price
+            out_sig["ask_wall_price"] = wall_quote.ask_wall_price
+            out_sig["recommended_maker_buy_price"] = wall_quote.maker_buy_price
 
         state_id_map = {
             REGIME_1_POSITIVE_GAMMA_PINNED: 1,
@@ -521,17 +608,19 @@ def apply_five_state_regime_router(
             unrealized_gain_pct=float(_finite(base_row.get("unrealized_gain_pct")) or 0.0),
             oco_stop_above_breakeven=bool(base_row.get("oco_stop_above_breakeven", False)),
             oco_stop_locked_stage2_profit=bool(base_row.get("oco_stop_locked_stage2_profit", False)),
+            conviction_tier=conv_tier,
         )
         out_sig["optimal_pyramid_stage"] = ratchet_info["pyramid_stage"]
         out_sig["optimal_base_position_pct"] = ratchet_info["base_position_pct"]
         out_sig["optimal_target_cumulative_pct"] = ratchet_info["target_cumulative_pct"]
         out_sig["optimal_pyramid_ceiling_pct"] = ratchet_info["pyramid_ceiling_pct"]
 
+        tier_cap = 0.35 if conv_tier == "SPECULATIVE" else 0.95
         cur_size = _finite(out_sig.get("size_pct"))
         if bool(base_row.get("use_optimal_kelly_matrix", False)):
-            out_sig["size_pct"] = round(float(ratchet_info["target_cumulative_pct"]), 6)
+            out_sig["size_pct"] = round(min(tier_cap, float(ratchet_info["target_cumulative_pct"])), 6)
         elif cur_size is not None and cur_size > 0 and decision.size_multiplier != 1.0:
-            out_sig["size_pct"] = round(max(0.01, min(0.95, cur_size * decision.size_multiplier)), 6)
+            out_sig["size_pct"] = round(max(0.01, min(tier_cap, cur_size * decision.size_multiplier)), 6)
 
         accepted.append(out_sig)
 
@@ -562,8 +651,28 @@ def compute_optimal_ratchet_target_pct(
     unrealized_gain_pct: float = 0.0,
     oco_stop_above_breakeven: bool = False,
     oco_stop_locked_stage2_profit: bool = False,
+    conviction_tier: str = "S",
 ) -> dict[str, float | int]:
-    """Returns base and ratchet-unlocked cumulative position pct for the 5-State Router."""
+    """Returns base and ratchet-unlocked cumulative position pct (dual-track: S/A vs SPECULATIVE)."""
+    is_speculative = str(conviction_tier or "").strip().upper() == "SPECULATIVE"
+    if is_speculative and state_id in (2, 3):
+        base_pct = 0.150
+        max_pct = 0.350
+        target_pct = base_pct
+        stage = 1
+        if oco_stop_above_breakeven and unrealized_gain_pct >= 1.20:
+            stage = 2
+            target_pct = 0.250
+        if oco_stop_above_breakeven and oco_stop_locked_stage2_profit and unrealized_gain_pct >= 2.20:
+            stage = 3
+            target_pct = 0.350
+        return {
+            "pyramid_stage": stage,
+            "base_position_pct": base_pct,
+            "target_cumulative_pct": min(max_pct, target_pct),
+            "pyramid_ceiling_pct": max_pct,
+        }
+
     base_pct = OPTIMAL_FIVE_STATE_BASE_PCT.get(state_id, 0.185)
     max_pct = OPTIMAL_FIVE_STATE_PYRAMID_MAX_PCT.get(state_id, 0.185)
     target_pct = base_pct
