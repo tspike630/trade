@@ -1,0 +1,92 @@
+News isolation bundle for the production tree that failed the full PR 202 package.
+
+Source commit is the isolation pull request. The patched engine is built from
+production blob 612bd80af39ca2f6061229a67b39a14cd71cb91661947d8936c48bb101dd9d1f
+(bc392fea, 18185 bytes). It is not origin/main's engine.py. Do not copy
+origin/main's engine, guards, router, macro, CityU, Kelly, or perp modules.
+
+PR 204 is not in this archive. sources/news.py is not in this archive.
+No database, no secret, no environment edit, no trader start.
+
+What the copy changes
+Only live_bnb_boll_fade and live_bnb_boll_classic reach apply_news_isolation,
+after the existing guards and the existing top-cap. Other purposes are unchanged.
+The call does not open public_derivatives.db, cityu_institutional.db,
+lseg_macro.db, or x_watch, even when those files and env paths exist.
+With no crisis and no Fed hawkish shock, the original candidate objects and
+size_pct are returned. Crisis drops BUY and keeps SELL (state 5, cash_halt).
+Fed hawkish applies the state-4 template: size x0.55, tp x0.80, trailing off,
+LIMIT_MAKER, require_perp_beta_hedge as a label only. Kelly is not applied.
+aligned_rank_weight stays None. A missing, locked, timed-out, or unreadable
+news database is fail-open and is written on the tick payload as news_gate.
+
+apply_five_state_regime_router is unchanged and is still what origin/main's
+engine calls. This host must not receive that engine while the three databases
+exist, because that call classifies from counterparty and CityU with no switch.
+The isolation function does not call it.
+
+Shipped files
+- decision_engine/core/engine.py
+  before 612bd80af39ca2f6061229a67b39a14cd71cb91661947d8936c48bb101dd9d1f 18185
+  after  cf3df09b77025f943825006f4d15758cdb8ac9b84db20b611a1c5aa85571812a 19010
+- decision_engine/core/news_shock_gate.py
+  before absent
+  after  41f94998d779b036be36363e831abac3d4c3a7c6997d272d3c281e22742b92ee 46432
+
+Left untouched, and the preflight refuses if they differ
+- live_buy_guards.py 4ff94eb982a5afc1c60d919d9ba9557fcb10e42d157d18a20891ab61b4b8d9cc 4028
+- perp_microstructure_and_beta_hedge.py ea3d43afcb4e5aa6388c69e698742ac04b6ff3d10c27fa7a3f5dc8072c619a34 29257
+- portfolio_clusters.py 5dbd84373298ecd7df2480e4766c79d0b037663afa60e29fa21768303aec26d1 10395
+- sources/news.py 34d9fdc11116e31e274e3e829cec133d8d75786c1fd8822e61236ec6a4f1ae72
+
+Before copy
+  python3 preflight.py /path/to/repo
+  # continue only when the last line is PREFLIGHT_OK
+
+Backup
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  bak="/var/backups/news-isolation-$stamp"
+  mkdir -p "$bak/decision_engine/core"
+  cp -a decision_engine/core/engine.py "$bak/decision_engine/core/engine.py"
+  test ! -e decision_engine/core/news_shock_gate.py
+  sha256sum decision_engine/core/engine.py \
+    decision_engine/core/live_buy_guards.py \
+    decision_engine/core/perp_microstructure_and_beta_hedge.py \
+    decision_engine/core/portfolio_clusters.py | tee "$bak/BEFORE.sha256"
+
+Copy, with the shell in the repository root and EXTRACT set to this archive
+  cp -a "$EXTRACT/files/decision_engine/core/engine.py" decision_engine/core/engine.py
+  cp -a "$EXTRACT/files/decision_engine/core/news_shock_gate.py" decision_engine/core/news_shock_gate.py
+  python3 - "$EXTRACT/SHA256SUMS" "$PWD" << 'PY'
+import hashlib, sys
+from pathlib import Path
+sums, repo = Path(sys.argv[1]), Path(sys.argv[2])
+bad = 0
+for line in sums.read_text().splitlines():
+    digest, rel = line.split("  ", 1)
+    if not rel.startswith("files/"):
+        continue
+    target = repo / rel[len("files/"):]
+    got = hashlib.sha256(target.read_bytes()).hexdigest()
+    print(("ok " if got == digest else "MISMATCH ") + str(target))
+    bad += got != digest
+raise SystemExit(bad)
+PY
+
+Smoke, from /tmp, after the copy
+  cd /tmp
+  PYTHONPATH=/path/to/repo python3 - << 'PY'
+import decision_engine.core.engine as engine
+names = engine.DecisionEngine.tick.__code__.co_names
+assert "apply_news_isolation" in names
+for forbidden in ("apply_five_state_regime_router", "evaluate_macro_gate", "attach_cityu_institutional_context", "attach_counterparty_context"):
+    assert forbidden not in names, forbidden
+print("SMOKE_OK")
+PY
+  # Do not restart a trader.
+
+Rollback
+  cp -a "$bak/decision_engine/core/engine.py" decision_engine/core/engine.py
+  rm -f decision_engine/core/news_shock_gate.py
+  sha256sum -c "$bak/BEFORE.sha256"
+  # RSS, the three databases, perp, clusters, and guards stay.
