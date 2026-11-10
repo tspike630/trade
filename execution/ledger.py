@@ -78,7 +78,7 @@ def read_spot_buy_blocks_readonly(path: str | Path) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT * FROM binance_spot_positions
-            WHERE status NOT IN ('closed', 'closed_dust', 'oco_filled')
+            WHERE status NOT IN ('closed', 'closed_dust', 'oco_filled', 'closed_canceled')
             ORDER BY id ASC
             """
         ).fetchall()
@@ -331,6 +331,12 @@ class ExecutionLedger:
             "residual_qty",
             "residual_quote",
             "purpose",
+            "oco_ratchet_count",
+            "initial_stop_price",
+            "entry_order_qty",
+            "entry_limit_price",
+            "created_at_ms",
+            "exit_filled_qty",
         ):
             if name not in have:
                 self.conn.execute(
@@ -878,6 +884,21 @@ class ExecutionLedger:
         row = self.binance_spot_position_by_decision(decision_id)
         if row is None:
             raise RuntimeError(f"binance spot position missing for {decision_id}")
+        extra = {
+            key: spec[key]
+            for key in (
+                "oco_ratchet_count",
+                "initial_stop_price",
+                "entry_order_qty",
+                "entry_limit_price",
+                "created_at_ms",
+            )
+            if key in spec and spec.get(key) not in (None, "")
+        }
+        if extra:
+            updated = self.update_binance_spot_position(int(row["id"]), extra)
+            if isinstance(updated, dict):
+                return updated
         return row
 
     def binance_spot_position_by_decision(
@@ -901,6 +922,12 @@ class ExecutionLedger:
         "quantity",
         "stop_price",
         "take_profit_price",
+        "oco_ratchet_count",
+        "initial_stop_price",
+        "entry_order_qty",
+        "entry_limit_price",
+        "created_at_ms",
+        "exit_filled_qty",
         "protection",
         "exit_order_id",
         "exit_reason",
@@ -947,7 +974,8 @@ class ExecutionLedger:
             f"""
             SELECT * FROM binance_spot_positions
             WHERE status IN (
-                'open', 'qty_unconfirmed', 'oco_working', 'oco_unknown', 'oco_failed'
+                'open', 'qty_unconfirmed', 'oco_working', 'oco_unknown', 'oco_failed',
+                'maker_resting', 'maker_cancel_unknown', 'time_stop_unknown'
             )
             {clause}
             ORDER BY id ASC
@@ -970,7 +998,7 @@ class ExecutionLedger:
         rows = self.conn.execute(
             f"""
             SELECT * FROM binance_spot_positions
-            WHERE status NOT IN ('closed', 'closed_dust', 'oco_filled')
+            WHERE status NOT IN ('closed', 'closed_dust', 'oco_filled', 'closed_canceled')
             {clause}
             ORDER BY id ASC
             """,
