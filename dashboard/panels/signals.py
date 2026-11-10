@@ -61,7 +61,10 @@ def render_signals(store: DataStore) -> None:
 
 def _row(item: SignalRow) -> dict[str, object]:
     check, check_class = flag_text(item.validation_ok, yes="通过", no="拒绝")
-    done, done_class = flag_text(item.executed, yes="是", no="否")
+    if item.book_label:
+        done, done_class = item.book_label, item.book_tone or "muted"
+    else:
+        done, done_class = flag_text(item.executed, yes="是", no="否")
     if item.validation_ok is None and item.executed is None:
         link = "未关联"
     elif item.exec_dup:

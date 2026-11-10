@@ -12,7 +12,8 @@ from dashboard.panels.common import col, data_table, panel_box, show_unavailable
 def render_execution(store: DataStore) -> None:
     with panel_box(
         "执行记录",
-        "execution_log 最近 50 条。拒绝分布含校验失败，以及 status / 回执中的 PM、风控、paper 拒绝。",
+        "execution_log 最近 50 条。现货以 binance_spot_positions 当前行为准；"
+        "首包回执不代替后续成交。拒绝分布不含已入账挂单。",
     ):
         _buckets(store)
         _rows(store)
@@ -57,7 +58,10 @@ def _rows(store: DataStore) -> None:
             col("strategy", "策略"),
             col("action", "动作"),
             col("token", "代币"),
-            col("done", "已执行"),
+            col("done", "状态"),
+            col("filled", "已成交"),
+            col("order_qty", "委托"),
+            col("protection", "保护"),
             col("executor", "执行器"),
             col("receipt", "回执摘要"),
         ],
@@ -67,7 +71,10 @@ def _rows(store: DataStore) -> None:
 
 
 def _row(item: ExecutionRow) -> dict[str, object]:
-    done, done_class = flag_text(item.executed, yes="是", no="否")
+    if item.book_label:
+        done, done_class = item.book_label, item.book_tone or "muted"
+    else:
+        done, done_class = flag_text(item.executed, yes="是", no="否")
     return {
         "id": item.id,
         "ts": fmt_ts(item.ts),
@@ -77,6 +84,9 @@ def _row(item: ExecutionRow) -> dict[str, object]:
         "token": short_addr(item.token_address),
         "done": done,
         "done_class": done_class,
+        "filled": item.filled_text or "—",
+        "order_qty": item.order_text or "—",
+        "protection": item.protection_text or "—",
         "executor": item.executor or "—",
         "receipt": item.receipt_summary,
     }
