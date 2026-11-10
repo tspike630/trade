@@ -30,12 +30,13 @@ from decision_engine.core.cross_venue_deviation import (
     pair_exact_bars,
     summarize_pairs,
 )
+from decision_engine.core.cross_venue_calibration import evaluate_cross_venue, usd_not_calibrated
 from decision_engine.core.vision_backfill import (
     RateLimiter,
+    cached_fetch,
     connect,
     coverage_report,
     core_usdt_symbols,
-    fetch_bytes,
     ingest_zip,
     iter_plan,
     write_manifest,
@@ -54,8 +55,9 @@ def run_vision(args: argparse.Namespace, out: Path) -> dict[str, object]:
     dates = closed_utc_days(_end_date(args.end), args.days)
     db = connect(out / "vision.db")
     limiter = RateLimiter(args.min_interval)
+    cache_dir = out / "cache"
     for kind, symbol, url in iter_plan(symbols, dates):
-        fetched = fetch_bytes(url, limiter)
+        fetched = cached_fetch(db, cache_dir, url, limiter)
         ingest_zip(db, kind, symbol, fetched)
         print(f"{fetched.status} {kind} {symbol} {url} {fetched.detail or fetched.byte_count}")
     report = coverage_report(db, symbols)
@@ -119,27 +121,36 @@ def run_ccxt(args: argparse.Namespace, out: Path) -> dict[str, object]:
             exchange.close()
         except Exception:
             pass
-    pairs = []
+    studies = []
     for base in args.bases.split(","):
         left = load_venue_bars(conn, "okx", f"{base}/USDT")
         right = load_venue_bars(conn, "bybit", f"{base}/USDT")
-        paired = pair_exact_bars(left, right)
-        pairs.append(
-            {
-                "base": base,
-                "quote": "USDT",
-                "left": "okx",
-                "right": "bybit",
-                **gap_counts(left, right),
-                **summarize_pairs(paired),
-            }
-        )
+        if not left or not right:
+            studies.append(
+                {
+                    "base": base,
+                    "quote": "USDT",
+                    "status": "insufficient",
+                    "reason": "need both OKX and Bybit USDT bars",
+                    "gaps": gap_counts(left, right),
+                    "summary": summarize_pairs(pair_exact_bars(left, right)),
+                    "unlock_news_gate": False,
+                }
+            )
+            continue
+        study = evaluate_cross_venue(left, right, quote="USDT")
+        study["base"] = base
+        study["summary"] = summarize_pairs(pair_exact_bars(left, right))
+        studies.append(study)
     report = {
         "core_bases": list(core_bases()),
         "requested_bases": args.bases.split(","),
         "ccxt_days": args.ccxt_days,
         "venues": results,
-        "usdt_pairs": pairs,
+        "usdt_studies": studies,
+        "usd": usd_not_calibrated(
+            "Coinbase Exchange is USD. This package has no second USD venue and no timestamped USDTUSD series."
+        ),
         "usd_not_pooled_with_usdt": True,
         "interpolation": "none",
     }

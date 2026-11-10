@@ -4,12 +4,12 @@
 whose fetch is more than 90 minutes after publication is a late archive:
 it is counted and then removed from the predictive sample.
 
-Archive book depth and top-trader ratios are not the gate's ``obi_top5``,
-``taker_buy_ratio``, or ``whale_retail_divergence``. ``x_watch`` has no
-history, so heat stays unavailable and online accumulation stays off.
-``OnchainCalibration`` is returned only when a non-synthetic study names
-those gate series, has heat history, and clears the frozen tests. This
-module does not attach that object to the engine.
+Archive book depth and top-trader ratios are not the gate's ``obi_top5``
+or ``whale_retail_divergence``. ``x_watch`` has no history, so heat stays
+unavailable. The live ``OnchainCalibration`` needs heat, top-5 imbalance,
+taker share, and whale divergence together. This module never constructs
+that object. A taker quote share can be recorded only as partial evidence,
+and it still does not open the live gate.
 """
 
 from __future__ import annotations
@@ -24,10 +24,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from decision_engine.core.news_shock_gate import OnchainCalibration
 from decision_engine.core.vision_backfill import CORE_BASES
 
-SCHEMA_VERSION = "news_oos_v1"
+SCHEMA_VERSION = "news_oos_v2"
 LATE_ARCHIVE_MIN = 90
 HORIZON_MIN = 60
 EMBARGO_MIN = 60
@@ -81,32 +80,73 @@ def mentioned_bases(title: str) -> tuple[str, ...]:
     return tuple(found)
 
 
+def _delay_minutes(row: Mapping[str, object]) -> float | None:
+    fetched = _parse(str(row.get("fetched_at") or ""))
+    published = _parse(str(row.get("published_at") or ""))
+    if fetched is None or published is None:
+        return None
+    return (fetched - published).total_seconds() / 60.0
+
+
 def audit_news_rows(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
-    """Count the rows that were actually passed in. Nothing is hardcoded."""
+    """Count the rows that were actually passed in. Nothing is hardcoded.
+
+    The primary predictive cut is a fetch more than 90 minutes after
+    publication. Other cuts are reported so that cut can be audited. A
+    parent pre-count of 1906 / 1325 / 581 and an older inventory of
+    1859 / 164 are not results of this function.
+    """
     total = len(rows)
-    late = 0
-    bad_clock = 0
-    usable = 0
+    missing_fetched = 0
+    missing_published = 0
+    fetch_before_publish = 0
+    delays: list[float] = []
     for row in rows:
         fetched = _parse(str(row.get("fetched_at") or ""))
         published = _parse(str(row.get("published_at") or ""))
         if fetched is None:
-            bad_clock += 1
+            missing_fetched += 1
             continue
         if published is None:
-            bad_clock += 1
+            missing_published += 1
             continue
-        delay_min = (fetched - published).total_seconds() / 60.0
-        if delay_min > LATE_ARCHIVE_MIN:
-            late += 1
+        delay = (fetched - published).total_seconds() / 60.0
+        if delay < 0:
+            fetch_before_publish += 1
             continue
-        usable += 1
+        delays.append(delay)
+    sensitivity = {}
+    for cut in (60, 90, 180, 360):
+        late = sum(1 for item in delays if item > cut)
+        sensitivity[str(cut)] = {
+            "late_archive_excluded": late,
+            "predictive_candidates": len(delays) - late,
+        }
+    primary = sensitivity["90"]
     return {
         "rows_in_input": total,
-        "late_archive_excluded": late,
-        "bad_clock_excluded": bad_clock,
-        "predictive_candidates": usable,
+        "missing_fetched_at": missing_fetched,
+        "missing_published_at": missing_published,
+        "fetched_before_published": fetch_before_publish,
+        "dated_rows": len(delays),
+        "late_archive_excluded": primary["late_archive_excluded"],
+        "bad_clock_excluded": missing_fetched + missing_published + fetch_before_publish,
+        "predictive_candidates": primary["predictive_candidates"],
+        "late_archive_rule": "exclude when fetched_at - published_at > 90 minutes",
+        "clock": "fetched_at",
+        "published_at_replaces_fetched_at": False,
+        "sensitivity_by_cutoff_minutes": sensitivity,
         "hardcoded_inventory_used": False,
+        "reference_counts_not_used": {
+            "parent_precount_2026_11_10": {
+                "rows": 1906,
+                "late_archive_gt_90min": 1325,
+                "predictive_candidates": 581,
+                "is_final": False,
+            },
+            "older_inventory": {"rows": 1859, "excluded_old_news": 164},
+            "used_as_this_result": False,
+        },
     }
 
 
@@ -266,46 +306,47 @@ def evaluate_study(
     adjusted_map = {index: value for index, value in zip((item[0] for item in usable), holm([item[1] for item in usable]))} if usable else {}
     adjusted = [adjusted_map.get(index) for index in range(len(hypotheses))]
     significant = [value is not None and value <= 0.05 for value in adjusted]
-    series_match = tuple(series) == GATE_SERIES and heat_available
     enough = test_clusters >= MIN_TEST_CLUSTERS and predictive_rows > 0
-    any_significant = any(significant)
-    unlock = (
+    taker_index = next(
+        (index for index, item in enumerate(hypotheses) if item.get("name") == "taker_buy_quote_share"),
+        None,
+    )
+    taker_p = None if taker_index is None else adjusted[taker_index]
+    taker_significant = taker_p is not None and taker_p <= 0.05
+    partial = None
+    if (
         (not synthetic)
-        and series_match
         and enough
-        and any_significant
+        and taker_significant
         and bool(news_db_sha256)
         and all(split_times.get(key) for key in ("train_end", "validation_end", "test_end"))
-    )
+    ):
+        partial = {
+            "field": "taker_buy_ratio",
+            "definition": "taker_buy_quote_volume / quote_volume",
+            "matches_live_entry_zone_definition": True,
+            "aligned_min": TAKER_SHARE_ALIGNED,
+            "divergent_max": TAKER_SHARE_DIVERGENT,
+            "applied_to_live_gate": False,
+            "reason": (
+                "judge_onchain still returns pending unless heat_evolution, "
+                "obi_top5, and whale_retail_divergence are present too"
+            ),
+        }
     if synthetic:
         status = "synthetic_not_a_calibration"
     elif not enough:
         status = "insufficient"
-    elif not series_match or not heat_available:
-        status = "not_transferable"
-    elif not any_significant:
+    elif not taker_significant:
         status = "not_significant"
-    elif unlock:
-        status = "unlock_evidence"
     else:
-        status = "insufficient"
-    calibration = None
-    if unlock:
-        calibration = {
-            "min_heat_delta": 1,
-            "min_obi_aligned": 0.15,
-            "min_taker_aligned": TAKER_SHARE_ALIGNED,
-            "min_whale_aligned": 1.2,
-            "max_obi_divergent": -0.15,
-            "max_taker_divergent": TAKER_SHARE_DIVERGENT,
-            "max_whale_divergent": 0.8,
-            "max_feature_age_min": 90.0,
-        }
+        status = "partial_taker_only"
+    unlock = False
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
         "unlock": unlock,
-        "production_attested": unlock,
+        "production_attested": False,
         "synthetic": synthetic,
         "x_watch_history": "closed",
         "x_watch_online_accumulation": "off",
@@ -330,38 +371,46 @@ def evaluate_study(
         "news_db_sha256": news_db_sha256,
         "split_times": dict(split_times),
         "hypotheses": list(hypotheses),
-        "calibration": calibration,
+        "live_gate_unlock": False,
+        "cannot_identify": [
+            "heat_evolution",
+            "obi_top5",
+            "whale_retail_divergence",
+            "book_depth_as_obi_top5",
+            "top_trader_ratio_as_whale_retail_divergence",
+        ],
+        "will_not_fully_unlock_onchain_calibration": True,
+        "partial_taker_evidence": partial,
         "false_positive_rate": None,
         "classification_accuracy": None,
     }
 
 
-def load_unlocked_calibration(evidence: Mapping[str, object]) -> OnchainCalibration | None:
-    """Return a calibration only from an attested non-synthetic evidence record."""
+def taker_buy_quote_share(quote_volume: float, taker_buy_quote_volume: float) -> float | None:
+    """Same ratio as ``taker_buy_ratio = taker_buy_quote_volume / quote_volume``.
+
+    Values outside ``[0, 1]`` are not that share and are rejected.
+    """
+    if quote_volume <= 0 or not math.isfinite(quote_volume) or not math.isfinite(taker_buy_quote_volume):
+        return None
+    share = taker_buy_quote_volume / quote_volume
+    if share < 0 or share > 1:
+        return None
+    return share
+
+
+def partial_taker_record(evidence: Mapping[str, object]) -> dict[str, object] | None:
+    """Partial taker evidence only. Never a live ``OnchainCalibration``."""
     if evidence.get("schema_version") != SCHEMA_VERSION:
         return None
-    if evidence.get("synthetic") is True or evidence.get("unlock") is not True:
+    if evidence.get("synthetic") is True or evidence.get("live_gate_unlock") is not False:
         return None
-    if evidence.get("production_attested") is not True:
+    raw = evidence.get("partial_taker_evidence")
+    if not isinstance(raw, Mapping) or raw.get("applied_to_live_gate") is not False:
         return None
-    if not evidence.get("news_db_sha256") or not evidence.get("split_times"):
+    if raw.get("definition") != "taker_buy_quote_volume / quote_volume":
         return None
-    raw = evidence.get("calibration")
-    if not isinstance(raw, Mapping):
-        return None
-    try:
-        return OnchainCalibration(
-            min_heat_delta=int(raw["min_heat_delta"]),
-            min_obi_aligned=float(raw["min_obi_aligned"]),
-            min_taker_aligned=float(raw["min_taker_aligned"]),
-            min_whale_aligned=float(raw["min_whale_aligned"]),
-            max_obi_divergent=float(raw["max_obi_divergent"]),
-            max_taker_divergent=float(raw["max_taker_divergent"]),
-            max_whale_divergent=float(raw["max_whale_divergent"]),
-            max_feature_age_min=float(raw["max_feature_age_min"]),
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
+    return dict(raw)
 
 
 def read_news_readonly(path: Path) -> tuple[list[dict[str, object]], str]:
@@ -431,11 +480,12 @@ def build_effect_rows(
             ret = forward_return_bps(float(future[0]["open"]), float(future[-1]["close"]))
             if ret is None:
                 continue
-            quote = float(known[-1].get("quote_volume") or 0)
-            taker_quote = known[-1].get("taker_buy_quote_volume")
             taker_share = None
-            if quote > 0 and taker_quote is not None:
-                taker_share = float(taker_quote) / quote
+            if known[-1].get("quote_volume") is not None and known[-1].get("taker_buy_quote_volume") is not None:
+                taker_share = taker_buy_quote_share(
+                    float(known[-1]["quote_volume"]),
+                    float(known[-1]["taker_buy_quote_volume"]),
+                )
             top_ratio = None
             for row in metric_rows.get(symbol) or []:
                 stamp = _as_dt(row["create_time"])

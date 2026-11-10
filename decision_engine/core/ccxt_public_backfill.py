@@ -174,6 +174,34 @@ def make_ccxt_fetcher(exchange: Any, symbol: str, limiter: RateLimiter) -> Fetch
     return fetch_page
 
 
+def resume_open_ms(
+    conn: sqlite3.Connection,
+    exchange: str,
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+) -> int:
+    """First missing closed open. A stored prefix is not requested again."""
+    ensure_ccxt_ohlcv(conn)
+    stored = [
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT ts FROM ccxt_ohlcv
+            WHERE exchange = ? AND symbol = ? AND timeframe = '5m' AND ts >= ? AND ts < ?
+            ORDER BY ts
+            """,
+            (exchange, symbol, start_ms, end_ms),
+        )
+    ]
+    cursor = int(start_ms)
+    for ts in stored:
+        if ts != cursor:
+            break
+        cursor += STEP_MS
+    return cursor
+
+
 def backfill_symbol(
     conn: sqlite3.Connection,
     exchange_id: str,
@@ -185,23 +213,45 @@ def backfill_symbol(
     limit: int = 100,
 ) -> dict[str, object]:
     symbol = symbol_for(exchange_id, base)
-    rows, error = closed_pages(fetch_page, start_ms=start_ms, end_ms=end_ms, limit=limit)
-    written = insert_closed_bars(conn, exchange_id, symbol, rows) if rows else 0
-    status = "ok" if error is None else "partial" if rows else "error"
-    record_status(conn, exchange_id, symbol, status, error, len(rows), start_ms, end_ms)
+    resume = resume_open_ms(conn, exchange_id, symbol, start_ms, end_ms)
+    fetched: list[list[float]] = []
+    error = None
+    if resume < end_ms:
+        fetched, error = closed_pages(fetch_page, start_ms=resume, end_ms=end_ms, limit=limit)
+    written = insert_closed_bars(conn, exchange_id, symbol, fetched) if fetched else 0
+    stored = conn.execute(
+        """
+        SELECT COUNT(*) FROM ccxt_ohlcv
+        WHERE exchange = ? AND symbol = ? AND timeframe = '5m' AND ts >= ? AND ts < ?
+        """,
+        (exchange_id, symbol, start_ms, end_ms),
+    ).fetchone()[0]
+    if resume >= end_ms and error is None:
+        status = "skipped_covered"
+    elif error is None:
+        status = "ok"
+    elif stored:
+        status = "partial"
+    else:
+        status = "error"
+    record_status(conn, exchange_id, symbol, status, error, int(stored), start_ms, end_ms)
     expected = max(0, (end_ms - start_ms) // STEP_MS)
     return {
         "exchange": exchange_id,
         "base": base,
         "symbol": symbol,
         "quote": quote_for(exchange_id),
-        "rows": len(rows),
+        "rows": int(stored),
+        "fetched_rows": len(fetched),
+        "resume_open_ms": resume,
         "inserted": written,
         "expected_closed_bars": expected,
-        "missing_bars": expected - len(rows),
+        "missing_bars": expected - int(stored),
         "status": status,
         "detail": error,
-        "history_covers_requested_start": bool(rows) and int(rows[0][0]) <= start_ms + STEP_MS,
+        "history_covers_requested_start": resume > start_ms or (
+            bool(fetched) and int(fetched[0][0]) <= start_ms + STEP_MS
+        ),
     }
 
 

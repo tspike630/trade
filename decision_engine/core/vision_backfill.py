@@ -305,6 +305,36 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def cached_fetch(
+    conn: sqlite3.Connection,
+    cache_dir: Path,
+    url: str,
+    limiter: RateLimiter,
+) -> FetchResult:
+    """Reuse a recorded sha256 without another HTTP request when the cache matches.
+
+    A previous ``ok`` row with no cache file still skips the network: the rows
+    are already in the database.
+    """
+    row = conn.execute(
+        "SELECT sha256, byte_count, status FROM vision_files WHERE url = ?",
+        (url,),
+    ).fetchone()
+    if row and row[2] == "ok" and row[0]:
+        sha = str(row[0])
+        cached = cache_dir / f"{sha}.zip"
+        if cached.is_file():
+            payload = cached.read_bytes()
+            if hashlib.sha256(payload).hexdigest() == sha:
+                return FetchResult(url, "ok", sha, len(payload), "reused_local_cache", payload)
+        return FetchResult(url, "ok", sha, int(row[1] or 0), "reused_manifest", None)
+    fetched = fetch_bytes(url, limiter)
+    if fetched.payload is not None and fetched.sha256:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / f"{fetched.sha256}.zip").write_bytes(fetched.payload)
+    return fetched
+
+
 def already_stored(conn: sqlite3.Connection, url: str, sha256: str | None) -> bool:
     row = conn.execute(
         "SELECT sha256, status FROM vision_files WHERE url = ?",
@@ -375,6 +405,8 @@ def ingest_zip(
     symbol: str,
     fetched: FetchResult,
 ) -> int:
+    if fetched.detail == "reused_manifest":
+        return 0
     if fetched.status != "ok" or fetched.payload is None or fetched.sha256 is None:
         _record_file(conn, fetched, 0)
         conn.commit()

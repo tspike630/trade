@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
+import subprocess
+import sys
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from decision_engine.core.ccxt_public_backfill import (
     PageResult,
@@ -15,6 +19,7 @@ from decision_engine.core.ccxt_public_backfill import (
     ensure_ccxt_ohlcv,
 )
 from decision_engine.core.cross_venue_deviation import gap_counts, pair_exact_bars
+from decision_engine.core.cross_venue_calibration import evaluate_cross_venue, usd_not_calibrated
 from decision_engine.core.news_oos_calibration import (
     ARCHIVE_SERIES,
     audit_news_rows,
@@ -23,11 +28,13 @@ from decision_engine.core.news_oos_calibration import (
     dedup_events,
     evaluate_study,
     feature_is_known,
-    load_unlocked_calibration,
+    partial_taker_record,
+    taker_buy_quote_share,
     time_split,
 )
 from decision_engine.core.vision_backfill import (
     FetchResult,
+    cached_fetch,
     connect,
     coverage_report,
     detect_epoch_unit,
@@ -116,6 +123,27 @@ class VisionTests(unittest.TestCase):
             self.assertFalse(report["complete"])
             self.assertFalse(report["obi_top5_column"])
 
+    def test_second_pass_reuses_the_manifest_without_http(self) -> None:
+        payload = _zip_bytes(
+            "BTCUSDT-metrics.csv",
+            "create_time,symbol,sum_open_interest,sum_open_interest_value,"
+            "count_toptrader_long_short_ratio,sum_toptrader_long_short_ratio,"
+            "count_long_short_ratio,sum_taker_long_short_vol_ratio\n"
+            "2026-11-08 00:35:00,BTCUSDT,1,2,3,1,0.5,0.2\n",
+        )
+        fetched = FetchResult("https://example.test/a.zip", "ok", "abc", len(payload), None, payload)
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conn = connect(root / "vision.db")
+            ingest_zip(conn, "metrics", "BTCUSDT", fetched)
+            with patch(
+                "decision_engine.core.vision_backfill.fetch_bytes",
+                side_effect=AssertionError("http"),
+            ):
+                again = cached_fetch(conn, root / "cache", fetched.url, limiter=None)  # type: ignore[arg-type]
+            self.assertEqual(again.detail, "reused_manifest")
+            self.assertEqual(ingest_zip(conn, "metrics", "BTCUSDT", again), 0)
+
 
 class CcxtTests(unittest.TestCase):
     def test_pagination_stops_and_does_not_invent_missing_minutes(self) -> None:
@@ -160,6 +188,27 @@ class CcxtTests(unittest.TestCase):
             self.assertEqual(result["rows"], 0)
             self.assertEqual(result["status"], "error")
             self.assertIn("blocked", str(result["detail"]))
+
+    def test_stored_prefix_is_not_requested_again(self) -> None:
+        with TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(Path(tmp) / "ccxt.db")
+            ensure_ccxt_ohlcv(conn)
+            calls: list[int] = []
+
+            def fetch_page(timeframe: str, since: int, limit: int) -> PageResult:
+                del timeframe, limit
+                calls.append(since)
+                return PageResult([[since, 1, 1, 1, 1, 1]], None)
+
+            backfill_symbol(
+                conn, "okx", "BTC", start_ms=0, end_ms=900_000, fetch_page=fetch_page, limit=1
+            )
+            calls.clear()
+            second = backfill_symbol(
+                conn, "okx", "BTC", start_ms=0, end_ms=900_000, fetch_page=fetch_page, limit=1
+            )
+            self.assertEqual(calls, [])
+            self.assertEqual(second["status"], "skipped_covered")
 
 
 class NewsCalibrationTests(unittest.TestCase):
@@ -243,9 +292,14 @@ class NewsCalibrationTests(unittest.TestCase):
             synthetic=False,
         )
         self.assertFalse(report["unlock"])
-        self.assertEqual(report["status"], "not_transferable")
+        self.assertFalse(report["live_gate_unlock"])
+        self.assertTrue(report["will_not_fully_unlock_onchain_calibration"])
+        self.assertIn("obi_top5", report["cannot_identify"])
+        self.assertIn("heat_evolution", report["cannot_identify"])
+        self.assertEqual(report["status"], "partial_taker_only")
+        self.assertFalse(report["partial_taker_evidence"]["applied_to_live_gate"])
         self.assertIsNone(report["false_positive_rate"])
-        self.assertIsNone(load_unlocked_calibration(report))
+        self.assertIsNotNone(partial_taker_record(report))
 
     def test_synthetic_evidence_stays_locked_and_a_real_gate_record_can_open(self) -> None:
         synthetic = evaluate_study(
@@ -259,7 +313,8 @@ class NewsCalibrationTests(unittest.TestCase):
             synthetic=True,
         )
         self.assertFalse(synthetic["unlock"])
-        self.assertIsNone(load_unlocked_calibration(synthetic))
+        self.assertFalse(synthetic["live_gate_unlock"])
+        self.assertIsNone(partial_taker_record(synthetic))
         attested = evaluate_study(
             predictive_rows=100,
             test_clusters=40,
@@ -270,10 +325,10 @@ class NewsCalibrationTests(unittest.TestCase):
             split_times={"train_end": "a", "validation_end": "b", "test_end": "c"},
             synthetic=False,
         )
-        loaded = load_unlocked_calibration(attested)
-        self.assertIsNotNone(loaded)
-        assert loaded is not None
-        self.assertEqual(loaded.min_heat_delta, 1)
+        self.assertFalse(attested["live_gate_unlock"])
+        self.assertIsNone(attested["partial_taker_evidence"])
+        self.assertIsNone(taker_buy_quote_share(10, 15))
+        self.assertAlmostEqual(taker_buy_quote_share(10, 6) or 0, 0.6)
 
     def test_split_purges_the_label_window(self) -> None:
         rows = []
@@ -301,6 +356,80 @@ class NewsCalibrationTests(unittest.TestCase):
         stats = bootstrap_treated([("c1", True, 20.0), ("c2", False, 0.0)], reps=50, seed=1)
         self.assertAlmostEqual(float(stats["mean_diff_bps"]), 20.0)
         self.assertGreater(float(stats["clusters"]), 1)
+
+    def test_delay_sensitivity_is_not_the_old_inventory(self) -> None:
+        rows = [
+            {
+                "published_at": "2026-11-01T00:00:00Z",
+                "fetched_at": "2026-11-01T03:00:00Z",
+            }
+        ]
+        audit = audit_news_rows(rows)
+        self.assertEqual(audit["sensitivity_by_cutoff_minutes"]["90"]["late_archive_excluded"], 1)
+        self.assertEqual(audit["sensitivity_by_cutoff_minutes"]["180"]["late_archive_excluded"], 0)
+        self.assertFalse(audit["reference_counts_not_used"]["used_as_this_result"])
+        self.assertNotEqual(audit["rows_in_input"], 1906)
+        self.assertNotEqual(audit["rows_in_input"], 1859)
+
+
+class CrossVenueTests(unittest.TestCase):
+    def test_one_venue_and_usd_stay_uncalibrated(self) -> None:
+        usd = usd_not_calibrated("no second USD venue")
+        self.assertEqual(usd["status"], "not_calibrated")
+        self.assertFalse(usd["unlock_news_gate"])
+        thin = evaluate_cross_venue(
+            {0: {"open": 1, "high": 1, "low": 1, "close": 1}},
+            {0: {"open": 1, "high": 1, "low": 1, "close": 1}},
+            quote="USDT",
+        )
+        self.assertEqual(thin["status"], "insufficient")
+        self.assertFalse(thin["unlock_news_gate"])
+
+    def test_aligned_wick_needs_the_peer_and_a_forward_bar(self) -> None:
+        left = {}
+        right = {}
+        for index in range(40):
+            open_ms = index * 300_000
+            left[open_ms] = {"open": 100, "high": 100, "low": 100, "close": 100}
+            right[open_ms] = {"open": 100, "high": 100, "low": 100, "close": 100}
+        left[20 * 300_000]["high"] = 101
+        report = evaluate_cross_venue(left, right, quote="USDT")
+        self.assertGreater(report["gaps"]["aligned"], 0)
+        self.assertEqual(report["gaps"]["filled_by_interpolation"], 0)
+        self.assertFalse(report["unlock_news_gate"])
+
+
+class CleanPackageTests(unittest.TestCase):
+    def test_empty_directory_imports_and_runs_the_offline_fixture(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        names = [
+            "decision_engine/__init__.py",
+            "decision_engine/core/__init__.py",
+            "decision_engine/core/vision_backfill.py",
+            "decision_engine/core/ccxt_public_backfill.py",
+            "decision_engine/core/cross_venue_deviation.py",
+            "decision_engine/core/cross_venue_calibration.py",
+            "decision_engine/core/news_oos_calibration.py",
+            "packaging/calib_backfill/selfcheck_offline.py",
+            "packaging/calib_backfill/requirements.txt",
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in names:
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(repo / name, target)
+            self.assertFalse((root / "decision_engine/core/news_shock_gate.py").exists())
+            completed = subprocess.run(
+                [sys.executable, str(root / "packaging/calib_backfill/selfcheck_offline.py")],
+                cwd=root,
+                env={"PYTHONPATH": str(root), "PATH": "/usr/bin:/bin"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertIn("OFFLINE_OK", completed.stdout)
 
 
 if __name__ == "__main__":
