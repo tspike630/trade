@@ -218,6 +218,7 @@ class TestNewsIsolation(unittest.TestCase):
         hot = attach_counterparty_context(
             [{"binance_symbol": "SOLUSDT"}],
             db_path=self.dbs["counterparty"],
+            now_ms=1,
         )
         self.assertEqual(hot[0]["funding_z"], -3.0)
         self.assertEqual(hot[0]["liq_cascade_regime"], "long_liquidation_waterfall")

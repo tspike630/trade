@@ -23,6 +23,10 @@ from decision_engine.core.live_bnb_turnover import (
     stamp_turnover,
 )
 from decision_engine.core.live_buy_guards import apply_live_buy_guards
+from decision_engine.core.volume_z_1h import (
+    attach_stored_volume_z,
+    persist_volume_z_for_decision_tick,
+)
 from decision_engine.core.macro_circuit_breaker import (
     evaluate_macro_gate,
     resolve_macro_db_path,
@@ -147,6 +151,11 @@ class DecisionEngine:
         macro_halt = macro_status.halt_reason
         if bnb_spot:
             hot, bnb_source = self._load_live_bnb_hot(hot)
+            from decision_engine.core.perp_microstructure_and_beta_hedge import (
+                attach_counterparty_context,
+            )
+
+            hot = attach_counterparty_context(hot, now_ms=now_ms)
             # Coordinates are the entry-zone overlay. The classic arm reads
             # the factor fields the paper legs already use.
             if self.bus.purpose == PURPOSE_LIVE_BNB_BOLL_FADE:
@@ -155,14 +164,10 @@ class DecisionEngine:
                     hot,
                     now_ms=now_ms,
                 )
-                from decision_engine.core.perp_microstructure_and_beta_hedge import (
-                    attach_counterparty_context,
-                )
                 from decision_engine.core.cityu_institutional_alpha import (
                     attach_cityu_institutional_context,
                 )
 
-                hot = attach_counterparty_context(hot)
                 hot = attach_cityu_institutional_context(hot, now_ms=now_ms)
         scanned = len(hot)
         if bnb_spot:
@@ -257,6 +262,8 @@ class DecisionEngine:
                 apply_five_state_regime_router,
             )
 
+            persist_volume_z_for_decision_tick(self.adapter.db_path, now_ms=now_ms)
+            hot = attach_stored_volume_z(self.adapter.conn, hot, now_ms=now_ms)
             symbols: list[str] = []
             for sig in passed:
                 if str(sig.get("action") or "").strip().lower() != "buy":
