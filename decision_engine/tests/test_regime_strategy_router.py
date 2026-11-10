@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 
 from decision_engine.core.regime_strategy_router import (
@@ -213,6 +214,62 @@ class TestFiveStateRegimeRouter(unittest.TestCase):
             }
         )
         self.assertTrue(dec_vol_below.allow_buy)
+
+    def test_taker_and_whale_thresholds_are_inclusive_on_both_sides(self) -> None:
+        bull = {
+            "symbol": "SOLUSDT",
+            "nvda_1h_ret_pct": 1.60,
+            "xs_breadth_1h": 0.75,
+            "xs_rank_pct_1h": 0.85,
+        }
+        weak_taker = math.nextafter(0.45, 0.0)
+        strong_taker = math.nextafter(0.45, 1.0)
+        thin_obi = math.nextafter(-0.25, -1.0)
+        supported_obi = math.nextafter(-0.25, 0.0)
+        weak_whale = math.nextafter(0.65, 0.0)
+        strong_whale = math.nextafter(0.65, 1.0)
+        climax = math.nextafter(3.8, math.inf)
+        below_climax = math.nextafter(3.8, 0.0)
+
+        cases = (
+            ({"obi_top5": -0.25, "taker_buy_ratio": 0.45}, False, "regime3_thin_bid_book_trap"),
+            ({"obi_top5": -0.25, "taker_buy_ratio": weak_taker}, False, "regime3_thin_bid_book_trap"),
+            ({"obi_top5": -0.25, "taker_buy_ratio": strong_taker}, True, None),
+            ({"obi_top5": -0.25}, False, "regime3_thin_bid_book_trap"),
+            ({"obi_top5": thin_obi, "taker_buy_ratio": 0.45}, False, "regime3_thin_bid_book_trap"),
+            ({"obi_top5": supported_obi, "taker_buy_ratio": 0.45}, True, None),
+            ({"volume_z": 3.8, "whale_retail_divergence": 0.65}, False, "regime3_climax_volume_distribution_trap"),
+            ({"volume_z": 3.8, "whale_retail_divergence": weak_whale}, False, "regime3_climax_volume_distribution_trap"),
+            ({"volume_z": 3.8, "whale_retail_divergence": strong_whale}, True, None),
+            ({"volume_z": 3.8}, True, None),
+            ({"volume_z": climax, "whale_retail_divergence": 0.65}, False, "regime3_climax_volume_distribution_trap"),
+            ({"volume_z": below_climax, "whale_retail_divergence": 0.65}, True, None),
+        )
+        for extra, allow, reason in cases:
+            decision = evaluate_five_state_regime({**bull, **extra})
+            self.assertEqual(decision.allow_buy, allow, extra)
+            self.assertEqual(decision.reject_reason, reason, extra)
+
+        rejected, _counts = apply_five_state_regime_router(
+            [{"action": "buy", "binance_symbol": "SOLUSDT", "size_pct": 0.05, "obi_top5": -0.25, "taker_buy_ratio": 0.45}],
+            [{"binance_symbol": "SOLUSDT", **bull}],
+        )
+        self.assertEqual(rejected, [])
+        accepted, _counts = apply_five_state_regime_router(
+            [{
+                "action": "buy",
+                "binance_symbol": "SOLUSDT",
+                "size_pct": 0.05,
+                "obi_top5": -0.25,
+                "taker_buy_ratio": strong_taker,
+                "volume_z": 3.8,
+                "whale_retail_divergence": strong_whale,
+            }],
+            [{"binance_symbol": "SOLUSDT", **bull}],
+        )
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(accepted[0]["recommended_order_type"], "LIMIT_MAKER")
+        self.assertEqual(accepted[0]["market_regime"], REGIME_3_CROSS_ASSET_BULL_PULLBACK)
 
 
 if __name__ == "__main__":

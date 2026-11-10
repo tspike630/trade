@@ -1,12 +1,15 @@
+import inspect
 import math
 import unittest
 
 from decision_engine.core.regime_strategy_router import (
+    REGIME_1_POSITIVE_GAMMA_PINNED,
     REGIME_3_CROSS_ASSET_BULL_PULLBACK,
     REGIME_4_CROWDED_LONG_DEFENSIVE,
     evaluate_five_state_regime,
 )
 from decision_engine.core.smile_and_quantile_models import (
+    empirical_quantile,
     fit_volatility_smile_residuals,
     resolve_rolling_thresholds,
 )
@@ -59,6 +62,112 @@ class SmileAndQuantileModelsTests(unittest.TestCase):
         self.assertEqual(dec.regime, REGIME_4_CROWDED_LONG_DEFENSIVE)
         self.assertEqual(dec.playbook, "smile_put_wing_crash_insurance_defensive")
         self.assertTrue(dec.require_perp_beta_hedge)
+
+    def test_history_has_no_clock_window_or_current_bar_exclusion(self) -> None:
+        self.assertNotIn("now_ms", inspect.signature(empirical_quantile).parameters)
+        self.assertNotIn("max_window", inspect.signature(empirical_quantile).parameters)
+        calm, used = empirical_quantile([0.2] * 30, 0.95, min_samples=30, fallback=1.20)
+        self.assertTrue(used)
+        # The extra points stand in for a current bar and a future print.
+        # They move the quantile because this helper does not drop them.
+        contaminated, used_hot = empirical_quantile(
+            [0.2] * 30 + [80.0, 90.0],
+            0.95,
+            min_samples=30,
+            fallback=1.20,
+        )
+        self.assertTrue(used_hot)
+        self.assertGreater(contaminated, calm)
+        fallback, used_short = empirical_quantile(
+            [0.2] * 29 + [float("nan"), None, "x"],  # type: ignore[list-item]
+            0.95,
+            min_samples=30,
+            fallback=1.20,
+        )
+        self.assertFalse(used_short)
+        self.assertEqual(fallback, 1.20)
+        thresholds = resolve_rolling_thresholds({})
+        self.assertFalse(thresholds.used_empirical_nvda)
+        self.assertFalse(thresholds.used_empirical_vol_z)
+        self.assertAlmostEqual(thresholds.nvda_breakout_1h_pct, 1.20, places=3)
+        self.assertAlmostEqual(thresholds.climax_vol_z, 3.80, places=3)
+
+    def test_negative_or_zero_tte_is_dropped_and_missing_tte_keeps_the_seven_day_default(self) -> None:
+        spot = 100.0
+        invalid = [
+            {"strike": strike, "iv_pct": 50.0, "tte_years": tenor}
+            for strike, tenor in ((90, -1.0), (95, 0.0), (100, 1e-8), (110, float("nan")))
+        ]
+        self.assertIsNone(fit_volatility_smile_residuals(invalid, spot))
+        missing_tenor = [
+            {"strike": strike, "iv_pct": 50.0}
+            for strike in (90, 95, 100, 110)
+        ]
+        fitted = fit_volatility_smile_residuals(missing_tenor, spot)
+        self.assertIsNotNone(fitted)
+        assert fitted is not None
+        self.assertEqual(fitted.n_strikes, 4)
+
+    def test_explicit_iv_unit_and_same_contract_labels(self) -> None:
+        spot = 100.0
+        strikes = (90, 95, 100, 110)
+        percent = [
+            {"strike": strike, "iv": 50.0, "tte_years": 7.0 / 365.0, "iv_unit": "percent",
+             "underlying": "BTC", "expiry": "2026-12-25"}
+            for strike in strikes
+        ]
+        decimal = [
+            {**row, "iv": 0.50, "iv_unit": "decimal"}
+            for row in percent
+        ]
+        percent_fit = fit_volatility_smile_residuals(percent, spot)
+        decimal_fit = fit_volatility_smile_residuals(decimal, spot)
+        self.assertIsNotNone(percent_fit)
+        self.assertIsNotNone(decimal_fit)
+        assert percent_fit is not None and decimal_fit is not None
+        self.assertAlmostEqual(percent_fit.atm_fitted_iv_pct, decimal_fit.atm_fitted_iv_pct, places=3)
+        unlabeled = [
+            {"strike": strike, "iv": 2.5, "tte_years": 7.0 / 365.0}
+            for strike in strikes
+        ]
+        scaled = fit_volatility_smile_residuals(unlabeled, spot)
+        self.assertIsNotNone(scaled)
+        assert scaled is not None
+        self.assertGreater(scaled.atm_fitted_iv_pct, 100.0)
+        unknown = [{**row, "iv_unit": "pct"} for row in percent]
+        self.assertIsNone(fit_volatility_smile_residuals(unknown, spot))
+        mixed_expiry = [dict(row) for row in percent]
+        mixed_expiry[-1]["expiry"] = "2027-01-30"
+        self.assertIsNone(fit_volatility_smile_residuals(mixed_expiry, spot))
+        mixed_underlying = [dict(row) for row in percent]
+        mixed_underlying[-1]["underlying"] = "ETH"
+        self.assertIsNone(fit_volatility_smile_residuals(mixed_underlying, spot))
+        partial = [dict(row) for row in percent]
+        del partial[0]["expiry"]
+        self.assertIsNone(fit_volatility_smile_residuals(partial, spot))
+
+    def test_price_usd_does_not_select_the_smile(self) -> None:
+        spot = 100_000.0
+        tte = 7.0 / 365.0
+        chain = []
+        for strike in (90_000, 94_000, 97_000, 100_000, 103_000, 106_000, 110_000):
+            moneyness = math.log(strike / spot) / math.sqrt(tte)
+            iv = 50.0 + 2.0 * moneyness + 12.0 * moneyness * moneyness
+            if strike == 90_000:
+                iv += 7.5
+            chain.append({"strike": strike, "iv_pct": iv, "tte_years": tte})
+        ignored = evaluate_five_state_regime(
+            {"symbol": "BTCUSDT", "price_usd": spot, "option_chain": chain}
+        )
+        self.assertEqual(ignored.regime, REGIME_1_POSITIVE_GAMMA_PINNED)
+        self.assertNotEqual(ignored.playbook, "smile_put_wing_crash_insurance_defensive")
+        selected = evaluate_five_state_regime(
+            {"symbol": "BTCUSDT", "close": spot, "option_chain": chain}
+        )
+        self.assertEqual(selected.playbook, "smile_put_wing_crash_insurance_defensive")
+        plain = evaluate_five_state_regime({"symbol": "BTCUSDT", "spot_price": spot})
+        self.assertEqual(plain.regime, REGIME_1_POSITIVE_GAMMA_PINNED)
+        self.assertNotEqual(plain.playbook, "smile_put_wing_crash_insurance_defensive")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,11 @@ Inspired by global top-2 algorithmic market-making microstructure practice:
   ``<= best_ask - tick_size`` (and ``<= best_bid`` when ``post_only_at_or_below_best_bid``
   is False, allowed up to ``best_ask - tick_size`` inside the spread) so the order never
   crosses the ask and enjoys downside protection from the whale wall immediately behind it.
+
+The top N levels are the N best prices after the whole book is ranked. The raw
+list is not cut first. ``qty`` is base-asset size, and notional is ``price * qty``.
+A quote size or a USD depth total is not a level. No event time is read. This
+module does not apply a freshness window.
 """
 
 from __future__ import annotations
@@ -28,8 +33,8 @@ class WallMidQuote:
     raw_mid_price: float
     bid_wall_price: float
     ask_wall_price: float
-    bid_wall_notional_usd: float
-    ask_wall_notional_usd: float
+    bid_wall_notional_usd: float | None
+    ask_wall_notional_usd: float | None
     maker_buy_price: float
     maker_sell_price: float
     used_true_bid_wall: bool
@@ -48,11 +53,16 @@ def _finite_pos(val: object) -> float | None:
     return f
 
 
-def _parse_book_levels(levels: object, max_levels: int = 20) -> list[tuple[float, float]]:
+def _parse_book_levels(levels: object) -> list[tuple[float, float]]:
+    """Positive price and base-asset qty. Input order is not a rank.
+
+    ``notional_usd`` and ``quote_qty`` are not read. A missing size stays out
+    of the book instead of becoming a zero-qty level.
+    """
     if not isinstance(levels, Sequence) or isinstance(levels, (str, bytes)):
         return []
     out: list[tuple[float, float]] = []
-    for item in levels[:max_levels]:
+    for item in levels:
         if isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) >= 2:
             px = _finite_pos(item[0])
             qty = _finite_pos(item[1])
@@ -88,8 +98,9 @@ def compute_wall_mid_from_book(
     max_levels: int = 20,
 ) -> WallMidQuote | None:
     """Computes WallMid and 1-tick wall-frontrun LIMIT_MAKER prices from L2 bids & asks."""
-    parsed_bids = sorted(_parse_book_levels(bids, max_levels=max_levels), key=lambda x: x[0], reverse=True)
-    parsed_asks = sorted(_parse_book_levels(asks, max_levels=max_levels), key=lambda x: x[0])
+    cap = max(0, int(max_levels))
+    parsed_bids = sorted(_parse_book_levels(bids), key=lambda x: x[0], reverse=True)[:cap]
+    parsed_asks = sorted(_parse_book_levels(asks), key=lambda x: x[0])[:cap]
     if not parsed_bids or not parsed_asks:
         return None
 
@@ -177,8 +188,8 @@ def extract_wall_mid_from_row(row: dict[str, Any]) -> WallMidQuote | None:
             raw_mid_price=round(0.5 * (b_bid + b_ask), 8),
             bid_wall_price=round(bid_wall, 8),
             ask_wall_price=round(ask_wall, 8),
-            bid_wall_notional_usd=float(_finite_pos(row.get("bid_wall_notional_usd")) or 0.0),
-            ask_wall_notional_usd=float(_finite_pos(row.get("ask_wall_notional_usd")) or 0.0),
+        bid_wall_notional_usd=_finite_pos(row.get("bid_wall_notional_usd")),
+        ask_wall_notional_usd=_finite_pos(row.get("ask_wall_notional_usd")),
             maker_buy_price=round(maker_buy, 8),
             maker_sell_price=round(maker_sell, 8),
             used_true_bid_wall=True,

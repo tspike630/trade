@@ -62,7 +62,15 @@ def empirical_quantile(
     clamp_min: float | None = None,
     clamp_max: float | None = None,
 ) -> tuple[float, bool]:
-    """Computes linear-interpolated empirical quantile with safety clamps and cold-start fallback."""
+    """Linear-interpolated empirical quantile with a cold-start fallback.
+
+    Every finite value in ``values`` is part of the sample. There is no event
+    time, so this function cannot drop the current bar, a future point, or an
+    old point, and it does not apply a maximum window. ``min_samples`` is only
+    a count. A live caller has to pass an already closed, bounded history.
+    The length of that window is not chosen here. Non-finite values are
+    omitted and are not replaced with zero.
+    """
     clean = sorted(v for v in (_finite(x) for x in values) if v is not None)
     if len(clean) < min_samples:
         return fallback, False
@@ -80,7 +88,11 @@ def empirical_quantile(
 
 
 def resolve_rolling_thresholds(row: dict[str, Any]) -> RollingAdaptiveThresholds:
-    """Computes rolling adaptive thresholds from history arrays on row (or safe static defaults)."""
+    """Thresholds from history arrays already stored on ``row``, or the static defaults.
+
+    The arrays are not a point-in-time query. This function does not read a
+    clock, exclude the current bar, or cap the window.
+    """
     nvda_hist = row.get("nvda_1h_ret_history") or ()
     smh_hist = row.get("smh_1h_ret_history") or ()
     vol_z_hist = row.get("vol_z_1h_history") or ()
@@ -138,19 +150,63 @@ def _solve_3x3(mat: list[list[float]], rhs: list[float]) -> tuple[float, float, 
     return a[0][3], a[1][3], a[2][3]
 
 
+def _text_label(value: object) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _contract_label(chain: Sequence[Any], key: str, *, casefold: bool = False) -> tuple[str, str | None]:
+    """Shared label, or ``conflict`` when the dicts do not all carry the same one.
+
+    Omitting the key on every dict is ``ok`` with a null label. A label on only
+    some dicts is a conflict. Non-dicts are ignored.
+    """
+    seen: list[str] = []
+    dicts = 0
+    for item in chain:
+        if not isinstance(item, dict):
+            continue
+        dicts += 1
+        label = _text_label(item.get(key))
+        if label is None:
+            continue
+        seen.append(label.casefold() if casefold else label)
+    if not seen:
+        return "ok", None
+    if len(seen) != dicts or len(set(seen)) != 1:
+        return "conflict", None
+    return "ok", seen[0]
+
+
 def fit_volatility_smile_residuals(
     option_chain: Sequence[dict[str, Any]],
     spot_price: float,
     *,
     residual_spike_pct: float = 4.0,
 ) -> SmileResidualSnapshot | None:
-    """Fits parabola IV(m) = a*m^2 + b*m + c over moneyness m = ln(K/S)/sqrt(T) and extracts wing residuals.
+    """Fit IV(m) = a*m^2 + b*m + c on m = ln(K/S)/sqrt(T) and return wing residuals.
 
-    Each item in ``option_chain`` should contain ``strike`` (K), ``iv_pct`` (implied vol in %, e.g. 55.0),
-    and optional ``tte_years`` (time-to-expiry in years, default 7/365).
+    Each item needs ``strike`` and ``iv_pct`` or ``iv``. ``tte_years`` defaults
+    to 7/365 only when that field is absent. Zero and negative time are dropped.
+    When ``underlying``, ``expiry``, or ``iv_unit`` is present, every dict must
+    carry the same value. ``iv_unit`` ``percent`` or ``decimal`` selects the
+    scale. Without ``iv_unit``, a value below 3 is still multiplied by 100.
+    That heuristic is not an explicit unit. Leave-one-out starts at 5 points;
+    a 4-point residual includes the point in its own fit. No event time is read.
     """
     s = _finite(spot_price)
-    if s is None or s <= 0 or not isinstance(option_chain, Sequence):
+    if s is None or s <= 0 or not isinstance(option_chain, Sequence) or isinstance(option_chain, (str, bytes)):
+        return None
+    for key in ("underlying", "expiry"):
+        status, _label = _contract_label(option_chain, key)
+        if status == "conflict":
+            return None
+    status, iv_unit = _contract_label(option_chain, "iv_unit", casefold=True)
+    if status == "conflict":
+        return None
+    if iv_unit not in (None, "percent", "decimal"):
         return None
 
     pts: list[tuple[float, float]] = []
@@ -158,12 +214,23 @@ def fit_volatility_smile_residuals(
         if not isinstance(opt, dict):
             continue
         k = _finite(opt.get("strike"))
-        iv = _finite(opt.get("iv_pct") or opt.get("iv"))
-        tte = _finite(opt.get("tte_years")) or (7.0 / 365.0)
-        if k is None or k <= 0 or iv is None or iv <= 0 or tte <= 1e-6:
+        iv = _finite(opt.get("iv_pct") if opt.get("iv_pct") is not None else opt.get("iv"))
+        raw_tte = opt.get("tte_years")
+        if raw_tte is None:
+            tte = 7.0 / 365.0
+        else:
+            parsed_tte = _finite(raw_tte)
+            if parsed_tte is None or parsed_tte <= 1e-6:
+                continue
+            tte = parsed_tte
+        if k is None or k <= 0 or iv is None or iv <= 0:
             continue
-        # Convert decimal IV (e.g. 0.55) to percentage (55.0) if needed
-        iv_pct = iv * 100.0 if iv < 3.0 else iv
+        if iv_unit == "percent":
+            iv_pct = iv
+        elif iv_unit == "decimal":
+            iv_pct = iv * 100.0
+        else:
+            iv_pct = iv * 100.0 if iv < 3.0 else iv
         m = math.log(k / s) / math.sqrt(tte)
         if abs(m) <= 2.5:
             pts.append((m, iv_pct))

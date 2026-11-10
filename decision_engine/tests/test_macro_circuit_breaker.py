@@ -307,6 +307,37 @@ class MacroCircuitBreakerTests(unittest.TestCase):
                 bus.close()
                 adapter.close()
 
+    def test_hermetic_cpi_and_fomc_clocks_do_not_require_the_real_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "macro.db"
+            _create_macro_db(db)
+            cpi_ms = _utc_ms("2026-11-10T13:30:00Z")
+            fomc_ms = _utc_ms("2026-11-18T19:00:00Z")
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-10', '2026-11-10 21:30:00', '2026-11-10T13:30:00Z', ?, 'United States', 3, 'Core CPI MM, SA')
+                """,
+                (cpi_ms,),
+            )
+            conn.execute(
+                """
+                INSERT INTO central_bank_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, event_name, is_high_impact
+                ) VALUES ('2026-11-19', '2026-11-19 03:00:00', '2026-11-18T19:00:00Z', ?, 'United States', 'FOMC Minutes', 1)
+                """,
+                (fomc_ms,),
+            )
+            conn.commit()
+            conn.close()
+            self.assertEqual(evaluate_macro_gate(db, now_ms=cpi_ms).halt_reason, "macro_rel3_blackout")
+            self.assertEqual(
+                evaluate_macro_gate(db, now_ms=fomc_ms).halt_reason,
+                "central_bank_blackout",
+            )
+
     def test_real_lseg_macro_db_upcoming_events_if_present(self) -> None:
         real_db = Path(__file__).resolve().parents[2] / "data" / "lseg" / "lseg_macro.db"
         if not real_db.is_file():

@@ -1,3 +1,4 @@
+import inspect
 import unittest
 
 from decision_engine.core.regime_strategy_router import (
@@ -5,7 +6,10 @@ from decision_engine.core.regime_strategy_router import (
     apply_five_state_regime_router,
     evaluate_five_state_regime,
 )
-from decision_engine.core.wall_mid_pricing import compute_wall_mid_from_book
+from decision_engine.core.wall_mid_pricing import (
+    compute_wall_mid_from_book,
+    extract_wall_mid_from_row,
+)
 
 
 class WallMidAndWhaleSkewTests(unittest.TestCase):
@@ -63,6 +67,89 @@ class WallMidAndWhaleSkewTests(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertAlmostEqual(out[0]["wall_mid_price"], 600.0, places=4)
         self.assertAlmostEqual(out[0]["recommended_maker_buy_price"], 598.1, places=4)
+
+    def test_unsorted_book_ranks_by_price_before_the_top_20_cut(self) -> None:
+        real_bids = [(100.00, 0.1), (99.95, 0.2), (99.90, 0.2), (99.80, 500.0), (99.70, 0.3)]
+        real_asks = [(100.02, 0.1), (100.10, 0.2), (100.20, 0.2), (100.40, 500.0), (100.50, 0.3)]
+        # Worse prices occupy the first 25 raw slots. A cut before the sort
+        # would never see the touch or the whale wall.
+        bids = [(90.0 - i, 0.01) for i in range(25)] + list(real_bids)
+        asks = [(200.0 + i, 0.01) for i in range(25)] + list(real_asks)
+        quote = compute_wall_mid_from_book(bids, asks, tick_size=0.01)
+        self.assertIsNotNone(quote)
+        assert quote is not None
+        self.assertAlmostEqual(quote.bid_wall_price, 99.80, places=4)
+        self.assertAlmostEqual(quote.ask_wall_price, 100.40, places=4)
+        self.assertAlmostEqual(quote.raw_mid_price, 100.01, places=4)
+        self.assertAlmostEqual(quote.maker_buy_price, 99.81, places=4)
+        self.assertGreater(quote.maker_buy_price, 0.0)
+        self.assertLess(quote.maker_buy_price, real_asks[0][0])
+        self.assertGreater(quote.maker_sell_price, real_bids[0][0])
+
+    def test_invalid_units_and_quote_size_do_not_become_a_book(self) -> None:
+        quote = compute_wall_mid_from_book(
+            [
+                (0.0, 1.0),
+                (-1.0, 2.0),
+                (float("nan"), 1.0),
+                (100.0, 0.0),
+                (100.0, -2.0),
+                {"price": 100.0, "notional_usd": 1_000_000.0},
+                {"px": 99.0, "quote_qty": 50.0},
+            ],
+            [
+                (101.0, -1.0),
+                {"price": 101.0, "notional_usd": 1_000_000.0},
+            ],
+            tick_size=0.01,
+        )
+        self.assertIsNone(quote)
+        self.assertIsNone(
+            extract_wall_mid_from_row(
+                {
+                    "orderbook_imbalance_20": -0.80,
+                    "bid_depth_20_usd": 1_000_000.0,
+                    "ask_depth_20_usd": 1_000_000.0,
+                    "obi_top5": -0.30,
+                }
+            )
+        )
+
+    def test_missing_wall_notional_stays_unset(self) -> None:
+        quote = extract_wall_mid_from_row(
+            {
+                "bid_wall_price": 99.80,
+                "ask_wall_price": 100.40,
+                "best_bid": 100.00,
+                "best_ask": 100.02,
+                "tick_size": 0.01,
+            }
+        )
+        self.assertIsNotNone(quote)
+        assert quote is not None
+        self.assertIsNone(quote.bid_wall_notional_usd)
+        self.assertIsNone(quote.ask_wall_notional_usd)
+        self.assertAlmostEqual(quote.maker_buy_price, 99.81, places=4)
+
+    def test_book_helper_has_no_freshness_clock(self) -> None:
+        self.assertNotIn("now_ms", inspect.signature(compute_wall_mid_from_book).parameters)
+        stale = compute_wall_mid_from_book(
+            [
+                {"price": 100.0, "qty": 1.0, "ts_ms": 0},
+                {"price": 99.5, "qty": 1.0, "ts_ms": 0},
+            ],
+            [
+                {"price": 100.2, "qty": 1.0, "ts_ms": 0},
+                {"price": 100.8, "qty": 1.0, "ts_ms": 0},
+            ],
+            tick_size=0.01,
+        )
+        fresh = compute_wall_mid_from_book(
+            [(100.0, 1.0), (99.5, 1.0)],
+            [(100.2, 1.0), (100.8, 1.0)],
+            tick_size=0.01,
+        )
+        self.assertEqual(stale, fresh)
 
 
 if __name__ == "__main__":
