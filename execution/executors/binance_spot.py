@@ -395,6 +395,21 @@ def _maker_entry_lifecycle_ready(client: Any) -> bool:
     )
 
 
+def _apply_recommended_order_type(extras: dict[str, Any], action: object) -> dict[str, Any]:
+    """Use a decision's LIMIT_MAKER stamp only when the order did not name a type."""
+    if str(action or "").strip().lower() != "buy":
+        return extras
+    explicit = extras.get("order_type", extras.get("binance_order_type"))
+    if explicit is not None and not (isinstance(explicit, str) and not str(explicit).strip()):
+        return extras
+    recommended = str(extras.get("recommended_order_type") or "").strip().upper()
+    if recommended not in {"LIMIT", "LIMIT_MAKER"}:
+        return extras
+    copied = dict(extras)
+    copied["order_type"] = recommended
+    return copied
+
+
 def _parse_order_type(raw: object) -> _OrderType | None:
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return "MARKET"
@@ -2181,6 +2196,7 @@ class BinanceSpotAdapter:
         shell_filled = False
         if purpose == PURPOSE_LIVE_BNB_BOLL_CLASSIC:
             extras, shell_filled = apply_classic_exit_shell(extras)
+        extras = _apply_recommended_order_type(extras, sig.get("action"))
         mode = str(sig.get("mode") or "").strip().lower()
         raw_symbol = extras.get("binance_symbol")
         if raw_symbol is None or (isinstance(raw_symbol, str) and not raw_symbol.strip()):

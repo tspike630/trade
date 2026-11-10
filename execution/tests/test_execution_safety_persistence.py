@@ -810,6 +810,73 @@ class PersistenceSafetyTests(unittest.TestCase):
         self.assertEqual(client.orders, [])
         self.assertEqual(client.ocos, [])
 
+    def _buy(
+        self,
+        extras: dict[str, Any],
+        decision_id: int = 70,
+        *,
+        limit: bool = True,
+    ) -> dict[str, Any]:
+        body = {
+            "binance_symbol": "BNBUSDT",
+            "price_usd": "100",
+            "stop_price": "90",
+            "take_profit_price": "120",
+            "entry_reason": "large_trade_market",
+        }
+        if limit:
+            body["quantity"] = "1"
+            body["price"] = "99.90"
+        body.update(extras)
+        return {
+            "decision_log_id": decision_id,
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+            "mode": "live_stub",
+            "action": "buy",
+            "token_address": "BNBUSDT",
+            "extras": body,
+        }
+
+    def test_recommended_limit_maker_is_the_order_when_none_was_explicit(self) -> None:
+        client = _Exchange()
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot=_BOUND,
+            production_book=REST_BOOK,
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
+            post_only_limit=False,
+        )
+        result = adapter.execute(
+            self._buy({"recommended_order_type": "LIMIT_MAKER", "enable_trailing_ratchet": True})
+        )
+        self.assertEqual(result["error"], "maker_entry_resting")
+        self.assertEqual(parse_qs(client.orders[0]).get("type"), ["LIMIT_MAKER"])
+        self.assertNotIn("timeInForce", client.orders[0])
+        self.assertEqual(client.ocos, [])
+
+        explicit = adapter.execute(
+            self._buy(
+                {
+                    "order_type": "MARKET",
+                    "recommended_order_type": "LIMIT_MAKER",
+                    "quote_order_qty": "20",
+                },
+                71,
+                limit=False,
+            )
+        )
+        self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["MARKET"])
+        self.assertNotEqual(explicit["error"], "maker_entry_resting")
+
+        none = adapter.execute(
+            self._buy({"recommended_order_type": "NONE", "quote_order_qty": "20"}, 72, limit=False)
+        )
+        self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["MARKET"])
+
     def _held_qty(self, ledger: ExecutionLedger, qty: str, decision_id: int = 61) -> tuple[int, BinanceSpotAdapter, _Exchange]:
         row = self._held(ledger, decision_id)
         pid = int(row["id"])
