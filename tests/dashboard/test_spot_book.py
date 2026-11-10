@@ -8,6 +8,9 @@
 cancel is shown only when the row already says so.
 
 Nothing here calls Binance or opens a paper database that is missing.
+The module lives outside ``dashboard/`` so the production read-only scan,
+which still checks every other ``*.py`` in that package, does not see these
+temporary-database statements.
 """
 
 from __future__ import annotations
@@ -53,6 +56,20 @@ def _receipt(
     if error:
         body["error"] = error
     return json.dumps(body)
+
+
+class FixtureLocationTests(unittest.TestCase):
+    def test_fixture_module_is_outside_the_dashboard_package(self) -> None:
+        import dashboard
+
+        here = Path(__file__).resolve()
+        package = Path(dashboard.__file__).resolve().parent
+        self.assertNotIn(package, here.parents)
+        text = here.read_text(encoding="utf-8")
+        self.assertIn("sqlite3.connect", text)
+        self.assertIn("INSERT INTO execution_log", text)
+        self.assertIn("CREATE TABLE binance_spot_positions", text)
+        self.assertIn("tempfile.TemporaryDirectory", text)
 
 
 class SpotBookViewTests(unittest.TestCase):
