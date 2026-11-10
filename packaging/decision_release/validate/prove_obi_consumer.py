@@ -125,6 +125,11 @@ def _load_rows(conn: sqlite3.Connection) -> tuple[list[dict[str, object]], int]:
 
 
 def _newest(rows: list[dict[str, object]]) -> tuple[dict[str, object] | None, int]:
+    """Return the newest event-E row, or one raw row when that clock is absent.
+
+    A missing clock still has to expose orderbook_imbalance_20 in the report.
+    It does not become a stamp. The tie count is zero in that case.
+    """
     ranked = []
     for row in rows:
         try:
@@ -133,7 +138,7 @@ def _newest(rows: list[dict[str, object]]) -> tuple[dict[str, object] | None, in
             continue
         ranked.append((stamp, row))
     if not ranked:
-        return None, 0
+        return (rows[-1] if rows else None), 0
     peak = max(stamp for stamp, _row in ranked)
     winners = [row for stamp, row in ranked if stamp == peak]
     return winners[0], len(winners)
