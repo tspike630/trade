@@ -5,13 +5,19 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from decision_engine.core.cityu_institutional_alpha import (
+    _cftc_cycle,
     attach_cityu_institutional_context,
+    cftc_publication_utc,
     compute_cot_regime_from_series,
+    due_cftc_asof,
     load_cityu_institutional_snapshot,
 )
+from scripts.import_lseg_bars_incremental import slow_variable_cycle
 from decision_engine.core.macro_circuit_breaker import evaluate_macro_gate
 from decision_engine.core.perp_microstructure_and_beta_hedge import (
     evaluate_perp_microstructure,
@@ -111,10 +117,15 @@ class TestCityUInstitutionalAlpha(unittest.TestCase):
             c1.execute(
                 "CREATE TABLE lseg_cftc_cot_positioning (date TEXT, symbol TEXT, open_interest TEXT, lev_money_net TEXT, asset_mgr_net TEXT)"
             )
+            now_ms = 1_762_000_000_000
+            # Newest print is the Tuesday whose Friday 15:30 New York release
+            # is already past this clock. The date-only importer is not used.
+            end = due_cftc_asof(datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc))
             for i in range(15):
+                day = end - timedelta(days=14 - i)
                 c1.execute(
                     "INSERT INTO lseg_cftc_cot_positioning VALUES (?, 'BTC', '20000', ?, ?)",
-                    (f"2026-08-{i+1:02d}", str(-2000 - i * 200), str(2000 + i * 200)),
+                    (day.isoformat(), str(-2000 - i * 200), str(2000 + i * 200)),
                 )
             c1.commit()
             c1.close()
@@ -123,7 +134,6 @@ class TestCityUInstitutionalAlpha(unittest.TestCase):
             c2.execute(
                 "CREATE TABLE cross_asset_bars (ric TEXT, interval TEXT, utc_ms INTEGER, close REAL)"
             )
-            now_ms = 1_762_000_000_000
             for idx in range(13):
                 px = 200.0 * (1.015 if idx == 0 else 1.0)
                 c2.execute(
@@ -141,6 +151,67 @@ class TestCityUInstitutionalAlpha(unittest.TestCase):
             attach_cityu_institutional_context(rows, inst_db_path=inst_db, lseg_db_path=lseg_db, now_ms=now_ms)
             self.assertEqual(rows[0]["cot_regime"], "cot_institutional_squeeze_favorable")
             self.assertAlmostEqual(rows[0]["nvda_1h_ret_pct"], 1.5, places=2)
+
+    def test_cftc_cycle_matches_the_importer_contract(self) -> None:
+        samples = (
+            date(2026, 11, 10),
+            date(2026, 11, 6),
+            date(2026, 11, 7),
+            date(2025, 11, 1),
+        )
+        for asof in samples:
+            for source in (date(2020, 3, 24), date(2026, 11, 3), asof, asof - timedelta(days=7)):
+                self.assertEqual(
+                    _cftc_cycle(source, asof),
+                    slow_variable_cycle("cftc", source, asof),
+                )
+        # Date-only Friday 00:00 UTC already names 2026-11-03. The reader
+        # waits until 15:30 America/New_York. There is no holiday calendar,
+        # so a Thursday file does not move that instant earlier.
+        friday = datetime(2026, 11, 6, 15, 29, tzinfo=ZoneInfo("America/New_York"))
+        released = datetime(2026, 11, 6, 15, 30, tzinfo=ZoneInfo("America/New_York"))
+        self.assertEqual(due_cftc_asof(friday), date(2026, 10, 27))
+        self.assertEqual(due_cftc_asof(released), date(2026, 11, 3))
+        self.assertEqual(cftc_publication_utc(date(2026, 11, 3)), released.astimezone(timezone.utc))
+        self.assertEqual(
+            slow_variable_cycle("cftc", date(2026, 11, 3), date(2026, 11, 6)),
+            "current_cycle",
+        )
+        thursday = datetime(2026, 11, 5, 18, 0, tzinfo=ZoneInfo("America/New_York"))
+        self.assertEqual(due_cftc_asof(thursday), date(2026, 10, 27))
+
+    def test_2020_and_prior_week_do_not_stamp_the_current_regime(self) -> None:
+        now_ms = 1_762_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            inst_db = Path(tmp) / "cityu_institutional.db"
+            conn = sqlite3.connect(inst_db)
+            conn.execute(
+                "CREATE TABLE lseg_cftc_cot_positioning (date TEXT, symbol TEXT, open_interest TEXT, lev_money_net TEXT, asset_mgr_net TEXT)"
+            )
+            # A 2020 series that would be crowded if the date were ignored.
+            for i, lev in enumerate([2.0, 2.5, 1.8, 2.2, 2.1, 1.9, 2.3, 2.0, 2.4, 2.1, 2.2, 9.5]):
+                day = date(2020, 1, 7) + timedelta(days=7 * i)
+                conn.execute(
+                    "INSERT INTO lseg_cftc_cot_positioning VALUES (?, 'BTC', '10000', ?, '0')",
+                    (day.isoformat(), str(lev * 100)),
+                )
+            conn.commit()
+            old = load_cityu_institutional_snapshot(inst_db, None, now_ms=now_ms)
+            self.assertEqual(old.cot_regime, "neutral")
+            self.assertIsNone(old.btc_cot_lev_z)
+            conn.execute("DELETE FROM lseg_cftc_cot_positioning")
+            prior = date(2025, 10, 21)
+            for i, lev in enumerate([2.0, 2.5, 1.8, 2.2, 2.1, 1.9, 2.3, 2.0, 2.4, 2.1, 2.2, 9.5]):
+                day = prior - timedelta(days=7 * (11 - i))
+                conn.execute(
+                    "INSERT INTO lseg_cftc_cot_positioning VALUES (?, 'BTC', '10000', ?, '0')",
+                    (day.isoformat(), str(lev * 100)),
+                )
+            conn.commit()
+            conn.close()
+            stale_week = load_cityu_institutional_snapshot(inst_db, None, now_ms=now_ms)
+            self.assertEqual(stale_week.cot_regime, "neutral")
+            self.assertIsNone(stale_week.btc_cot_lev_z)
 
 
 if __name__ == "__main__":

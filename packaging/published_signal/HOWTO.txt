@@ -1,0 +1,33 @@
+PR 208 acceptance kit. Not a deploy and not a merge. No git command is required.
+
+Unpack the tar and run:
+
+  python3 packaging/published_signal/run_acceptance.py
+
+The tree already contains the import dependencies and the packed blobs:
+
+  scripts/import_lseg_bars_incremental.py
+  scripts/build_news_isolation_engine.py
+  deploy/news_isolation/preflight.py
+  deploy/news_isolation/engine.py
+  decision_engine/tests/fixtures/news_isolation/bc392fea-engine.py
+  decision_engine/tests/fixtures/news_isolation/bc392fea.tar.gz
+  decision_engine/tests/fixtures/news_isolation/ab2d2eb-perp.py
+  decision_engine/tests/fixtures/news_isolation/ab2d2eb-clusters.py
+  crawler/logging_setup.py
+
+The news tests read those files. They do not call git. The same hash checks remain:
+bc392fea engine sha256 612bd80af39ca2f6061229a67b39a14cd71cb91661947d8936c48bb101dd9d1f
+and length 18185; ab2d2eb perp 2965309802aa1bb1c6be151f99119c93ab75f4426c19b651997563d7a59c8237;
+clusters 5dbd84373298ecd7df2480e4766c79d0b037663afa60e29fa21768303aec26d1;
+bc392 guards 4ff94eb982a5afc1c60d919d9ba9557fcb10e42d157d18a20891ab61b4b8d9cc.
+
+SHA256SUMS, if present beside this file in an outer archive, has no header.
+Each line is sha256, two spaces, decimal byte size, two spaces, relative path.
+
+Expected counts: prior 40 + CityU 6 = 46, news 8, private OBI 3, published 3.
+Sum 60. Published 3 includes the test that a finite obi_top5 and volume_z
+already on the signal are not overwritten.
+
+CFTC reader policy is unchanged by this kit: Friday 15:30 America/New_York,
+no holiday calendar, no 3600-second cutoff.
