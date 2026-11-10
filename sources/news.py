@@ -524,14 +524,18 @@ def run_once(
                 observed_at=fetched_at,
                 log_path=observation_log,
             )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("observation log failed: %s", exc)
-            stats["observation_log"] = {"status": "error", "detail": str(exc), "x_news_status": "unavailable"}
-        else:
             with NewsStore(db_path) as check:
                 after = {row["url"]: row["onchain_status"] for row in check.rows_by_url(seen_urls)}
             if after != onchain_before:
                 stats["observation_log"]["source_onchain_status_changed"] = True
+        except Exception as exc:  # noqa: BLE001
+            # Lock, disk full, or a bad log path must not fail the RSS pull.
+            log.warning("observation log failed: %s", exc)
+            stats["observation_log"] = {
+                "status": "error",
+                "detail": str(exc),
+                "x_news_status": "unavailable",
+            }
     return stats
 
 

@@ -6,6 +6,7 @@ import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import decision_engine  # noqa: F401
 from decision_engine.core.ccxt_listing_guard import (
@@ -21,7 +22,8 @@ from decision_engine.core.shadow_stop_prone_oos import (
     run_oos_report,
     state1_blocks_on_negative_change_1h,
 )
-from sources.news import NEWS_EVENTS_DDL, NewsStore
+from decision_engine.core.regime_strategy_router import apply_five_state_regime_router
+from sources.news import NEWS_EVENTS_DDL, NewsItem, NewsStore, run_once
 
 NOW = datetime(2026, 11, 10, 6, 0, tzinfo=timezone.utc)
 NOW_MS = int(NOW.timestamp() * 1000)
@@ -167,6 +169,128 @@ class TestObservationLog(unittest.TestCase):
         self.assertEqual(obs["perp_taker_status"], "buy_sell_ratio_not_buy_share")
         self.assertAlmostEqual(obs["whale_retail_divergence"], 1.4)
         self.assertNotEqual(obs["taker_buy_ratio"], obs["perp_taker_buy_sell_ratio"])
+
+
+class TestObservationDoesNotBlockPoll(unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _item(self) -> NewsItem:
+        return NewsItem(
+            source="coindesk",
+            source_tier="whitelist",
+            title="Desk note",
+            url="https://example.test/old-copy",
+            published_at="2026-01-16T00:49:34Z",
+            summary="",
+            raw={"title": "Desk note"},
+        )
+
+    def _pull(self, *, poll_id: str, log: Path) -> dict:
+        def _fetch(_client, _src):
+            return [self._item()], None
+
+        with patch("sources.news.fetch_feed", _fetch):
+            return run_once(
+                db_path=str(self.root / "news.db"),
+                source_ids=["coindesk"],
+                poll_id=poll_id,
+                observation_log=str(log),
+                timeout_sec=1.0,
+            )
+
+    def test_old_copy_dedup_still_logs_each_new_poll(self) -> None:
+        log = self.root / "obs.db"
+        first = self._pull(poll_id="round-a", log=log)
+        second = self._pull(poll_id="round-b", log=log)
+        third = self._pull(poll_id="round-b", log=log)
+        self.assertEqual(first["items_written"], 1)
+        self.assertEqual(second["items_dup"], 1)
+        self.assertEqual(second["observation_log"]["rows_written"], 1)
+        self.assertEqual(third["observation_log"]["rows_written"], 0)
+        self.assertEqual(second["observation_log"]["x_news_status"], "unavailable")
+        conn = sqlite3.connect(log)
+        conn.row_factory = sqlite3.Row
+        rows = [dict(row) for row in conn.execute(
+            "SELECT poll_id, x_news_status, published_at FROM feature_observations ORDER BY poll_id"
+        )]
+        news = sqlite3.connect(self.root / "news.db")
+        status = news.execute("SELECT onchain_status, fetched_at FROM news_events").fetchone()
+        news.close()
+        conn.close()
+        self.assertEqual([row["poll_id"] for row in rows], ["round-a", "round-b"])
+        self.assertTrue(all(row["x_news_status"] == "unavailable" for row in rows))
+        self.assertEqual(status[0], "pending")
+        self.assertEqual(status[1], first["fetched_at"])
+
+    def test_disk_full_and_locked_log_do_not_fail_the_rss_pull(self) -> None:
+        def _fetch(_client, _src):
+            return [self._item()], None
+
+        with patch("sources.news.fetch_feed", _fetch), patch(
+            "sources.news.record_news_poll",
+            side_effect=sqlite3.OperationalError("database or disk is full"),
+        ):
+            stats = run_once(
+                db_path=str(self.root / "news.db"),
+                source_ids=["coindesk"],
+                poll_id="disk-full",
+                observation_log=str(self.root / "obs.db"),
+                timeout_sec=1.0,
+            )
+        self.assertEqual(stats["items_written"], 1)
+        self.assertEqual(stats["observation_log"]["status"], "error")
+        self.assertIn("disk is full", stats["observation_log"]["detail"])
+        self.assertEqual(stats["observation_log"]["x_news_status"], "unavailable")
+
+        locked = self.root / "locked.db"
+        holder = sqlite3.connect(locked)
+        holder.isolation_level = None
+        holder.execute("BEGIN EXCLUSIVE")
+        try:
+            with patch("sources.news.fetch_feed", _fetch):
+                again = run_once(
+                    db_path=str(self.root / "news.db"),
+                    source_ids=["coindesk"],
+                    poll_id="locked-log",
+                    observation_log=str(locked),
+                    timeout_sec=1.0,
+                )
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        self.assertEqual(again["items_dup"], 1)
+        self.assertEqual(again["observation_log"]["status"], "error")
+        self.assertIn("locked", again["observation_log"]["detail"].lower())
+        self.assertEqual(again["observation_log"]["x_news_status"], "unavailable")
+
+    def test_router_does_not_call_the_observation_writer(self) -> None:
+        router = Path("decision_engine/core/regime_strategy_router.py").read_text(encoding="utf-8")
+        engine = Path("decision_engine/core/engine.py").read_text(encoding="utf-8")
+        self.assertNotIn("record_news_poll", router)
+        self.assertNotIn("record_news_poll", engine)
+        with patch(
+            "sources.news.record_news_poll",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            out, _counts = apply_five_state_regime_router(
+                [{
+                    "action": "buy",
+                    "binance_symbol": "SOLUSDT",
+                    "size_pct": 0.1,
+                    "funding_z": 0.1,
+                    "xs_breadth_1h": 0.4,
+                }],
+                [],
+            )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["action"], "buy")
 
 
 class TestShadowOos(unittest.TestCase):
