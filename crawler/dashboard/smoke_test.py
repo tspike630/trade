@@ -16,7 +16,6 @@ import io
 import json
 import logging
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -103,6 +102,7 @@ from dashboard.shadow_phase0 import FLAG_LIQ, FLAG_R3, PHASE0_NAIL, load_shadow_
 from nicegui.client import Client
 from nicegui.page import page as ng_page
 from dashboard.app import backtest_equity_tone, jev_gate_view, prior_pulse_tone
+from dashboard.package_guard import package_write_offenders
 from dashboard.parsing import bucket_key, extract_jev_strength, liq_bucket_label, rejection_key
 from dashboard.settings import (
     bind_host,
@@ -146,12 +146,6 @@ _TOUCHED = (
     "LIVE_EXCHANGE_API_SECRET",
     "LIVE_EXCHANGE_API_URL",
 )
-_WRITE_SQL = re.compile(
-    r"(?i)\b(insert\s+into|update\s+[a-z0-9_]+\s+set|delete\s+from|replace\s+into|"
-    r"drop\s+table|alter\s+table|create\s+table)\b"
-)
-
-
 def _iso(stamp: datetime) -> str:
     return stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -4697,22 +4691,11 @@ class DashboardSmokeTest(unittest.TestCase):
 
     def test_package_has_no_write_sql_or_trade_controls(self) -> None:
         root = Path(__file__).resolve().parent
-        offenders: list[str] = []
-        for path in root.rglob("*.py"):
-            if path.name == "smoke_test.py":
-                continue
-            text = path.read_text(encoding="utf-8")
-            if _WRITE_SQL.search(text) and path.name != "sessions.py":
-                offenders.append(f"write sql in {path.name}")
-            if "sqlite3.connect" in text and path.name not in ("data.py", "sessions.py"):
-                offenders.append(f"sqlite connect in {path.name}")
-            assignments = re.findall(r"os\.environ\[[^\]]+\]\s*=", text)
-            allowed_storage = path.name == "__init__.py" and assignments == ['os.environ["NICEGUI_STORAGE_PATH"] =']
-            if assignments and not allowed_storage:
-                offenders.append(f"env assignment in {path.name}: {assignments}")
-            for banned in ("ui.switch", "ui.toggle", "ui.checkbox", "ui.html(", "place_order"):
-                if banned in text:
-                    offenders.append(f"{banned} in {path.name}")
+        self.assertEqual(package_write_offenders(root), [])
+        packaged_tests = sorted(
+            path.relative_to(root).as_posix() for path in root.rglob("test_*.py")
+        )
+        self.assertEqual(packaged_tests, [])
         data = (root / "data.py").read_text(encoding="utf-8")
         self.assertIn("mode=ro", data)
         self.assertIn("query_only=ON", data)
@@ -4720,7 +4703,6 @@ class DashboardSmokeTest(unittest.TestCase):
         self.assertIn("数据不可用", common)
         for name in ("risk.py", "positions.py", "signals.py", "execution.py"):
             self.assertIn("show_unavailable", (root / "panels" / name).read_text(encoding="utf-8"))
-        self.assertEqual(offenders, [])
 
     def test_c4_order_flow_stays_blind(self) -> None:
         root = Path(__file__).resolve().parent
