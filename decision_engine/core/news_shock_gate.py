@@ -840,8 +840,15 @@ def load_news_snapshot(
     symbols: Sequence[str] | None = None,
     x_watch_db: str | Path | None = None,
     derivatives_db: str | Path | None = None,
+    include_market_features: bool = True,
+    include_x_watch: bool = True,
 ) -> NewsReadSnapshot:
-    """One read-only snapshot. Callers reuse it for every symbol in the tick."""
+    """One read-only snapshot. Callers reuse it for every symbol in the tick.
+
+    ``include_market_features`` and ``include_x_watch`` default to the existing
+    reads. The isolation entry point turns both off so a present counterparty
+    or watch database is not opened.
+    """
     clock = now or datetime.now(timezone.utc)
     if clock.tzinfo is None:
         clock = clock.replace(tzinfo=timezone.utc)
@@ -860,21 +867,27 @@ def load_news_snapshot(
         shocks, context, scanned, suppressed = (), 0, 0, 0
 
     symbol_list = _symbols_upper(symbols)
-    try:
-        x_availability, x_detail, x_points = _read_x_watch(
-            resolve_x_watch_path(x_watch_db), now=clock, timeout_sec=timeout_sec
-        )
-    except (sqlite3.Error, OSError) as exc:
-        x_availability, x_detail, x_points = "error", str(exc), ()
-    try:
-        feature_availability, feature_detail, obi, taker, whale = _read_features(
-            resolve_derivatives_path(derivatives_db),
-            symbol_list,
-            now=clock,
-            timeout_sec=timeout_sec,
-        )
-    except (sqlite3.Error, OSError) as exc:
-        feature_availability, feature_detail, obi, taker, whale = "error", str(exc), (), (), ()
+    if not include_x_watch:
+        x_availability, x_detail, x_points = "not_requested", None, ()
+    else:
+        try:
+            x_availability, x_detail, x_points = _read_x_watch(
+                resolve_x_watch_path(x_watch_db), now=clock, timeout_sec=timeout_sec
+            )
+        except (sqlite3.Error, OSError) as exc:
+            x_availability, x_detail, x_points = "error", str(exc), ()
+    if not include_market_features:
+        feature_availability, feature_detail, obi, taker, whale = "not_requested", None, (), (), ()
+    else:
+        try:
+            feature_availability, feature_detail, obi, taker, whale = _read_features(
+                resolve_derivatives_path(derivatives_db),
+                symbol_list,
+                now=clock,
+                timeout_sec=timeout_sec,
+            )
+        except (sqlite3.Error, OSError) as exc:
+            feature_availability, feature_detail, obi, taker, whale = "error", str(exc), (), (), ()
 
     if availability not in {"ok", "missing_db"}:
         log.warning(
@@ -1171,6 +1184,156 @@ def snapshot_observation(snapshot: NewsReadSnapshot) -> dict[str, Any]:
         "window_min": snapshot.window_min,
         "db_path": snapshot.db_path,
     }
+
+
+_HAWKISH_SIZE = 0.55
+_HAWKISH_TP = 0.80
+_ISOLATION_PRIOR_REGIME = "positive_gamma_mean_reversion"
+
+
+def _isolation_report(
+    *,
+    availability: str,
+    detail: str | None,
+    fail_open: bool,
+    changed: bool,
+    effect: str = "keep",
+    dropped_buys: int = 0,
+    sells_kept: int = 0,
+    shock: NewsShockStatus | None = None,
+) -> dict[str, Any]:
+    return {
+        "mode": "isolation",
+        "availability": availability,
+        "detail": detail,
+        "fail_open": fail_open,
+        "candidates_changed": changed,
+        "effect": effect,
+        "dropped_buys": dropped_buys,
+        "sells_kept": sells_kept,
+        "market_regime": (
+            REGIME_CRISIS if effect == "crisis_halt"
+            else REGIME_DEFENSIVE if effect == "hawkish_defensive"
+            else None
+        ),
+        "regime_playbook": (
+            "cash_halt" if effect == "crisis_halt"
+            else "news_hawkish_defensive_fade" if effect == "hawkish_defensive"
+            else None
+        ),
+        "router_called": False,
+        "market_features_read": False,
+        "kelly_applied": False,
+        "aligned_rank_weight": None,
+        "onchain_calibration": None,
+        "hedge_filled": False,
+        "primary_severity": None if shock is None else shock.severity,
+        "primary_source": None if shock is None else shock.source,
+    }
+
+
+def _apply_hawkish_buy(sig: Mapping[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
+    """State-4 news template. Does not read a regime row or a Kelly matrix."""
+    out = dict(sig)
+    out.update(meta)
+    out["news_shock_applied"] = True
+    out["market_regime"] = REGIME_DEFENSIVE
+    out["regime_playbook"] = "news_hawkish_defensive_fade"
+    out["regime_size_multiplier"] = _HAWKISH_SIZE
+    out["regime_tp_multiplier"] = _HAWKISH_TP
+    out["enable_trailing_ratchet"] = False
+    out["require_perp_beta_hedge"] = True
+    out["recommended_order_type"] = "LIMIT_MAKER"
+    out["perp_beta_hedge_already_on"] = False
+    out["news_hedge_label_only"] = True
+    current = _finite(out.get("size_pct"))
+    if current is not None and current > 0:
+        out["size_pct"] = round(max(0.01, min(0.95, current * _HAWKISH_SIZE)), 6)
+    return out
+
+
+def apply_news_isolation(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    db_path: str | Path | None = None,
+    now: datetime | None = None,
+    timeout_sec: float = 1.0,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Apply only a Fed/crisis news shock. Leave every other candidate alone.
+
+    This does not classify funding, CityU, LSEG macro, or Kelly, and it does
+    not open the counterparty or x_watch databases. Missing, locked, timed out,
+    and unreadable news databases pass the original candidate objects through.
+
+    Crisis uses the state-5 result: drop BUY, keep SELL. Hawkish uses the
+    state-4 defensive template. ``apply_five_state_regime_router`` is a
+    separate call and is not used here.
+    """
+    rows = list(candidates)
+    try:
+        snapshot = load_news_snapshot(
+            db_path,
+            now=now,
+            timeout_sec=timeout_sec,
+            include_market_features=False,
+            include_x_watch=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return rows, _isolation_report(
+            availability="error",
+            detail=f"{type(exc).__name__}:{exc}",
+            fail_open=True,
+            changed=False,
+        )
+
+    shock = primary_shock(snapshot.shocks) if snapshot.availability == "ok" else None
+    if snapshot.availability != "ok" or shock is None or shock.severity not in {"crisis", "hawkish"}:
+        return rows, _isolation_report(
+            availability=snapshot.availability,
+            detail=snapshot.detail,
+            fail_open=snapshot.availability != "ok",
+            changed=False,
+            shock=shock,
+        )
+
+    kept: list[Any] = []
+    dropped = 0
+    sells = 0
+    for sig in rows:
+        if not isinstance(sig, dict):
+            kept.append(sig)
+            continue
+        action = str(sig.get("action") or "").strip().lower()
+        if action != "buy":
+            stamped = dict(sig)
+            stamped.update(observation_for_passthrough(snapshot))
+            kept.append(stamped)
+            sells += 1
+            continue
+        overlay = evaluate_news_overlay(
+            regime=_ISOLATION_PRIOR_REGIME,
+            allow_buy=True,
+            snapshot=snapshot,
+            row=sig,
+            calibration=None,
+        )
+        if overlay.effect is NewsRouteEffect.CRISIS_HALT:
+            dropped += 1
+            continue
+        if overlay.effect is NewsRouteEffect.HAWKISH_DEFENSIVE:
+            kept.append(_apply_hawkish_buy(sig, overlay.meta))
+            continue
+        kept.append(sig)
+    return kept, _isolation_report(
+        availability="ok",
+        detail=None,
+        fail_open=False,
+        changed=True,
+        effect="crisis_halt" if shock.severity == "crisis" else "hawkish_defensive",
+        dropped_buys=dropped,
+        sells_kept=sells,
+        shock=shock,
+    )
 
 
 def window_start(now: datetime, minutes: int = NEWS_WINDOW_MIN) -> datetime:
