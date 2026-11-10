@@ -28,7 +28,13 @@ STEP_MS = 5 * 60 * 1000
 BARS_PER_HOUR = 12
 MIN_CLOSED_1H = 20
 FRESH_MS = 30 * 60 * 1000
+# The 2026-11-10 local audit found no Binance series with 20 closed 1h
+# (max 7 of 52) and no cross-venue pair with 20 matches inside 5 seconds.
+# Short history is missing coverage, not proof of a new listing. Both
+# blocks stay off until a current book and a real listing clock exist.
+CHASE_BLOCK_ENABLED = False
 SPREAD_BLOCK_ENABLED = False
+WICK_SYNC_MS = 5_000
 
 CHASE_REGIMES = frozenset(
     {
@@ -247,14 +253,18 @@ def assess_symbol(
     base["bar_status"] = status
     if status != "contiguous":
         base["reason"] = "incomplete_5m_run"
+        base["listing_class"] = "unknown"
         return base
-    if hours >= MIN_CLOSED_1H:
-        base["listing_class"] = "mature"
-        base["reason"] = "enough_closed_1h"
+    if hours < MIN_CLOSED_1H:
+        # A short run, including Binance's observed maximum of 7 closed 1h,
+        # does not identify a new coin. The file can simply be incomplete.
+        base["listing_class"] = "unknown"
+        base["reason"] = "coverage_insufficient_not_a_new_listing"
+        base["block_chase"] = False
         return base
-    base["listing_class"] = "new"
-    base["block_chase"] = True
-    base["reason"] = "fewer_than_20_closed_1h"
+    base["listing_class"] = "mature"
+    base["reason"] = "enough_closed_1h"
+    base["block_chase"] = False
     return base
 
 
@@ -285,11 +295,12 @@ def spread_shadow(snapshot: CcxtGuardSnapshot, symbol: str, *, now_ms: int) -> d
         report["reason"] = "quote_not_aligned"
         return report
     stamps = [int(row["ts"]) for row in by_exchange.values()]
-    if max(stamps) - min(stamps) > STEP_MS:
-        report["reason"] = "clocks_not_synced"
+    skew = max(stamps) - min(stamps)
+    if skew > WICK_SYNC_MS:
+        report["reason"] = "not_a_5s_sync_60s_polls_are_not_wicks"
         return report
-    report["coverage"] = "sufficient"
-    report["reason"] = "shadow_only"
+    # One fresh pair of quotes is not the audit's >=20 matches within 5s.
+    report["reason"] = "single_snapshot_is_not_20_synced_prints"
     report["spread_block"] = False
     return report
 
@@ -301,7 +312,12 @@ def apply_ccxt_listing_guard(
     now_ms: int | None = None,
     exchange: str = "binance",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Drop a chase buy only for an authoritative new listing. State 1 stays."""
+    """Record listing and spread coverage. This build does not drop buys.
+
+    A short closed-1h run is missing coverage, not a new listing. State 1
+    stays a mean-reversion buy. ``CHASE_BLOCK_ENABLED`` and
+    ``SPREAD_BLOCK_ENABLED`` are both false.
+    """
     clock = int(datetime.now(timezone.utc).timestamp() * 1000) if now_ms is None else int(now_ms)
     if snapshot is None:
         snapshot = _empty("not_configured", None, None)
@@ -321,13 +337,15 @@ def apply_ccxt_listing_guard(
         row["ccxt_stale"] = snapshot.stale
         row["ccxt_spread_block"] = False
         row["ccxt_spread_coverage"] = spread["coverage"]
-        block = bool(assessment["block_chase"]) and regime in CHASE_REGIMES and action == "buy"
+        structural = bool(assessment["block_chase"]) and regime in CHASE_REGIMES and action == "buy"
         if regime == STATE1:
-            block = False
+            structural = False
             row["ccxt_state1_preserved"] = True
-        if snapshot.stale or snapshot.availability != "ok":
-            block = False
-        row["ccxt_chase_block"] = block
+        if snapshot.stale or snapshot.availability != "ok" or not CHASE_BLOCK_ENABLED:
+            structural = False
+        row["ccxt_chase_block"] = structural
+        row["ccxt_chase_block_enabled"] = CHASE_BLOCK_ENABLED
+        block = structural
         if block:
             dropped += 1
             continue
@@ -337,4 +355,6 @@ def apply_ccxt_listing_guard(
         "stale": snapshot.stale,
         "dropped_chase_buys": dropped,
         "spread_block_enabled": SPREAD_BLOCK_ENABLED,
+        "chase_block_enabled": CHASE_BLOCK_ENABLED,
+        "cited_audit_recomputed_here": False,
     }

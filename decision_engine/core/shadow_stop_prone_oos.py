@@ -16,6 +16,46 @@ from typing import Any, Mapping, Sequence
 
 BLOCK_ENABLED = False
 MIN_TEST_ROWS = 80
+STOP_LABEL = "stop_loss"
+
+# Cited from the parent read-only audit at 2026-11-10 15:04:27 HKT.
+# This process did not re-query those databases.
+LOCAL_SHADOW_CCXT_AUDIT: dict[str, Any] = {
+    "recomputed_here": False,
+    "audit_id": "shadow-ccxt-audit-20261110",
+    "audit_time_hkt": "2026-11-10 15:04:27 HKT",
+    "label": "exit_reason==stop_loss",
+    "negative_pnl_is_not_a_stop": True,
+    "predictive_rows": "features_usable_at_entry==1 only",
+    "flags_known_at_entry": False,
+    "flags_tagged_at_hkt": "2026-11-03 after outcomes were known",
+    "stored_skip_equals": "shadow_R3_vol_chg_rsi",
+    "stored_skip_is_not": "R3 OR thin-pool, even though rule_id says R3+LIQ150k",
+    "same_book_temporal_oos": {"n": 21, "stop_loss": 0},
+    "multibook_oos_ex_discovery": {"n": 656, "stop_loss": 172, "take_profit": 111},
+    "r3_on_multibook_oos": {
+        "flagged": "37/97",
+        "unflagged": "135/559",
+        "fisher_p_two_sided": 0.00567764954741716,
+        "take_profit_skipped": 28,
+    },
+    "strategies_in_multibook": 41,
+    "oct20_grid_rules": 7,
+    "population": "solana dex paper only; not Binance",
+    "live_stop_loss": 11,
+    "live_bad_tick_false_stop_loss": 2,
+    "change_1h_lt_0_multibook_oos_fisher_p": 0.435304757622255,
+    "ccxt_last_bars_hkt": "2026-10-24 about 17 days before the audit",
+    "binance_series": 52,
+    "binance_with_at_least_20_closed_1h": 0,
+    "binance_max_closed_1h": 7,
+    "listings_seeded_2026_11_05": 518,
+    "cross_venue_pairs": 66,
+    "pairs_with_at_least_20_matches_within_5s": 0,
+    "enable_hard_filter": False,
+    "enable_chase_block": False,
+    "enable_spread_block": False,
+}
 
 CANDIDATE_FEATURES = (
     "volatility_24h_extreme",
@@ -142,17 +182,31 @@ def _time_split(rows: Sequence[dict[str, Any]]) -> dict[str, list[dict[str, Any]
     }
 
 
+def is_stop_loss(row: Mapping[str, Any]) -> bool:
+    """Only the exact exit label. A negative pnl is not a stop."""
+    return str(row.get("exit_reason") or "").strip().lower() == STOP_LABEL
+
+
+def usable_at_entry(row: Mapping[str, Any]) -> bool:
+    """Stored shadow flags were batch-tagged after the fact.
+
+    A row is predictive only when the source says the raw features were
+    already known at entry. Rows without that column are left in, and the
+    report says they were not attested.
+    """
+    if "features_usable_at_entry" not in row:
+        return True
+    return str(row.get("features_usable_at_entry")).strip() in {"1", "1.0"}
+
+
 def _stop_rate(rows: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
-    stops = 0
-    for row in rows:
-        reason = str(row.get("exit_reason") or "").lower()
-        if "stop" in reason:
-            stops += 1
+    stops = sum(1 for row in rows if is_stop_loss(row))
     return stops, len(rows)
 
 
 def run_oos_report(path: str | Path | None) -> dict[str, Any]:
     """Describe a sample. ``enable_block`` is false in this build."""
+    cited = dict(LOCAL_SHADOW_CCXT_AUDIT)
     if path is None:
         return {
             "availability": "not_configured",
@@ -160,6 +214,7 @@ def run_oos_report(path: str | Path | None) -> dict[str, Any]:
             "reason": "no path supplied; observe only",
             "dex_liquidity_transferable_to_binance": False,
             "change_1h_negative_is_a_state1_reject": False,
+            "local_audit_2026_11_10": cited,
         }
     source = Path(path)
     rows, problem = _load_rows(source)
@@ -172,8 +227,10 @@ def run_oos_report(path: str | Path | None) -> dict[str, Any]:
             "dex_liquidity_transferable_to_binance": False,
             "change_1h_negative_is_a_state1_reject": False,
             "n": 0,
+            "local_audit_2026_11_10": cited,
         }
-    splits = _time_split(rows)
+    predictive = [row for row in rows if usable_at_entry(row)]
+    splits = _time_split(predictive)
     test = splits["test"]
     high: list[dict[str, Any]] = []
     rest: list[dict[str, Any]] = []
@@ -195,7 +252,12 @@ def run_oos_report(path: str | Path | None) -> dict[str, Any]:
             "State 1 is not rejected for change_1h < 0. "
             "DEX liquidity_usd is not a Binance gate."
         ),
-        "n": len(rows),
+        "n": len(predictive),
+        "rows_excluded_not_knowable_at_entry": len(rows) - len(predictive),
+        "label": STOP_LABEL,
+        "negative_pnl_counted_as_stop": False,
+        "stored_skip_equals_r3_not_r3_or_liq": True,
+        "local_audit_2026_11_10": cited,
         "split": {key: len(value) if key != "unsorted_dropped" else value for key, value in splits.items()},
         "test_high_vol_stops": {"stops": high_stops, "n": high_n},
         "test_other_stops": {"stops": rest_stops, "n": rest_n},

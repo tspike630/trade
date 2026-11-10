@@ -320,17 +320,35 @@ class TestShadowOos(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "shadow.csv"
             start = datetime(2026, 10, 1, tzinfo=timezone.utc)
-            lines = ["opened_at,exit_reason,volatility_24h,change_1h,liq_usd"]
+            lines = [
+                "opened_at,exit_reason,volatility_24h,change_1h,liq_usd,pnl_usd,features_usable_at_entry"
+            ]
             for i in range(120):
                 stamp = (start + timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
                 vol = 4.0 if i % 2 == 0 else 0.2
-                reason = "stop" if i % 2 == 0 else "tp"
-                lines.append(f"{stamp},{reason},{vol},-0.01,10000")
+                reason = "stop_loss" if i % 2 == 0 else "take_profit"
+                lines.append(f"{stamp},{reason},{vol},-0.01,10000,-1,1")
+            lines.append(
+                f"{(start + timedelta(hours=121)).strftime('%Y-%m-%dT%H:%M:%SZ')},max_hold,3,-0.2,10000,-50,1"
+            )
+            lines.append(
+                f"{(start + timedelta(hours=122)).strftime('%Y-%m-%dT%H:%M:%SZ')},stop_loss,4,-0.2,10000,-1,0"
+            )
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             report = run_oos_report(path)
         self.assertEqual(report["availability"], "ok")
         self.assertFalse(report["enable_block"])
         self.assertFalse(report["production_attested"])
+        self.assertFalse(report["local_audit_2026_11_10"]["recomputed_here"])
+        self.assertEqual(report["local_audit_2026_11_10"]["same_book_temporal_oos"]["stop_loss"], 0)
+        self.assertEqual(report["local_audit_2026_11_10"]["multibook_oos_ex_discovery"]["n"], 656)
+        self.assertEqual(report["local_audit_2026_11_10"]["r3_on_multibook_oos"]["take_profit_skipped"], 28)
+        self.assertEqual(report["local_audit_2026_11_10"]["binance_max_closed_1h"], 7)
+        self.assertEqual(report["local_audit_2026_11_10"]["pairs_with_at_least_20_matches_within_5s"], 0)
+        self.assertEqual(report["rows_excluded_not_knowable_at_entry"], 1)
+        self.assertEqual(report["label"], "stop_loss")
+        self.assertFalse(report["negative_pnl_counted_as_stop"])
+        self.assertTrue(report["stored_skip_equals_r3_not_r3_or_liq"])
         self.assertGreater(report["split"]["test"], 0)
         self.assertIn("change_1h<0 alone", report["excluded_from_any_block"])
 
@@ -432,8 +450,12 @@ class TestCcxtGuard(unittest.TestCase):
                 "market_regime": "cross_asset_momentum_pullback",
             }
             kept_chase, report_chase = apply_ccxt_listing_guard([chase], snap2, now_ms=NOW_MS)
-            self.assertEqual(kept_chase, [])
-            self.assertEqual(report_chase["dropped_chase_buys"], 1)
+            self.assertEqual(len(kept_chase), 1)
+            self.assertFalse(kept_chase[0]["ccxt_chase_block"])
+            self.assertEqual(kept_chase[0]["ccxt_listing_class"], "unknown")
+            self.assertEqual(kept_chase[0]["ccxt_listing_reason"], "coverage_insufficient_not_a_new_listing")
+            self.assertEqual(report_chase["dropped_chase_buys"], 0)
+            self.assertFalse(report_chase["chase_block_enabled"])
             sell = {"action": "sell", "ccxt_symbol": "NEW/USDT", "market_regime": "cross_asset_momentum_pullback"}
             kept_sell, _report = apply_ccxt_listing_guard([sell], snap2, now_ms=NOW_MS)
             self.assertEqual(kept_sell[0]["action"], "sell")
@@ -463,6 +485,7 @@ class TestCcxtGuard(unittest.TestCase):
             )
             self.assertEqual(len(kept_stale), 1)
             self.assertFalse(kept_stale[0]["ccxt_chase_block"])
+            self.assertNotEqual(kept_stale[0]["ccxt_listing_class"], "new")
 
 
 if __name__ == "__main__":
