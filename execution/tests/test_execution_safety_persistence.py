@@ -6,9 +6,12 @@ the ledger drops. No live HTTP.
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -28,9 +31,18 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     PURPOSE_LIVE_BNB_BOLL_FADE,
     REST_BOOK,
     buy_exposure_block,
+    funding_after_reservation,
+    reserved_quote_usdt,
     row_quote_usdt,
 )
 from execution.executors.binance_spot_protect import PROTECTION_EXCHANGE  # noqa: E402
+from decision_engine.core.regime_strategy_router import evaluate_five_state_regime  # noqa: E402
+from decision_engine.core.data_adapter import IndicatorDataAdapter  # noqa: E402
+from decision_engine.core.engine import DecisionEngine  # noqa: E402
+from decision_engine.core.risk_manager import RiskManager  # noqa: E402
+from decision_engine.core.signal_bus import SignalBus  # noqa: E402
+from decision_engine.strategies import get_strategy  # noqa: E402
+from decision_engine.tests.test_published_signal_contract import _seed_state3  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
 from execution.ledger import ExecutionLedger  # noqa: E402
 
@@ -442,8 +454,15 @@ class PersistenceSafetyTests(unittest.TestCase):
         self.assertIsNotNone(row_quote_usdt(armed))
         self.assertGreater(row_quote_usdt(armed) or 0, 0)
         self.assertEqual(
-            buy_exposure_block([armed], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+            buy_exposure_block([armed], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="BNBUSDT"),
             "maker_resting_blocks_buy",
+        )
+        self.assertIsNone(
+            buy_exposure_block([armed], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT")
+        )
+        self.assertGreater(
+            reserved_quote_usdt([armed]),
+            0,
         )
 
         pid = int(armed["id"])
@@ -810,6 +829,211 @@ class PersistenceSafetyTests(unittest.TestCase):
         self.assertEqual(client.orders, [])
         self.assertEqual(client.ocos, [])
 
+    def _buy(
+        self,
+        extras: dict[str, Any],
+        decision_id: int = 70,
+        *,
+        limit: bool = True,
+    ) -> dict[str, Any]:
+        body = {
+            "binance_symbol": "BNBUSDT",
+            "price_usd": "100",
+            "stop_price": "90",
+            "take_profit_price": "120",
+            "entry_reason": "large_trade_market",
+        }
+        if limit:
+            body["quantity"] = "1"
+            body["price"] = "99.90"
+        body.update(extras)
+        return {
+            "decision_log_id": decision_id,
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+            "mode": "live_stub",
+            "action": "buy",
+            "token_address": "BNBUSDT",
+            "extras": body,
+        }
+
+    def test_recommended_limit_maker_is_the_order_when_none_was_explicit(self) -> None:
+        client = _Exchange()
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot=_BOUND,
+            production_book=REST_BOOK,
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
+            post_only_limit=False,
+        )
+        result = adapter.execute(
+            self._buy({"recommended_order_type": "LIMIT_MAKER", "enable_trailing_ratchet": True})
+        )
+        self.assertEqual(result["error"], "maker_entry_resting")
+        self.assertEqual(parse_qs(client.orders[0]).get("type"), ["LIMIT_MAKER"])
+        self.assertNotIn("timeInForce", client.orders[0])
+        self.assertEqual(client.ocos, [])
+
+        explicit = adapter.execute(
+            self._buy(
+                {
+                    "order_type": "LIMIT",
+                    "recommended_order_type": "LIMIT_MAKER",
+                    "price": "99.90",
+                },
+                71,
+            )
+        )
+        self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["LIMIT"])
+        self.assertEqual(parse_qs(client.orders[-1]).get("timeInForce"), ["GTC"])
+        self.assertNotEqual(explicit["error"], "maker_entry_resting")
+
+        none = adapter.execute(
+            self._buy({"recommended_order_type": "NONE", "quote_order_qty": "20"}, 72, limit=False)
+        )
+        self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["MARKET"])
+
+        from decision_engine.core.signal_bus import normalize_signal
+
+        norm = normalize_signal(
+            {
+                "action": "buy",
+                "strategy_id": "tech",
+                "token_address": "BNBUSDT",
+                "binance_symbol": "BNBUSDT",
+                "size_pct": 0.1,
+                "recommended_order_type": "LIMIT_MAKER",
+                "volume_z": 1.2,
+                "stop_price": "90",
+                "take_profit_price": "120",
+                "quantity": "1",
+                "price": "99.90",
+                "price_usd": "100",
+                "entry_reason": "large_trade_market",
+            },
+            purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+        )
+        extras = norm["_extras"]
+        self.assertEqual(extras.get("recommended_order_type"), "LIMIT_MAKER")
+        self.assertEqual(extras.get("volume_z"), 1.2)
+        self.assertNotIn("order_type", extras)
+        carried = adapter.execute(
+            {
+                "decision_log_id": 73,
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "mode": "live_stub",
+                "action": "buy",
+                "token_address": "BNBUSDT",
+                "extras": extras,
+            }
+        )
+        self.assertEqual(carried["error"], "maker_entry_resting")
+        self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["LIMIT_MAKER"])
+
+    def test_published_state3_signal_posts_limit_maker_without_network(self) -> None:
+        now_ms = int(time.time() * 1000)
+        db = self.root / "decision.db"
+        book = self.root / "public_derivatives.db"
+        _seed_state3(db, book, now_ms)
+        saved = {
+            key: os.environ.get(key)
+            for key in (
+                "PUBLIC_DERIVATIVES_DB_PATH",
+                "NEWS_EVENTS_DB_PATH",
+                "LIVE_BNB_FACTOR_SOURCE",
+                "BINANCE_SPOT_BOOK_USDT",
+            )
+        }
+        os.environ["PUBLIC_DERIVATIVES_DB_PATH"] = str(book)
+        os.environ["NEWS_EVENTS_DB_PATH"] = str(self.root / "missing-news.db")
+        os.environ.pop("LIVE_BNB_FACTOR_SOURCE", None)
+        os.environ.pop("BINANCE_SPOT_BOOK_USDT", None)
+        indicator = IndicatorDataAdapter(db)
+        bus = SignalBus(db, purpose=PURPOSE_LIVE_BNB_BOLL_FADE)
+        try:
+            payload = DecisionEngine(
+                indicator,
+                bus,
+                [get_strategy("tech_boll_fade_v1")],
+                risk=RiskManager(cooldown_sec=0),
+            ).tick()
+        finally:
+            bus.close()
+            indicator.close()
+        self.assertEqual(payload["emitted"], 1)
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        stored = conn.execute(
+            "SELECT action, size_pct, raw_json FROM decision_log ORDER BY id"
+        ).fetchone()
+        conn.close()
+        assert stored is not None
+        raw = json.loads(stored["raw_json"])
+        extras = dict(raw["extras"])
+        self.assertEqual(stored["action"], "buy")
+        self.assertFalse(extras.get("news_shock_applied"))
+        self.assertEqual(extras["recommended_order_type"], "LIMIT_MAKER")
+        self.assertEqual(extras["order_type"], "MARKET")
+        self.assertEqual(extras["obi_top5"], -0.10)
+        self.assertEqual(extras["obi_top5_source_ts_ms"], now_ms)
+        self.assertNotIn("orderbook_imbalance_20", extras)
+        self.assertLess(extras["volume_z"], 3.8)
+        os.environ["BINANCE_SPOT_BOOK_USDT"] = "1000"
+        client = _Exchange()
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: now_ms,
+            account_snapshot=_BOUND,
+            production_book=REST_BOOK,
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
+            post_only_limit=False,
+        )
+        result = adapter.execute(
+            {
+                "decision_log_id": int(stored["id"]) if "id" in stored.keys() else 80,
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "mode": "live_stub",
+                "action": stored["action"],
+                "token_address": "FADEUSDT",
+                "size_pct": stored["size_pct"],
+                "extras": extras,
+            }
+        )
+        self.assertEqual(result["error"], "maker_entry_resting", result)
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(client.ocos, [])
+        form = {key: values[0] for key, values in parse_qs(client.orders[0]).items()}
+        form.pop("signature", None)
+        self.assertEqual(form.get("symbol"), "FADEUSDT")
+        self.assertEqual(form.get("side"), "BUY")
+        self.assertEqual(form.get("type"), "LIMIT_MAKER")
+        self.assertNotIn("timeInForce", form)
+        self.assertNotIn("orderbook_imbalance_20", form)
+        self.assertNotIn("-0.55", client.orders[0])
+        self.assertTrue(form.get("quantity"))
+        self.assertTrue(form.get("price"))
+        artifact = {
+            "news_shock_applied": extras.get("news_shock_applied"),
+            "obi_top5": extras.get("obi_top5"),
+            "obi_top5_source_ts_ms": extras.get("obi_top5_source_ts_ms"),
+            "volume_z": extras.get("volume_z"),
+            "order": {key: form[key] for key in ("symbol", "side", "type", "quantity", "price") if key in form},
+        }
+        out = self.root / "state3_order.json"
+        out.write_text(json.dumps(artifact, sort_keys=True), encoding="utf-8")
+        self.assertEqual(artifact["order"]["type"], "LIMIT_MAKER")
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
     def _held_qty(self, ledger: ExecutionLedger, qty: str, decision_id: int = 61) -> tuple[int, BinanceSpotAdapter, _Exchange]:
         row = self._held(ledger, decision_id)
         pid = int(row["id"])
@@ -942,3 +1166,323 @@ class PersistenceSafetyTests(unittest.TestCase):
         self.assertEqual(Decimal(stored["quantity"]), Decimal("1.10"))
         self.assertEqual(len(client.sells), 1)
         self.assertLessEqual(Decimal(parse_qs(client.sells[0])["quantity"][0]), Decimal("1.50"))
+
+    def _maker_adapter(self, client: _Exchange, ws: object | None = None) -> BinanceSpotAdapter:
+        return BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot=_BOUND,
+            production_book=REST_BOOK,
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
+            post_only_limit=False,
+            ws_cache=ws,
+        )
+
+    def test_stale_ws_bid_does_not_override_a_fresh_rest_book(self) -> None:
+        client = _Exchange()
+        client.order_book = lambda symbol, limit=5: {  # type: ignore[method-assign]
+            "bids": [["100.70", "5"]],
+            "asks": [["100.80", "5"]],
+        }
+
+        class _Stale:
+            def get_ticker_price(self, symbol: str) -> dict[str, str | int]:
+                return {
+                    "best_bid": "100.10",
+                    "best_ask": "100.20",
+                    "price": "100.15",
+                    "ws_age_ms": 900_000,
+                }
+
+        result = self._maker_adapter(client, _Stale()).execute(
+            self._buy({"recommended_order_type": "LIMIT_MAKER", "price": "101"})
+        )
+        self.assertEqual(result["error"], "maker_entry_resting", result)
+        self.assertEqual(Decimal(parse_qs(client.orders[0])["price"][0]), Decimal("100.70"))
+        self.assertEqual(parse_qs(client.orders[0]).get("type"), ["LIMIT_MAKER"])
+
+    def test_stale_ws_mark_uses_rest_ticker_and_does_not_read_wall_mid(self) -> None:
+        os.environ["BINANCE_SPOT_WS_MAX_AGE_MS"] = "2500"
+        client = _Exchange()
+        client.ticker_price = lambda symbol: {"symbol": symbol, "price": "100.55"}  # type: ignore[method-assign]
+        client.order_book = lambda symbol, limit=5: {  # type: ignore[method-assign]
+            "bids": [["100.50", "5"]],
+            "asks": [["100.60", "5"]],
+        }
+
+        class _Mark:
+            def __init__(self, price: str, age: object) -> None:
+                self.price = price
+                self.age = age
+
+            def get_ticker_price(self, symbol: str) -> dict[str, object]:
+                payload: dict[str, object] = {"price": self.price, "source": "ws_l1"}
+                if self.age is not None:
+                    payload["ws_age_ms"] = self.age
+                return payload
+
+        adapter = self._maker_adapter(client, _Mark("90", 900_000))
+        result = adapter.execute(
+            self._buy(
+                {
+                    "recommended_order_type": "LIMIT_MAKER",
+                    "price": "100.80",
+                    "price_usd": "100.8",
+                    "stop_price": "99",
+                    "take_profit_price": "120",
+                    "wall_mid_price": "88.88",
+                }
+            )
+        )
+        self.assertEqual(result["error"], "maker_entry_resting", result)
+        form = parse_qs(client.orders[0])
+        self.assertEqual(form.get("type"), ["LIMIT_MAKER"])
+        self.assertEqual(Decimal(form["price"][0]), Decimal("100.50"))
+        self.assertNotIn("88.88", client.orders[0])
+        self.assertEqual(adapter._mark_telemetry.get("mark_source"), "rest_fallback")
+
+        fresh = self._maker_adapter(client, _Mark("100.40", 2500))
+        mark, err = fresh._read_entry_mark(client, "BNBUSDT")
+        self.assertIsNone(err)
+        self.assertEqual(mark, "100.40")
+
+        stale = self._maker_adapter(client, _Mark("90", 2501))
+        mark, err = stale._read_entry_mark(client, "BNBUSDT")
+        self.assertIsNone(err)
+        self.assertEqual(mark, "100.55")
+
+        missing_age = self._maker_adapter(client, _Mark("100.25", None))
+        mark, err = missing_age._read_entry_mark(client, "BNBUSDT")
+        self.assertIsNone(err)
+        self.assertEqual(mark, "100.55")
+
+        invalid = self._maker_adapter(client, _Mark("90", "stale"))
+        mark, err = invalid._read_entry_mark(client, "BNBUSDT")
+        self.assertIsNone(err)
+        self.assertEqual(mark, "100.55")
+
+        def _ticker_down(symbol: str) -> dict[str, str]:
+            raise TimeoutError("ticker down")
+
+        client.ticker_price = _ticker_down  # type: ignore[method-assign]
+        closed = self._maker_adapter(client, _Mark("90", 2501))
+        mark, err = closed._read_entry_mark(client, "BNBUSDT")
+        self.assertIsNone(mark)
+        self.assertEqual(err, "mark_unavailable")
+        refused = closed.execute(
+            self._buy(
+                {
+                    "recommended_order_type": "LIMIT_MAKER",
+                    "price": "100.80",
+                    "stop_price": "99",
+                    "take_profit_price": "120",
+                },
+                76,
+            )
+        )
+        self.assertEqual(refused["error"], "mark_unavailable")
+        self.assertEqual(refused["submitted"], False)
+        self.assertEqual(len(client.orders), 1)
+
+    def test_unproved_ws_age_uses_rest_for_mark_and_book(self) -> None:
+        os.environ["BINANCE_SPOT_WS_MAX_AGE_MS"] = "2500"
+        accepted = (0, 1, 2500, "0", "2500", "2500.0", " 1500 ")
+        rejected = (
+            None,
+            "",
+            "nan",
+            "inf",
+            "-inf",
+            "NaN",
+            "Infinity",
+            "stale",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            False,
+            -1,
+            10**18,
+            2501,
+            "-5",
+            "2500.5",
+        )
+        for age in accepted:
+            payload = {"ws_age_ms": age}
+            try:
+                got = BinanceSpotAdapter._ws_age_ms(payload)
+            except Exception as exc:  # noqa: BLE001
+                self.fail(f"accepted age {age!r} raised {type(exc).__name__}: {exc}")
+            self.assertIsNotNone(got, age)
+            self.assertLessEqual(got, 2500)
+        missing_key: dict[str, object] = {}
+        self.assertIsNone(BinanceSpotAdapter._ws_age_ms(missing_key))
+        for age in rejected:
+            payload = {"ws_age_ms": age}
+            try:
+                got = BinanceSpotAdapter._ws_age_ms(payload)
+            except Exception as exc:  # noqa: BLE001
+                self.fail(f"rejected age {age!r} raised {type(exc).__name__}: {exc}")
+            self.assertIsNone(got, age)
+
+        client = _Exchange()
+        client.ticker_price = lambda symbol: {"symbol": symbol, "price": "100.55"}  # type: ignore[method-assign]
+        client.order_book = lambda symbol, limit=5: {  # type: ignore[method-assign]
+            "bids": [["100.50", "4"]],
+            "asks": [["100.60", "4"]],
+        }
+
+        class _Book:
+            def __init__(self, age: object, *, present: bool = True) -> None:
+                self.age = age
+                self.present = present
+
+            def get_ticker_price(self, symbol: str) -> dict[str, object]:
+                payload: dict[str, object] = {
+                    "price": "100.25",
+                    "best_bid": "100.20",
+                    "best_ask": "100.30",
+                    "source": "ws_l1",
+                }
+                if self.present:
+                    payload["ws_age_ms"] = self.age
+                return payload
+
+        for age, present in ((None, False), (None, True), ("stale", True), (float("inf"), True), (2501, True)):
+            adapter = self._maker_adapter(client, _Book(age, present=present))
+            mark, err = adapter._read_entry_mark(client, "BNBUSDT")
+            self.assertIsNone(err, age)
+            self.assertEqual(mark, "100.55", age)
+            bid, ask, book_err = adapter._maker_top_of_book(client, "BNBUSDT")
+            self.assertIsNone(book_err, age)
+            self.assertEqual(Decimal(bid or "0"), Decimal("100.50"))
+            self.assertEqual(Decimal(ask or "0"), Decimal("100.60"))
+
+        result = self._maker_adapter(client, _Book(None, present=False)).execute(
+            self._buy(
+                {
+                    "recommended_order_type": "LIMIT_MAKER",
+                    "price": "100.80",
+                    "price_usd": "100.8",
+                    "stop_price": "99",
+                    "take_profit_price": "120",
+                    "wall_mid_price": "88.88",
+                },
+                77,
+            )
+        )
+        self.assertEqual(result["error"], "maker_entry_resting", result)
+        form = parse_qs(client.orders[-1])
+        self.assertEqual(form.get("type"), ["LIMIT_MAKER"])
+        self.assertEqual(Decimal(form["price"][0]), Decimal("100.50"))
+        self.assertNotIn("88.88", client.orders[-1])
+        self.assertNotIn("100.20", client.orders[-1])
+
+        def _down(symbol: str, limit: int = 5) -> dict[str, str]:
+            raise TimeoutError("rest down")
+
+        client.ticker_price = _down  # type: ignore[method-assign]
+        client.order_book = _down  # type: ignore[method-assign]
+        before = len(client.orders)
+        refused = self._maker_adapter(client, _Book(None, present=False)).execute(
+            self._buy(
+                {
+                    "recommended_order_type": "LIMIT_MAKER",
+                    "order_type": "MARKET",
+                    "price": "100.80",
+                    "stop_price": "99",
+                    "take_profit_price": "120",
+                },
+                78,
+            )
+        )
+        self.assertEqual(refused["submitted"], False)
+        self.assertIn(refused["error"], {"mark_unavailable", "maker_book_unavailable"})
+        self.assertEqual(len(client.orders), before)
+        self.assertNotEqual(refused["error"], "maker_entry_resting")
+
+    def test_crossed_or_missing_book_does_not_invent_a_maker_price(self) -> None:
+        crossed = _Exchange()
+        crossed.order_book = lambda symbol, limit=5: {  # type: ignore[method-assign]
+            "bids": [["100.20", "1"]],
+            "asks": [["100.10", "1"]],
+        }
+        class _NoWs:
+            pass
+
+        refused = self._maker_adapter(crossed, _NoWs()).execute(
+            self._buy({"recommended_order_type": "LIMIT_MAKER", "price": "100.79", "price_usd": "100.80"})
+        )
+        self.assertEqual(refused["error"], "orderbook_crossed")
+        self.assertEqual(crossed.orders, [])
+
+        missing = _Exchange()
+        missing.order_book = lambda symbol, limit=5: {}  # type: ignore[method-assign]
+        absent = self._maker_adapter(missing, _NoWs()).execute(
+            self._buy(
+                {"recommended_order_type": "LIMIT_MAKER", "price": "100.79", "price_usd": "100.80"},
+                74,
+            )
+        )
+        self.assertEqual(absent["error"], "maker_book_unavailable")
+        self.assertEqual(absent["submitted"], False)
+        self.assertEqual(missing.orders, [])
+
+        market = self._maker_adapter(missing, _NoWs()).execute(
+            self._buy({"order_type": "MARKET", "recommended_order_type": "NONE", "quote_order_qty": "20"}, 75, limit=False)
+        )
+        self.assertEqual(parse_qs(missing.orders[0]).get("type"), ["MARKET"])
+        self.assertNotEqual(market["error"], "maker_book_unavailable")
+
+    def test_unfilled_maker_reserves_its_symbol_and_not_another(self) -> None:
+        resting = {
+            "symbol": "BNBUSDT",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+            "status": "maker_resting",
+            "quantity": None,
+            "entry_order_id": "91001",
+            "entry_order_qty": "1",
+            "entry_limit_price": "99.95",
+            "entry_price": "99.95",
+            "protection": "maker_resting",
+        }
+        self.assertEqual(
+            buy_exposure_block([resting], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="BNBUSDT"),
+            "maker_resting_blocks_buy",
+        )
+        self.assertIsNone(
+            buy_exposure_block([resting], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT")
+        )
+        self.assertEqual(reserved_quote_usdt([resting]), Decimal("99.95"))
+        self.assertEqual(
+            funding_after_reservation("120", Decimal("20"), "99.95", Decimal("100")),
+            "funding_block",
+        )
+        naked = dict(resting, status="open", protection="held_position_exit", quantity="1")
+        self.assertEqual(
+            buy_exposure_block([naked], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+            "unprotected_position_blocks_buy",
+        )
+        unknown = dict(resting, status="maker_cancel_unknown", quantity="0.40")
+        self.assertEqual(
+            buy_exposure_block([unknown], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+            "maker_resting_blocks_buy",
+        )
+
+    def test_published_limit_maker_recommendation_covers_eligible_states(self) -> None:
+        cases = {
+            "state1": {},
+            "state2": {"funding_z": -2.0},
+            "state3": {"xs_breadth_1h": 0.80, "xs_rank_pct_1h": 0.90, "obi_top5": -0.10, "volume_z": 1.2},
+            "state4": {"funding_z": 1.9},
+        }
+        for name, row in cases.items():
+            decision = evaluate_five_state_regime(row)
+            self.assertTrue(decision.allow_buy, name)
+            self.assertEqual(decision.recommended_order_type, "LIMIT_MAKER", name)
+        halted = evaluate_five_state_regime({}, macro_halt="macro")
+        self.assertFalse(halted.allow_buy)
+        self.assertEqual(halted.recommended_order_type, "NONE")

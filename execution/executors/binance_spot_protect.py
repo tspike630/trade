@@ -989,12 +989,16 @@ def peg_maker_buy_price(
 
     bid_n = _to_decimal(best_bid)
     ask_n = _to_decimal(best_ask)
-    mark_n = _to_decimal(mark)
-    ceiling = ask_n if ask_n is not None else mark_n
+    if bid_n is None or ask_n is None:
+        return None, False, "maker_book_unavailable"
+    if ask_n <= bid_n:
+        return None, False, "orderbook_crossed"
+    ceiling = ask_n
+    del mark
 
     was_clamped = False
     chosen = aligned
-    if ceiling is not None and chosen >= ceiling:
+    if chosen >= ceiling:
         if bid_n is not None and bid_n < ceiling:
             candidate = _align(bid_n, tick_n, ROUND_DOWN)
         else:
