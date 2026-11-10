@@ -1,0 +1,30 @@
+# Template only. scripts/sync_deploy.sh does not install systemd units and
+# does not restart processes. Copy this file yourself after the crawler
+# component sync has placed scripts/fetch_public_derivatives_and_counterparty.py
+# in the runtime. Public market data only: no orders, no API key.
+#
+# The database must be the same file the decision engine reads
+# (PUBLIC_DERIVATIVES_DB_PATH, or data/counterparty/public_derivatives.db next
+# to the checkout). From a git checkout the equivalent command is:
+#   python3 scripts/fetch_public_derivatives_and_counterparty.py --loop --interval 300 --db data/counterparty/public_derivatives.db
+[Unit]
+Description=Public derivatives collector (read-only --loop)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dexscreener-crawler
+EnvironmentFile=-/etc/dexscreener-crawler.env
+Environment=PUBLIC_DERIVATIVES_DB_PATH=/opt/dexscreener-crawler/data/counterparty/public_derivatives.db
+ExecStart=/usr/bin/flock -n -E 3 /run/lock/public-derivatives-collector.lock /opt/dexscreener-crawler/.venv/bin/python scripts/fetch_public_derivatives_and_counterparty.py --loop --interval 300
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=public-derivatives-collector
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

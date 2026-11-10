@@ -75,5 +75,14 @@ out="$("$S" --dry-run execution 2>&1)"; check "systemd same" "grep -q 'execution
 echo "Extra=1" >> "$T/units/dexscreener-execution.service"; cp "$T/units/dexscreener-execution.service" "$T/u.bak"
 out="$("$S" --dry-run execution 2>&1)"; check "systemd differ, unit not written" "grep -q 'execution.service differ' <<<\"\$out\" && cmp -s '$T/units/dexscreener-execution.service' '$T/u.bak'"
 
+# public collector is part of the crawler runtime sync
+mkdir -p scripts
+echo 'print("collector")' > scripts/fetch_public_derivatives_and_counterparty.py
+git add scripts/fetch_public_derivatives_and_counterparty.py
+git commit -qm collector
+git push -q origin main
+out="$("$S" --dry-run crawler 2>&1)"; rc=$?
+check "crawler sync lists public collector" "[[ $rc == 0 ]] && grep -q 'scripts/fetch_public_derivatives_and_counterparty.py' <<<\"\$out\""
+
 echo "1..$N  failures=$FAIL"
 exit $(( FAIL > 0 ))
