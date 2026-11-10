@@ -1016,20 +1016,20 @@ class SupplyIngestTests(unittest.TestCase):
             self.assertFalse(report["archive_rows_complete"])
             self.assertFalse(report["complete"])
             conn.execute(
-                "INSERT INTO vision_metrics (symbol, create_time_ms, source_url) VALUES ('BTCUSDT', ?, 'm')",
-                (opens[0],),
+                "INSERT INTO vision_metrics (symbol, create_time_ms, source_url) VALUES ('BTCUSDT', ?, ?)",
+                (opens[0], url),
             )
             conn.execute(
-                "INSERT INTO vision_metrics (symbol, create_time_ms, source_url) VALUES ('BTCUSDT', ?, 'm')",
-                (opens[0] + 300_000,),
+                "INSERT INTO vision_metrics (symbol, create_time_ms, source_url) VALUES ('BTCUSDT', ?, ?)",
+                (opens[0] + 300_000, url),
             )
             conn.execute(
-                "INSERT INTO vision_metrics (symbol, create_time_ms, source_url) VALUES ('BTCUSDT', ?, 'm')",
-                (opens[0] + 900_000,),
+                "INSERT INTO vision_metrics (symbol, create_time_ms, source_url) VALUES ('BTCUSDT', ?, ?)",
+                (opens[0] + 900_000, url),
             )
             conn.execute(
-                "INSERT INTO vision_book_depth (symbol, timestamp_ms, percentage, source_url) VALUES ('BTCUSDT', ?, -1, 'b')",
-                (opens[0],),
+                "INSERT INTO vision_book_depth (symbol, timestamp_ms, percentage, source_url) VALUES ('BTCUSDT', ?, -1, ?)",
+                (opens[0], url),
             )
             conn.commit()
             observed = coverage_report(conn, ["BTCUSDT"], [day])
@@ -1038,6 +1038,105 @@ class SupplyIngestTests(unittest.TestCase):
             self.assertEqual(metrics_day["rows"], 3)
             self.assertTrue(any(gap["delta_ms"] == 600_000 for gap in metrics_day["sampling_gaps"]))
             self.assertNotIn("expected_count", metrics_day)
+
+    def test_unverified_other_url_cannot_fill_a_planned_slot(self) -> None:
+        february = tuple(date(2026, 2, day) for day in range(1, 29))
+        opens = expected_closed_5m_opens(february)
+        missing_open = 1769934000000
+        self.assertEqual(len(opens), 8064)
+        self.assertIn(missing_open, opens)
+        monthly = (
+            "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/"
+            "BTCUSDT-5m-2026-02.zip"
+        )
+        legacy = (
+            "https://data.binance.vision/data/spot/daily/klines/BTCUSDT/5m/"
+            "BTCUSDT-5m-2026-02-01.zip"
+        )
+        with TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "vision.db")
+            conn.execute(
+                """
+                INSERT INTO vision_files (
+                    url, sha256, byte_count, row_count, status, detail, schema_version,
+                    checksum_sha256, checksum_status
+                ) VALUES (?, 'aa', 10, 8063, 'ok', NULL, 'vision_backfill_v1', 'aa', 'verified')
+                """,
+                (monthly,),
+            )
+            conn.execute(
+                """
+                INSERT INTO vision_files (
+                    url, sha256, byte_count, row_count, status, detail, schema_version,
+                    checksum_sha256, checksum_status
+                ) VALUES (?, 'bb', 10, 1, 'ok', NULL, 'vision_backfill_v1', NULL, NULL)
+                """,
+                (legacy,),
+            )
+            conn.executemany(
+                """
+                INSERT INTO vision_spot_klines (
+                    symbol, interval, open_time_ms, close_time_ms, open, high, low, close,
+                    volume, quote_volume, timestamp_unit, source_url
+                ) VALUES ('BTCUSDT', '5m', ?, ?, 100, 101, 99, 100.5, 1, 40.5, 'ms', ?)
+                """,
+                [(stamp, stamp + 299_999, monthly) for stamp in opens if stamp != missing_open],
+            )
+            conn.execute(
+                """
+                INSERT INTO vision_spot_klines (
+                    symbol, interval, open_time_ms, close_time_ms, open, high, low, close,
+                    volume, quote_volume, timestamp_unit, source_url
+                ) VALUES ('BTCUSDT', '5m', ?, ?, 100, 101, 99, 100.5, 1, -7.5, 'ms', ?)
+                """,
+                (missing_open, missing_open + 299_999, legacy),
+            )
+            conn.commit()
+            report = coverage_report(conn, ["BTCUSDT"], february, [monthly])
+            slot = report["kline_slots"][0]
+            self.assertIn(missing_open, slot["missing_timestamps_ms"])
+            self.assertEqual(slot["missing_count"], 1)
+            self.assertTrue(report["files_downloaded_ok"])
+            self.assertFalse(report["archive_rows_complete"])
+            self.assertFalse(report["complete"])
+            self.assertFalse(overall_complete(report, None))
+            self.assertEqual(
+                conn.execute(
+                    "SELECT quote_volume FROM vision_spot_klines WHERE source_url = ?",
+                    (legacy,),
+                ).fetchone()[0],
+                -7.5,
+            )
+            conn.execute("DELETE FROM vision_spot_klines WHERE source_url = ?", (legacy,))
+            conn.commit()
+            after = coverage_report(conn, ["BTCUSDT"], february, [monthly])
+            self.assertIn(missing_open, after["kline_slots"][0]["missing_timestamps_ms"])
+            self.assertFalse(overall_complete(after, None))
+            verified_open = opens[0]
+            conn.execute(
+                """
+                INSERT INTO vision_spot_klines (
+                    symbol, interval, open_time_ms, close_time_ms, open, high, low, close,
+                    volume, quote_volume, timestamp_unit, source_url
+                ) VALUES ('BTCUSDT', '5m', ?, ?, 100, 101, 99, 100.5, 1, -7.5, 'ms', ?)
+                """,
+                (verified_open, verified_open + 299_999, legacy),
+            )
+            conn.commit()
+            both = conn.execute(
+                """
+                SELECT source_url, quote_volume FROM vision_spot_klines
+                WHERE symbol = 'BTCUSDT' AND open_time_ms = ?
+                """,
+                (verified_open,),
+            ).fetchall()
+            self.assertEqual(
+                {(row[0], row[1]) for row in both},
+                {(monthly, 40.5), (legacy, -7.5)},
+            )
+            covered = coverage_report(conn, ["BTCUSDT"], february, [monthly])
+            self.assertNotIn(verified_open, covered["kline_slots"][0]["missing_timestamps_ms"])
+            self.assertIn(missing_open, covered["kline_slots"][0]["missing_timestamps_ms"])
 
 
 if __name__ == "__main__":

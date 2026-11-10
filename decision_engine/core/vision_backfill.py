@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS vision_metrics (
     feature_availability_basis TEXT,
     downloaded_at_ms INTEGER,
     http_last_modified TEXT,
-    PRIMARY KEY (symbol, create_time_ms)
+    PRIMARY KEY (symbol, create_time_ms, source_url)
 );
 CREATE TABLE IF NOT EXISTS vision_book_depth (
     symbol TEXT NOT NULL,
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS vision_book_depth (
     depth_semantics TEXT,
     downloaded_at_ms INTEGER,
     http_last_modified TEXT,
-    PRIMARY KEY (symbol, timestamp_ms, percentage)
+    PRIMARY KEY (symbol, timestamp_ms, percentage, source_url)
 );
 CREATE TABLE IF NOT EXISTS vision_spot_klines (
     symbol TEXT NOT NULL,
@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS vision_spot_klines (
     source_url TEXT NOT NULL,
     downloaded_at_ms INTEGER,
     http_last_modified TEXT,
-    PRIMARY KEY (symbol, interval, open_time_ms)
+    PRIMARY KEY (symbol, interval, open_time_ms, source_url)
 );
 """
 
@@ -151,6 +151,12 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("downloaded_at_ms", "INTEGER"),
         ("http_last_modified", "TEXT"),
     ),
+}
+
+_SOURCE_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "vision_metrics": ("symbol", "create_time_ms", "source_url"),
+    "vision_book_depth": ("symbol", "timestamp_ms", "percentage", "source_url"),
+    "vision_spot_klines": ("symbol", "interval", "open_time_ms", "source_url"),
 }
 
 
@@ -445,6 +451,45 @@ def checksum_url_for(url: str) -> str:
     return url + ".CHECKSUM"
 
 
+def _primary_key(conn: sqlite3.Connection, table: str) -> tuple[str, ...]:
+    ranked = sorted(
+        (int(row[5]), str(row[1]))
+        for row in conn.execute(f"PRAGMA table_info({table})")
+        if int(row[5]) > 0
+    )
+    return tuple(name for _, name in ranked)
+
+
+def _ensure_source_primary_keys(conn: sqlite3.Connection) -> None:
+    """Let two archive URLs share an open without replacing each other.
+
+    Existing rows are copied. A stale URL stays in the table and cannot occupy
+    the only key of a verified URL.
+    """
+    for table, pk in _SOURCE_PRIMARY_KEYS.items():
+        if _primary_key(conn, table) == pk:
+            continue
+        info = list(conn.execute(f"PRAGMA table_info({table})"))
+        columns = [str(row[1]) for row in info]
+        defs: list[str] = []
+        for row in info:
+            name = str(row[1])
+            piece = f'"{name}" {row[2] or "TEXT"}'
+            if int(row[3]) == 1:
+                piece += " NOT NULL"
+            if row[4] is not None:
+                piece += f" DEFAULT {row[4]}"
+            defs.append(piece)
+        pk_sql = ", ".join(f'"{name}"' for name in pk)
+        staging = f"{table}__srcpk"
+        conn.execute(f"DROP TABLE IF EXISTS {staging}")
+        conn.execute(f"CREATE TABLE {staging} ({', '.join(defs)}, PRIMARY KEY ({pk_sql}))")
+        quoted = ", ".join(f'"{name}"' for name in columns)
+        conn.execute(f"INSERT INTO {staging} ({quoted}) SELECT {quoted} FROM {table}")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+
+
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
@@ -454,6 +499,7 @@ def connect(path: Path) -> sqlite3.Connection:
         for name, declaration in columns:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+    _ensure_source_primary_keys(conn)
     forbidden = {
         str(row[1])
         for table in ("vision_metrics", "vision_book_depth", "vision_spot_klines", "vision_files")
@@ -1005,15 +1051,50 @@ def _per_date_observations(
     return report
 
 
+def _trusted_urls(
+    files: Sequence[Mapping[str, object]],
+    planned_urls: Sequence[str] | None,
+) -> list[str]:
+    verified = {
+        str(row["url"])
+        for row in files
+        if row["status"] == "ok" and row.get("checksum_status") == "verified"
+    }
+    if planned_urls is None:
+        return sorted(verified)
+    return [url for url in planned_urls if url in verified]
+
+
+def _stamps_for_sources(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    symbol: str,
+    urls: Sequence[str],
+) -> list[int]:
+    if not urls:
+        return []
+    marks = ",".join("?" for _ in urls)
+    return [
+        int(row[0])
+        for row in conn.execute(
+            f"SELECT {column} FROM {table} WHERE symbol = ? AND source_url IN ({marks}) "
+            f"AND {column} IS NOT NULL",
+            (symbol, *urls),
+        )
+    ]
+
+
 def coverage_report(
     conn: sqlite3.Connection,
     symbols: Sequence[str],
     dates: Sequence[date] | None = None,
+    planned_urls: Sequence[str] | None = None,
 ) -> dict[str, object]:
     files = [
-        dict(zip(("url", "status", "detail", "row_count"), row))
+        dict(zip(("url", "status", "detail", "row_count", "checksum_status"), row))
         for row in conn.execute(
-            "SELECT url, status, detail, row_count FROM vision_files ORDER BY url"
+            "SELECT url, status, detail, row_count, checksum_status FROM vision_files ORDER BY url"
         )
     ]
     per_symbol: list[dict[str, object]] = []
@@ -1049,17 +1130,14 @@ def coverage_report(
     errors = [row for row in files if row["status"] not in {"ok", "missing"}]
     requested = list(dates) if dates is not None else None
     expected_opens = expected_closed_5m_opens(requested) if requested is not None else []
+    trusted = _trusted_urls(files, planned_urls)
     kline_slots: list[dict[str, object]] = []
     metrics_by_date: list[dict[str, object]] = []
     book_by_date: list[dict[str, object]] = []
     for symbol in symbols:
-        present = {
-            int(row[0])
-            for row in conn.execute(
-                "SELECT open_time_ms FROM vision_spot_klines WHERE symbol = ?",
-                (symbol,),
-            )
-        }
+        present = set(
+            _stamps_for_sources(conn, "vision_spot_klines", "open_time_ms", symbol, trusted)
+        )
         missing_opens = [stamp for stamp in expected_opens if stamp not in present]
         kline_slots.append(
             {
@@ -1070,25 +1148,30 @@ def coverage_report(
                 "missing_timestamps_ms": missing_opens,
             }
         )
-        metric_stamps = [
-            int(row[0])
-            for row in conn.execute(
-                "SELECT create_time_ms FROM vision_metrics WHERE symbol = ? AND create_time_ms IS NOT NULL",
-                (symbol,),
-            )
-        ]
-        book_stamps = [
-            int(row[0])
-            for row in conn.execute(
-                "SELECT timestamp_ms FROM vision_book_depth WHERE symbol = ? AND timestamp_ms IS NOT NULL",
-                (symbol,),
-            )
-        ]
+        metric_stamps = _stamps_for_sources(
+            conn, "vision_metrics", "create_time_ms", symbol, trusted
+        )
+        book_stamps = _stamps_for_sources(
+            conn, "vision_book_depth", "timestamp_ms", symbol, trusted
+        )
         metrics_by_date.append({"symbol": symbol, "dates": _per_date_observations(metric_stamps, requested)})
         book_by_date.append({"symbol": symbol, "dates": _per_date_observations(book_stamps, requested)})
-    files_downloaded_ok = bool(files) and all(
-        row["status"] == "ok" and int(row["row_count"] or 0) > 0 for row in files
-    )
+    if planned_urls is not None:
+        by_url = {str(row["url"]): row for row in files}
+        files_downloaded_ok = bool(planned_urls) and all(
+            url in by_url
+            and by_url[url]["status"] == "ok"
+            and by_url[url].get("checksum_status") == "verified"
+            and int(by_url[url]["row_count"] or 0) > 0
+            for url in planned_urls
+        )
+    else:
+        files_downloaded_ok = bool(files) and all(
+            row["status"] == "ok"
+            and row.get("checksum_status") == "verified"
+            and int(row["row_count"] or 0) > 0
+            for row in files
+        )
     kline_slots_complete = requested is not None and bool(symbols) and all(
         item["missing_count"] == 0 and int(item["expected_closed_bars"]) > 0 for item in kline_slots
     )

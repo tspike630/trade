@@ -66,7 +66,8 @@ def run_vision(
     limiter = RateLimiter(args.min_interval)
     mode = getattr(args, "metric_availability", METRIC_AVAILABILITY_UNKNOWN)
     cache_dir = out / "cache"
-    for kind, symbol, url in iter_plan(symbols, dates):
+    plan = iter_plan(symbols, dates)
+    for kind, symbol, url in plan:
         outcome = import_planned_file(
             db,
             kind,
@@ -78,7 +79,7 @@ def run_vision(
             cache_dir=cache_dir,
         )
         print(f"{outcome} {kind} {symbol} {url}")
-    report = coverage_report(db, symbols, dates)
+    report = coverage_report(db, symbols, dates, [url for _, _, url in plan])
     report["dates"] = [item.isoformat() for item in dates]
     report["metric_availability_requested"] = mode
     write_manifest(out / "vision_manifest.json", report)
