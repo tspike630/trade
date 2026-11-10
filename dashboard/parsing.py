@@ -9,9 +9,10 @@ import json
 import math
 import re
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from dashboard.auth import scrub
+from dashboard.spot_book import spot_book_view
 
 STRENGTH_RE = re.compile(r"jev_strength=([0-9.]+)")
 _SECRET_ASSIGN_RE = re.compile(
@@ -240,6 +241,9 @@ def rejection_key(
     validation_errors: str | None,
     status: str | None = None,
     receipt: dict[str, Any] | None = None,
+    *,
+    spot_position: Mapping[str, Any] | None = None,
+    spot_table: bool = False,
 ) -> str | None:
     """Bucket key for a rejected execution row, or None when the row is not a rejection.
 
@@ -249,8 +253,21 @@ def rejection_key(
 
     When the receipt carries ``pm_check.reason`` (e.g. ``pm_rejected:max_open_per_strategy``),
     that fine key is used so overview buckets match ``order_events.rejected``.
+
+    A spot row the book already accepted is not a rejection, even when the
+    first receipt was stored as ``rejected`` / ``live_refused``.
     """
+    spot = spot_book_view(
+        receipt,
+        status,
+        spot_position,
+        position_table=spot_table,
+    )
     errors = validation_error_text(validation_errors)
+    if spot is not None and not spot.is_rejection:
+        if validation_ok != 1 or errors.strip():
+            return bucket_key(validation_errors)
+        return None
     if validation_ok != 1 or errors.strip():
         return bucket_key(validation_errors)
     receipt_status = ""
