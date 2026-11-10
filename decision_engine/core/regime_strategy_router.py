@@ -263,9 +263,11 @@ def evaluate_five_state_regime(
                 require_perp_beta_hedge=False,
                 recommended_order_type="NONE",
             )
-        # AGENTS.md states the threshold only. The window, closed-bar cadence,
-        # and std convention for volume_z / vol_z_1h are not defined here.
-        # A missing value does not reject, and no series is synthesized.
+        # Threshold 3.8 is the manual. The series is the 2026-11-10 collection
+        # contract in volume_z_1h.py: closed 1h USDT quote volume versus the
+        # previous 20 closed hours, current bar excluded, sample std n-1.
+        # vol_z_1h is that same key when a row already carries the alias.
+        # A missing value does not reject.
         vol_z = _finite(row.get("volume_z") or row.get("vol_z_1h"))
         if vol_z is not None and vol_z >= 3.8:
             return RegimeRoutingDecision(
