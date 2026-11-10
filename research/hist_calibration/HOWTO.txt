@@ -13,7 +13,10 @@ No git checkout is required. Unpack the source tar, then:
   PYTHONPATH=. python3 -m research.hist_calibration analyze --news-db /path/to/news_events.db --out /tmp/hist-report.json
   PYTHONPATH=. python3 -m unittest research.tests.test_hist_calibration research.tests.test_onchain_contract -q
 
-analyze is read-only on news_events.db. activate exits 3 while the gates
+analyze is read-only. Pass --stage and --manifest together. A stage
+without a manifest, or with a checksum mismatch, is not study-ready.
+Two verified prices at the same open time are a conflict and neither price
+is used. Book depth stays a percentage band. activate exits 3 while the gates
 fail. x_watch is not enabled. bookDepth is not obi_top5.
 
 Stage tables, for the collection agent to fill, are created by stage-init

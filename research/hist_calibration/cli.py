@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
@@ -115,20 +116,39 @@ def _probe(args: argparse.Namespace) -> int:
 
 
 def _analyze(args: argparse.Namespace) -> int:
+    from research.hist_calibration.stage_consumer import (
+        attach_verified_returns,
+        load_manifest,
+        study_from_stage,
+    )
+
     news = inventory_news(Path(args.news_db)) if args.news_db else {"availability": "missing_db", "rows": None}
+    manifest = load_manifest(Path(args.manifest)) if args.manifest else None
+    stage_report: dict[str, object] = {
+        "present": bool(args.stage),
+        "study_ready": False,
+        "raw_stage_study_ready": False,
+    }
     events = []
     for event in news.get("events") or []:
-        events.append(
-            {
-                **event,
-                "symbol": args.benchmark_symbol,
-                "obi_top5_asof": None,
-                "taker_asof": None,
-                "whale_asof": None,
-                "heat_delta": None,
-                "forward_return": None,
-            }
-        )
+        events.append({**event, "symbol": args.benchmark_symbol})
+    if args.stage:
+        if manifest is None:
+            stage_report["error"] = "missing_manifest"
+        else:
+            conn = sqlite3.connect(f"file:{Path(args.stage).resolve().as_posix()}?mode=ro", uri=True)
+            try:
+                stage_report = study_from_stage(conn, manifest)
+            finally:
+                conn.close()
+            events = attach_verified_returns(events, stage_report["bars"])
+    else:
+        for event in events:
+            event["forward_return"] = None
+            event["obi_top5_asof"] = None
+            event["taker_asof"] = None
+            event["whale_asof"] = None
+            event["heat_delta"] = None
     body = decide(
         {
             "events": events,
@@ -138,13 +158,34 @@ def _analyze(args: argparse.Namespace) -> int:
             "book_depth_used_as_obi": False,
             "obi_from_book_depth": False,
             "x_watch_used_as_history": False,
-            "scope": "readonly_news_no_historical_obi_top5",
+            "scope": "verified_stage" if stage_report.get("study_ready") else "stage_not_study_ready",
         }
     )
     body["news_inventory"] = {key: value for key, value in news.items() if key != "events"}
+    body["stage"] = {
+        "study_ready": stage_report.get("study_ready", False),
+        "raw_stage_study_ready": False,
+        "conflicts": stage_report.get("conflicts", []),
+        "verified_bars": len(stage_report.get("bars") or []),
+        "ignored_rows": stage_report.get("ignored_rows"),
+        "verification_ok": (stage_report.get("verification") or {}).get("ok") if isinstance(stage_report.get("verification"), dict) else False,
+        "errors": (stage_report.get("verification") or {}).get("errors") if isinstance(stage_report.get("verification"), dict) else [stage_report.get("error")],
+    }
     body["x_watch"] = "online_only"
+    body["obi_top5_from_book_depth"] = False
+    if not stage_report.get("study_ready"):
+        body["calibration_status"] = "not_ready"
+        body["gates_passed"] = False
+        body["onchain_calibration"] = None
+        if "stage_not_study_ready" not in body["gates_failed"]:
+            body["gates_failed"] = [*body["gates_failed"], "stage_not_study_ready"]
     write_json(Path(args.out), body)
-    print(json.dumps({"status": body["calibration_status"], "gates_failed": body["gates_failed"], "rows": news.get("rows")}))
+    print(json.dumps({
+        "status": body["calibration_status"],
+        "study_ready": body["stage"]["study_ready"],
+        "gates_failed": body["gates_failed"],
+        "rows": news.get("rows"),
+    }))
     return 0 if body["calibration_status"] == "not_ready" or body["gates_passed"] else 3
 
 
@@ -192,6 +233,8 @@ def main(argv: list[str] | None = None) -> int:
 
     analyze = sub.add_parser("analyze", help="Read-only news inventory and gate decision.")
     analyze.add_argument("--news-db", default=None)
+    analyze.add_argument("--stage", default=None)
+    analyze.add_argument("--manifest", default=None)
     analyze.add_argument("--benchmark-symbol", default=None)
     analyze.add_argument("--out", required=True)
     analyze.set_defaults(func=_analyze)
