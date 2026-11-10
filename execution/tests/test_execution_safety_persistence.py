@@ -1204,6 +1204,89 @@ class PersistenceSafetyTests(unittest.TestCase):
         self.assertEqual(Decimal(parse_qs(client.orders[0])["price"][0]), Decimal("100.70"))
         self.assertEqual(parse_qs(client.orders[0]).get("type"), ["LIMIT_MAKER"])
 
+    def test_stale_ws_mark_uses_rest_ticker_and_does_not_read_wall_mid(self) -> None:
+        os.environ["BINANCE_SPOT_WS_MAX_AGE_MS"] = "2500"
+        client = _Exchange()
+        client.ticker_price = lambda symbol: {"symbol": symbol, "price": "100.55"}  # type: ignore[method-assign]
+        client.order_book = lambda symbol, limit=5: {  # type: ignore[method-assign]
+            "bids": [["100.50", "5"]],
+            "asks": [["100.60", "5"]],
+        }
+
+        class _Mark:
+            def __init__(self, price: str, age: object) -> None:
+                self.price = price
+                self.age = age
+
+            def get_ticker_price(self, symbol: str) -> dict[str, object]:
+                payload: dict[str, object] = {"price": self.price, "source": "ws_l1"}
+                if self.age is not None:
+                    payload["ws_age_ms"] = self.age
+                return payload
+
+        adapter = self._maker_adapter(client, _Mark("90", 900_000))
+        result = adapter.execute(
+            self._buy(
+                {
+                    "recommended_order_type": "LIMIT_MAKER",
+                    "price": "100.80",
+                    "price_usd": "100.8",
+                    "stop_price": "99",
+                    "take_profit_price": "120",
+                    "wall_mid_price": "88.88",
+                }
+            )
+        )
+        self.assertEqual(result["error"], "maker_entry_resting", result)
+        form = parse_qs(client.orders[0])
+        self.assertEqual(form.get("type"), ["LIMIT_MAKER"])
+        self.assertEqual(Decimal(form["price"][0]), Decimal("100.50"))
+        self.assertNotIn("88.88", client.orders[0])
+        self.assertEqual(adapter._mark_telemetry.get("mark_source"), "rest_fallback")
+
+        fresh = self._maker_adapter(client, _Mark("100.40", 2500))
+        mark, err = fresh._read_entry_mark(client, "BNBUSDT")
+        self.assertIsNone(err)
+        self.assertEqual(mark, "100.40")
+
+        stale = self._maker_adapter(client, _Mark("90", 2501))
+        mark, err = stale._read_entry_mark(client, "BNBUSDT")
+        self.assertIsNone(err)
+        self.assertEqual(mark, "100.55")
+
+        missing_age = self._maker_adapter(client, _Mark("100.20", None))
+        mark, err = missing_age._read_entry_mark(client, "BNBUSDT")
+        self.assertIsNone(err)
+        self.assertEqual(mark, "100.20")
+
+        invalid = self._maker_adapter(client, _Mark("90", "stale"))
+        mark, err = invalid._read_entry_mark(client, "BNBUSDT")
+        self.assertIsNone(err)
+        self.assertEqual(mark, "100.55")
+
+        def _ticker_down(symbol: str) -> dict[str, str]:
+            raise TimeoutError("ticker down")
+
+        client.ticker_price = _ticker_down  # type: ignore[method-assign]
+        closed = self._maker_adapter(client, _Mark("90", 2501))
+        mark, err = closed._read_entry_mark(client, "BNBUSDT")
+        self.assertIsNone(mark)
+        self.assertEqual(err, "mark_unavailable")
+        refused = closed.execute(
+            self._buy(
+                {
+                    "recommended_order_type": "LIMIT_MAKER",
+                    "price": "100.80",
+                    "stop_price": "99",
+                    "take_profit_price": "120",
+                },
+                76,
+            )
+        )
+        self.assertEqual(refused["error"], "mark_unavailable")
+        self.assertEqual(refused["submitted"], False)
+        self.assertEqual(len(client.orders), 1)
+
     def test_crossed_or_missing_book_does_not_invent_a_maker_price(self) -> None:
         crossed = _Exchange()
         crossed.order_book = lambda symbol, limit=5: {  # type: ignore[method-assign]

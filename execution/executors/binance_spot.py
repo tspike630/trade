@@ -1616,17 +1616,23 @@ class BinanceSpotAdapter:
         return None, None, "maker_book_unavailable"
 
     @staticmethod
+    def _ws_age_ok(payload: dict) -> bool:
+        """Same 2500 ms window as a book quote. A missing age is not stale."""
+        age = payload.get("ws_age_ms")
+        if age is None:
+            return True
+        try:
+            age_ms = int(age)
+        except (TypeError, ValueError):
+            return False
+        return 0 <= age_ms <= default_max_age_ms()
+
+    @staticmethod
     def _fresh_bbo(payload: object) -> tuple[str, str] | str | None:
         if not isinstance(payload, dict):
             return None
-        age = payload.get("ws_age_ms")
-        if age is not None:
-            try:
-                age_ms = int(age)
-            except (TypeError, ValueError):
-                return None
-            if age_ms < 0 or age_ms > default_max_age_ms():
-                return None
+        if not BinanceSpotAdapter._ws_age_ok(payload):
+            return None
         bid = _to_decimal(payload.get("best_bid"))
         ask = _to_decimal(payload.get("best_ask"))
         if bid is None or ask is None:
@@ -1646,10 +1652,15 @@ class BinanceSpotAdapter:
         ws_cache = self._active_ws_cache()
         if ws_cache is not None and callable(getattr(ws_cache, "get_ticker_price", None)):
             ws_tick = ws_cache.get_ticker_price(symbol)
-            if isinstance(ws_tick, dict) and _to_decimal(ws_tick.get("price")) is not None:
+            if (
+                isinstance(ws_tick, dict)
+                and _to_decimal(ws_tick.get("price")) is not None
+                and self._ws_age_ok(ws_tick)
+            ):
+                age = ws_tick.get("ws_age_ms")
                 self._mark_telemetry = {
                     "mark_source": str(ws_tick.get("source") or "ws_l1"),
-                    "mark_ws_age_ms": int(ws_tick.get("ws_age_ms") or 0),
+                    "mark_ws_age_ms": 0 if age is None else int(age),
                 }
                 return str(ws_tick["price"]).strip(), None
 
