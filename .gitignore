@@ -20,3 +20,6 @@ LIVE_TRADING_DISABLED
 
 # written at deploy sync time, never committed
 decision_engine/DEPLOY_SHA
+
+# LSEG local data exports & side-channel DB
+data/lseg/

@@ -18,6 +18,17 @@ from typing import Any
 
 from logging_setup import get_logger
 
+from decision_engine.core.multi_horizon_and_xs_regime import (
+    multi_horizon_regime_enabled,
+    stamp_cross_sectional_metrics,
+)
+from decision_engine.core.perp_microstructure_and_beta_hedge import (
+    symbol_beta_vs_btc,
+)
+from decision_engine.core.portfolio_clusters import (
+    compute_inverse_vol_size,
+    symbol_sector_cluster,
+)
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
@@ -102,6 +113,8 @@ class TechBollFadeStrategy(BaseStrategy):
         self._pending.clear()
         self.rejected = {}
         hot = data.get("hot_tokens") or []
+        if multi_horizon_regime_enabled() and isinstance(hot, list) and hot:
+            hot, _xs_ctx = stamp_cross_sectional_metrics(hot)
         hits = 0
         book_warned = False
         for row in hot:
@@ -125,10 +138,37 @@ class TechBollFadeStrategy(BaseStrategy):
                         decision.alpha,
                         decision.deep_zone_price,
                     )
+                elif reason == "orderflow_toxic_sell_dump":
+                    log.info(
+                        "orderflow_toxic_sell_dump symbol=%s taker_buy_ratio=%s "
+                        "trade_size_ratio=%s alpha=%s",
+                        row.get("binance_symbol"),
+                        decision.taker_buy_ratio,
+                        decision.trade_size_ratio,
+                        decision.alpha,
+                    )
                 continue
             sized = buy_size_fields(row, floor_pct=self.position_pct)
-            multiplier = float(decision.position_size_multiplier or 1.0)
-            size_pct = float(sized["size_pct"]) * multiplier
+            tier_multiplier = float(decision.position_size_multiplier or 1.0)
+            entry_ref = (
+                decision.limit_price
+                if decision.order_type == "LIMIT" and decision.limit_price is not None
+                else decision.price
+            )
+            vol_sized = compute_inverse_vol_size(
+                float(sized["size_pct"]),
+                tier_multiplier=tier_multiplier,
+                entry_price=entry_ref,
+                stop_price=decision.stop_price,
+                volatility_24h=_finite(row.get("volatility_24h")),
+            )
+            size_pct = vol_sized.size_pct
+            multiplier = vol_sized.effective_multiplier
+            size_note = (
+                vol_sized.position_size_note
+                if vol_sized.applied and vol_sized.position_size_note
+                else decision.position_size_note
+            )
             if not 0.0 < size_pct <= 1.0:
                 self.rejected["size_pct_invalid"] = (
                     self.rejected.get("size_pct_invalid", 0) + 1
@@ -154,13 +194,36 @@ class TechBollFadeStrategy(BaseStrategy):
                     self.rejected.get(REJECT_BELOW_MIN, 0) + 1
                 )
                 continue
-            lift_extra: dict[str, Any] = {}
+            sym_str = str(row.get("binance_symbol") or "")
+            lift_extra: dict[str, Any] = {
+                "sector_cluster": symbol_sector_cluster(sym_str),
+                "beta_vs_btc": symbol_beta_vs_btc(sym_str),
+                "risk_parity_scalar": vol_sized.risk_parity_scalar,
+            }
+            if vol_sized.stop_distance_pct is not None:
+                lift_extra["stop_distance_pct"] = vol_sized.stop_distance_pct
+            if decision.funding_rate is not None:
+                lift_extra["funding_rate"] = decision.funding_rate
+            if decision.perp_basis_bps is not None:
+                lift_extra["perp_basis_bps"] = decision.perp_basis_bps
+            if decision.perp_regime is not None:
+                lift_extra["perp_regime"] = decision.perp_regime
+            if decision.boll_bandwidth_pct is not None:
+                lift_extra["boll_bandwidth_pct"] = decision.boll_bandwidth_pct
+            if decision.xs_rel_1h is not None:
+                lift_extra["xs_rel_1h"] = decision.xs_rel_1h
+            if decision.horizon_regime and decision.horizon_regime != "disabled":
+                lift_extra["horizon_regime"] = decision.horizon_regime
+            if decision.composite_alpha_score is not None:
+                lift_extra["composite_alpha_score"] = decision.composite_alpha_score
             if lifted:
-                lift_extra = {
-                    "size_pct_before_min_notional": size_before_floor,
-                    "min_notional_lift": True,
-                    "min_notional_usdt": format(ENTRY_MIN_NOTIONAL_USDT, "f"),
-                }
+                lift_extra.update(
+                    {
+                        "size_pct_before_min_notional": size_before_floor,
+                        "min_notional_lift": True,
+                        "min_notional_usdt": format(ENTRY_MIN_NOTIONAL_USDT, "f"),
+                    }
+                )
                 log.info(
                     "entry_min_notional_lift symbol=%s size_pct=%s -> %s multiplier=%s",
                     row.get("binance_symbol"),
@@ -168,6 +231,10 @@ class TechBollFadeStrategy(BaseStrategy):
                     size_pct,
                     multiplier,
                 )
+            if decision.taker_buy_ratio is not None:
+                lift_extra["taker_buy_ratio"] = decision.taker_buy_ratio
+                lift_extra["taker_buy_ratio_source"] = decision.taker_buy_ratio_source
+                lift_extra["orderflow_regime"] = decision.orderflow_regime
             hits += 1
             order_type = decision.order_type or "MARKET"
             self.buy(
@@ -197,7 +264,7 @@ class TechBollFadeStrategy(BaseStrategy):
                 order_type=order_type,
                 limit_price=decision.limit_price,
                 position_size_multiplier=multiplier,
-                position_size_note=decision.position_size_note,
+                position_size_note=size_note,
                 entry_reason=decision.entry_reason,
                 crowding_tier=decision.tier,
                 deep_zone_price=decision.deep_zone_price,

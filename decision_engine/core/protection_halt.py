@@ -153,6 +153,19 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str] | None:
     return {str(item[1]) for item in info}
 
 
+_OPTIONAL_POSITION_COLUMNS = (
+    "id",
+    "decision_log_id",
+    "quantity",
+    "stop_price",
+    "take_profit_price",
+    "entry_price",
+    "exit_reason",
+    "created_at",
+    "updated_at",
+)
+
+
 def _read_table(
     conn: sqlite3.Connection,
     table: str,
@@ -167,6 +180,11 @@ def _read_table(
     for name in columns:
         if name not in have:
             return [], f"protection_column_missing:{table}.{name}"
+    if table == "binance_spot_positions":
+        extra = [col for col in _OPTIONAL_POSITION_COLUMNS if col in have and col not in columns]
+        if extra:
+            select_cols = ", ".join((*columns, *extra))
+            sql = f"SELECT {select_cols} FROM binance_spot_positions"
     rows = conn.execute(sql).fetchall()
     return [dict(row) for row in rows], None
 

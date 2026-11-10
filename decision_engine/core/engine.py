@@ -23,6 +23,10 @@ from decision_engine.core.live_bnb_turnover import (
     stamp_turnover,
 )
 from decision_engine.core.live_buy_guards import apply_live_buy_guards
+from decision_engine.core.macro_circuit_breaker import (
+    evaluate_macro_gate,
+    resolve_macro_db_path,
+)
 from decision_engine.core.protection_halt import (
     ProtectionBook,
     purpose_halt_reason,
@@ -87,6 +91,7 @@ class DecisionEngine:
         entry_ih_min_hours: float | None = None,
         protection_book: ProtectionBook | None = None,
         protection_ledger: str | Path | None = None,
+        macro_db: str | Path | None = None,
     ):
         self.adapter = adapter
         self.bus = bus
@@ -107,6 +112,9 @@ class DecisionEngine:
                 if protection_ledger is not None
                 else resolve_ledger_path()
             )
+        self._macro_db: Path | None = (
+            Path(macro_db).expanduser() if macro_db is not None else None
+        )
         self._protection_unwired_logged = False
         self.tick_count = 0
         resolved = getattr(adapter, "db_path", None)
@@ -125,6 +133,13 @@ class DecisionEngine:
             purpose_halt_reason(self.bus.purpose, protection_book) if bnb_spot else None
         )
         now_ms = int(time.time() * 1000)
+        macro_path = self._macro_db if self._macro_db is not None else resolve_macro_db_path()
+        macro_status = evaluate_macro_gate(
+            macro_path,
+            now_ms=now_ms,
+            purpose=self.bus.purpose,
+        )
+        macro_halt = macro_status.halt_reason
         if bnb_spot:
             hot, bnb_source = self._load_live_bnb_hot(hot)
             # Coordinates are the entry-zone overlay. The classic arm reads
@@ -135,6 +150,15 @@ class DecisionEngine:
                     hot,
                     now_ms=now_ms,
                 )
+                from decision_engine.core.perp_microstructure_and_beta_hedge import (
+                    attach_counterparty_context,
+                )
+                from decision_engine.core.cityu_institutional_alpha import (
+                    attach_cityu_institutional_context,
+                )
+
+                hot = attach_counterparty_context(hot)
+                hot = attach_cityu_institutional_context(hot, now_ms=now_ms)
         scanned = len(hot)
         if bnb_spot:
             # Floor and universe membership. The 600-name scan is already loaded;
@@ -202,6 +226,7 @@ class DecisionEngine:
                 bnb_factor_source=bnb_source,
                 turnover_report=turnover_report,
                 protection_halt=protection_halt,
+                macro_halt=macro_halt,
             )
 
         # Shared buy choke point: every strategy's candidates pass through
@@ -218,9 +243,19 @@ class DecisionEngine:
             passed,
             purpose=self.bus.purpose,
             book=protection_book,
+            macro_halt=macro_halt,
         )
         top_report: dict[str, Any] | None = None
         if bnb_spot:
+            from decision_engine.core.regime_strategy_router import (
+                apply_five_state_regime_router,
+            )
+
+            passed, _ = apply_five_state_regime_router(
+                passed,
+                hot,
+                macro_halt=macro_halt,
+            )
             passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
         emitted = self.bus.publish_many(passed)
         log.info(
@@ -239,6 +274,7 @@ class DecisionEngine:
             turnover_report=turnover_report,
             top_report=top_report,
             protection_halt=guard_report.get("protection_halt") or protection_halt,
+            macro_halt=guard_report.get("macro_halt") or macro_halt,
             stop_gap_rejected=int(guard_report.get("stop_gap_rejected") or 0),
         )
 
@@ -254,6 +290,7 @@ class DecisionEngine:
         turnover_report: dict[str, Any] | None = None,
         top_report: dict[str, Any] | None = None,
         protection_halt: str | None = None,
+        macro_halt: str | None = None,
         stop_gap_rejected: int = 0,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -273,6 +310,8 @@ class DecisionEngine:
             payload["live_bnb_top_buys"] = top_report
         if protection_halt:
             payload["protection_halt"] = protection_halt
+        if macro_halt:
+            payload["macro_halt"] = macro_halt
         if stop_gap_rejected:
             payload["stop_gap_rejected"] = stop_gap_rejected
         return payload

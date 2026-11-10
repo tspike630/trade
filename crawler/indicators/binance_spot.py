@@ -13,11 +13,6 @@ price series changes (spot kline closes, trailing 1h quote volume as the
 
 Writes ``binance_klines`` and ``binance_indicators`` only.
 ``INDICATORS_WEIGHT_*`` stay untouched. No orders.
-
-The eight ``binance_indicators`` columns added with the taker-buy kline fields
-are read-only observations. This module does not change ``tech_boll_fade``
-thresholds. Definitions and the consumer contract are in
-``docs/binance_readonly_fields_2026-11-07.md``.
 """
 
 from __future__ import annotations
@@ -39,12 +34,7 @@ from logging_setup import get_logger, setup_logging
 
 from indicators.base import INTERVAL_SEC, utc_now_iso
 from indicators.library_apply import apply_library_fields
-from indicators.technical import (
-    change_pct,
-    volatility_stdev_returns,
-    volume_7d_avg,
-    volume_strength,
-)
+from indicators.technical import change_pct, volatility_stdev_returns, volume_strength
 from indicators.technical_lib import compute_pandas_ta
 
 log = get_logger("indicators.binance_spot")
@@ -52,21 +42,8 @@ log = get_logger("indicators.binance_spot")
 DEFAULT_BASE = "https://api.binance.com"
 DEFAULT_INTERVAL = "5m"
 DEFAULT_KLINE_LIMIT = 500
-# One public request. 1000×5m is about 3.5d, short of 7d. Older stored rows
-# are kept; this module does not page with startTime.
-KLINE_FETCH_CAP = 1000
 _HOUR_MS = 3_600_000
 _DAY_MS = 86_400_000
-_5M_MS = 300_000
-# Latest closed bar plus the 11 before it. The bar 60m earlier is outside.
-_HOUR_BARS = 12
-# 24h of 5m bars immediately before the latest closed bar. That bar is excluded.
-_PRIOR_DAY_BARS = 288
-# Trailing day that includes the latest bar (prior 288 + current).
-_TRAILING_DAY_BARS = _PRIOR_DAY_BARS + 1
-# 7d of 5m steps. Both endpoints are required, so the grid is 2017 bars.
-_WEEK_STEPS = 7 * 24 * 12
-_WEEK_BARS = _WEEK_STEPS + 1
 _INTERVALS = frozenset({"1m", "3m", "5m", "15m", "30m", "1h"})
 _NOT_A_BASE = frozenset(
     {"USDT", "USD", "USDC", "FDUSD", "BUSD", "TUSD", "DAI", "USDP"}
@@ -117,49 +94,13 @@ _INDICATOR_COLS = (
     "boll_mid",
     "boll_lower",
     "quote_volume_24h",
+    "taker_buy_quote_volume",
+    "taker_buy_ratio",
     "sample_count",
     "kline_close_time_ms",
     "tier",
     "tech_updated_at",
     "updated_at",
-    "change_7d",
-    "volume_7d_avg",
-    "taker_buy_quote_volume_5m",
-    "buy_ratio_5m",
-    "buy_ratio_1h",
-    "avg_trade_usd_5m",
-    "trade_size_ratio",
-    "lower_wick_ratio",
-)
-
-_KLINE_WRITE_COLS = (
-    "symbol",
-    "interval",
-    "open_time_ms",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "quote_volume",
-    "close_time_ms",
-    "trades",
-    "taker_buy_volume",
-    "taker_buy_quote_volume",
-)
-_KLINE_ADD_COLUMNS = (
-    ("taker_buy_volume", "REAL"),
-    ("taker_buy_quote_volume", "REAL"),
-)
-_INDICATOR_ADD_COLUMNS = (
-    ("change_7d", "REAL"),
-    ("volume_7d_avg", "REAL"),
-    ("taker_buy_quote_volume_5m", "REAL"),
-    ("buy_ratio_5m", "REAL"),
-    ("buy_ratio_1h", "REAL"),
-    ("avg_trade_usd_5m", "REAL"),
-    ("trade_size_ratio", "REAL"),
-    ("lower_wick_ratio", "REAL"),
 )
 
 _SQL_PATH = Path(__file__).resolve().parents[1] / "models" / "binance_indicator_tables.sql"
@@ -186,10 +127,10 @@ class SpotKline:
     low: float
     close: float
     volume: float
-    quote_volume: float | None
+    quote_volume: float
     close_time_ms: int
     trades: int | None = None
-    taker_buy_volume: float | None = None
+    taker_buy_base_volume: float | None = None
     taker_buy_quote_volume: float | None = None
 
 
@@ -487,21 +428,8 @@ def _float_or_none(value: Any) -> float | None:
     return number
 
 
-def _optional_float(raw: Sequence[Any], index: int) -> float | None:
-    """Index past the end, blank, or non-numeric → None. Does not reject the row."""
-    if len(raw) <= index or raw[index] in (None, ""):
-        return None
-    return _float_or_none(raw[index])
-
-
 def parse_kline_row(raw: Any) -> SpotKline | None:
-    """One Binance ``/api/v3/klines`` element. Malformed rows are skipped.
-
-    A row of 8 or 9 fields (no taker columns) still parses. Index 7 is quote
-    volume. A blank or non-numeric quote stays None and does not drop the
-    OHLC row, and it is not stored as 0. Index 9 is taker buy base volume
-    and index 10 is taker buy quote volume. A bad taker cell becomes None.
-    """
+    """One Binance ``/api/v3/klines`` element. Malformed rows are skipped."""
     if not isinstance(raw, (list, tuple)) or len(raw) < 8:
         return None
     try:
@@ -514,8 +442,8 @@ def parse_kline_row(raw: Any) -> SpotKline | None:
     lo = _float_or_none(raw[3])
     close = _float_or_none(raw[4])
     volume = _float_or_none(raw[5])
-    quote = _optional_float(raw, 7)
-    if None in (op, hi, lo, close, volume):
+    quote = _float_or_none(raw[7])
+    if None in (op, hi, lo, close, volume, quote):
         return None
     if op <= 0 or close <= 0 or hi <= 0 or lo <= 0:
         return None
@@ -525,6 +453,16 @@ def parse_kline_row(raw: Any) -> SpotKline | None:
             trades = int(raw[8])
         except (TypeError, ValueError):
             trades = None
+    taker_buy_base: float | None = None
+    if len(raw) > 9 and raw[9] not in (None, ""):
+        parsed_tb = _float_or_none(raw[9])
+        if parsed_tb is not None and parsed_tb >= 0:
+            taker_buy_base = parsed_tb
+    taker_buy_quote: float | None = None
+    if len(raw) > 10 and raw[10] not in (None, ""):
+        parsed_tq = _float_or_none(raw[10])
+        if parsed_tq is not None and parsed_tq >= 0:
+            taker_buy_quote = parsed_tq
     return SpotKline(
         open_time_ms=open_time,
         open=op,
@@ -535,9 +473,22 @@ def parse_kline_row(raw: Any) -> SpotKline | None:
         quote_volume=quote,
         close_time_ms=close_time,
         trades=trades,
-        taker_buy_volume=_optional_float(raw, 9),
-        taker_buy_quote_volume=_optional_float(raw, 10),
+        taker_buy_base_volume=taker_buy_base,
+        taker_buy_quote_volume=taker_buy_quote,
     )
+
+
+def taker_buy_ratio_from_kline(bar: SpotKline) -> float | None:
+    """Active taker-buy notional share in ``[0, 1]`` for one kline bar."""
+    if bar.taker_buy_quote_volume is not None and bar.quote_volume > 0:
+        ratio = bar.taker_buy_quote_volume / bar.quote_volume
+        if 0.0 <= ratio <= 1.0 + 1e-6:
+            return min(1.0, max(0.0, ratio))
+    if bar.taker_buy_base_volume is not None and bar.volume > 0:
+        ratio = bar.taker_buy_base_volume / bar.volume
+        if 0.0 <= ratio <= 1.0 + 1e-6:
+            return min(1.0, max(0.0, ratio))
+    return None
 
 
 def _iso_ms(ms: int) -> str:
@@ -547,70 +498,25 @@ def _iso_ms(ms: int) -> str:
 def price_series_from_klines(klines: Sequence[SpotKline]) -> list[dict[str, Any]]:
     """Close series shaped for ``change_pct`` / ``volume_strength``.
 
-    ``volume_h1`` is the trailing 1h quote-volume sum ending at that bar
-    (close time strictly after ``bar.close - 1h``). That is the sample
-    ``volume_strength`` already reads; the ratio is unchanged.
-
-    ``volume_h24`` is set only when the bar ends a continuous run of 289
-    5m bars (the prior 288 plus this one, open span exactly 24h) and every
-    bar in that run has a quote volume. It is the sum of those quotes. A
-    shorter prefix, a gap, or a missing quote leaves it None. A missing
-    quote is not added as 0. The walk is linear.
+    ``volume_h1`` is the trailing 1h quote-volume sum ending at that bar.
+    That is the sample ``volume_strength`` already reads; the ratio is unchanged.
     """
     ordered = sorted(klines, key=lambda bar: (bar.close_time_ms, bar.open_time_ms))
     series: list[dict[str, Any]] = []
-    hour_start = 0
-    hour_total = 0.0
-    hour_missing = 0
-    day_start = 0
-    day_total = 0.0
-    day_missing = 0
-    run = 0
     for index, bar in enumerate(ordered):
-        quote = bar.quote_volume
-        if quote is None:
-            hour_missing += 1
-        else:
-            hour_total += float(quote)
         cutoff = bar.close_time_ms - _HOUR_MS
-        while hour_start <= index and ordered[hour_start].close_time_ms <= cutoff:
-            old = ordered[hour_start].quote_volume
-            if old is None:
-                hour_missing -= 1
-            else:
-                hour_total -= float(old)
-            hour_start += 1
-        if index > 0 and bar.open_time_ms == ordered[index - 1].open_time_ms + _5M_MS:
-            run += 1
-        else:
-            run = 1
-            day_start = index
-            day_total = 0.0
-            day_missing = 0
-        if quote is None:
-            day_missing += 1
-        else:
-            day_total += float(quote)
-        while index - day_start + 1 > _TRAILING_DAY_BARS:
-            old = ordered[day_start].quote_volume
-            if old is None:
-                day_missing -= 1
-            else:
-                day_total -= float(old)
-            day_start += 1
-        volume_h24: float | None = None
-        if (
-            run >= _TRAILING_DAY_BARS
-            and index - day_start + 1 == _TRAILING_DAY_BARS
-            and day_missing == 0
-        ):
-            volume_h24 = day_total
+        total = 0.0
+        seen = False
+        for prev in ordered[: index + 1]:
+            if prev.close_time_ms <= cutoff or prev.close_time_ms > bar.close_time_ms:
+                continue
+            total += float(prev.quote_volume)
+            seen = True
         series.append(
             {
                 "price_usd": float(bar.close),
                 "recorded_at": _iso_ms(bar.close_time_ms),
-                "volume_h1": None if hour_missing else hour_total,
-                "volume_h24": volume_h24,
+                "volume_h1": total if seen else None,
             }
         )
     return series
@@ -627,8 +533,6 @@ def quote_volume_24h(klines: Sequence[SpotKline]) -> float | None:
     for bar in klines:
         if bar.close_time_ms < cutoff:
             continue
-        if bar.quote_volume is None:
-            return None
         total += float(bar.quote_volume)
         seen = True
     if not seen:
@@ -636,194 +540,28 @@ def quote_volume_24h(klines: Sequence[SpotKline]) -> float | None:
     return total
 
 
-def _closed_bars(klines: Sequence[SpotKline], now_ms: int | None) -> list[SpotKline]:
-    """Closed bars only (``close_time_ms <= now``), one row per open time.
-
-    A later duplicate open replaces an earlier one. The forming bar, whose
-    close is still in the future, is left out of every field below.
-    """
-    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
-    by_open: dict[int, SpotKline] = {}
-    for bar in klines:
-        if int(bar.close_time_ms) > now:
-            continue
-        by_open[int(bar.open_time_ms)] = bar
-    return [by_open[key] for key in sorted(by_open)]
-
-
-def _continuous_tail(ordered: Sequence[SpotKline], count: int) -> bool:
-    """True when the last ``count`` bars are a 5m grid with no hole."""
-    if count <= 0 or len(ordered) < count:
-        return False
-    window = ordered[-count:]
-    origin = int(window[0].open_time_ms)
-    for index, bar in enumerate(window):
-        if int(bar.open_time_ms) != origin + index * _5M_MS:
-            return False
-    return True
-
-
-def _lower_wick_ratio(bar: SpotKline) -> float | None:
-    """Where the close sits in the high-low range. Not the lower wick.
-
-    ``(close - low) / (high - low)``. A flat bar (``high == low``) is 0.
-    ``high < low`` is NULL. The value is not clamped to ``[0, 1]``.
-    A true lower wick would be ``(min(open, close) - low) / (high - low)``;
-    this column does not use that.
-    """
-    high = float(bar.high)
-    low = float(bar.low)
-    if high < low:
-        return None
-    if high == low:
-        return 0.0
-    return (float(bar.close) - low) / (high - low)
-
-
-def _buy_ratio_5m(bar: SpotKline) -> float | None:
-    """Latest closed bar: taker buy quote / quote volume. Zero quote is NULL."""
-    taker = bar.taker_buy_quote_volume
-    quote = bar.quote_volume
-    if taker is None or quote is None or taker < 0 or quote <= 0:
-        return None
-    return float(taker) / float(quote)
-
-
-def _buy_ratio_1h(ordered: Sequence[SpotKline]) -> float | None:
-    """Sum of taker quote / sum of quote over 12 continuous closed 5m bars.
-
-    The latest bar is included. The ratio uses taker quote and quote volume
-    only. A missing taker base volume does not blank it. Any missing taker
-    quote or quote volume in that window, or a quote sum of 0, is NULL. A
-    shorter or gappy hour is NULL. The bar that opened 60m earlier is outside.
-    """
-    if not _continuous_tail(ordered, _HOUR_BARS):
-        return None
-    taker_sum = 0.0
-    quote_sum = 0.0
-    for bar in ordered[-_HOUR_BARS:]:
-        quote = bar.quote_volume
-        taker_quote = bar.taker_buy_quote_volume
-        if taker_quote is None or quote is None or taker_quote < 0 or quote < 0:
-            return None
-        taker_sum += float(taker_quote)
-        quote_sum += float(quote)
-    if quote_sum <= 0:
-        return None
-    return taker_sum / quote_sum
-
-
-def _avg_trade_usd(bar: SpotKline) -> float | None:
-    """``quote_volume / trades``. Missing or non-positive trades → None."""
-    trades = bar.trades
-    quote = bar.quote_volume
-    if trades is None or quote is None or trades <= 0 or quote < 0:
-        return None
-    return float(quote) / float(trades)
-
-
-def _trade_size_ratio(ordered: Sequence[SpotKline]) -> float | None:
-    """Latest average print / prior-288 ``sum(quote) / sum(trades)``.
-
-    The current bar is not in the baseline. The 288 bars must be the
-    continuous 5m grid immediately before it (open of the oldest is exactly
-    24h before the current open, so its close is exactly 24h before the
-    current close). A gap, a short window, a missing quote, or a non-positive
-    trade count anywhere in those 288 bars is NULL. The baseline is not the
-    mean of per-bar ``quote / trades``.
-    """
-    need = _PRIOR_DAY_BARS + 1
-    if not _continuous_tail(ordered, need):
-        return None
-    current_avg = _avg_trade_usd(ordered[-1])
-    if current_avg is None:
-        return None
-    quote_sum = 0.0
-    trade_sum = 0.0
-    for bar in ordered[-need:-1]:
-        quote = bar.quote_volume
-        trades = bar.trades
-        if quote is None or trades is None or quote < 0 or trades <= 0:
-            return None
-        quote_sum += float(quote)
-        trade_sum += float(trades)
-    if trade_sum <= 0 or quote_sum <= 0:
-        return None
-    return current_avg / (quote_sum / trade_sum)
-
-
-def _week_fields(
-    ordered: Sequence[SpotKline],
-    series: list[dict[str, Any]],
-) -> dict[str, float | None]:
-    """``change_pct`` / ``volume_7d_avg`` only on a continuous 7d 5m grid.
-
-    Both helpers accept a 6h skew and ``volume_7d_avg`` skips empty days, so
-    a hole or a window a few hours short of 7d can still produce a number.
-    Those results are not stored. The grid is the last 2017 closed 5m bars
-    (open span exactly 7d). ``volume_h24`` is stamped only for a real
-    trailing 289-bar day. On a series that starts at the 7d anchor, the
-    first such stamp is ~24h later, outside the helper's 6h skew, so
-    ``volume_7d_avg`` stays None. Filling the early bars with a prefix sum
-    is not a trailing day: the helper then keeps that short sum for the
-    first bucket (288 bars, not 289) and the average is not seven full days.
-    """
-    empty = {"change_7d": None, "volume_7d_avg": None}
-    if not _continuous_tail(ordered, _WEEK_BARS):
-        return empty
-    span = int(ordered[-1].open_time_ms) - int(ordered[-_WEEK_BARS].open_time_ms)
-    if span != _WEEK_STEPS * _5M_MS:
-        return empty
-    return {
-        "change_7d": change_pct(series, INTERVAL_SEC["change_7d"]),
-        "volume_7d_avg": volume_7d_avg(series),
-    }
-
-
-def _readonly_fields(
-    ordered: Sequence[SpotKline],
-    series: list[dict[str, Any]],
-    interval: str,
-) -> dict[str, Any]:
-    """Eight nullable columns. Non-5m intervals stay NULL (the bar counts are 5m)."""
-    latest = ordered[-1] if ordered else None
-    out: dict[str, Any] = {
-        "change_7d": None,
-        "volume_7d_avg": None,
-        "taker_buy_quote_volume_5m": None,
-        "buy_ratio_5m": None,
-        "buy_ratio_1h": None,
-        "avg_trade_usd_5m": None,
-        "trade_size_ratio": None,
-        "lower_wick_ratio": None,
-    }
-    if interval != DEFAULT_INTERVAL or latest is None:
-        return out
-    out["taker_buy_quote_volume_5m"] = latest.taker_buy_quote_volume
-    out["buy_ratio_5m"] = _buy_ratio_5m(latest)
-    out["buy_ratio_1h"] = _buy_ratio_1h(ordered)
-    out["avg_trade_usd_5m"] = _avg_trade_usd(latest)
-    out["trade_size_ratio"] = _trade_size_ratio(ordered)
-    out["lower_wick_ratio"] = _lower_wick_ratio(latest)
-    out.update(_week_fields(ordered, series))
-    return out
+def _closed_klines(
+    klines: Sequence[SpotKline],
+    *,
+    now_ms: int | None = None,
+) -> list[SpotKline]:
+    if now_ms is None:
+        return list(klines)
+    cutoff = int(now_ms)
+    return [bar for bar in klines if int(bar.close_time_ms) <= cutoff]
 
 
 def factors_from_klines(
     klines: Sequence[SpotKline],
     *,
     now_ms: int | None = None,
-    interval: str = DEFAULT_INTERVAL,
 ) -> dict[str, Any] | None:
-    """Same tech_boll family as paper: change_*, volume_strength, BOLL(20, 2σ) on close.
-
-    Micro and 7d columns use closed bars only. ``interval`` other than 5m
-    leaves those eight columns NULL.
-    """
-    closed = _closed_bars(klines, now_ms)
+    """Same tech_boll family as paper: change_*, volume_strength, BOLL(20, 2σ) on close."""
+    closed = _closed_klines(klines, now_ms=now_ms)
     series = price_series_from_klines(closed)
     if not series:
         return None
+    last_bar = max(closed, key=lambda bar: (bar.close_time_ms, bar.open_time_ms))
     closes = [float(row["price_usd"]) for row in series]
     lib = compute_pandas_ta(closes)
     fields, _fresh = apply_library_fields(None, lib)
@@ -837,42 +575,35 @@ def factors_from_klines(
         "volatility_24h": volatility_stdev_returns(series),
         "volume_strength": volume_strength(series),
         "quote_volume_24h": quote_volume_24h(closed),
+        "taker_buy_quote_volume": last_bar.taker_buy_quote_volume,
+        "taker_buy_ratio": taker_buy_ratio_from_kline(last_bar),
         "sample_count": len(series),
-        "kline_close_time_ms": max(bar.close_time_ms for bar in closed),
+        "kline_close_time_ms": last_bar.close_time_ms,
     }
     out.update(fields)
-    out.update(_readonly_fields(closed, series, interval))
     return out
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
-
-
-def _add_columns(
-    conn: sqlite3.Connection,
-    table: str,
-    columns: Sequence[tuple[str, str]],
-) -> None:
-    have = _table_columns(conn, table)
-    for name, typ in columns:
-        if name in have:
-            continue
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
+    present = {
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in present:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create binance_* tables and add missing columns on tables that already exist.
-
-    ``CREATE TABLE IF NOT EXISTS`` does not change an old table. New columns
-    are added with ``ALTER TABLE ... ADD COLUMN`` only when absent. Rows and
-    columns this migration does not own are left in place. A second call is
-    a no-op. Does not migrate ``token_indicators``.
-    """
+    """Create binance_* tables. Does not migrate token_indicators."""
     script = _SQL_PATH.read_text(encoding="utf-8")
     conn.executescript(script)
-    _add_columns(conn, "binance_klines", _KLINE_ADD_COLUMNS)
-    _add_columns(conn, "binance_indicators", _INDICATOR_ADD_COLUMNS)
+    _ensure_column(conn, "binance_klines", "taker_buy_base_volume", "REAL")
+    _ensure_column(conn, "binance_klines", "taker_buy_quote_volume", "REAL")
+    _ensure_column(conn, "binance_indicators", "taker_buy_quote_volume", "REAL")
+    _ensure_column(conn, "binance_indicators", "taker_buy_ratio", "REAL")
+    _ensure_column(conn, "binance_indicators", "funding_rate", "REAL")
+    _ensure_column(conn, "binance_indicators", "funding_z", "REAL")
+    _ensure_column(conn, "binance_indicators", "open_interest_change_1h", "REAL")
+    _ensure_column(conn, "binance_indicators", "perp_basis_bps", "REAL")
 
 
 def connect_rw(path: Path) -> sqlite3.Connection:
@@ -890,19 +621,7 @@ def upsert_klines(
     interval: str,
     klines: Sequence[SpotKline],
 ) -> int:
-    """Insert or update kline rows. Columns this writer does not own stay put.
-
-    Older open times that are not in ``klines`` are not deleted. A later read
-    can therefore span more than one fetch window.
-    """
     ensure_schema(conn)
-    names = ", ".join(_KLINE_WRITE_COLS)
-    placeholders = ", ".join("?" for _ in _KLINE_WRITE_COLS)
-    updates = ", ".join(
-        f"{name}=excluded.{name}"
-        for name in _KLINE_WRITE_COLS
-        if name not in ("symbol", "interval", "open_time_ms")
-    )
     rows = [
         (
             symbol,
@@ -916,89 +635,30 @@ def upsert_klines(
             bar.quote_volume,
             bar.close_time_ms,
             bar.trades,
-            bar.taker_buy_volume,
+            bar.taker_buy_base_volume,
             bar.taker_buy_quote_volume,
         )
         for bar in klines
     ]
     conn.executemany(
-        f"""
-        INSERT INTO binance_klines ({names}) VALUES ({placeholders})
-        ON CONFLICT(symbol, interval, open_time_ms) DO UPDATE SET {updates}
+        """
+        INSERT OR REPLACE INTO binance_klines (
+            symbol, interval, open_time_ms, open, high, low, close,
+            volume, quote_volume, close_time_ms, trades,
+            taker_buy_base_volume, taker_buy_quote_volume
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
     return len(rows)
 
 
-def load_stored_klines(
-    conn: sqlite3.Connection,
-    symbol: str,
-    interval: str,
-) -> list[SpotKline]:
-    """Every stored bar for one symbol, oldest open first. Not capped at 1000."""
-    ensure_schema(conn)
-    fetched = conn.execute(
-        """
-        SELECT open_time_ms, open, high, low, close, volume, quote_volume,
-               close_time_ms, trades, taker_buy_volume, taker_buy_quote_volume
-        FROM binance_klines
-        WHERE symbol = ? AND interval = ?
-        ORDER BY open_time_ms ASC
-        """,
-        (symbol, interval),
-    ).fetchall()
-    loaded: list[SpotKline] = []
-    for row in fetched:
-        op = _float_or_none(row[1])
-        hi = _float_or_none(row[2])
-        lo = _float_or_none(row[3])
-        close = _float_or_none(row[4])
-        volume = _float_or_none(row[5])
-        quote = _float_or_none(row[6])
-        if None in (op, hi, lo, close, volume):
-            continue
-        if op <= 0 or hi <= 0 or lo <= 0 or close <= 0:
-            continue
-        trades: int | None
-        if row[8] is None:
-            trades = None
-        else:
-            try:
-                trades = int(row[8])
-            except (TypeError, ValueError):
-                trades = None
-        loaded.append(
-            SpotKline(
-                open_time_ms=int(row[0]),
-                open=op,
-                high=hi,
-                low=lo,
-                close=close,
-                volume=volume,
-                quote_volume=quote,
-                close_time_ms=int(row[7]),
-                trades=trades,
-                taker_buy_volume=_float_or_none(row[9]),
-                taker_buy_quote_volume=_float_or_none(row[10]),
-            )
-        )
-    return loaded
-
-
 def upsert_indicator(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
-    """Insert or update one indicator row. Unlisted columns on the table stay put."""
     ensure_schema(conn)
-    names = ", ".join(_INDICATOR_COLS)
     placeholders = ", ".join("?" for _ in _INDICATOR_COLS)
-    updates = ", ".join(
-        f"{name}=excluded.{name}" for name in _INDICATOR_COLS if name != "symbol"
-    )
+    names = ", ".join(_INDICATOR_COLS)
     conn.execute(
-        f"""
-        INSERT INTO binance_indicators ({names}) VALUES ({placeholders})
-        ON CONFLICT(symbol) DO UPDATE SET {updates}
-        """,
+        f"INSERT OR REPLACE INTO binance_indicators ({names}) VALUES ({placeholders})",
         tuple(row.get(col) for col in _INDICATOR_COLS),
     )
 
@@ -1012,19 +672,13 @@ def persist_klines_and_factors(
     updated_at: str | None = None,
     now_ms: int | None = None,
 ) -> dict[str, Any] | None:
-    """Write one symbol's klines and tech_boll row. DEX tables are not touched.
-
-    Factors are computed from every stored bar for this symbol and interval,
-    not only the batch just fetched. Rows older than the fetch window stay
-    in ``binance_klines``.
-    """
-    upsert_klines(conn, meta.symbol, interval, klines)
-    merged = load_stored_klines(conn, meta.symbol, interval)
-    factors = factors_from_klines(merged, now_ms=now_ms, interval=interval)
+    """Write one symbol's closed klines and tech_boll row. DEX tables are not touched."""
+    closed = _closed_klines(klines, now_ms=now_ms)
+    factors = factors_from_klines(closed)
     if factors is None:
-        conn.commit()
         return None
     now = updated_at or utc_now_iso()
+    upsert_klines(conn, meta.symbol, interval, closed)
     stored = {
         "symbol": meta.symbol,
         "base_asset": meta.base_asset,
@@ -1050,37 +704,92 @@ def ingest_spot_klines(
     kline_limit: int = DEFAULT_KLINE_LIMIT,
     pause_sec: float = 0.0,
     base_url: str = DEFAULT_BASE,
+    ws_cache: Any | None = None,
 ) -> dict[str, int]:
-    """Fetch public klines for ``symbols`` and write the side tables.
+    """Fetch public klines for ``symbols`` (preferring WebSocket cache when warm) and write side tables.
 
     ``symbols`` must already be the primary universe (or a subset of it).
     This function does not discover listings.
     """
     if interval not in _INTERVALS:
         raise ValueError(f"interval must be one of {sorted(_INTERVALS)}")
-    # Single request. Do not walk startTime to backfill 7d; stored rows accumulate.
-    limit = max(20, min(int(kline_limit), KLINE_FETCH_CAP))
+    limit = max(20, min(int(kline_limit), 1000))
     ensure_schema(conn)
-    stats = {"symbols": 0, "klines": 0, "indicators": 0, "failed": 0, "skipped": 0}
+    active_cache = ws_cache
+    if active_cache is None:
+        try:
+            from execution.binance_ws_stream import get_global_ws_cache, ws_stream_enabled
+            if ws_stream_enabled():
+                active_cache = get_global_ws_cache()
+        except ImportError:
+            active_cache = None
+
+    stats = {
+        "symbols": 0,
+        "klines": 0,
+        "indicators": 0,
+        "failed": 0,
+        "skipped": 0,
+        "ws_hits": 0,
+        "rest_fetches": 0,
+    }
     total = len(symbols)
     for index, meta in enumerate(symbols):
-        url = kline_url(meta.symbol, interval=interval, limit=limit, base=base_url)
-        try:
-            payload = fetcher(url)
-        except Exception as exc:  # noqa: BLE001 — one symbol must not abort the universe
-            stats["failed"] += 1
-            log.warning("kline fetch failed symbol=%s err=%s", meta.symbol, exc)
-            continue
-        if not isinstance(payload, list):
-            stats["failed"] += 1
-            log.warning("kline payload not a list symbol=%s", meta.symbol)
-            continue
-        bars = [bar for row in payload if (bar := parse_kline_row(row)) is not None]
+        bars: list[SpotKline] = []
+        used_ws = False
+        clock_ms = int(time.time() * 1000)
+
+        if active_cache is not None and callable(getattr(active_cache, "get_closed_klines", None)):
+            cached = active_cache.get_closed_klines(meta.symbol, interval, min_bars=20)
+            if cached:
+                bars = [
+                    SpotKline(
+                        open_time_ms=int(item.open_time_ms),
+                        open=float(item.open),
+                        high=float(item.high),
+                        low=float(item.low),
+                        close=float(item.close),
+                        volume=float(item.volume),
+                        quote_volume=float(item.quote_volume),
+                        close_time_ms=int(item.close_time_ms),
+                        trades=item.trades,
+                        taker_buy_base_volume=item.taker_buy_base_volume,
+                        taker_buy_quote_volume=item.taker_buy_quote_volume,
+                    )
+                    for item in cached
+                    if int(item.close_time_ms) <= clock_ms
+                ]
+                if len(bars) >= 20:
+                    used_ws = True
+                    stats["ws_hits"] += 1
+
+        if not used_ws:
+            url = kline_url(meta.symbol, interval=interval, limit=limit, base=base_url)
+            try:
+                payload = fetcher(url)
+            except Exception as exc:  # noqa: BLE001 — one symbol must not abort the universe
+                stats["failed"] += 1
+                log.warning("kline fetch failed symbol=%s err=%s", meta.symbol, exc)
+                continue
+            if not isinstance(payload, list):
+                stats["failed"] += 1
+                log.warning("kline payload not a list symbol=%s", meta.symbol)
+                continue
+            clock_ms = int(time.time() * 1000)
+            bars = [
+                bar
+                for row in payload
+                if (bar := parse_kline_row(row)) is not None and bar.close_time_ms <= clock_ms
+            ]
+            stats["rest_fetches"] += 1
+            if bars and active_cache is not None and callable(getattr(active_cache, "seed_klines", None)):
+                active_cache.seed_klines(meta.symbol, interval, bars)
+
         if not bars:
             stats["skipped"] += 1
             continue
         try:
-            stored = persist_klines_and_factors(conn, meta, bars, interval=interval)
+            stored = persist_klines_and_factors(conn, meta, bars, interval=interval, now_ms=clock_ms)
         except sqlite3.Error as exc:
             stats["failed"] += 1
             log.warning("kline write failed symbol=%s err=%s", meta.symbol, exc)
@@ -1091,17 +800,59 @@ def ingest_spot_klines(
         stats["symbols"] += 1
         stats["klines"] += len(bars)
         stats["indicators"] += 1
-        if pause_sec > 0 and index + 1 < total:
+        if not used_ws and pause_sec > 0 and index + 1 < total:
             time.sleep(pause_sec)
     log.info(
-        "binance kline ingest symbols=%s indicators=%s klines=%s failed=%s skipped=%s",
+        "binance kline ingest symbols=%s indicators=%s klines=%s ws_hits=%s rest_fetches=%s failed=%s skipped=%s",
         stats["symbols"],
         stats["indicators"],
         stats["klines"],
+        stats["ws_hits"],
+        stats["rest_fetches"],
         stats["failed"],
         stats["skipped"],
     )
     return stats
+
+
+def bind_ws_kline_close_writer(
+    conn: sqlite3.Connection,
+    symbols: Sequence[SpotSymbol],
+    cache: Any,
+    *,
+    interval: str = DEFAULT_INTERVAL,
+) -> Callable[[str, str, list[Any]], None]:
+    """Register an event-driven callback on ``cache`` that persists factors immediately on bar close."""
+    meta_map = {item.symbol.upper(): item for item in symbols}
+
+    def _on_close(symbol: str, tf: str, ws_bars: list[Any]) -> None:
+        if tf != interval:
+            return
+        meta = meta_map.get(symbol.upper())
+        if meta is None:
+            return
+        bars = [
+            SpotKline(
+                open_time_ms=int(b.open_time_ms),
+                open=float(b.open),
+                high=float(b.high),
+                low=float(b.low),
+                close=float(b.close),
+                volume=float(b.volume),
+                quote_volume=float(b.quote_volume),
+                close_time_ms=int(b.close_time_ms),
+                trades=getattr(b, "trades", None),
+                taker_buy_base_volume=getattr(b, "taker_buy_base_volume", None),
+                taker_buy_quote_volume=getattr(b, "taker_buy_quote_volume", None),
+            )
+            for b in ws_bars
+        ]
+        if len(bars) >= 20:
+            persist_klines_and_factors(conn, meta, bars, interval=interval)
+
+    if callable(getattr(cache, "register_kline_close_callback", None)):
+        cache.register_kline_close_callback(_on_close)
+    return _on_close
 
 
 def filter_universe(

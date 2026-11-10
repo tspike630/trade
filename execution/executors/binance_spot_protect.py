@@ -35,9 +35,12 @@ from execution.executors.binance_spot import (
 
 BLOCK_SELL_ENV = "BINANCE_SPOT_BLOCK_SELL_ON_KILL"
 FEE_BPS_ENV = "BINANCE_SPOT_TAKER_FEE_BPS"
+REANCHOR_OCO_ENV = "BINANCE_SPOT_REANCHOR_OCO_ON_FILL"
+AUTO_FLATTEN_ENV = "BINANCE_SPOT_AUTO_FLATTEN_ON_OCO_FAIL"
 ENTRY_MIN_NOTIONAL_USDT = Decimal("20")
 BOOK_ENV = "BINANCE_SPOT_BOOK_USDT"
 DEFAULT_TAKER_FEE_BPS = Decimal("10")
+MIN_REANCHOR_STOP_GAP = Decimal("0.005")
 OCO_PATH = "/api/v3/orderList/oco"
 ORDER_LIST_PATH = "/api/v3/orderList"
 
@@ -46,6 +49,7 @@ PROTECTION_PENDING = "oco_pending"
 PROTECTION_EXCHANGE = "exchange_oco"
 PROTECTION_FALLBACK = "loop_fallback"
 PROTECTION_DUST = "dust_abandon"
+PROTECTION_AUTO_FLATTEN = "auto_flatten"
 
 # listOrderStatus / listStatusType values that mean the list is still live.
 _OCO_WORKING = frozenset({"EXECUTING", "EXEC_STARTED"})
@@ -58,6 +62,25 @@ def block_sell_on_kill() -> bool:
     if raw is None:
         return False
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def reanchor_oco_on_fill_enabled() -> bool:
+    raw = os.environ.get(REANCHOR_OCO_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def auto_flatten_on_oco_fail_enabled() -> bool:
+    raw = os.environ.get(AUTO_FLATTEN_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def flatten_client_order_id(decision_id: object) -> str | None:
+    """Deterministic client order id for an emergency naked-position flatten sell."""
+    return _client_piece("bnbfade-fl-", decision_id)
 
 
 def taker_fee_rate() -> Decimal | None:
@@ -96,28 +119,30 @@ def protective_order_block(gates: dict[str, Any]) -> str | None:
     return None
 
 
-def _client_piece(prefix: str, raw: object) -> str | None:
+def _client_piece(prefix: str, raw: object, *, ratchet_seq: int = 0) -> str | None:
     if isinstance(raw, bool) or raw is None:
         return None
     text = str(raw).strip()
     if not text.isdigit():
         return None
-    client_id = f"{prefix}{text}"
+    seq = int(ratchet_seq) if isinstance(ratchet_seq, int) and not isinstance(ratchet_seq, bool) else 0
+    suffix = f"-r{seq}" if seq > 0 else ""
+    client_id = f"{prefix}{text}{suffix}"
     if len(client_id) > 36:
         return None
     return client_id
 
 
-def oco_list_client_id(decision_id: object) -> str | None:
-    return _client_piece("bnbfade-ol-", decision_id)
+def oco_list_client_id(decision_id: object, *, ratchet_seq: int = 0) -> str | None:
+    return _client_piece("bnbfade-ol-", decision_id, ratchet_seq=ratchet_seq)
 
 
-def oco_above_client_id(decision_id: object) -> str | None:
-    return _client_piece("bnbfade-tp-", decision_id)
+def oco_above_client_id(decision_id: object, *, ratchet_seq: int = 0) -> str | None:
+    return _client_piece("bnbfade-tp-", decision_id, ratchet_seq=ratchet_seq)
 
 
-def oco_below_client_id(decision_id: object) -> str | None:
-    return _client_piece("bnbfade-sl-", decision_id)
+def oco_below_client_id(decision_id: object, *, ratchet_seq: int = 0) -> str | None:
+    return _client_piece("bnbfade-sl-", decision_id, ratchet_seq=ratchet_seq)
 
 
 def reference_price(extras: dict[str, Any]) -> Decimal | None:
@@ -374,6 +399,78 @@ def protective_band_error(
     return error
 
 
+def reanchor_oco_prices_to_fill(
+    *,
+    signal_entry_price: object,
+    stop_price: str,
+    take_profit_price: str,
+    fill_price: object,
+    mark: object,
+    filters: list[Any],
+) -> tuple[dict[str, str] | None, str | None]:
+    """Re-anchor OCO stop (and TP if crossed) to the actual fill/mark price.
+
+    Preserves the signal's relative stop distance (floored at 50 bps) below
+    ``min(fill_price, mark)`` so entry slippage does not leave a filled BUY
+    unprotectable due to ``oco_price_restriction``.
+    """
+    tick = _tick_size(filters)
+    if tick is None:
+        return None, "oco_missing_tick"
+    tick_n = _to_decimal(tick)
+    stop_n = _to_decimal(stop_price)
+    tp_n = _to_decimal(take_profit_price)
+    sig_entry_n = _to_decimal(signal_entry_price)
+    fill_n = _to_decimal(fill_price)
+    mark_n = _to_decimal(mark)
+    if tick_n is None or stop_n is None or tp_n is None:
+        return None, "oco_prices_crossed"
+    anchors = [p for p in (fill_n, mark_n) if p is not None and p > 0]
+    if not anchors:
+        return None, "mark_unavailable"
+    ref_low = min(anchors)
+    ref_high = max(anchors)
+
+    if sig_entry_n is not None and sig_entry_n > stop_n > 0:
+        orig_sl_gap = (sig_entry_n - stop_n) / sig_entry_n
+    else:
+        orig_sl_gap = MIN_REANCHOR_STOP_GAP
+    sl_gap = max(orig_sl_gap, MIN_REANCHOR_STOP_GAP)
+
+    new_stop = _align(ref_low * (Decimal("1") - sl_gap), tick_n, ROUND_DOWN)
+    if new_stop >= ref_low:
+        new_stop = ref_low - tick_n * Decimal("2")
+    if new_stop <= 0:
+        return None, "oco_prices_crossed"
+
+    new_tp = _align(tp_n, tick_n, ROUND_DOWN)
+    if new_tp <= ref_high:
+        if sig_entry_n is not None and tp_n > sig_entry_n > 0:
+            orig_tp_gap = (tp_n - sig_entry_n) / sig_entry_n
+        else:
+            orig_tp_gap = Decimal("0.01")
+        tp_gap = max(orig_tp_gap, MIN_REANCHOR_STOP_GAP)
+        new_tp = _align(ref_high * (Decimal("1") + tp_gap), tick_n, ROUND_DOWN)
+        if new_tp <= ref_high:
+            new_tp = ref_high + tick_n * Decimal("2")
+
+    new_stop_str = _decimal_text(new_stop)
+    new_tp_str = _decimal_text(new_tp)
+    for candidate in anchors:
+        err = protective_band_error(
+            stop_price=new_stop_str,
+            take_profit_price=new_tp_str,
+            mark=candidate,
+            filters=filters,
+        )
+        if err is not None:
+            return None, err
+    return {
+        "stop_price": new_stop_str,
+        "take_profit_price": new_tp_str,
+    }, None
+
+
 def fill_average_price(placed: dict[str, Any] | None) -> str | None:
     """Average fill from quote spent and base filled. A zero qty is not a price."""
     if not isinstance(placed, dict):
@@ -398,14 +495,15 @@ def build_spot_oco(
     filters: list[Any],
     mark: object,
     timestamp_ms: int,
+    ratchet_seq: int = 0,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Form body for ``POST /api/v3/orderList/oco``. No network.
 
     Returns ``(spec, error)``. ``spec["pairs"]`` is the unsigned form.
     """
-    list_id = oco_list_client_id(decision_id)
-    above_id = oco_above_client_id(decision_id)
-    below_id = oco_below_client_id(decision_id)
+    list_id = oco_list_client_id(decision_id, ratchet_seq=ratchet_seq)
+    above_id = oco_above_client_id(decision_id, ratchet_seq=ratchet_seq)
+    below_id = oco_below_client_id(decision_id, ratchet_seq=ratchet_seq)
     if list_id is None or above_id is None or below_id is None:
         return None, "invalid_oco_client_id"
     lot, step = _limit_lot(filters)
@@ -658,7 +756,7 @@ def resolve_entry_size(
     plan["quote_usdt"] = quote_text
     order_type = str(extras.get("order_type") or extras.get("binance_order_type") or "MARKET").strip().upper()
     sized = dict(extras)
-    if order_type == "LIMIT":
+    if order_type in {"LIMIT", "LIMIT_MAKER"}:
         price = _to_decimal(extras.get("limit_price"))
         if price is None:
             price = _to_decimal(extras.get("price"))
@@ -671,7 +769,7 @@ def resolve_entry_size(
         if qty_text is None:
             return extras, "entry_not_viable:below_min_qty", plan
         sized["quantity"] = qty_text
-        plan["order_type"] = "LIMIT"
+        plan["order_type"] = order_type
         plan["needs_lot_floor"] = True
         return sized, None, plan
     if order_type not in {"MARKET", ""}:
@@ -691,3 +789,393 @@ def tracked_exit(position: dict[str, Any]) -> bool:
     if isinstance(row_id, str) and row_id.strip().isdigit():
         return int(row_id.strip()) > 0
     return False
+
+
+ORDERBOOK_GATE_ENV = "BINANCE_SPOT_ORDERBOOK_GATE"
+MAX_SPREAD_BPS_ENV = "BINANCE_SPOT_MAX_SPREAD_BPS"
+MAX_IMPACT_BPS_ENV = "BINANCE_SPOT_MAX_IMPACT_BPS"
+DEFAULT_MAX_SPREAD_BPS = Decimal("35")
+DEFAULT_MAX_IMPACT_BPS = Decimal("50")
+
+
+def orderbook_gate_enabled() -> bool:
+    raw = os.environ.get(ORDERBOOK_GATE_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def max_spread_bps() -> Decimal:
+    val = _to_decimal(os.environ.get(MAX_SPREAD_BPS_ENV))
+    if val is None or val <= 0:
+        return DEFAULT_MAX_SPREAD_BPS
+    return val
+
+
+def max_impact_bps() -> Decimal:
+    val = _to_decimal(os.environ.get(MAX_IMPACT_BPS_ENV))
+    if val is None or val <= 0:
+        return DEFAULT_MAX_IMPACT_BPS
+    return val
+
+
+def _parse_book_levels(raw: object) -> list[tuple[Decimal, Decimal]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[tuple[Decimal, Decimal]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        px = _to_decimal(item[0])
+        qty = _to_decimal(item[1])
+        if px is not None and qty is not None and px > 0 and qty > 0:
+            out.append((px, qty))
+    return out
+
+
+def evaluate_orderbook_impact(
+    depth: object,
+    *,
+    quote_usdt: object = None,
+    quantity: object = None,
+    spread_cap_bps: Decimal | None = None,
+    impact_cap_bps: Decimal | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Evaluate L2 orderbook spread, top-5 imbalance (OBI), and market-buy VWAP impact.
+
+    Returns ``(metrics, error)``. When ``error`` is non-None, a market BUY
+    should be refused before ``new_order`` is sent.
+    """
+    if not isinstance(depth, dict):
+        return None, "orderbook_unavailable"
+    bids = sorted(_parse_book_levels(depth.get("bids")), key=lambda x: x[0], reverse=True)
+    asks = sorted(_parse_book_levels(depth.get("asks")), key=lambda x: x[0])
+    if not bids or not asks:
+        return None, "orderbook_empty"
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    if best_ask <= best_bid:
+        return None, "orderbook_crossed"
+    mid = (best_bid + best_ask) / Decimal("2")
+    spread_bps = ((best_ask - best_bid) / mid) * Decimal("10000")
+
+    bid_5 = sum((px * qty for px, qty in bids[:5]), Decimal("0"))
+    ask_5 = sum((px * qty for px, qty in asks[:5]), Decimal("0"))
+    total_5 = bid_5 + ask_5
+    obi_5 = float((bid_5 - ask_5) / total_5) if total_5 > 0 else 0.0
+
+    s_cap = max_spread_bps() if spread_cap_bps is None else spread_cap_bps
+    i_cap = max_impact_bps() if impact_cap_bps is None else impact_cap_bps
+
+    target_quote = _to_decimal(quote_usdt)
+    target_qty = _to_decimal(quantity)
+
+    vwap = best_ask
+    impact_bps = ((best_ask - mid) / mid) * Decimal("10000")
+    depth_covered = True
+
+    if target_quote is not None and target_quote > 0:
+        rem_quote = target_quote
+        acc_qty = Decimal("0")
+        acc_quote = Decimal("0")
+        for px, qty in asks:
+            lvl_quote = px * qty
+            if lvl_quote >= rem_quote:
+                take_qty = rem_quote / px
+                acc_qty += take_qty
+                acc_quote += rem_quote
+                rem_quote = Decimal("0")
+                break
+            acc_qty += qty
+            acc_quote += lvl_quote
+            rem_quote -= lvl_quote
+        if rem_quote > Decimal("0.00000001") or acc_qty <= 0:
+            depth_covered = False
+        else:
+            vwap = acc_quote / acc_qty
+            impact_bps = ((vwap - mid) / mid) * Decimal("10000")
+    elif target_qty is not None and target_qty > 0:
+        rem_qty = target_qty
+        acc_qty = Decimal("0")
+        acc_quote = Decimal("0")
+        for px, qty in asks:
+            if qty >= rem_qty:
+                acc_qty += rem_qty
+                acc_quote += rem_qty * px
+                rem_qty = Decimal("0")
+                break
+            acc_qty += qty
+            acc_quote += qty * px
+            rem_qty -= qty
+        if rem_qty > Decimal("0.00000001") or acc_qty <= 0:
+            depth_covered = False
+        else:
+            vwap = acc_quote / acc_qty
+            impact_bps = ((vwap - mid) / mid) * Decimal("10000")
+
+    metrics: dict[str, Any] = {
+        "best_bid": _decimal_text(best_bid),
+        "best_ask": _decimal_text(best_ask),
+        "mid_price": _decimal_text(mid),
+        "spread_bps": round(float(spread_bps), 4),
+        "expected_vwap": _decimal_text(vwap),
+        "impact_bps": round(float(impact_bps), 4),
+        "obi_top5": round(obi_5, 4),
+        "depth_covered": depth_covered,
+    }
+    if not depth_covered:
+        return metrics, "orderbook_depth_insufficient"
+    if spread_bps > s_cap:
+        return metrics, "orderbook_spread_too_wide"
+    if impact_bps > i_cap:
+        return metrics, "orderbook_impact_too_high"
+    return metrics, None
+
+
+POST_ONLY_LIMIT_ENV = "BINANCE_SPOT_POST_ONLY_LIMIT"
+SOR_MAKER_FALLBACK_ENV = "BINANCE_SPOT_SOR_MAKER_FALLBACK"
+ENTRY_TTL_SEC_ENV = "BINANCE_SPOT_ENTRY_TTL_SEC"
+DEFAULT_ENTRY_TTL_SEC = 180
+
+
+def post_only_limit_enabled() -> bool:
+    raw = os.environ.get(POST_ONLY_LIMIT_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def sor_maker_fallback_enabled() -> bool:
+    raw = os.environ.get(SOR_MAKER_FALLBACK_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def entry_ttl_sec() -> int:
+    raw = os.environ.get(ENTRY_TTL_SEC_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_ENTRY_TTL_SEC
+    try:
+        val = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_ENTRY_TTL_SEC
+    return max(5, val)
+
+
+def peg_maker_buy_price(
+    limit_price: object,
+    *,
+    best_bid: object = None,
+    best_ask: object = None,
+    mark: object = None,
+    stop_price: object = None,
+    take_profit_price: object = None,
+    filters: list[Any],
+) -> tuple[str | None, bool, str | None]:
+    """Clamp a BUY ``LIMIT_MAKER`` price below ``best_ask`` so it rests as Maker.
+
+    Returns ``(pegged_price_str, was_clamped, error)``.
+    """
+    tick = _tick_size(filters)
+    if tick is None:
+        return None, False, "oco_missing_tick"
+    tick_n = _to_decimal(tick)
+    limit_n = _to_decimal(limit_price)
+    if tick_n is None or limit_n is None:
+        return None, False, "missing_limit_price"
+    aligned = _align(limit_n, tick_n, ROUND_DOWN)
+    if aligned <= 0:
+        return None, False, "invalid_limit_price"
+
+    bid_n = _to_decimal(best_bid)
+    ask_n = _to_decimal(best_ask)
+    mark_n = _to_decimal(mark)
+    ceiling = ask_n if ask_n is not None else mark_n
+
+    was_clamped = False
+    chosen = aligned
+    if ceiling is not None and chosen >= ceiling:
+        if bid_n is not None and bid_n < ceiling:
+            candidate = _align(bid_n, tick_n, ROUND_DOWN)
+        else:
+            candidate = _align(ceiling - tick_n, tick_n, ROUND_DOWN)
+        if candidate <= 0:
+            return None, False, "maker_peg_below_zero"
+        chosen = candidate
+        was_clamped = True
+
+    stop_n = _to_decimal(stop_price)
+    tp_n = _to_decimal(take_profit_price)
+    if stop_n is not None and chosen <= stop_n:
+        return None, was_clamped, "maker_peg_crossed_stop"
+    if tp_n is not None and chosen >= tp_n:
+        return None, was_clamped, "maker_peg_crossed_tp"
+    return _decimal_text(chosen), was_clamped, None
+
+
+def sor_maker_fallback_spec(
+    *,
+    quote_usdt: object,
+    best_bid: object,
+    best_ask: object,
+    stop_price: object,
+    take_profit_price: object,
+    filters: list[Any],
+) -> tuple[dict[str, str] | None, str | None]:
+    """Convert a blocked ``MARKET`` BUY into a passive ``LIMIT_MAKER`` order at ``best_bid``."""
+    q_n = _to_decimal(quote_usdt)
+    bid_n = _to_decimal(best_bid)
+    if q_n is None or bid_n is None:
+        return None, "sor_maker_missing_quote_or_bid"
+    pegged_px, _clamped, peg_err = peg_maker_buy_price(
+        bid_n,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        stop_price=stop_price,
+        take_profit_price=take_profit_price,
+        filters=filters,
+    )
+    if peg_err or pegged_px is None:
+        return None, peg_err or "sor_maker_peg_failed"
+    px_n = _to_decimal(pegged_px)
+    lot, step = _limit_lot(filters)
+    if px_n is None or lot is None or step is None:
+        return None, "oco_missing_lot_filter"
+    fee = taker_fee_rate() or Decimal("0")
+    raw_qty = q_n / px_n
+    floored_qty = floor_base_qty(_decimal_text(raw_qty), step)
+    floored_n = _to_decimal(floored_qty) if floored_qty is not None else None
+    min_qty = _to_decimal(lot.get("minQty"))
+    if floored_qty is None or floored_n is None or (min_qty is not None and floored_n < min_qty):
+        return None, "entry_not_viable:below_min_qty"
+    net_n = floored_n * (Decimal("1") - fee)
+    net_floored = floor_base_qty(_decimal_text(net_n), step) if net_n > 0 else None
+    if net_floored is None or (min_qty is not None and (_to_decimal(net_floored) or Decimal("0")) < min_qty):
+        return None, "entry_not_viable:below_min_qty"
+    notion = floored_n * px_n
+    min_notional = _min_notional(filters)
+    if notion < ENTRY_MIN_NOTIONAL_USDT:
+        return None, "entry_notional_below_min"
+    if min_notional is not None and notion < min_notional:
+        return None, "entry_not_viable:below_min_notional"
+    return {
+        "order_type": "LIMIT_MAKER",
+        "price": pegged_px,
+        "quantity": floored_qty,
+    }, None
+
+
+TRAILING_RATCHET_ENV = "BINANCE_SPOT_TRAILING_RATCHET"
+RATCHET_TRIGGER_PCT_ENV = "BINANCE_SPOT_RATCHET_TRIGGER_PCT"
+BREAKEVEN_BUFFER_BPS_ENV = "BINANCE_SPOT_BREAKEVEN_BUFFER_BPS"
+TRAILING_DIST_PCT_ENV = "BINANCE_SPOT_TRAILING_DIST_PCT"
+MAX_HOLD_SEC_ENV = "BINANCE_SPOT_MAX_HOLD_SEC"
+DEFAULT_RATCHET_TRIGGER_PCT = Decimal("0.60")
+DEFAULT_BREAKEVEN_BUFFER_BPS = Decimal("25")
+DEFAULT_TRAILING_DIST_PCT = Decimal("0.015")
+PROTECTION_TIME_STOP = "time_stop_exit"
+
+
+def trailing_ratchet_enabled() -> bool:
+    raw = os.environ.get(TRAILING_RATCHET_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def max_hold_sec() -> int:
+    raw = os.environ.get(MAX_HOLD_SEC_ENV)
+    if raw is None or not str(raw).strip():
+        return 0
+    try:
+        val = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, val)
+
+
+def compute_ratcheted_stop_price(
+    row: dict[str, Any],
+    *,
+    mark: object,
+    filters: list[Any],
+    trigger_pct: Decimal | None = None,
+    breakeven_buffer_bps: Decimal | None = None,
+    trail_dist_pct: Decimal | None = None,
+) -> tuple[str | None, str | None]:
+    """Compute a ratcheted stop-loss price when mark progresses toward take-profit.
+
+    - Triggers only when unrealized progress ``(mark - entry) / (tp - entry) >= trigger_pct``
+      (default 0.60).
+    - Sets candidate stop to ``max(entry * (1 + breakeven_buffer), mark * (1 - trail_dist))``
+      floored to ``tickSize``.
+    - Requires the new stop to improve on the current ``stop_price`` by at least 2 ticks
+      and to pass ``protective_band_error`` against ``mark``.
+    Returns ``(new_stop_price_str, ratchet_reason)`` or ``(None, None)``.
+    """
+    tick = _tick_size(filters)
+    if tick is None:
+        return None, None
+    tick_n = _to_decimal(tick)
+    entry = _to_decimal(row.get("entry_price") or row.get("signal_entry_price"))
+    cur_stop = _to_decimal(row.get("stop_price"))
+    tp = _to_decimal(row.get("take_profit_price"))
+    mark_n = _to_decimal(mark)
+    if (
+        tick_n is None
+        or entry is None
+        or cur_stop is None
+        or tp is None
+        or mark_n is None
+    ):
+        return None, None
+    if tp <= entry or mark_n <= entry or mark_n >= tp:
+        return None, None
+
+    progress = (mark_n - entry) / (tp - entry)
+    trig = (
+        trigger_pct
+        if trigger_pct is not None
+        else (_to_decimal(os.environ.get(RATCHET_TRIGGER_PCT_ENV)) or DEFAULT_RATCHET_TRIGGER_PCT)
+    )
+    if progress < trig:
+        return None, None
+
+    be_bps = (
+        breakeven_buffer_bps
+        if breakeven_buffer_bps is not None
+        else (_to_decimal(os.environ.get(BREAKEVEN_BUFFER_BPS_ENV)) or DEFAULT_BREAKEVEN_BUFFER_BPS)
+    )
+    trail_pct = (
+        trail_dist_pct
+        if trail_dist_pct is not None
+        else (_to_decimal(os.environ.get(TRAILING_DIST_PCT_ENV)) or DEFAULT_TRAILING_DIST_PCT)
+    )
+
+    be_stop = entry * (Decimal("1") + be_bps / Decimal("10000"))
+    trail_stop = mark_n * (Decimal("1") - trail_pct)
+    if trail_stop > be_stop:
+        raw_target = trail_stop
+        reason = "trailing_profit_ratchet"
+    else:
+        raw_target = be_stop
+        reason = "breakeven_ratchet"
+
+    aligned_stop = _align(raw_target, tick_n, ROUND_DOWN)
+    max_allowed = _align(mark_n - tick_n * Decimal("2"), tick_n, ROUND_DOWN)
+    if aligned_stop > max_allowed:
+        aligned_stop = max_allowed
+    if aligned_stop < cur_stop + tick_n * Decimal("2"):
+        return None, None
+
+    stop_str = _decimal_text(aligned_stop)
+    tp_str = _decimal_text(tp)
+    if protective_band_error(
+        stop_price=stop_str,
+        take_profit_price=tp_str,
+        mark=mark_n,
+        filters=filters,
+    ) is not None:
+        return None, None
+    return stop_str, reason

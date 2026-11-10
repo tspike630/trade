@@ -436,12 +436,13 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(INDICATORS_WEIGHT_FUNDING, 0.0)
         self.assertEqual(INDICATORS_WEIGHT_SENTIMENT, 0.0)
         root = Path(__file__).resolve().parents[1]
+        repo = root.parent
         watched = [
             root / "indicators" / "composite.py",
             root / "indicators" / "run.py",
-            root / "decision_engine" / "core" / "engine.py",
-            root / "review" / "factor_loop.py",
-            root / "review" / "gates.py",
+            repo / "decision_engine" / "core" / "engine.py",
+            repo / "review" / "factor_loop.py",
+            repo / "review" / "gates.py",
         ]
         for path in watched:
             text = path.read_text(encoding="utf-8")

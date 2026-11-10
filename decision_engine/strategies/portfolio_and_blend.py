@@ -29,7 +29,7 @@ from decision_engine.strategies.and_vol_climax_selfbuilt import (
 )
 from decision_engine.strategies.and_vol_climax_swing import evaluate_and_vol_climax_swing
 from decision_engine.strategies.base_strategy import BaseStrategy
-from decision_engine.strategies.entry_sizing import buy_size_fields
+from decision_engine.strategies.entry_sizing import tick_now, buy_size_fields
 
 log = get_logger("decision_engine.portfolio_and_blend")
 
@@ -95,7 +95,7 @@ class PortfolioAndBlendStrategy(BaseStrategy):
         self.rejected = {}
         self.sleeve_hits = {name: 0 for name, _ in SLEEVES}
         hot = data.get("hot_tokens") or []
-        now = datetime.now(timezone.utc)
+        now = tick_now(data)
         claimed: set[str] = set()
         emits = 0
 

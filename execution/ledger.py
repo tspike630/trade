@@ -899,6 +899,8 @@ class ExecutionLedger:
     _BINANCE_SPOT_MUTABLE = (
         "status",
         "quantity",
+        "stop_price",
+        "take_profit_price",
         "protection",
         "exit_order_id",
         "exit_reason",

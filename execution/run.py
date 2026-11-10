@@ -143,7 +143,7 @@ def _peer_isolation_guard(
             )
         purpose = next(iter(live))
         main_ledger = _default_main_ledger_path()
-        if ledger_path.resolve() == main_ledger:
+        if ledger_path.resolve() == main_ledger.resolve():
             return (
                 f"{purpose} requires an isolated --ledger "
                 f"(not shared {main_ledger.name})"
@@ -176,7 +176,7 @@ def _peer_isolation_guard(
             )
         return None
     main_ledger = _default_main_ledger_path()
-    if ledger_path.resolve() == main_ledger:
+    if ledger_path.resolve() == main_ledger.resolve():
         return (
             "peer mode requires isolated --ledger / EXECUTION_LEDGER_PATH "
             f"(not shared {main_ledger.name})"

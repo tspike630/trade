@@ -12,7 +12,7 @@ from typing import Any
 from logging_setup import get_logger
 
 from decision_engine.strategies.base_strategy import BaseStrategy
-from decision_engine.strategies.entry_sizing import buy_size_fields
+from decision_engine.strategies.entry_sizing import tick_now, buy_size_fields
 from decision_engine.strategies.selfbuilt_momentum_a import evaluate_candidate_a
 from decision_engine.strategies.vol_climax_mcap_band import evaluate_vol_climax_mcap_band
 
@@ -57,7 +57,7 @@ class AndVolClimaxSelfbuiltStrategy(BaseStrategy):
         self.rejected = {}
         hot = data.get("hot_tokens") or []
         hits = 0
-        now = datetime.now(timezone.utc)
+        now = tick_now(data)
         for row in hot:
             ok, why, extras = evaluate_and_vol_climax_selfbuilt(row, now=now)
             if not ok:

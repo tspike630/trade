@@ -15,9 +15,7 @@ CREATE TABLE IF NOT EXISTS binance_klines (
     quote_volume REAL,
     close_time_ms INTEGER NOT NULL,
     trades INTEGER,
-    -- Nullable. /api/v3/klines index 9 (taker buy base). Missing is unknown, not zero.
-    taker_buy_volume REAL,
-    -- Nullable. /api/v3/klines index 10 (taker buy quote). Missing is unknown, not zero.
+    taker_buy_base_volume REAL,
     taker_buy_quote_volume REAL,
     PRIMARY KEY (symbol, interval, open_time_ms)
 );
@@ -47,22 +45,13 @@ CREATE TABLE IF NOT EXISTS binance_indicators (
     boll_mid REAL,
     boll_lower REAL,
     quote_volume_24h REAL,
+    taker_buy_quote_volume REAL,
+    taker_buy_ratio REAL,
     sample_count INTEGER,
     kline_close_time_ms INTEGER,
     tier TEXT,
     tech_updated_at TEXT,
-    updated_at TEXT NOT NULL,
-    -- Read-only producer fields. NULL when the closed 5m history does not cover
-    -- the window. trade_size_ratio is already read by list_binance_hot_tokens
-    -- when the value is not NULL. See docs/binance_readonly_fields_2026-11-07.md.
-    change_7d REAL,
-    volume_7d_avg REAL,
-    taker_buy_quote_volume_5m REAL,
-    buy_ratio_5m REAL,
-    buy_ratio_1h REAL,
-    avg_trade_usd_5m REAL,
-    trade_size_ratio REAL,
-    lower_wick_ratio REAL
+    updated_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_binance_indicators_tech

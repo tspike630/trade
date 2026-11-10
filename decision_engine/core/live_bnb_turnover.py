@@ -45,6 +45,15 @@ from decision_engine import config as de_config
 from decision_engine.core.binance_indicators import binance_indicators_fresh_sec
 from decision_engine.core.bnb_native import load_trading_usdt_symbols
 from decision_engine.core.bnb_spot_map import classify_listed_symbol, default_listing_db_paths
+from decision_engine.core.multi_horizon_and_xs_regime import (
+    multi_horizon_regime_enabled,
+)
+from decision_engine.core.portfolio_clusters import (
+    cluster_cap_enabled,
+    cluster_exposure_key,
+    max_per_cluster_per_tick,
+    symbol_sector_cluster,
+)
 
 log = get_logger("decision_engine.live_bnb_turnover")
 
@@ -65,6 +74,7 @@ REASON_TURNOVER_INVALID = "turnover_invalid"
 REASON_TURNOVER_STALE = "turnover_stale"
 REASON_TURNOVER_TIME_MISSING = "turnover_time_missing"
 REASON_TURNOVER_BELOW = "turnover_below_min"
+REASON_CLUSTER_TICK_CAP = "cluster_tick_cap_exceeded"
 
 # Lower-cased. ``quoteVolume_24h`` is the production column. Generic
 # ``updated_at`` is not a collection time and does not qualify.
@@ -554,15 +564,18 @@ def stamp_turnover(signals: list[dict[str, Any]], hot: list[dict[str, Any]]) -> 
                 sig[key] = row.get(key)
 
 
-def _rank_key(sig: dict[str, Any]) -> tuple[bool, float, float, str]:
+def _rank_key(sig: dict[str, Any]) -> tuple[bool, float, float, float, str]:
+    alpha_score, alpha_bad = _finite_quote(sig.get("composite_alpha_score"))
+    if alpha_bad or not multi_horizon_regime_enabled():
+        alpha_score = None
     strength, invalid = _finite_quote(sig.get("volume_strength"))
     if invalid:
         strength = None
     turnover, _bad = _finite_quote(sig.get("quote_turnover_24h_usdt"))
     spot = _symbol_of(sig) or ""
     if strength is None:
-        return (True, 0.0, -(turnover or 0.0), spot)
-    return (False, -strength, -(turnover or 0.0), spot)
+        return (True, -(alpha_score or 0.0), 0.0, -(turnover or 0.0), spot)
+    return (False, -(alpha_score or 0.0), -strength, -(turnover or 0.0), spot)
 
 
 def _buy_still_valid(sig: dict[str, Any], *, now_ms: int, window_ms: int, floor: float) -> str | None:
@@ -594,12 +607,16 @@ def cap_live_bnb_buys(
 
     Ranking runs after eligibility, risk, and cooldown have already removed
     rows. A rejected or cooled-down name is not in ``signals`` and cannot take
-    the slot. Duplicate symbols keep the higher rank.
+    the slot. Duplicate symbols keep the higher rank. When
+    ``LIVE_BNB_CLUSTER_CAP_ENABLED=1``, correlated sector clusters are capped
+    at ``max_per_cluster_per_tick()`` (default 1) per tick.
     """
     clock = int(time_ms() if now_ms is None else now_ms)
     window_ms = turnover_fresh_ms()
     floor = min_quote_volume_usdt()
     limit = top_buys_per_tick()
+    enforce_cluster = cluster_cap_enabled()
+    cluster_limit = max_per_cluster_per_tick()
     reasons: Counter[str] = Counter()
     eligible: list[dict[str, Any]] = []
     for sig in signals:
@@ -613,10 +630,18 @@ def cap_live_bnb_buys(
     ranked = sorted(eligible, key=_rank_key)
     chosen: list[dict[str, Any]] = []
     seen: set[str] = set()
+    cluster_counts: Counter[str] = Counter()
     for sig in ranked:
         spot = _symbol_of(sig) or str(sig.get("token_address") or "")
         if spot in seen:
             continue
+        cluster = symbol_sector_cluster(spot)
+        if enforce_cluster and cluster != "idiosyncratic":
+            ckey = cluster_exposure_key(spot) or cluster
+            if cluster_counts[ckey] >= cluster_limit:
+                reasons[REASON_CLUSTER_TICK_CAP] += 1
+                continue
+            cluster_counts[ckey] += 1
         seen.add(spot)
         chosen.append(sig)
         if len(chosen) >= limit:

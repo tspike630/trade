@@ -32,8 +32,6 @@
 - `binance_klines`
 - `binance_indicators`
 
-只读列的口径见 `docs/binance_readonly_fields_2026-11-07.md`。`trade_size_ratio` 一旦是非空数，主分支现有扫描会把它送进入场；其余新列当前扫描不读。
-
 `INDICATORS_WEIGHT_*` 保持 0。不把 `local_score` 当入场门。不下单。
 
 ```bash

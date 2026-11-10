@@ -17,7 +17,7 @@ from typing import Any
 from logging_setup import get_logger
 
 from decision_engine.strategies.base_strategy import BaseStrategy
-from decision_engine.strategies.entry_sizing import buy_size_fields, pool_age_days
+from decision_engine.strategies.entry_sizing import tick_now, buy_size_fields, pool_age_days
 
 log = get_logger("decision_engine.vol_spike_entry")
 
@@ -109,7 +109,7 @@ class VolSpikeEntryStrategy(BaseStrategy):
         self.rejected = {}
         hot = data.get("hot_tokens") or []
         hits = 0
-        now = datetime.now(timezone.utc)
+        now = tick_now(data)
         for row in hot:
             ok, why, extras = evaluate_vol_spike(row, now=now)
             if not ok:

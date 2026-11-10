@@ -72,12 +72,19 @@ _OPTIONAL_COLS = (
     "kline_low",
     "low",
     "trade_size_ratio",
+    "taker_buy_ratio",
+    "taker_buy_quote_volume",
+    "taker_buy_base_volume",
     "avg_trade_size",
     "avg_trade_size_24h",
     "bar_quote_volume",
     "bar_trades",
     "baseline_quote_volume",
     "baseline_trades",
+    "funding_rate",
+    "funding_z",
+    "open_interest_change_1h",
+    "perp_basis_bps",
 )
 
 

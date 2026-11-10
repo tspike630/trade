@@ -432,15 +432,22 @@ class HistoryReplay:
             pts = pair_pts.get(key)
             if not pts:
                 return None, None
+            best_before_px, best_before_liq, best_before_dt = None, None, None
             best_px, best_liq, best_abs = None, None, None
             for pdt, px, liq in pts:
                 d = abs((pdt - target).total_seconds())
                 if d > self.price_tol_sec:
                     continue
+                if pdt <= target and (best_before_dt is None or pdt >= best_before_dt):
+                    best_before_dt = pdt
+                    best_before_px = px
+                    best_before_liq = liq
                 if best_abs is None or d < best_abs:
                     best_abs = d
                     best_px = px
                     best_liq = liq
+            if best_before_px is not None:
+                return best_before_px, best_before_liq
             return best_px, best_liq
 
         for bar_ts in bar_order:
