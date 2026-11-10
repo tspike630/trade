@@ -30,8 +30,10 @@ PYTHONPATH=. python -m indicators.binance_spot_1h_klines --once --db dexscreener
 PYTHONPATH=. python -m indicators.binance_spot_1h_klines --loop --sleep-sec 300 --db dexscreener.db
 ```
 
-``BINANCE_SPOT_UNIVERSE_DB`` still wins when it is set. This module does not
-change the 5m wrapper that already exports that variable.
+``BINANCE_SPOT_UNIVERSE_DB`` still wins when it is set, and it is the only
+file read. After the first existing candidate is chosen, a later missing,
+unreadable, or empty file fails that round. The loop does not open the next
+candidate. This module does not change the 5m wrapper.
 
 ``--db`` is the indicator sqlite that already holds ``binance_klines``.
 One process holds ``<db>.binance-1h-klines.lock``. A second start exits 3.
@@ -42,11 +44,13 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import math
 import os
 import sqlite3
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -58,8 +62,9 @@ from indicators.binance_spot import (
     fetch_json,
     filter_universe,
     kline_url,
-    load_primary_universe,
     parse_kline_row,
+    symbols_from_connection,
+    symbols_from_json,
     upsert_klines,
 )
 
@@ -253,10 +258,83 @@ def hourly_universe_paths(module_file: Path | None = None) -> list[Path]:
     return unique
 
 
+class UniverseSourceError(RuntimeError):
+    """The already selected universe file cannot be used this round."""
+
+
+def authoritative_universe_path(module_file: Path | None = None) -> Path | None:
+    """Pick the universe file once. A set env path wins even when it is absent.
+
+    Later candidates are only for layout discovery: a missing flattened file
+    may fall through to the repo checkout. An existing file is the selection,
+    including when it is unreadable or empty.
+    """
+    env_db = os.environ.get("BINANCE_SPOT_UNIVERSE_DB", "").strip()
+    if env_db:
+        return Path(env_db)
+    for path in hourly_universe_paths(module_file):
+        if path.is_file():
+            return path
+    return None
+
+
+def _symbols_from_sqlite_strict(path: Path) -> list[SpotSymbol]:
+    """Read one sqlite universe. A malformed file raises instead of looking empty."""
+    uri = "file:" + urllib.parse.quote(path.resolve().as_posix(), safe="/") + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    try:
+        conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+        return symbols_from_connection(conn)
+    finally:
+        conn.close()
+
+
+def read_selected_universe(path: Path) -> tuple[list[SpotSymbol], Path]:
+    """Read ``path`` only. Missing, unreadable, and empty are failures."""
+    if not path.is_file():
+        raise UniverseSourceError(f"universe_missing:{path}")
+    try:
+        if path.suffix.lower() == ".json":
+            rows = symbols_from_json(path)
+        else:
+            rows = _symbols_from_sqlite_strict(path)
+    except (OSError, sqlite3.Error, json.JSONDecodeError, UnicodeError, ValueError) as exc:
+        raise UniverseSourceError(
+            f"universe_read_error:{type(exc).__name__}:{exc}:{path}"
+        ) from exc
+    if not rows:
+        raise UniverseSourceError(f"universe_empty:{path}")
+    return rows, path
+
+
+class StickyHourlyUniverse:
+    """Re-read the selected universe file. Do not switch to another candidate."""
+
+    def __init__(self, module_file: Path | None = None) -> None:
+        self.module_file = module_file
+        self.path: Path | None = None
+
+    def __call__(self) -> tuple[list[SpotSymbol], Path | None]:
+        env_db = os.environ.get("BINANCE_SPOT_UNIVERSE_DB", "").strip()
+        if env_db:
+            self.path = Path(env_db)
+        elif self.path is None:
+            self.path = authoritative_universe_path(self.module_file)
+        if self.path is None:
+            raise UniverseSourceError("universe_unavailable")
+        return read_selected_universe(self.path)
+
+
 def load_hourly_universe(
     module_file: Path | None = None,
 ) -> tuple[list[SpotSymbol], Path | None]:
-    return load_primary_universe(hourly_universe_paths(module_file))
+    path = authoritative_universe_path(module_file)
+    if path is None:
+        return [], None
+    try:
+        return read_selected_universe(path)
+    except UniverseSourceError:
+        return [], None
 
 
 def acquire_hourly_lock(db_path: Path):
@@ -286,6 +364,8 @@ def _round_symbols(
         return list(symbols), [], len(symbols)
     try:
         rows, source = universe_loader()
+    except UniverseSourceError as exc:
+        return [], [{"symbol": "*", "error": str(exc)}], None
     except Exception as exc:  # noqa: BLE001 — do not keep the previous round's names
         return [], [{"symbol": "*", "error": f"universe_read_error:{type(exc).__name__}:{exc}"}], None
     if source is None:
@@ -413,7 +493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         loop=bool(args.loop),
         sleep_sec=int(args.sleep_sec),
         max_rounds=int(args.max_rounds),
-        universe_loader=load_hourly_universe,
+        universe_loader=StickyHourlyUniverse(),
         symbol_allow=allow,
     )
 
