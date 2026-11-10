@@ -1,4 +1,4 @@
-"""Hourly USDT quote volume_z: source bars, storage, reader, and the live tick."""
+"""Synthetic Binance-shaped 1h bars for volume_z. Not the box database."""
 
 from __future__ import annotations
 
@@ -67,6 +67,78 @@ def _series(current: float, *, extra: list | None = None) -> list:
     if extra:
         rows.extend(extra)
     return rows
+
+
+class SourceShapeTests(unittest.TestCase):
+    """Synthetic fixtures. Each case is a Binance kline array, not a stored z row."""
+
+    def test_gap_duplicate_conflict_and_out_of_order(self) -> None:
+        now_ms = _closed_now(VOLUME_Z_BASELINE_BARS)
+        intact = compute_volume_z(_series(1000.0), now_ms=now_ms)
+        self.assertIsNotNone(intact)
+        gapped = [_bar(index, 100.0) for index in range(22) if index != 10]
+        self.assertIsNone(compute_volume_z(gapped, now_ms=_closed_now(21)))
+        shuffled = list(_series(1000.0))
+        shuffled.reverse()
+        self.assertEqual(compute_volume_z(shuffled, now_ms=now_ms), intact)
+        conflicted = _series(1000.0) + [_bar(VOLUME_Z_BASELINE_BARS, 5.0)]
+        self.assertIsNone(compute_volume_z(conflicted, now_ms=now_ms))
+        identical = _series(1000.0) + [_bar(3, _BASELINE[3])]
+        self.assertEqual(compute_volume_z(identical, now_ms=now_ms), intact)
+
+    def test_newest_invalid_bar_does_not_keep_an_older_window(self) -> None:
+        now_ms = _closed_now(VOLUME_Z_BASELINE_BARS)
+        rows = _series(1000.0)
+        rows[-1][7] = -1.0
+        self.assertIsNone(compute_volume_z(rows, now_ms=now_ms))
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(Path(tmp) / "z.db")
+            _insert_klines(conn, "FADEUSDT", _series(1000.0))
+            self.assertIsNotNone(
+                refresh_volume_z_from_klines(conn, now_ms=now_ms, symbols=["FADEUSDT"])
+            )
+            conn.execute(
+                "UPDATE binance_klines SET quote_volume = -1 WHERE open_time_ms = ?",
+                (_START + VOLUME_Z_BASELINE_BARS * _HOUR_MS,),
+            )
+            conn.commit()
+            again = refresh_volume_z_from_klines(conn, now_ms=now_ms, symbols=["FADEUSDT"])
+            self.assertEqual(again, [])
+            left = conn.execute("SELECT COUNT(*) FROM decision_volume_z").fetchone()
+            self.assertEqual(int(left[0]), 0)
+            stamped = attach_stored_volume_z(
+                conn, [{"binance_symbol": "FADEUSDT"}], now_ms=now_ms
+            )
+            self.assertNotIn("volume_z", stamped[0])
+            conn.close()
+
+    def test_next_hour_boundary_uses_the_newly_closed_bar(self) -> None:
+        previous_close = _closed_now(VOLUME_Z_BASELINE_BARS)
+        newer = _bar(VOLUME_Z_MIN_CLOSED_BARS, 50.0)
+        rows = _series(1000.0) + [newer]
+        still_open = compute_volume_z(rows, now_ms=newer[6] - 1)
+        just_closed = compute_volume_z(rows, now_ms=newer[6])
+        assert still_open is not None and just_closed is not None
+        self.assertEqual(still_open[2], previous_close)
+        self.assertEqual(just_closed[2], newer[6])
+        self.assertNotEqual(still_open[0], just_closed[0])
+
+    def test_reader_rejects_a_stored_row_that_does_not_match_source(self) -> None:
+        now_ms = _closed_now(VOLUME_Z_BASELINE_BARS)
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(Path(tmp) / "z.db")
+            _insert_klines(conn, "FADEUSDT", _series(1000.0))
+            record = write_symbol_volume_z(conn, "FADEUSDT", _series(1000.0), now_ms=now_ms)
+            self.assertIsNotNone(record)
+            conn.execute(
+                "UPDATE decision_volume_z SET contract_version = 'other', volume_z = 99"
+            )
+            conn.commit()
+            stamped = attach_stored_volume_z(
+                conn, [{"binance_symbol": "FADEUSDT"}], now_ms=now_ms
+            )
+            self.assertNotIn("volume_z", stamped[0])
+            conn.close()
 
 
 class ComputeContractTests(unittest.TestCase):
@@ -251,8 +323,8 @@ class StorageAndTickTests(unittest.TestCase):
             wall = int(time.time() * 1000)
             shifted_reject = _shift(reject_rows, wall)
             shifted_allow = _shift(allow_rows, wall)
-            write_symbol_volume_z(reject_conn, "FADEUSDT", shifted_reject, now_ms=wall)
-            write_symbol_volume_z(allow_conn, "FADEUSDT", shifted_allow, now_ms=wall)
+            _insert_klines(reject_conn, "FADEUSDT", shifted_reject)
+            _insert_klines(allow_conn, "FADEUSDT", shifted_allow)
             reject_conn.close()
             allow_conn.close()
             rejected = self._tick(reject_db)
@@ -276,6 +348,8 @@ class StorageAndTickTests(unittest.TestCase):
         now_ms = _closed_now(VOLUME_Z_BASELINE_BARS)
         with tempfile.TemporaryDirectory() as tmp:
             conn = sqlite3.connect(Path(tmp) / "z.db")
+            _ensure_kline_table(conn)
+            _insert_klines(conn, "FADEUSDT", _series(1000.0))
             record = write_symbol_volume_z(conn, "FADEUSDT", _series(1000.0), now_ms=now_ms)
             self.assertIsNotNone(record)
             rows = [{"binance_symbol": "FADEUSDT", "volume_strength": 9.0}]
@@ -286,14 +360,10 @@ class StorageAndTickTests(unittest.TestCase):
             stale_rows = [{"binance_symbol": "FADEUSDT", "volume_strength": 9.0}]
             stale = attach_stored_volume_z(conn, stale_rows, now_ms=stale_clock)
             self.assertNotIn("volume_z", stale[0])
-            conn.execute(
-                """
-                CREATE TABLE binance_klines (
-                    symbol TEXT, interval TEXT, open_time_ms INTEGER,
-                    quote_volume REAL, close_time_ms INTEGER
-                )
-                """
+            boundary = attach_stored_volume_z(
+                conn, [{"binance_symbol": "FADEUSDT"}], now_ms=now_ms + 3_600_000
             )
+            self.assertIn("volume_z", boundary[0])
             for index, quote in enumerate(_BASELINE + [1000.0]):
                 opened = _START + index * _HOUR_MS
                 conn.execute(
@@ -312,6 +382,28 @@ class StorageAndTickTests(unittest.TestCase):
             self.assertAlmostEqual(written[0].volume_z, direct[0], places=9)
             self.assertAlmostEqual(written[0].baseline_mean, direct[4], places=9)
             conn.close()
+
+
+def _ensure_kline_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS binance_klines (
+            symbol TEXT, interval TEXT, open_time_ms INTEGER,
+            quote_volume REAL, close_time_ms INTEGER
+        )
+        """
+    )
+
+
+def _insert_klines(conn: sqlite3.Connection, symbol: str, rows: list) -> None:
+    """Store synthetic source rows the way binance_klines keeps 1h bars."""
+    _ensure_kline_table(conn)
+    for row in rows:
+        conn.execute(
+            "INSERT INTO binance_klines VALUES (?, '1h', ?, ?, ?)",
+            (symbol, row[0], row[7], row[6]),
+        )
+    conn.commit()
 
 
 def _shift(rows: list, close_ms: int) -> list:

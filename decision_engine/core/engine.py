@@ -23,7 +23,10 @@ from decision_engine.core.live_bnb_turnover import (
     stamp_turnover,
 )
 from decision_engine.core.live_buy_guards import apply_live_buy_guards
-from decision_engine.core.volume_z_1h import attach_stored_volume_z
+from decision_engine.core.volume_z_1h import (
+    attach_stored_volume_z,
+    persist_volume_z_for_decision_tick,
+)
 from decision_engine.core.macro_circuit_breaker import (
     evaluate_macro_gate,
     resolve_macro_db_path,
@@ -252,6 +255,7 @@ class DecisionEngine:
                 apply_five_state_regime_router,
             )
 
+            persist_volume_z_for_decision_tick(self.adapter.db_path, now_ms=now_ms)
             hot = attach_stored_volume_z(self.adapter.conn, hot, now_ms=now_ms)
             passed, _ = apply_five_state_regime_router(
                 passed,

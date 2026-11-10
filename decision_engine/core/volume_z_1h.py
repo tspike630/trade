@@ -11,16 +11,26 @@ The stored key is ``volume_z``. ``vol_z_1h`` is the only read alias, and
 only when that same key is already on a row. ``volume_strength``,
 ``quote_volume_24h``, and ``orderbook_imbalance_20`` are not this series.
 ``obi_top5`` is not computed here.
+
+The only writer is ``persist_volume_z_for_decision_tick``, called from the
+decision tick and from ``python -m decision_engine.core.volume_z_1h --db``.
+It reads ``binance_klines`` where ``interval = '1h'`` in that same SQLite
+file. It does not fetch and it does not start a collector loop. The latest
+21 closed bars must be consecutive hours. A gap, a conflicting duplicate
+hour, or an invalid newest quote deletes any previous ``volume_z``.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Sequence
 
-from decision_engine.core.binance_indicators import binance_indicators_fresh_sec
+log = logging.getLogger("decision_engine.volume_z_1h")
 
 VOLUME_Z_CONTRACT_VERSION = "hourly_usdt_quote_v1"
 VOLUME_Z_INTERVAL = "1h"
@@ -77,29 +87,36 @@ def _sample_std(values: Sequence[float]) -> float | None:
     return std
 
 
-def _parse_source_bar(item: object) -> tuple[int, int, float] | None:
-    """Return ``(open_ms, close_ms, quote_volume)`` for one 1h source bar."""
+def _raw_times_and_quote(item: object) -> tuple[int, int, float | None] | None:
+    """Split one source row into open, close, and quote.
+
+    ``quote is None`` means the timestamps are a closed 1h bar but the quote
+    volume is missing, negative, or non-finite. A row that is not a 1h bar
+    returns ``None`` and is ignored.
+    """
     if isinstance(item, (list, tuple)):
-        if len(item) <= _QUOTE_VOLUME_INDEX:
+        if len(item) <= _CLOSE_TIME_INDEX:
             return None
         open_ms = _finite(item[_OPEN_TIME_INDEX])
         close_ms = _finite(item[_CLOSE_TIME_INDEX])
-        quote = _finite(item[_QUOTE_VOLUME_INDEX])
+        quote = _finite(item[_QUOTE_VOLUME_INDEX]) if len(item) > _QUOTE_VOLUME_INDEX else None
     elif isinstance(item, dict):
         open_ms = _finite(item.get("open_time_ms"))
         close_ms = _finite(item.get("close_time_ms"))
         quote = _finite(item.get("quote_volume"))
     else:
         return None
-    if open_ms is None or close_ms is None or quote is None:
-        return None
-    if quote < 0:
+    if open_ms is None or close_ms is None:
         return None
     open_i = int(open_ms)
     close_i = int(close_ms)
     if close_i - open_i != _BINANCE_CLOSE_SPAN_MS:
         return None
-    return open_i, close_i, quote
+    if quote is None or quote < 0:
+        quote_out: float | None = None
+    else:
+        quote_out = quote
+    return open_i, close_i, quote_out
 
 
 def compute_volume_z(
@@ -109,26 +126,42 @@ def compute_volume_z(
 ) -> tuple[float, int, int, float, float, float] | None:
     """Compute the z-score. ``None`` means do not store a value.
 
+    The latest 21 closed 1h bars must be consecutive (open times exactly one
+    hour apart). The current bar is excluded from the baseline. An invalid
+    newest closed bar does not fall back to an older window.
+
     The returned tuple is ``(volume_z, open_ms, close_ms, current_quote,
     baseline_mean, baseline_std)``.
     """
-    parsed = [bar for item in source_rows if (bar := _parse_source_bar(item)) is not None]
-    closed = [bar for bar in parsed if bar[1] <= int(now_ms)]
-    by_open: dict[int, tuple[int, int, float]] = {}
-    for bar in closed:
-        previous = by_open.get(bar[0])
-        if previous is None or bar[1] >= previous[1]:
-            by_open[bar[0]] = bar
-    ordered = sorted(by_open.values(), key=lambda bar: (bar[1], bar[0]))
+    by_open: dict[int, tuple[int, int, float | None]] = {}
+    for item in source_rows:
+        parsed = _raw_times_and_quote(item)
+        if parsed is None or parsed[1] > int(now_ms):
+            continue
+        previous = by_open.get(parsed[0])
+        if previous is None:
+            by_open[parsed[0]] = parsed
+            continue
+        if previous[2] is None or parsed[2] is None or previous[2] != parsed[2]:
+            by_open[parsed[0]] = (parsed[0], max(previous[1], parsed[1]), None)
+            continue
+        if parsed[1] >= previous[1]:
+            by_open[parsed[0]] = parsed
+    ordered = sorted(by_open.values(), key=lambda bar: bar[0])
+    if not ordered or ordered[-1][2] is None:
+        return None
     if len(ordered) < VOLUME_Z_MIN_CLOSED_BARS:
         return None
-    current = ordered[-1]
-    baseline = ordered[-(VOLUME_Z_MIN_CLOSED_BARS):-1]
-    if len(baseline) != VOLUME_Z_BASELINE_BARS:
+    window = ordered[-VOLUME_Z_MIN_CLOSED_BARS :]
+    for older, newer in zip(window, window[1:]):
+        if newer[0] - older[0] != _HOUR_MS or older[2] is None or newer[2] is None:
+            return None
+    current = window[-1]
+    baseline = window[:-1]
+    assert current[2] is not None
+    quotes = [float(bar[2]) for bar in baseline if bar[2] is not None]
+    if len(quotes) != VOLUME_Z_BASELINE_BARS:
         return None
-    if any(bar[1] >= current[1] for bar in baseline):
-        return None
-    quotes = [bar[2] for bar in baseline]
     std = _sample_std(quotes)
     if std is None:
         return None
@@ -235,6 +268,10 @@ def refresh_volume_z_from_klines(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'binance_klines'"
     ).fetchone()
     if present is None:
+        _ensure_table(conn)
+        if symbols is None:
+            conn.execute(f"DELETE FROM {_TABLE}")
+            conn.commit()
         return []
     if symbols is None:
         found = conn.execute(
@@ -266,11 +303,50 @@ def refresh_volume_z_from_klines(
         record = write_symbol_volume_z(conn, symbol, source, now_ms=now_ms)
         if record is not None:
             written.append(record)
+    if symbols is None:
+        keep = {item.upper() for item in chosen}
+        _ensure_table(conn)
+        stored_symbols = [
+            str(row[0]) for row in conn.execute(f"SELECT symbol FROM {_TABLE}").fetchall()
+        ]
+        for symbol in stored_symbols:
+            if symbol.upper() not in keep:
+                conn.execute(f"DELETE FROM {_TABLE} WHERE symbol = ?", (symbol,))
+        conn.commit()
     return written
 
 
+def persist_volume_z_for_decision_tick(db_path: Path, *, now_ms: int) -> None:
+    """One writer: the decision tick, not a second kline collector.
+
+    Opens a short read-write connection to the same SQLite the indicator
+    reader already uses. Writes only ``decision_volume_z``. Does not fetch
+    candles and does not update ``binance_indicators`` or ``binance_klines``.
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        return
+    conn = sqlite3.connect(str(path), timeout=10.0)
+    try:
+        refresh_volume_z_from_klines(conn, now_ms=now_ms)
+    except sqlite3.Error as exc:
+        log.warning("volume_z persist skipped path=%s err=%s", path, exc)
+    finally:
+        conn.close()
+
+
+def _fresh_window_ms() -> int:
+    """Same window as ``binance_indicators_fresh_sec``. 0 disables the cutoff."""
+    raw = os.environ.get("BINANCE_INDICATORS_FRESH_SEC", "3600")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        value = 3600
+    return (value if value > 0 else 0) * 1000
+
+
 def _fresh(close_ms: int, now_ms: int) -> bool:
-    window_ms = binance_indicators_fresh_sec() * 1000
+    window_ms = _fresh_window_ms()
     age = int(now_ms) - int(close_ms)
     if age < 0:
         return False
@@ -297,8 +373,10 @@ def attach_stored_volume_z(
     try:
         cursor = conn.execute(
             f"""
-            SELECT symbol, volume_z, interval, quote_asset, source_close_time_ms,
-                   baseline_count, contract_version, baseline_std
+            SELECT symbol, volume_z, interval, quote_asset,
+                   source_open_time_ms, source_close_time_ms,
+                   current_quote_volume, baseline_count, baseline_mean,
+                   baseline_std, contract_version
             FROM {_TABLE}
             """
         )
@@ -314,19 +392,87 @@ def attach_stored_volume_z(
         saved = stored.get(symbol)
         if saved is None:
             continue
-        score = _finite(saved["volume_z"])
-        std = _finite(saved["baseline_std"])
-        close_ms = saved["source_close_time_ms"]
-        if (
-            score is None
-            or std is None
-            or std <= 0
-            or str(saved["interval"]) != VOLUME_Z_INTERVAL
-            or str(saved["quote_asset"]) != VOLUME_Z_QUOTE_ASSET
-            or str(saved["contract_version"]) != VOLUME_Z_CONTRACT_VERSION
-            or int(saved["baseline_count"]) != VOLUME_Z_BASELINE_BARS
-            or not _fresh(int(close_ms), now_ms)
-        ):
+        if not _stored_matches_source(conn, symbol, saved, now_ms=now_ms):
             continue
-        candidate[VOLUME_Z_KEY] = score
+        candidate[VOLUME_Z_KEY] = _finite(saved["volume_z"])
     return rows
+
+
+def _stored_matches_source(
+    conn: sqlite3.Connection,
+    symbol: str,
+    saved: dict[str, Any],
+    *,
+    now_ms: int,
+) -> bool:
+    """Require version, freshness, and a recompute that matches the stored bar."""
+    score = _finite(saved.get("volume_z"))
+    std = _finite(saved.get("baseline_std"))
+    close_ms = saved.get("source_close_time_ms")
+    if (
+        score is None
+        or std is None
+        or std <= 0
+        or close_ms is None
+        or str(saved.get("interval") or "") != VOLUME_Z_INTERVAL
+        or str(saved.get("quote_asset") or "") != VOLUME_Z_QUOTE_ASSET
+        or str(saved.get("contract_version") or "") != VOLUME_Z_CONTRACT_VERSION
+        or int(saved.get("baseline_count") or 0) != VOLUME_Z_BASELINE_BARS
+        or not _fresh(int(close_ms), now_ms)
+    ):
+        return False
+    present = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'binance_klines'"
+    ).fetchone()
+    if present is None:
+        return False
+    try:
+        source_rows = conn.execute(
+            """
+            SELECT open_time_ms, close_time_ms, quote_volume
+            FROM binance_klines
+            WHERE symbol = ? AND interval = ?
+            """,
+            (symbol, VOLUME_Z_INTERVAL),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    source = [
+        {"open_time_ms": row[0], "close_time_ms": row[1], "quote_volume": row[2]}
+        for row in source_rows
+    ]
+    computed = compute_volume_z(source, now_ms=now_ms)
+    if computed is None:
+        return False
+    got, open_ms, recomputed_close, current_quote, mean, recomputed_std = computed
+    return (
+        int(saved.get("source_open_time_ms") or -1) == open_ms
+        and int(close_ms) == recomputed_close
+        and math.isclose(score, got, rel_tol=0.0, abs_tol=1e-9)
+        and math.isclose(float(saved.get("current_quote_volume") or -1), current_quote, rel_tol=0.0, abs_tol=1e-9)
+        and math.isclose(float(saved.get("baseline_mean") or -1), mean, rel_tol=0.0, abs_tol=1e-9)
+        and math.isclose(std, recomputed_std, rel_tol=0.0, abs_tol=1e-9)
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """One-shot writer. The decision tick calls the same persist function.
+
+    ``python -m decision_engine.core.volume_z_1h --db <indicator.sqlite>``
+    Does not fetch and does not place orders. ``--db`` is required.
+    This module does not import crawler config, so it does not load ``.env``.
+    """
+    import argparse
+    import time
+
+    parser = argparse.ArgumentParser(description="Persist decision_volume_z from 1h binance_klines")
+    parser.add_argument("--db", required=True)
+    parser.add_argument("--now-ms", type=int, default=0)
+    args = parser.parse_args(argv)
+    now_ms = int(args.now_ms) if args.now_ms else int(time.time() * 1000)
+    persist_volume_z_for_decision_tick(Path(args.db), now_ms=now_ms)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
