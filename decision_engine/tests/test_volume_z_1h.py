@@ -22,6 +22,7 @@ from decision_engine.core.volume_z_1h import (
     VOLUME_Z_MIN_CLOSED_BARS,
     attach_stored_volume_z,
     compute_volume_z,
+    inspect_volume_z,
     refresh_volume_z_from_klines,
     write_symbol_volume_z,
 )
@@ -78,6 +79,10 @@ class SourceShapeTests(unittest.TestCase):
         self.assertIsNotNone(intact)
         gapped = [_bar(index, 100.0) for index in range(22) if index != 10]
         self.assertIsNone(compute_volume_z(gapped, now_ms=_closed_now(21)))
+        self.assertEqual(
+            inspect_volume_z(gapped, now_ms=_closed_now(21))["status"],
+            "latest_21_not_consecutive",
+        )
         shuffled = list(_series(1000.0))
         shuffled.reverse()
         self.assertEqual(compute_volume_z(shuffled, now_ms=now_ms), intact)

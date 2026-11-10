@@ -119,20 +119,11 @@ def _raw_times_and_quote(item: object) -> tuple[int, int, float | None] | None:
     return open_i, close_i, quote_out
 
 
-def compute_volume_z(
+def _closed_hours(
     source_rows: Sequence[object],
     *,
     now_ms: int,
-) -> tuple[float, int, int, float, float, float] | None:
-    """Compute the z-score. ``None`` means do not store a value.
-
-    The latest 21 closed 1h bars must be consecutive (open times exactly one
-    hour apart). The current bar is excluded from the baseline. An invalid
-    newest closed bar does not fall back to an older window.
-
-    The returned tuple is ``(volume_z, open_ms, close_ms, current_quote,
-    baseline_mean, baseline_std)``.
-    """
+) -> list[tuple[int, int, float | None]]:
     by_open: dict[int, tuple[int, int, float | None]] = {}
     for item in source_rows:
         parsed = _raw_times_and_quote(item)
@@ -147,29 +138,82 @@ def compute_volume_z(
             continue
         if parsed[1] >= previous[1]:
             by_open[parsed[0]] = parsed
-    ordered = sorted(by_open.values(), key=lambda bar: bar[0])
-    if not ordered or ordered[-1][2] is None:
-        return None
+    return sorted(by_open.values(), key=lambda bar: bar[0])
+
+
+def inspect_volume_z(
+    source_rows: Sequence[object],
+    *,
+    now_ms: int,
+) -> dict[str, Any]:
+    """Explain one symbol. ``status=ready`` is the only case that stores a value."""
+    ordered = _closed_hours(source_rows, now_ms=now_ms)
+    base = {
+        "closed_hours": len(ordered),
+        "volume_z": None,
+        "source_open_time_ms": None,
+        "source_close_time_ms": None,
+        "current_quote_volume": None,
+        "baseline_mean": None,
+        "baseline_std": None,
+    }
+    if not ordered:
+        return {**base, "status": "no_closed_1h_bar"}
+    if ordered[-1][2] is None:
+        return {**base, "status": "newest_closed_bar_invalid"}
     if len(ordered) < VOLUME_Z_MIN_CLOSED_BARS:
-        return None
+        return {**base, "status": "fewer_than_21_closed_hours"}
     window = ordered[-VOLUME_Z_MIN_CLOSED_BARS :]
     for older, newer in zip(window, window[1:]):
         if newer[0] - older[0] != _HOUR_MS or older[2] is None or newer[2] is None:
-            return None
+            return {**base, "status": "latest_21_not_consecutive"}
     current = window[-1]
-    baseline = window[:-1]
-    assert current[2] is not None
-    quotes = [float(bar[2]) for bar in baseline if bar[2] is not None]
-    if len(quotes) != VOLUME_Z_BASELINE_BARS:
-        return None
+    quotes = [float(bar[2]) for bar in window[:-1]]
     std = _sample_std(quotes)
     if std is None:
-        return None
+        return {**base, "status": "zero_or_nonfinite_std"}
     mean = sum(quotes) / len(quotes)
+    assert current[2] is not None
     score = (current[2] - mean) / std
     if not math.isfinite(score):
+        return {**base, "status": "nonfinite_score"}
+    return {
+        **base,
+        "status": "ready",
+        "volume_z": score,
+        "source_open_time_ms": current[0],
+        "source_close_time_ms": current[1],
+        "current_quote_volume": current[2],
+        "baseline_mean": mean,
+        "baseline_std": std,
+    }
+
+
+def compute_volume_z(
+    source_rows: Sequence[object],
+    *,
+    now_ms: int,
+) -> tuple[float, int, int, float, float, float] | None:
+    """Compute the z-score. ``None`` means do not store a value.
+
+    The latest 21 closed 1h bars must be consecutive (open times exactly one
+    hour apart). The current bar is excluded from the baseline. An invalid
+    newest closed bar does not fall back to an older window.
+
+    The returned tuple is ``(volume_z, open_ms, close_ms, current_quote,
+    baseline_mean, baseline_std)``.
+    """
+    found = inspect_volume_z(source_rows, now_ms=now_ms)
+    if found["status"] != "ready":
         return None
-    return score, current[0], current[1], current[2], mean, std
+    return (
+        float(found["volume_z"]),
+        int(found["source_open_time_ms"]),
+        int(found["source_close_time_ms"]),
+        float(found["current_quote_volume"]),
+        float(found["baseline_mean"]),
+        float(found["baseline_std"]),
+    )
 
 
 def _ensure_table(conn: sqlite3.Connection) -> None:
@@ -343,6 +387,17 @@ def _fresh_window_ms() -> int:
     except (TypeError, ValueError):
         value = 3600
     return (value if value > 0 else 0) * 1000
+
+
+def source_close_is_fresh(close_ms: int, now_ms: int) -> bool:
+    """True when the source close is inside the indicator freshness window.
+
+    The window is ``BINANCE_INDICATORS_FRESH_SEC`` (default 3600 seconds),
+    inclusive. A consecutive 1h series switches to the new bar at its close
+    timestamp, so the previous bar is not asked to stay fresh for a second
+    hour. Age ``3600000`` still passes. Age ``3600001`` does not.
+    """
+    return _fresh(close_ms, now_ms)
 
 
 def _fresh(close_ms: int, now_ms: int) -> bool:
