@@ -4,7 +4,8 @@ News sidechannel — low-cost RSS observe-only pipeline.
 Strictly parallel to JEV / decision / paper / live:
   - writes ONLY to independent news_events.db (never dexscreener.db)
   - never touches decision_log, jev_signals, paper/live ledgers
-  - onchain_status stays pending/none until a future verifier runs
+  - ingest still writes onchain_status=pending; the read-only verifier
+    does not relabel a row until a calibrated config exists
 
 CLI:
   python -m sources.news --once
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -37,8 +39,26 @@ except ImportError:  # pragma: no cover
 
 log = get_logger("sources.news")
 
-_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DB_PATH = str(_ROOT / "news_events.db")
+
+def repo_root() -> Path:
+    """Repository root for both ``sources/news.py`` and ``crawler/sources/news.py``."""
+    here = Path(__file__).resolve()
+    for candidate in here.parents:
+        if (candidate / "decision_engine").is_dir() and (candidate / "AGENTS.md").is_file():
+            return candidate
+    return here.parents[1]
+
+
+def default_db_path() -> str:
+    """``NEWS_EVENTS_DB_PATH`` or ``<repo>/news_events.db``. Never the crawler package dir."""
+    env = os.environ.get("NEWS_EVENTS_DB_PATH", "").strip()
+    if env:
+        return env
+    return str(repo_root() / "news_events.db")
+
+
+_ROOT = repo_root()
+DEFAULT_DB_PATH = default_db_path()
 
 # ---------------------------------------------------------------------------
 # Source tiers (hardcoded table; override via --sources / env later)
@@ -83,6 +103,20 @@ SOURCE_CATALOG: list[dict[str, Any]] = [
         "name": "Decrypt",
         "tier": TIER_WHITELIST,
         "url": "https://decrypt.co/feed",
+        "enabled": True,
+    },
+    {
+        "id": "fed_monetary",
+        "name": "Federal Reserve Monetary Policy",
+        "tier": TIER_WHITELIST,
+        "url": "https://www.federalreserve.gov/feeds/press_monetary.xml",
+        "enabled": True,
+    },
+    {
+        "id": "fed_speeches",
+        "name": "Federal Reserve Speeches",
+        "tier": TIER_WHITELIST,
+        "url": "https://www.federalreserve.gov/feeds/speeches.xml",
         "enabled": True,
     },
     # Rumor / lower-confidence — observe only; never promote without on-chain align
@@ -396,7 +430,7 @@ def fetch_feed(
 
 def run_once(
     *,
-    db_path: str = DEFAULT_DB_PATH,
+    db_path: str | None = None,
     source_ids: Optional[list[str]] = None,
     timeout_sec: float = REQUEST_TIMEOUT_SEC,
 ) -> dict[str, Any]:
@@ -404,6 +438,8 @@ def run_once(
     Pull all enabled feeds once; upsert into news_events.
     Returns summary stats. Never writes trading signals.
     """
+    if not db_path:
+        db_path = default_db_path()
     sources = enabled_sources(source_ids)
     fetched_at = utc_now_iso()
     stats: dict[str, Any] = {
@@ -464,8 +500,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--db",
-        default=DEFAULT_DB_PATH,
-        help=f"SQLite path (default {DEFAULT_DB_PATH}; independent of dexscreener.db)",
+        default=None,
+        help="SQLite path (default NEWS_EVENTS_DB_PATH or <repo>/news_events.db)",
     )
     parser.add_argument(
         "--sources",
