@@ -109,13 +109,15 @@ class _MakerAndSorMockClient:
 
     def cancel_order(self, signed_query: str, *, api_key: str) -> dict:
         self.cancel_order_queries.append(signed_query)
-        return {
+        canceled = {
             "symbol": "SOLUSDT",
             "orderId": 91001,
             "status": "CANCELED",
             "executedQty": "0.00",
             "cummulativeQuoteQty": "0.00",
         }
+        self.order_on_get = canceled
+        return canceled
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict:
         self.new_oco_calls += 1

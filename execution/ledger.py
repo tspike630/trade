@@ -973,7 +973,7 @@ class ExecutionLedger:
             SELECT * FROM binance_spot_positions
             WHERE status IN (
                 'open', 'qty_unconfirmed', 'oco_working', 'oco_unknown', 'oco_failed',
-                'maker_resting', 'time_stop_unknown'
+                'maker_resting', 'maker_cancel_unknown', 'time_stop_unknown'
             )
             {clause}
             ORDER BY id ASC

@@ -431,7 +431,7 @@ def row_quote_usdt(row: object) -> Decimal | None:
     """
     if not isinstance(row, dict):
         return None
-    if str(row.get("status") or "") == "maker_resting":
+    if str(row.get("status") or "") in {"maker_resting", "maker_cancel_unknown"}:
         order_qty = _decimal_text(row.get("entry_order_qty"))
         limit_px = _decimal_text(row.get("entry_limit_price"))
         if order_qty is None or limit_px is None:
@@ -688,7 +688,7 @@ def buy_exposure_block(
             continue
         if status == "qty_unconfirmed":
             return "parent_fill_incomplete"
-        if status == "maker_resting":
+        if status in {"maker_resting", "maker_cancel_unknown"}:
             return "maker_resting_blocks_buy"
         if status == "time_stop_unknown":
             return "time_stop_unconfirmed_blocks_buy"

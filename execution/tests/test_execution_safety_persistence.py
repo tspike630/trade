@@ -77,12 +77,18 @@ def _working(list_id: int, above: int, below: int, client: str) -> dict[str, Any
 class _Exchange:
     def __init__(self) -> None:
         self.cancels: list[str] = []
+        self.entry_cancels: list[str] = []
+        self.list_queries: list[str] = []
         self.ocos: list[str] = []
         self.orders: list[str] = []
         self.sells: list[str] = []
         self.oco_mode = "ok"
         self.sell_mode = "ok"
         self.list_mode = "working"
+        self.hold_list_timeout_after_cancel = False
+        self.cancel_ack: dict[str, Any] | None = None
+        self.after_cancel: dict[str, Any] | None = None
+        self.cancel_error: BaseException | None = None
         self.entry: dict[str, Any] = {
             "orderId": 91001,
             "symbol": "BNBUSDT",
@@ -105,6 +111,7 @@ class _Exchange:
         return {"bids": [["99.95", "50"]], "asks": [["100.05", "50"]]}
 
     def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.list_queries.append(signed_query)
         if self.list_mode == "absent":
             raise BinanceRequestError(400, code=-2018, message="Order list does not exist.")
         if self.list_mode == "timeout":
@@ -115,7 +122,10 @@ class _Exchange:
 
     def cancel_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.cancels.append(signed_query)
-        self.list_mode = "absent"
+        if self.hold_list_timeout_after_cancel:
+            self.list_mode = "timeout"
+        elif self.list_mode != "timeout":
+            self.list_mode = "absent"
         return {
             "orderListId": 5001,
             "listStatusType": "ALL_DONE",
@@ -167,8 +177,21 @@ class _Exchange:
         return self.entry
 
     def cancel_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
-        self.entry = dict(self.entry, status="CANCELED", executedQty=self.entry.get("executedQty") or "0")
-        return self.entry
+        self.entry_cancels.append(signed_query)
+        if self.cancel_error is not None:
+            err = self.cancel_error
+            self.cancel_error = None
+            raise err
+        ack = self.cancel_ack or dict(
+            self.entry,
+            status="CANCELED",
+            executedQty=self.entry.get("executedQty") or "0",
+        )
+        if self.after_cancel is not None:
+            self.entry = dict(self.after_cancel)
+        else:
+            self.entry = dict(self.entry, status="CANCELED", executedQty=self.entry.get("executedQty") or "0")
+        return ack
 
 
 class PersistenceSafetyTests(unittest.TestCase):
@@ -413,12 +436,6 @@ class PersistenceSafetyTests(unittest.TestCase):
             "maker_resting_blocks_buy",
         )
 
-        client.entry = dict(
-            client.entry,
-            status="PARTIALLY_FILLED",
-            executedQty="0.40",
-            cummulativeQuoteQty="39.98",
-        )
         pid = int(armed["id"])
         gateway = ExecutionGateway(
             decision_db=self.root / "decision.db",
@@ -428,26 +445,13 @@ class PersistenceSafetyTests(unittest.TestCase):
             accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
             binance_spot=adapter,
         )
-        gateway.tick_binance_protective_exits({"BNBUSDT": "100"})
-        partial = ledger.binance_spot_position_by_id(pid)
-        assert partial is not None
-        self.assertEqual(partial["status"], "maker_resting")
-        self.assertEqual(Decimal(partial["quantity"]), Decimal("0.40"))
-        self.assertEqual(client.ocos, [])
-        reserved = row_quote_usdt(partial)
-        assert reserved is not None
-        self.assertGreater(reserved, 0)
-
         adapter.clock_ms = lambda: 1_700_000_200_000
-        client.entry = dict(client.entry, status="NEW", executedQty="0.00", cummulativeQuoteQty="0")
-        # Quantity already 0.40 from the partial. TTL cancel of a later zero read
-        # must not OCO the unfilled remainder. Force a fresh zero-fill rest first.
-        ledger.update_binance_spot_position(pid, {"quantity": None, "status": "maker_resting"})
         gateway.tick_binance_protective_exits({"BNBUSDT": "100"})
         closed = ledger.binance_spot_position_by_id(pid)
         assert closed is not None
         self.assertEqual(closed["status"], "closed_canceled")
         self.assertEqual(client.ocos, [])
+        self.assertEqual(len(client.entry_cancels), 1)
         self.assertIsNone(
             buy_exposure_block([closed], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="BNBUSDT")
         )
@@ -508,3 +512,290 @@ class PersistenceSafetyTests(unittest.TestCase):
         assert stored is not None
         self.assertEqual(stored["status"], "oco_working")
         self.assertEqual(stored["entry_price"], "99.95")
+
+    def _arm_resting(self, ledger: ExecutionLedger, *, created_at_ms: str = "1700000000000") -> dict[str, Any]:
+        return ledger.arm_binance_spot_position(
+            {
+                "decision_log_id": 11,
+                "symbol": "BNBUSDT",
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "status": "maker_resting",
+                "quantity": None,
+                "stop_price": "90",
+                "take_profit_price": "120",
+                "entry_price": "99.95",
+                "entry_order_id": "91001",
+                "protection": "maker_resting",
+                "entry_order_qty": "1",
+                "entry_limit_price": "99.95",
+                "created_at_ms": created_at_ms,
+            }
+        )
+
+    def _gateway(self, ledger: ExecutionLedger, adapter: BinanceSpotAdapter) -> ExecutionGateway:
+        return ExecutionGateway(
+            decision_db=self.root / "decision.db",
+            ledger_path=ledger.path,
+            paper_enabled=False,
+            pm_enabled=False,
+            accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
+            binance_spot=adapter,
+        )
+
+    def test_partial_fill_cancels_the_remainder_and_protects_only_the_fill(self) -> None:
+        ledger = self._ledger()
+        armed = self._arm_resting(ledger)
+        client = _Exchange()
+        client.entry = dict(
+            client.entry,
+            status="PARTIALLY_FILLED",
+            executedQty="0.40",
+            cummulativeQuoteQty="39.98",
+        )
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_030_000,
+        )
+        self._gateway(ledger, adapter).tick_binance_protective_exits({"BNBUSDT": "100"})
+        self.assertEqual(len(client.entry_cancels), 1)
+        self.assertEqual(len(client.ocos), 1)
+        form = parse_qs(client.ocos[0])
+        self.assertEqual(Decimal(form["quantity"][0]), Decimal("0.40"))
+        self.assertNotEqual(Decimal(form["quantity"][0]), Decimal("1"))
+        stored = ledger.binance_spot_position_by_id(int(armed["id"]))
+        assert stored is not None
+        self.assertEqual(stored["status"], "oco_working")
+        self.assertEqual(Decimal(stored["quantity"]), Decimal("0.40"))
+        self.assertEqual(client.orders, [])
+
+    def test_ttl_cancel_protects_a_fill_that_lands_during_the_cancel(self) -> None:
+        ledger = self._ledger()
+        armed = self._arm_resting(ledger, created_at_ms="1700000000000")
+        client = _Exchange()
+        client.entry = dict(client.entry, status="NEW", executedQty="0.00", cummulativeQuoteQty="0")
+        client.cancel_ack = {
+            "orderId": 91001,
+            "symbol": "BNBUSDT",
+            "status": "CANCELED",
+            "executedQty": "0.00",
+            "cummulativeQuoteQty": "0",
+        }
+        client.after_cancel = {
+            "orderId": 91001,
+            "symbol": "BNBUSDT",
+            "status": "CANCELED",
+            "executedQty": "0.40",
+            "cummulativeQuoteQty": "39.98",
+        }
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_200_000,
+        )
+        self._gateway(ledger, adapter).tick_binance_protective_exits({"BNBUSDT": "100"})
+        self.assertEqual(len(client.ocos), 1)
+        self.assertEqual(Decimal(parse_qs(client.ocos[0])["quantity"][0]), Decimal("0.40"))
+        stored = ledger.binance_spot_position_by_id(int(armed["id"]))
+        assert stored is not None
+        self.assertEqual(stored["status"], "oco_working")
+        self.assertNotEqual(stored["status"], "closed_canceled")
+
+    def test_cancel_unknown_keeps_the_reservation_until_restart_confirms_the_fill(self) -> None:
+        ledger = self._ledger()
+        armed = self._arm_resting(ledger)
+        pid = int(armed["id"])
+        client = _Exchange()
+        client.entry = dict(
+            client.entry,
+            status="PARTIALLY_FILLED",
+            executedQty="0.40",
+            cummulativeQuoteQty="39.98",
+        )
+        client.cancel_error = TimeoutError("cancel timed out")
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_030_000,
+        )
+        self._gateway(ledger, adapter).tick_binance_protective_exits({"BNBUSDT": "100"})
+        unknown = ledger.binance_spot_position_by_id(pid)
+        assert unknown is not None
+        self.assertEqual(unknown["status"], "maker_cancel_unknown")
+        self.assertEqual(client.ocos, [])
+        self.assertEqual(client.orders, [])
+        reserved = row_quote_usdt(unknown)
+        assert reserved is not None
+        self.assertGreater(reserved, 0)
+        self.assertEqual(
+            buy_exposure_block([unknown], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+            "maker_resting_blocks_buy",
+        )
+
+        restarted = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_040_000,
+        )
+        self._gateway(ledger, restarted).tick_binance_protective_exits({"BNBUSDT": "100"})
+        stored = ledger.binance_spot_position_by_id(pid)
+        assert stored is not None
+        self.assertEqual(stored["status"], "oco_working")
+        self.assertEqual(len(client.ocos), 1)
+        self.assertEqual(Decimal(parse_qs(client.ocos[0])["quantity"][0]), Decimal("0.40"))
+        self.assertEqual(client.orders, [])
+
+    def test_cancel_race_does_not_drop_or_inflate_the_fill(self) -> None:
+        ledger = self._ledger()
+        armed = self._arm_resting(ledger)
+        client = _Exchange()
+        client.entry = dict(
+            client.entry,
+            status="PARTIALLY_FILLED",
+            executedQty="0.40",
+            cummulativeQuoteQty="39.98",
+        )
+        client.cancel_ack = {
+            "orderId": 91001,
+            "status": "CANCELED",
+            "executedQty": "0.00",
+            "cummulativeQuoteQty": "0",
+        }
+        client.after_cancel = {
+            "orderId": 91001,
+            "symbol": "BNBUSDT",
+            "status": "CANCELED",
+            "executedQty": "0.55",
+            "cummulativeQuoteQty": "54.97",
+        }
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_030_000,
+        )
+        self._gateway(ledger, adapter).tick_binance_protective_exits({"BNBUSDT": "100"})
+        self.assertEqual(len(client.ocos), 1)
+        qty = Decimal(parse_qs(client.ocos[0])["quantity"][0])
+        self.assertEqual(qty, Decimal("0.55"))
+        stored = ledger.binance_spot_position_by_id(int(armed["id"]))
+        assert stored is not None
+        self.assertEqual(Decimal(stored["quantity"]), Decimal("0.55"))
+        self.assertNotEqual(stored["status"], "closed_canceled")
+
+    def test_persisted_created_at_ms_does_not_arm_max_hold_without_config(self) -> None:
+        os.environ.pop("BINANCE_SPOT_MAX_HOLD_SEC", None)
+        ledger = self._ledger()
+        row = self._held(ledger)
+        self.assertEqual(row.get("created_at_ms"), "1700000000000")
+        self.assertIn(row.get("max_hold_sec"), (None, "", "0"))
+        self.assertIn(row.get("max_hold_min"), (None, "", "0"))
+        client = _Exchange()
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_800_000_000_000,
+        )
+        self.assertIsNone(adapter.max_hold_sec)
+        self._gateway(ledger, adapter).tick_binance_protective_exits({"BNBUSDT": "120"})
+        stored = ledger.binance_spot_position_by_id(int(row["id"]))
+        assert stored is not None
+        self.assertEqual(stored["status"], "oco_working")
+        self.assertEqual(client.sells, [])
+        self.assertEqual(client.orders, [])
+        self.assertEqual(stored.get("created_at_ms"), "1700000000000")
+
+    def test_oco_replacement_timeout_does_not_repost_or_flatten(self) -> None:
+        ledger = self._ledger()
+        row = self._held(ledger)
+        pid = int(row["id"])
+        client = _Exchange()
+        client.oco_mode = "timeout"
+        client.hold_list_timeout_after_cancel = True
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_000_000,
+            trailing_ratchet=True,
+            auto_flatten_on_oco_fail=True,
+        )
+
+        def tick(mark: str) -> None:
+            self._gateway(ledger, adapter).tick_binance_protective_exits({"BNBUSDT": mark})
+
+        tick("102.80")
+        first = ledger.binance_spot_position_by_id(pid)
+        assert first is not None
+        self.assertEqual(first["status"], "oco_unknown")
+        self.assertEqual(first.get("oco_ratchet_count"), "1")
+        self.assertIn(first.get("oco_order_list_id"), (None, ""))
+        self.assertEqual(len(client.ocos), 1)
+        self.assertEqual(parse_qs(client.ocos[0]).get("listClientOrderId"), ["bnbfade-ol-42-r1"])
+        self.assertEqual(client.sells, [])
+        self.assertTrue(
+            any("origClientOrderId=bnbfade-ol-42-r1" in query for query in client.list_queries)
+        )
+        self.assertFalse(any("orderListId=5001" in query for query in client.list_queries[1:]))
+
+        tick("103.40")
+        tick("103.80")
+        stored = ledger.binance_spot_position_by_id(pid)
+        assert stored is not None
+        self.assertEqual(stored["status"], "oco_unknown")
+        self.assertEqual(stored.get("oco_ratchet_count"), "1")
+        self.assertEqual(len(client.ocos), 1)
+        self.assertEqual(client.sells, [])
+        self.assertFalse(any("bnbfade-ol-42-r2" in query for query in client.ocos))
+        self.assertFalse(any("bnbfade-ol-42-r3" in query for query in client.ocos))
+
+    def test_maker_buy_is_refused_before_post_when_cancel_is_unavailable(self) -> None:
+        client = _Exchange()
+        client.cancel_order = None  # type: ignore[method-assign]
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot=_BOUND,
+            production_book=REST_BOOK,
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
+            post_only_limit=True,
+        )
+        result = adapter.execute(
+            {
+                "decision_log_id": 12,
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "mode": "live_stub",
+                "action": "buy",
+                "token_address": "BNBUSDT",
+                "extras": {
+                    "binance_symbol": "BNBUSDT",
+                    "order_type": "LIMIT",
+                    "quantity": "1",
+                    "price": "100.20",
+                    "price_usd": "100",
+                    "stop_price": "90",
+                    "take_profit_price": "120",
+                    "entry_reason": "large_trade_market",
+                },
+            }
+        )
+        self.assertEqual(result["error"], "maker_lifecycle_unsupported")
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["executed"], 0)
+        self.assertEqual(client.orders, [])
+        self.assertEqual(client.ocos, [])

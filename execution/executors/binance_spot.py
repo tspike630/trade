@@ -387,6 +387,14 @@ def _positive_decimal(raw: object) -> str | None:
     return text
 
 
+def _maker_entry_lifecycle_ready(client: Any) -> bool:
+    """A resting buy can be submitted only when the fill can be canceled and protected."""
+    return all(
+        callable(getattr(client, name, None))
+        for name in ("get_order", "cancel_order", "new_oco")
+    )
+
+
 def _parse_order_type(raw: object) -> _OrderType | None:
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return "MARKET"
@@ -2762,6 +2770,24 @@ class BinanceSpotAdapter:
                                 )
                             )
 
+        posted = {key_name: value for key_name, value in pairs}
+        if posted.get("side") == "BUY" and posted.get("type") == "LIMIT_MAKER":
+            if not _maker_entry_lifecycle_ready(client):
+                return self._finish(
+                    _result(
+                        ok=False,
+                        dry_run=False,
+                        executed=0,
+                        submitted=False,
+                        error="maker_lifecycle_unsupported",
+                        symbol=symbol,
+                        order=None,
+                        exchange_order_id=None,
+                        gates=gates,
+                        exit_plan=plan,
+                        consumer_allowed=False,
+                    )
+                )
         signed = sign_query(pairs, secret)
         try:
             placed = client.new_order(signed, api_key=key)
@@ -3179,7 +3205,7 @@ class BinanceSpotAdapter:
                 submitted=False,
             )
         status = str(row.get("status") or "")
-        if status == "maker_resting" or row.get("reconcile_resting_entry") is True:
+        if status in {"maker_resting", "maker_cancel_unknown"} or row.get("reconcile_resting_entry") is True:
             return self.reconcile_resting_entry(row, mark=mark, persist=persist)
         if status == "time_stop_unknown":
             return self._resume_time_stop(row, mark=mark, save=save)
@@ -3407,6 +3433,151 @@ class BinanceSpotAdapter:
             protection=PROTECTION_PENDING,
         )
 
+    def _adopt_terminal_entry(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        payload: dict[str, Any],
+        mark: object,
+        persist: Callable[[dict[str, Any]], dict[str, Any] | None] | None,
+        filled_qty: str | None,
+        avg_px: str | None,
+    ) -> dict[str, Any]:
+        """OCO only the base the entry order actually filled. Zero is terminal."""
+        status = str(payload.get("status") or "").upper()
+        if status == "FILLED" or (
+            status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"}
+            and filled_qty
+        ):
+            if not filled_qty:
+                save(
+                    {
+                        "status": "maker_cancel_unknown",
+                        "last_error": "maker_fill_unconfirmed",
+                    }
+                )
+                return self._coverage(
+                    row,
+                    book="maker_cancel_unknown",
+                    submitted=False,
+                    error="maker_fill_unconfirmed",
+                    protection="maker_resting",
+                )
+            upd: dict[str, Any] = {"status": "open", "quantity": filled_qty}
+            if avg_px:
+                upd["entry_price"] = avg_px
+            save(upd)
+            ref_mark = mark if _to_decimal(mark) is not None else (avg_px or row.get("entry_price"))
+            return self.maintain_held_position(row, ref_mark, persist=persist)
+        save(
+            {
+                "status": "closed_canceled",
+                "exit_reason": "entry_ttl_expired",
+                "last_error": "entry_ttl_expired",
+            }
+        )
+        return self._coverage(
+            row,
+            book="closed_canceled",
+            submitted=True,
+            ok=True,
+            error=None,
+            reason="entry_ttl_expired",
+        )
+
+    def _cancel_resting_entry(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        lookup: Any,
+        symbol: str,
+        entry_order_id: str,
+        key: str,
+        secret: str,
+        mark: object,
+        persist: Callable[[dict[str, Any]], dict[str, Any] | None] | None,
+        clock_now: int,
+    ) -> dict[str, Any]:
+        """Cancel the open remainder, then read the fill once more before any OCO."""
+        client = self._trade_client()
+        cancel_fn = getattr(client, "cancel_order", None) if client is not None else None
+        save(
+            {
+                "status": "maker_cancel_unknown",
+                "last_error": "maker_cancel_pending",
+            }
+        )
+        if not callable(cancel_fn):
+            save({"last_error": "maker_cancel_unsupported"})
+            return self._coverage(
+                row,
+                book="maker_cancel_unknown",
+                submitted=False,
+                error="maker_cancel_unsupported",
+                protection="maker_resting",
+            )
+        pairs = [
+            ("symbol", symbol),
+            ("orderId", entry_order_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(clock_now)),
+        ]
+        try:
+            cancel_fn(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            save({"last_error": "maker_cancel_unknown"})
+            return self._coverage(
+                row,
+                book="maker_cancel_unknown",
+                submitted=False,
+                error="maker_cancel_unknown",
+                protection="maker_resting",
+            )
+        try:
+            fresh = lookup(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            save({"last_error": "maker_cancel_unknown"})
+            return self._coverage(
+                row,
+                book="maker_cancel_unknown",
+                submitted=False,
+                error="maker_cancel_unknown",
+                protection="maker_resting",
+            )
+        if not isinstance(fresh, dict):
+            save({"last_error": "maker_cancel_unknown"})
+            return self._coverage(
+                row,
+                book="maker_cancel_unknown",
+                submitted=False,
+                error="maker_cancel_unknown",
+                protection="maker_resting",
+            )
+        fresh_status = str(fresh.get("status") or "").upper()
+        if fresh_status in {"NEW", "PARTIALLY_FILLED", "PENDING_NEW"}:
+            save({"last_error": "maker_cancel_unknown"})
+            return self._coverage(
+                row,
+                book="maker_cancel_unknown",
+                submitted=False,
+                error="maker_cancel_unknown",
+                protection="maker_resting",
+            )
+        filled_qty = sellable_base_qty(fresh, symbol) or filled_base_qty(fresh)
+        return self._adopt_terminal_entry(
+            row,
+            save,
+            fresh,
+            mark,
+            persist,
+            filled_qty,
+            fill_average_price(fresh),
+        )
+
     def reconcile_resting_entry(
         self,
         position: dict[str, Any],
@@ -3418,10 +3589,11 @@ class BinanceSpotAdapter:
     ) -> dict[str, Any]:
         """Reconcile a resting ``LIMIT`` / ``LIMIT_MAKER`` entry order.
 
-        - If ``FILLED`` on Binance: adopts fill quantity and price, then places native OCO.
-        - If expired past ``ttl_sec`` (default 180s): cancels the order via ``DELETE /api/v3/order``.
-          If ``executedQty == 0``, marks ``closed_canceled``; if partially filled, arms native OCO
-          for the filled portion.
+        A partial fill cancels the open remainder on that tick. The confirming
+        read, not the cancel body, is the sellable quantity. Native OCO covers
+        only that quantity. A cancel or read that does not finish stays
+        ``maker_cancel_unknown``: the quote stays reserved and no OCO is sent.
+        A zero-fill order is canceled only after ``ttl_sec`` (default 180s).
         """
         row = dict(position)
 
@@ -3476,77 +3648,33 @@ class BinanceSpotAdapter:
         limit_ttl_sec = self._entry_ttl_sec() if ttl_sec is None else max(5, int(ttl_sec))
         expired = created_ms is not None and (clock_now - int(created_ms)) >= limit_ttl_sec * 1000
 
-        if ord_status == "PARTIALLY_FILLED" and not expired:
-            # Keep the remainder reserved. Do not OCO until the entry is terminal,
-            # so a later fill cannot sit outside a list we would have to cancel.
-            upd_partial: dict[str, Any] = {"status": "maker_resting"}
-            if filled_qty:
-                upd_partial["quantity"] = filled_qty
-            if avg_px:
-                upd_partial["entry_price"] = avg_px
-            save(upd_partial)
-            return self._coverage(
+        terminal = ord_status in {
+            "FILLED",
+            "CANCELED",
+            "CANCELLED",
+            "EXPIRED",
+            "REJECTED",
+            "EXPIRED_IN_MATCH",
+        }
+        # A partial fill is inventory. Cancel the resting remainder immediately
+        # and protect only the quantity the next read still shows. Do not wait
+        # out the TTL with an unprotected fill.
+        if ord_status == "PARTIALLY_FILLED" or (ord_status in {"NEW", "PARTIALLY_FILLED"} and expired):
+            return self._cancel_resting_entry(
                 row,
-                book="maker_resting",
-                submitted=False,
-                ok=True,
-                error=None,
-                protection="maker_resting",
+                save,
+                lookup,
+                symbol,
+                entry_order_id,
+                key,
+                secret,
+                mark,
+                persist,
+                clock_now,
             )
-
-        if ord_status == "FILLED" and filled_qty:
-            upd: dict[str, Any] = {
-                "status": "open",
-                "quantity": filled_qty,
-            }
-            if avg_px:
-                upd["entry_price"] = avg_px
-            save(upd)
-            ref_mark = mark if _to_decimal(mark) is not None else (avg_px or row.get("entry_price"))
-            return self.maintain_held_position(row, ref_mark, persist=persist)
-
-        if ord_status in {"NEW", "PARTIALLY_FILLED"} and expired:
-            cancel_fn = getattr(client, "cancel_order", None)
-            if callable(cancel_fn):
-                c_pairs = [
-                    ("symbol", symbol),
-                    ("orderId", entry_order_id),
-                    ("recvWindow", RECV_WINDOW_MS),
-                    ("timestamp", str(clock_now)),
-                ]
-                try:
-                    canceled = cancel_fn(sign_query(c_pairs, secret), api_key=key)
-                    if isinstance(canceled, dict):
-                        filled_qty = sellable_base_qty(canceled, symbol) or filled_base_qty(canceled) or filled_qty
-                        avg_px = fill_average_price(canceled) or avg_px
-                except Exception as exc:  # noqa: BLE001
-                    if isinstance(exc, AssertionError):
-                        raise
-                    return self._coverage(row, book="unchanged", submitted=False, error=_public_error(exc, key, secret))
-            if filled_qty:
-                upd_part: dict[str, Any] = {
-                    "status": "open",
-                    "quantity": filled_qty,
-                }
-                if avg_px:
-                    upd_part["entry_price"] = avg_px
-                save(upd_part)
-                ref_mark = mark if _to_decimal(mark) is not None else (avg_px or row.get("entry_price"))
-                return self.maintain_held_position(row, ref_mark, persist=persist)
-            save(
-                {
-                    "status": "closed_canceled",
-                    "exit_reason": "entry_ttl_expired",
-                    "last_error": "entry_ttl_expired",
-                }
-            )
-            return self._coverage(
-                row,
-                book="closed_canceled",
-                submitted=True,
-                ok=True,
-                error=None,
-                reason="entry_ttl_expired",
+        if terminal:
+            return self._adopt_terminal_entry(
+                row, save, order_payload, mark, persist, filled_qty, avg_px
             )
 
         return self._coverage(
@@ -4058,6 +4186,9 @@ class BinanceSpotAdapter:
                 "status": "oco_unknown",
                 "protection": PROTECTION_PENDING,
                 "oco_list_client_id": spec["list_client_id"],
+                "oco_order_list_id": "",
+                "oco_above_order_id": "",
+                "oco_below_order_id": "",
                 "oco_above_client_id": spec["above_client_id"],
                 "oco_below_client_id": spec["below_client_id"],
                 "quantity": spec["quantity"],
