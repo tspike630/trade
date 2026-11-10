@@ -336,6 +336,7 @@ class ExecutionLedger:
             "entry_order_qty",
             "entry_limit_price",
             "created_at_ms",
+            "exit_filled_qty",
         ):
             if name not in have:
                 self.conn.execute(
@@ -926,6 +927,7 @@ class ExecutionLedger:
         "entry_order_qty",
         "entry_limit_price",
         "created_at_ms",
+        "exit_filled_qty",
         "protection",
         "exit_order_id",
         "exit_reason",

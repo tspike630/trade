@@ -635,39 +635,41 @@ def classify_oco(payload: dict[str, Any], *, held_qty: str) -> dict[str, Any]:
         "above_order_id": above_id,
         "below_order_id": below_id,
     }
-    if oco_is_working(payload):
-        partial = False
-        for row in _reports(payload):
-            if str(row.get("status") or "").upper() == "PARTIALLY_FILLED":
-                partial = True
-        base["state"] = "partial_working" if partial else "working"
-        return base
     executed = Decimal("0")
     filled_reason: str | None = None
     any_open = False
+    order_qty: Decimal | None = None
     for row in _reports(payload):
         status = str(row.get("status") or "").upper()
         got = _to_decimal(row.get("executedQty")) or Decimal("0")
         executed += got
-        if status == "FILLED" or (status == "PARTIALLY_FILLED" and got > 0):
+        orig = _to_decimal(row.get("origQty") or row.get("origQuantity"))
+        if orig is not None:
+            order_qty = orig if order_qty is None else max(order_qty, orig)
+        if got > 0:
             leg = str(row.get("type") or "").upper()
             if leg in {"LIMIT_MAKER", "TAKE_PROFIT_LIMIT", "TAKE_PROFIT"}:
                 filled_reason = "take_profit"
             elif leg in {"STOP_LOSS_LIMIT", "STOP_LOSS"}:
                 filled_reason = "stop_loss"
-        if status not in _TERMINAL_LEG and status != "FILLED":
+        if status not in _TERMINAL_LEG and status not in {"FILLED", "PARTIALLY_FILLED"}:
             any_open = True
     held = _to_decimal(held_qty) or Decimal("0")
+    basis = order_qty if order_qty is not None else held
     base["executed_qty"] = _decimal_text(executed) if executed > 0 else "0"
-    if filled_reason and executed > 0 and not any_open:
-        if held > 0 and executed + Decimal("0.0000000000001") < held:
-            remainder = held - executed
+    if oco_is_working(payload):
+        base["state"] = "partial_working" if executed > 0 else "working"
+        if executed > 0 and basis > executed:
+            base["remainder_qty"] = _decimal_text(basis - executed)
+        return base
+    if executed > 0 and (filled_reason or not any_open):
+        if basis > executed:
             base["state"] = "partial"
-            base["remainder_qty"] = _decimal_text(remainder)
-            base["exit_reason"] = filled_reason
+            base["remainder_qty"] = _decimal_text(basis - executed)
+            base["exit_reason"] = filled_reason or "partial_fill"
             return base
         base["state"] = "filled"
-        base["exit_reason"] = filled_reason
+        base["exit_reason"] = filled_reason or "partial_fill"
         return base
     if list_status in {"ALL_DONE", "REJECT"} or (
         _reports(payload) and not any_open and executed <= 0

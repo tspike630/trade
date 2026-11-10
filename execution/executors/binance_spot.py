@@ -1738,56 +1738,76 @@ class BinanceSpotAdapter:
                 exchange_error=exchange_error,
             )
         signed = sign_query(pairs, secret)
+        existing = self._lookup_exit_order(client, symbol, client_id, key, secret)
+        if existing is not None:
+            return self._settle_reduce_sell(
+                row,
+                save,
+                existing,
+                client_id,
+                reason="oco_failed_auto_flatten",
+                protection=PROTECTION_AUTO_FLATTEN,
+                error_prefix=f"oco_failed_auto_flattened:{oco_error}",
+                exchange_error=exchange_error,
+            )
+        if str(row.get("last_error") or "").startswith("flatten_submit_unknown"):
+            return self._oco_failed(
+                row,
+                save,
+                f"{oco_error}|flatten_submit_unknown",
+                exchange_error=exchange_error,
+            )
         try:
             placed = client.new_order(signed, api_key=key)
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, AssertionError):
                 raise
+            looked = self._exit_lookup_state(client, symbol, client_id, key, secret)
             recovered = self._lookup_exit_order(client, symbol, client_id, key, secret)
-            if recovered is None:
-                sell_err = _public_error(exc, key, secret)
+            sell_err = _public_error(exc, key, secret)
+            if recovered is not None:
+                placed = recovered
+            elif callable(getattr(client, "get_order", None)) and looked == "unknown":
+                save(
+                    {
+                        "status": "oco_failed",
+                        "protection": PROTECTION_PENDING,
+                        "exit_client_order_id": client_id,
+                        "last_error": "flatten_submit_unknown",
+                    }
+                )
+                return self._coverage(
+                    row,
+                    book="oco_failed",
+                    submitted=False,
+                    error=f"{oco_error}|flatten_submit_unknown:{sell_err}",
+                    protection=PROTECTION_PENDING,
+                    exchange_error=exchange_error,
+                )
+            else:
                 return self._oco_failed(
                     row,
                     save,
                     f"{oco_error}|flatten_failed:{sell_err}",
                     exchange_error=exchange_error,
                 )
-            placed = recovered
-        order_id = _exit_order_accepted(placed) if isinstance(placed, dict) else None
-        if order_id is None:
+        if not isinstance(placed, dict):
             return self._oco_failed(
                 row,
                 save,
                 f"{oco_error}|flatten_rejected",
                 exchange_error=exchange_error,
             )
-        flat_err = f"oco_failed_auto_flattened:{oco_error}"
-        save(
-            {
-                "status": "closed",
-                "protection": PROTECTION_AUTO_FLATTEN,
-                "quantity": sized,
-                "exit_order_id": order_id,
-                "exit_reason": "oco_failed_auto_flatten",
-                "exit_client_order_id": client_id,
-                "last_error": flat_err,
-            }
-        )
-        out = self._coverage(
+        return self._settle_reduce_sell(
             row,
-            book="closed",
-            submitted=True,
-            ok=False,
-            error=flat_err,
-            protection=PROTECTION_AUTO_FLATTEN,
+            save,
+            placed,
+            client_id,
             reason="oco_failed_auto_flatten",
-            order=dict(pairs),
-            quantity=sized,
+            protection=PROTECTION_AUTO_FLATTEN,
+            error_prefix=f"oco_failed_auto_flattened:{oco_error}",
             exchange_error=exchange_error,
         )
-        out["exchange_order_id"] = order_id
-        out["exit_client_order_id"] = client_id
-        return out
 
     def _buy_with_native_oco(
         self,
@@ -3233,7 +3253,7 @@ class BinanceSpotAdapter:
         }:
             recon = self._reconcile_oco(row)
             state = str(recon.get("state") or "")
-            if state == "working":
+            if state in {"working", "partial_working"}:
                 if native_oco_verified(_recon_payload(recon))[0] is None:
                     save(
                         {
@@ -3248,6 +3268,16 @@ class BinanceSpotAdapter:
                         submitted=False,
                         error="native_oco_unverified",
                         protection=PROTECTION_PENDING,
+                    )
+                if self._account_oco_execution(row, recon, save) == "closed":
+                    return self._coverage(
+                        row,
+                        book="oco_filled",
+                        submitted=False,
+                        ok=True,
+                        protection=PROTECTION_EXCHANGE,
+                        error=None,
+                        reason=recon.get("exit_reason"),
                     )
                 save(self._oco_working_fields(row, recon))
                 hold_limit_sec = self._effective_max_hold_sec(row)
@@ -3349,7 +3379,17 @@ class BinanceSpotAdapter:
                     )
                 retry_place = True
             if state in {"unfilled", "partial"}:
-                remainder = recon.get("remainder_qty") or row.get("quantity")
+                if self._account_oco_execution(row, recon, save) == "closed":
+                    return self._coverage(
+                        row,
+                        book="oco_filled",
+                        submitted=False,
+                        ok=True,
+                        protection=PROTECTION_EXCHANGE,
+                        error=None,
+                        reason=recon.get("exit_reason"),
+                    )
+                remainder = row.get("quantity")
                 detail = (
                     "oco_partial_remainder" if state == "partial" else "oco_terminal_unfilled"
                 )
@@ -3830,7 +3870,7 @@ class BinanceSpotAdapter:
                     reason="time_stop_max_hold",
                 )
             classified = classify_oco(canceled, held_qty=str(row.get("quantity") or ""))
-            if classified.get("state") == "filled":
+            if self._account_oco_execution(row, classified, save) == "closed" or classified.get("state") == "filled":
                 save(
                     {
                         "status": "oco_filled",
@@ -3971,7 +4011,155 @@ class BinanceSpotAdapter:
                     quantity=sized,
                 )
             placed = found
-        return self._close_time_stop(row, save, placed if isinstance(placed, dict) else {}, client_id, dict(pairs))
+        return self._settle_reduce_sell(
+            row,
+            save,
+            placed if isinstance(placed, dict) else {},
+            client_id,
+            reason="time_stop_max_hold",
+            protection=PROTECTION_TIME_STOP,
+            error_prefix="time_stop_max_hold",
+            order=dict(pairs),
+        )
+
+    def _account_oco_execution(
+        self,
+        row: dict[str, Any],
+        recon: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+    ) -> str:
+        """Persist the unsold remainder of one OCO. A repeated read subtracts nothing new."""
+        executed = _to_decimal(recon.get("executed_qty")) or Decimal("0")
+        held = _to_decimal(row.get("quantity")) or Decimal("0")
+        accounted = _to_decimal(row.get("exit_filled_qty")) or Decimal("0")
+        if executed < accounted:
+            accounted = Decimal("0")
+        delta = executed - accounted
+        if delta <= 0:
+            if executed != (_to_decimal(row.get("exit_filled_qty")) or Decimal("0")):
+                save({"exit_filled_qty": _decimal_text(executed) if executed > 0 else "0"})
+            return "open"
+        remainder = held - delta
+        if remainder <= Decimal("0.00000001"):
+            save(
+                {
+                    "status": "oco_filled",
+                    "protection": PROTECTION_EXCHANGE,
+                    "exit_reason": recon.get("exit_reason"),
+                    "exit_filled_qty": _decimal_text(executed),
+                    "oco_list_status": recon.get("list_status"),
+                    "last_error": None,
+                }
+            )
+            return "closed"
+        save(
+            {
+                "quantity": _decimal_text(remainder),
+                "exit_filled_qty": _decimal_text(executed),
+            }
+        )
+        return "open"
+
+    def _settle_reduce_sell(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        placed: dict[str, Any],
+        client_id: str,
+        *,
+        reason: str,
+        protection: str,
+        error_prefix: str,
+        order: dict[str, str] | None = None,
+        exchange_error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Close only a sell that filled the whole remaining qty. A zero or partial fill stays open."""
+        order_id = _exit_order_accepted(placed)
+        if order_id is None:
+            book = "time_stop_unknown" if reason == "time_stop_max_hold" else "oco_failed"
+            save({"last_error": f"{error_prefix}_unconfirmed", "exit_client_order_id": client_id})
+            return self._coverage(
+                row,
+                book=book,
+                submitted=False,
+                error=f"{error_prefix}_unconfirmed",
+                protection=protection,
+                reason=reason,
+                order=order,
+                exchange_error=exchange_error,
+            )
+        held = _to_decimal(row.get("quantity")) or Decimal("0")
+        executed = _to_decimal(placed.get("executedQty")) or Decimal("0")
+        orig = _to_decimal(placed.get("origQty") or placed.get("origQuantity"))
+        prior_id = str(row.get("exit_order_id") or "")
+        accounted = (
+            _to_decimal(row.get("exit_filled_qty")) or Decimal("0")
+            if prior_id == str(order_id)
+            else Decimal("0")
+        )
+        if orig is not None:
+            remainder = orig - executed
+        else:
+            delta = executed - accounted
+            if delta < 0:
+                delta = Decimal("0")
+            remainder = held - delta
+        full = executed > 0 and remainder <= Decimal("0.00000001")
+        if full:
+            sold = _decimal_text(executed)
+            save(
+                {
+                    "status": "closed",
+                    "protection": protection,
+                    "quantity": sold,
+                    "exit_order_id": order_id,
+                    "exit_reason": reason,
+                    "exit_client_order_id": client_id,
+                    "exit_filled_qty": sold,
+                    "oco_list_status": "ALL_DONE",
+                    "last_error": None if reason == "time_stop_max_hold" else error_prefix,
+                }
+            )
+            out = self._coverage(
+                row,
+                book="closed",
+                submitted=True,
+                ok=reason == "time_stop_max_hold",
+                error=None if reason == "time_stop_max_hold" else error_prefix,
+                protection=protection,
+                reason=reason,
+                order=order,
+                quantity=sold,
+                exchange_error=exchange_error,
+            )
+            out["exchange_order_id"] = order_id
+            out["exit_client_order_id"] = client_id
+            return out
+        kept = _decimal_text(held if remainder < 0 else remainder)
+        book = "time_stop_unknown" if reason == "time_stop_max_hold" else "oco_failed"
+        open_protection = PROTECTION_TIME_STOP if reason == "time_stop_max_hold" else PROTECTION_PENDING
+        save(
+            {
+                "status": book,
+                "protection": open_protection,
+                "quantity": kept,
+                "exit_order_id": order_id,
+                "exit_client_order_id": client_id,
+                "exit_filled_qty": _decimal_text(executed) if executed > 0 else "0",
+                "last_error": "time_stop_sell_open" if reason == "time_stop_max_hold" else "flatten_sell_open",
+            }
+        )
+        return self._coverage(
+            row,
+            book=book,
+            submitted=False,
+            error="time_stop_sell_open" if reason == "time_stop_max_hold" else "flatten_sell_open",
+            protection=protection,
+            reason=reason,
+            order=order,
+            quantity=kept,
+            exchange_error=exchange_error,
+        )
 
     def _close_time_stop(
         self,
@@ -3981,45 +4169,16 @@ class BinanceSpotAdapter:
         client_id: str,
         order: dict[str, str] | None,
     ) -> dict[str, Any]:
-        order_id = _exit_order_accepted(placed)
-        if order_id is None:
-            save({"last_error": "time_stop_submit_unknown"})
-            return self._coverage(
-                row,
-                book="time_stop_unknown",
-                submitted=False,
-                error="time_stop_submit_unknown",
-                protection=PROTECTION_TIME_STOP,
-                reason="time_stop_max_hold",
-                order=order,
-            )
-        qty = _positive_decimal(placed.get("executedQty")) or _positive_decimal(row.get("quantity"))
-        save(
-            {
-                "status": "closed",
-                "protection": PROTECTION_TIME_STOP,
-                "quantity": None if qty is None else str(qty),
-                "exit_order_id": order_id,
-                "exit_reason": "time_stop_max_hold",
-                "exit_client_order_id": client_id,
-                "oco_list_status": "ALL_DONE",
-                "last_error": None,
-            }
-        )
-        out = self._coverage(
+        return self._settle_reduce_sell(
             row,
-            book="closed",
-            submitted=True,
-            ok=True,
-            error=None,
-            protection=PROTECTION_TIME_STOP,
+            save,
+            placed,
+            client_id,
             reason="time_stop_max_hold",
+            protection=PROTECTION_TIME_STOP,
+            error_prefix="time_stop_max_hold",
             order=order,
-            quantity=None if qty is None else str(qty),
         )
-        out["exchange_order_id"] = order_id
-        out["exit_client_order_id"] = client_id
-        return out
 
     def _exit_lookup_state(
         self,
@@ -4077,7 +4236,7 @@ class BinanceSpotAdapter:
         if cancel_err or canceled is None:
             return None
         classified = classify_oco(canceled, held_qty=str(row.get("quantity") or ""))
-        if classified.get("state") == "filled":
+        if self._account_oco_execution(row, classified, save) == "closed" or classified.get("state") == "filled":
             save(
                 {
                     "status": "oco_filled",
@@ -4095,6 +4254,15 @@ class BinanceSpotAdapter:
                 protection=PROTECTION_EXCHANGE,
                 error=None,
                 reason=classified.get("exit_reason"),
+            )
+        if classified.get("state") not in {"unfilled", "partial", "absent"}:
+            save({"last_error": "oco_cancel_unconfirmed"})
+            return self._coverage(
+                row,
+                book="oco_unknown",
+                submitted=False,
+                error="oco_cancel_unconfirmed",
+                protection=PROTECTION_PENDING,
             )
         prev_stop = str(row.get("stop_price") or "")
         next_seq = int(row.get("oco_ratchet_count") or 0) + 1

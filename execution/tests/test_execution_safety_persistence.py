@@ -89,6 +89,8 @@ class _Exchange:
         self.cancel_ack: dict[str, Any] | None = None
         self.after_cancel: dict[str, Any] | None = None
         self.cancel_error: BaseException | None = None
+        self.cancel_list_once: dict[str, Any] | None = None
+        self.sell_ack: dict[str, Any] | None = None
         self.entry: dict[str, Any] = {
             "orderId": 91001,
             "symbol": "BNBUSDT",
@@ -122,6 +124,10 @@ class _Exchange:
 
     def cancel_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.cancels.append(signed_query)
+        if self.cancel_list_once is not None:
+            body = self.cancel_list_once
+            self.cancel_list_once = None
+            return body
         if self.hold_list_timeout_after_cancel:
             self.list_mode = "timeout"
         elif self.list_mode != "timeout":
@@ -140,6 +146,8 @@ class _Exchange:
         self.ocos.append(signed_query)
         if self.oco_mode == "timeout":
             raise TimeoutError("oco timed out")
+        if self.oco_mode == "reject":
+            raise BinanceRequestError(400, code=-2010, message="Account has insufficient balance")
         if self.oco_mode == "unverified":
             return {
                 "orderListId": 5002,
@@ -156,10 +164,12 @@ class _Exchange:
             self.sells.append(signed_query)
             if self.sell_mode == "timeout":
                 raise TimeoutError("sell timed out")
-            self.exit_order = {
+            qty = form.get("quantity", ["1"])[0]
+            self.exit_order = self.sell_ack or {
                 "orderId": 77,
                 "status": "FILLED",
-                "executedQty": form.get("quantity", ["1"])[0],
+                "executedQty": qty,
+                "origQty": qty,
                 "cummulativeQuoteQty": "100",
             }
             self.exit_lookup = "found"
@@ -799,3 +809,136 @@ class PersistenceSafetyTests(unittest.TestCase):
         self.assertEqual(result["executed"], 0)
         self.assertEqual(client.orders, [])
         self.assertEqual(client.ocos, [])
+
+    def _held_qty(self, ledger: ExecutionLedger, qty: str, decision_id: int = 61) -> tuple[int, BinanceSpotAdapter, _Exchange]:
+        row = self._held(ledger, decision_id)
+        pid = int(row["id"])
+        ledger.update_binance_spot_position(pid, {"quantity": qty})
+        client = _Exchange()
+        adapter = BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_800_000_000_000,
+        )
+        return pid, adapter, client
+
+    def _tick(self, ledger: ExecutionLedger, adapter: BinanceSpotAdapter, mark: str = "100") -> None:
+        self._gateway(ledger, adapter).tick_binance_protective_exits({"BNBUSDT": mark})
+
+    def test_ratchet_after_partial_oco_fill_keeps_remainder_1_10(self) -> None:
+        ledger = self._ledger()
+        pid, adapter, client = self._held_qty(ledger, "1.50")
+        adapter.trailing_ratchet = True
+        client.cancel_list_once = {
+            "orderListId": 5001,
+            "listOrderStatus": "ALL_DONE",
+            "listStatusType": "ALL_DONE",
+            "orderReports": [
+                {
+                    "orderId": 6001,
+                    "type": "LIMIT_MAKER",
+                    "status": "PARTIALLY_FILLED",
+                    "executedQty": "0.40",
+                    "origQty": "1.50",
+                },
+                {
+                    "orderId": 6002,
+                    "type": "STOP_LOSS_LIMIT",
+                    "status": "CANCELED",
+                    "executedQty": "0",
+                    "origQty": "1.50",
+                },
+            ],
+        }
+        self._tick(ledger, adapter, "102.80")
+        stored = ledger.binance_spot_position_by_id(pid)
+        assert stored is not None
+        self.assertEqual(Decimal(stored["quantity"]), Decimal("1.10"))
+        self.assertNotEqual(stored["status"], "closed")
+        self.assertGreaterEqual(len(client.ocos), 1)
+        for query in client.ocos:
+            self.assertLessEqual(Decimal(parse_qs(query)["quantity"][0]), Decimal("1.10"))
+        self._tick(ledger, adapter, "103.40")
+        again = ledger.binance_spot_position_by_id(pid)
+        assert again is not None
+        self.assertEqual(Decimal(again["quantity"]), Decimal("1.10"))
+        for query in client.ocos:
+            self.assertLessEqual(Decimal(parse_qs(query)["quantity"][0]), Decimal("1.10"))
+        self.assertEqual(client.sells, [])
+
+    def test_time_stop_new_zero_fill_does_not_close_or_resell(self) -> None:
+        ledger = self._ledger()
+        pid, adapter, client = self._held_qty(ledger, "1.50")
+        adapter.max_hold_sec = 60
+        client.sell_ack = {"orderId": 77, "status": "NEW", "executedQty": "0", "origQty": "1.50"}
+        self._tick(ledger, adapter, "100")
+        stored = ledger.binance_spot_position_by_id(pid)
+        assert stored is not None
+        self.assertEqual(stored["status"], "time_stop_unknown")
+        self.assertEqual(Decimal(stored["quantity"]), Decimal("1.50"))
+        self.assertEqual(len(client.sells), 1)
+        self._tick(ledger, adapter, "100")
+        again = ledger.binance_spot_position_by_id(pid)
+        assert again is not None
+        self.assertNotEqual(again["status"], "closed")
+        self.assertEqual(Decimal(again["quantity"]), Decimal("1.50"))
+        self.assertEqual(len(client.sells), 1)
+
+    def test_time_stop_partial_fill_keeps_remainder_1_10(self) -> None:
+        ledger = self._ledger()
+        pid, adapter, client = self._held_qty(ledger, "1.50")
+        adapter.max_hold_sec = 60
+        client.sell_ack = {
+            "orderId": 77,
+            "status": "PARTIALLY_FILLED",
+            "executedQty": "0.40",
+            "origQty": "1.50",
+        }
+        self._tick(ledger, adapter, "100")
+        self._tick(ledger, adapter, "100")
+        stored = ledger.binance_spot_position_by_id(pid)
+        assert stored is not None
+        self.assertNotEqual(stored["status"], "closed")
+        self.assertEqual(Decimal(stored["quantity"]), Decimal("1.10"))
+        self.assertEqual(len(client.sells), 1)
+        self.assertEqual(Decimal(parse_qs(client.sells[0])["quantity"][0]), Decimal("1.50"))
+
+    def test_flatten_new_zero_fill_does_not_close_or_resell(self) -> None:
+        ledger = self._ledger()
+        pid, adapter, client = self._held_qty(ledger, "1.50", 62)
+        adapter.auto_flatten_on_oco_fail = True
+        client.list_mode = "absent"
+        client.oco_mode = "reject"
+        client.sell_ack = {"orderId": 78, "status": "NEW", "executedQty": "0.00", "origQty": "1.50"}
+        ledger.update_binance_spot_position(pid, {"status": "open", "protection": "oco_pending"})
+        self._tick(ledger, adapter, "100")
+        self._tick(ledger, adapter, "100")
+        stored = ledger.binance_spot_position_by_id(pid)
+        assert stored is not None
+        self.assertNotEqual(stored["status"], "closed")
+        self.assertEqual(Decimal(stored["quantity"]), Decimal("1.50"))
+        self.assertEqual(len(client.sells), 1)
+
+    def test_flatten_partial_fill_keeps_remainder_1_10(self) -> None:
+        ledger = self._ledger()
+        pid, adapter, client = self._held_qty(ledger, "1.50", 63)
+        adapter.auto_flatten_on_oco_fail = True
+        client.list_mode = "absent"
+        client.oco_mode = "reject"
+        client.sell_ack = {
+            "orderId": 79,
+            "status": "PARTIALLY_FILLED",
+            "executedQty": "0.40",
+            "origQty": "1.50",
+        }
+        ledger.update_binance_spot_position(pid, {"status": "open", "protection": "oco_pending"})
+        self._tick(ledger, adapter, "100")
+        self._tick(ledger, adapter, "100")
+        stored = ledger.binance_spot_position_by_id(pid)
+        assert stored is not None
+        self.assertNotEqual(stored["status"], "closed")
+        self.assertEqual(Decimal(stored["quantity"]), Decimal("1.10"))
+        self.assertEqual(len(client.sells), 1)
+        self.assertLessEqual(Decimal(parse_qs(client.sells[0])["quantity"][0]), Decimal("1.50"))
