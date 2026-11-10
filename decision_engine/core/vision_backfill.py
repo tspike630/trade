@@ -20,7 +20,7 @@ import json
 import sqlite3
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -52,6 +52,16 @@ METRIC_COLUMNS = (
     "sum_taker_long_short_vol_ratio",
 )
 
+# The CSV label is stored as written. Binance has not documented a bin-edge
+# convention for these files, so availability stays unverified unless the
+# operator explicitly asks for a research clock.
+LABEL_CONVENTION = "unverified"
+LABEL_AVAILABILITY = "unknown"
+METRIC_AVAILABILITY_UNKNOWN = "unknown"
+METRIC_AVAILABILITY_BIN_END = "explicit_conservative_bin_end"
+METRIC_BIN_MS = 300_000
+BOOK_DEPTH_SEMANTICS = "percentage_from_mid_aggregate"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS vision_files (
     url TEXT PRIMARY KEY,
@@ -60,7 +70,11 @@ CREATE TABLE IF NOT EXISTS vision_files (
     row_count INTEGER,
     status TEXT NOT NULL,
     detail TEXT,
-    schema_version TEXT NOT NULL
+    schema_version TEXT NOT NULL,
+    checksum_sha256 TEXT,
+    checksum_status TEXT,
+    downloaded_at_ms INTEGER,
+    http_last_modified TEXT
 );
 CREATE TABLE IF NOT EXISTS vision_metrics (
     symbol TEXT NOT NULL,
@@ -70,6 +84,14 @@ CREATE TABLE IF NOT EXISTS vision_metrics (
     count_long_short_ratio REAL,
     sum_taker_long_short_vol_ratio REAL,
     source_url TEXT NOT NULL,
+    create_time_raw TEXT,
+    create_time_unit TEXT,
+    label_convention TEXT,
+    label_availability TEXT,
+    feature_available_at_ms INTEGER,
+    feature_availability_basis TEXT,
+    downloaded_at_ms INTEGER,
+    http_last_modified TEXT,
     PRIMARY KEY (symbol, create_time_ms)
 );
 CREATE TABLE IF NOT EXISTS vision_book_depth (
@@ -79,6 +101,9 @@ CREATE TABLE IF NOT EXISTS vision_book_depth (
     depth REAL,
     notional REAL,
     source_url TEXT NOT NULL,
+    depth_semantics TEXT,
+    downloaded_at_ms INTEGER,
+    http_last_modified TEXT,
     PRIMARY KEY (symbol, timestamp_ms, percentage)
 );
 CREATE TABLE IF NOT EXISTS vision_spot_klines (
@@ -93,9 +118,39 @@ CREATE TABLE IF NOT EXISTS vision_spot_klines (
     taker_buy_quote_volume REAL,
     timestamp_unit TEXT NOT NULL,
     source_url TEXT NOT NULL,
+    downloaded_at_ms INTEGER,
+    http_last_modified TEXT,
     PRIMARY KEY (symbol, interval, open_time_ms)
 );
 """
+
+_ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "vision_files": (
+        ("checksum_sha256", "TEXT"),
+        ("checksum_status", "TEXT"),
+        ("downloaded_at_ms", "INTEGER"),
+        ("http_last_modified", "TEXT"),
+    ),
+    "vision_metrics": (
+        ("create_time_raw", "TEXT"),
+        ("create_time_unit", "TEXT"),
+        ("label_convention", "TEXT"),
+        ("label_availability", "TEXT"),
+        ("feature_available_at_ms", "INTEGER"),
+        ("feature_availability_basis", "TEXT"),
+        ("downloaded_at_ms", "INTEGER"),
+        ("http_last_modified", "TEXT"),
+    ),
+    "vision_book_depth": (
+        ("depth_semantics", "TEXT"),
+        ("downloaded_at_ms", "INTEGER"),
+        ("http_last_modified", "TEXT"),
+    ),
+    "vision_spot_klines": (
+        ("downloaded_at_ms", "INTEGER"),
+        ("http_last_modified", "TEXT"),
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -106,6 +161,10 @@ class FetchResult:
     byte_count: int
     detail: str | None
     payload: bytes | None
+    downloaded_at_ms: int | None = None
+    http_last_modified: str | None = None
+    checksum_sha256: str | None = None
+    checksum_status: str | None = None
 
 
 class RateLimiter:
@@ -230,9 +289,14 @@ def parse_metrics_csv(text: str) -> list[dict[str, object]]:
         raise ValueError("metrics columns missing " + ",".join(sorted(missing)))
     rows: list[dict[str, object]] = []
     for raw in reader:
+        raw_label = str(raw["create_time"]).strip()
         item: dict[str, object] = {
             "symbol": str(raw["symbol"]).strip().upper(),
-            "create_time_ms": parse_utc_text(str(raw["create_time"])),
+            "create_time_raw": raw_label,
+            "create_time_unit": _civil_unit(raw_label),
+            "create_time_ms": parse_utc_text(raw_label),
+            "label_convention": LABEL_CONVENTION,
+            "label_availability": LABEL_AVAILABILITY,
         }
         for column in METRIC_COLUMNS:
             text_value = (raw.get(column) or "").strip()
@@ -298,10 +362,70 @@ def parse_spot_kline_csv(text: str, symbol: str) -> list[dict[str, object]]:
     return rows
 
 
+def _civil_unit(label: str) -> str:
+    clock = label.strip().split(" ")[-1]
+    if "." in clock:
+        return "civil_utc_fractional_second"
+    return "civil_utc_second"
+
+
+def metric_feature_clock(create_time_ms: int, mode: str) -> tuple[int | None, str]:
+    """Research clock, separate from the CSV label and from download time.
+
+    ``unknown`` leaves feature availability unset. ``explicit_conservative_bin_end``
+    adds five minutes for a study that wants the bin treated as closed only at
+    its end. That choice is not a Binance attestation and does not change
+    ``create_time_ms``.
+    """
+    if mode == METRIC_AVAILABILITY_UNKNOWN:
+        return None, METRIC_AVAILABILITY_UNKNOWN
+    if mode == METRIC_AVAILABILITY_BIN_END:
+        return int(create_time_ms) + METRIC_BIN_MS, METRIC_AVAILABILITY_BIN_END
+    raise ValueError(f"unsupported metric availability mode {mode}")
+
+
+def parse_sha256sum(text: str, filename: str) -> str:
+    """Parse a Binance ``.CHECKSUM`` body (``sha256sum`` layout)."""
+    line = ""
+    for candidate in text.splitlines():
+        if candidate.strip():
+            line = candidate.strip()
+            break
+    if not line:
+        raise ValueError("empty checksum")
+    parts = line.split()
+    if len(parts) != 2:
+        raise ValueError("checksum line is not sha256sum layout")
+    digest, name = parts
+    if len(digest) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in digest):
+        raise ValueError("checksum is not a sha256 hex digest")
+    bare = name[1:] if name.startswith("*") else name
+    if Path(bare).name != Path(filename).name:
+        raise ValueError(f"checksum name {bare} does not match {Path(filename).name}")
+    return digest.lower()
+
+
+def checksum_url_for(url: str) -> str:
+    return url + ".CHECKSUM"
+
+
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.executescript(_SCHEMA)
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, declaration in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+    forbidden = {
+        str(row[1])
+        for table in ("vision_metrics", "vision_book_depth", "vision_spot_klines", "vision_files")
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+    if "obi_top5" in forbidden:
+        raise RuntimeError("vision tables must not carry obi_top5")
+    conn.commit()
     return conn
 
 
@@ -313,31 +437,68 @@ def already_stored(conn: sqlite3.Connection, url: str, sha256: str | None) -> bo
     return bool(row and row[1] == "ok" and sha256 is not None and row[0] == sha256)
 
 
+def stored_ok(conn: sqlite3.Connection, url: str) -> bool:
+    """True when this URL was imported. A later run must not download it again."""
+    row = conn.execute(
+        "SELECT status, sha256 FROM vision_files WHERE url = ?",
+        (url,),
+    ).fetchone()
+    return bool(row and row[0] == "ok" and row[1])
+
+
+def _clock_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _header_last_modified(headers: object) -> str | None:
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return None
+    value = getter("Last-Modified")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def fetch_bytes(url: str, limiter: RateLimiter, attempts: int = 4) -> FetchResult:
     last_detail = "not_attempted"
     for attempt in range(attempts):
         limiter.wait()
         request = Request(url, headers={"User-Agent": USER_AGENT})
+        downloaded_at_ms = _clock_ms()
         try:
             with urlopen(request, timeout=60) as response:
                 payload = response.read()
+                published = _header_last_modified(response.headers)
         except HTTPError as exc:
+            published = _header_last_modified(exc.headers)
             if exc.code == 404:
-                return FetchResult(url, "missing", None, 0, "404", None)
+                return FetchResult(
+                    url, "missing", None, 0, "404", None, downloaded_at_ms, published
+                )
             last_detail = f"http_{exc.code}"
             if exc.code not in (429, 500, 502, 503, 504) or attempt == attempts - 1:
-                return FetchResult(url, "error", None, 0, last_detail, None)
+                return FetchResult(
+                    url, "error", None, 0, last_detail, None, downloaded_at_ms, published
+                )
             time.sleep(2**attempt)
             continue
         except (URLError, TimeoutError, OSError) as exc:
             last_detail = type(exc).__name__
             if attempt == attempts - 1:
-                return FetchResult(url, "error", None, 0, last_detail, None)
+                return FetchResult(
+                    url, "error", None, 0, last_detail, None, downloaded_at_ms, None
+                )
             time.sleep(2**attempt)
             continue
         digest = hashlib.sha256(payload).hexdigest()
-        return FetchResult(url, "ok", digest, len(payload), None, payload)
-    return FetchResult(url, "error", None, 0, last_detail, None)
+        return FetchResult(
+            url, "ok", digest, len(payload), None, payload, downloaded_at_ms, published
+        )
+    return FetchResult(url, "error", None, 0, last_detail, None, _clock_ms(), None)
 
 
 def _record_file(
@@ -347,15 +508,21 @@ def _record_file(
 ) -> None:
     conn.execute(
         """
-        INSERT INTO vision_files (url, sha256, byte_count, row_count, status, detail, schema_version)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO vision_files (
+            url, sha256, byte_count, row_count, status, detail, schema_version,
+            checksum_sha256, checksum_status, downloaded_at_ms, http_last_modified
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(url) DO UPDATE SET
             sha256=excluded.sha256,
             byte_count=excluded.byte_count,
             row_count=excluded.row_count,
             status=excluded.status,
             detail=excluded.detail,
-            schema_version=excluded.schema_version
+            schema_version=excluded.schema_version,
+            checksum_sha256=excluded.checksum_sha256,
+            checksum_status=excluded.checksum_status,
+            downloaded_at_ms=excluded.downloaded_at_ms,
+            http_last_modified=excluded.http_last_modified
         """,
         (
             fetched.url,
@@ -365,8 +532,18 @@ def _record_file(
             fetched.status,
             fetched.detail,
             SCHEMA_VERSION,
+            fetched.checksum_sha256,
+            fetched.checksum_status,
+            fetched.downloaded_at_ms,
+            fetched.http_last_modified,
         ),
     )
+
+
+def _fail_file(conn: sqlite3.Connection, fetched: FetchResult, detail: str) -> None:
+    failed = replace(fetched, status="error", detail=detail[:300], payload=None)
+    _record_file(conn, failed, 0)
+    conn.commit()
 
 
 def ingest_zip(
@@ -374,6 +551,8 @@ def ingest_zip(
     kind: str,
     symbol: str,
     fetched: FetchResult,
+    *,
+    availability_mode: str = METRIC_AVAILABILITY_UNKNOWN,
 ) -> int:
     if fetched.status != "ok" or fetched.payload is None or fetched.sha256 is None:
         _record_file(conn, fetched, 0)
@@ -381,84 +560,233 @@ def ingest_zip(
         return 0
     if already_stored(conn, fetched.url, fetched.sha256):
         return 0
-    texts = _zip_texts(fetched.payload)
-    written = 0
-    if kind == "metrics":
-        for _name, text in texts:
-            for row in parse_metrics_csv(text):
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO vision_metrics (
-                        symbol, create_time_ms, count_toptrader_long_short_ratio,
-                        sum_toptrader_long_short_ratio, count_long_short_ratio,
-                        sum_taker_long_short_vol_ratio, source_url
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        row["symbol"],
-                        row["create_time_ms"],
-                        row["count_toptrader_long_short_ratio"],
-                        row["sum_toptrader_long_short_ratio"],
-                        row["count_long_short_ratio"],
-                        row["sum_taker_long_short_vol_ratio"],
-                        fetched.url,
-                    ),
-                )
-                written += 1
-    elif kind == "bookDepth":
-        for _name, text in texts:
-            for row in parse_book_depth_csv(text, symbol):
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO vision_book_depth (
-                        symbol, timestamp_ms, percentage, depth, notional, source_url
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        row["symbol"],
-                        row["timestamp_ms"],
-                        row["percentage"],
-                        row["depth"],
-                        row["notional"],
-                        fetched.url,
-                    ),
-                )
-                written += 1
-    elif kind == "klines":
-        for _name, text in texts:
-            for row in parse_spot_kline_csv(text, symbol):
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO vision_spot_klines (
-                        symbol, interval, open_time_ms, close_time_ms,
-                        open, high, low, close, volume, quote_volume,
-                        taker_buy_base_volume, taker_buy_quote_volume,
-                        timestamp_unit, source_url
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        row["symbol"],
-                        row["interval"],
-                        row["open_time_ms"],
-                        row["close_time_ms"],
-                        row["open"],
-                        row["high"],
-                        row["low"],
-                        row["close"],
-                        row["volume"],
-                        row["quote_volume"],
-                        row["taker_buy_base_volume"],
-                        row["taker_buy_quote_volume"],
-                        row["timestamp_unit"],
-                        fetched.url,
-                    ),
-                )
-                written += 1
-    else:
-        raise ValueError(kind)
+    try:
+        texts = _zip_texts(fetched.payload)
+        written = 0
+        if kind == "metrics":
+            for _name, text in texts:
+                for row in parse_metrics_csv(text):
+                    feature_ms, feature_basis = metric_feature_clock(
+                        int(row["create_time_ms"]), availability_mode
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO vision_metrics (
+                            symbol, create_time_ms, count_toptrader_long_short_ratio,
+                            sum_toptrader_long_short_ratio, count_long_short_ratio,
+                            sum_taker_long_short_vol_ratio, source_url,
+                            create_time_raw, create_time_unit, label_convention,
+                            label_availability, feature_available_at_ms,
+                            feature_availability_basis, downloaded_at_ms, http_last_modified
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["symbol"],
+                            row["create_time_ms"],
+                            row["count_toptrader_long_short_ratio"],
+                            row["sum_toptrader_long_short_ratio"],
+                            row["count_long_short_ratio"],
+                            row["sum_taker_long_short_vol_ratio"],
+                            fetched.url,
+                            row["create_time_raw"],
+                            row["create_time_unit"],
+                            row["label_convention"],
+                            row["label_availability"],
+                            feature_ms,
+                            feature_basis,
+                            fetched.downloaded_at_ms,
+                            fetched.http_last_modified,
+                        ),
+                    )
+                    written += 1
+        elif kind == "bookDepth":
+            for _name, text in texts:
+                for row in parse_book_depth_csv(text, symbol):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO vision_book_depth (
+                            symbol, timestamp_ms, percentage, depth, notional, source_url,
+                            depth_semantics, downloaded_at_ms, http_last_modified
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["symbol"],
+                            row["timestamp_ms"],
+                            row["percentage"],
+                            row["depth"],
+                            row["notional"],
+                            fetched.url,
+                            BOOK_DEPTH_SEMANTICS,
+                            fetched.downloaded_at_ms,
+                            fetched.http_last_modified,
+                        ),
+                    )
+                    written += 1
+        elif kind == "klines":
+            for _name, text in texts:
+                for row in parse_spot_kline_csv(text, symbol):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO vision_spot_klines (
+                            symbol, interval, open_time_ms, close_time_ms,
+                            open, high, low, close, volume, quote_volume,
+                            taker_buy_base_volume, taker_buy_quote_volume,
+                            timestamp_unit, source_url, downloaded_at_ms, http_last_modified
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["symbol"],
+                            row["interval"],
+                            row["open_time_ms"],
+                            row["close_time_ms"],
+                            row["open"],
+                            row["high"],
+                            row["low"],
+                            row["close"],
+                            row["volume"],
+                            row["quote_volume"],
+                            row["taker_buy_base_volume"],
+                            row["taker_buy_quote_volume"],
+                            row["timestamp_unit"],
+                            fetched.url,
+                            fetched.downloaded_at_ms,
+                            fetched.http_last_modified,
+                        ),
+                    )
+                    written += 1
+        else:
+            raise ValueError(kind)
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, ValueError, UnicodeError, OSError) as exc:
+        conn.rollback()
+        detail = f"bad_zip:{type(exc).__name__}:{exc}"
+        _fail_file(conn, fetched, detail)
+        return 0
     _record_file(conn, fetched, written)
     conn.commit()
     return written
+
+
+def import_planned_file(
+    conn: sqlite3.Connection,
+    kind: str,
+    symbol: str,
+    url: str,
+    fetcher: object,
+    limiter: RateLimiter,
+    *,
+    availability_mode: str = METRIC_AVAILABILITY_UNKNOWN,
+) -> str:
+    """Verify the publisher checksum, then import. One file cannot stop the run.
+
+    A URL already stored as ``ok`` is not downloaded again.
+    """
+    if stored_ok(conn, url):
+        return "skipped_stored"
+    get = getattr(fetcher, "__call__", None)
+    if get is None:
+        raise TypeError("fetcher must be callable")
+    try:
+        checksum = fetcher(checksum_url_for(url), limiter)
+    except (OSError, URLError, TimeoutError, HTTPError) as exc:
+        _fail_file(
+            conn,
+            FetchResult(url, "error", None, 0, None, None, _clock_ms(), None),
+            f"checksum_fetch:{type(exc).__name__}",
+        )
+        return "error"
+    if not isinstance(checksum, FetchResult):
+        _fail_file(
+            conn,
+            FetchResult(url, "error", None, 0, None, None, _clock_ms(), None),
+            "checksum_fetch:bad_result",
+        )
+        return "error"
+    if checksum.status != "ok" or not checksum.payload:
+        detail = "checksum_404" if checksum.status == "missing" else f"checksum_{checksum.detail or checksum.status}"
+        status = "missing" if checksum.status == "missing" else "error"
+        _record_file(
+            conn,
+            replace(
+                checksum,
+                url=url,
+                status=status,
+                detail=detail,
+                payload=None,
+                sha256=None,
+                checksum_status="missing" if checksum.status == "missing" else "fetch_error",
+            ),
+            0,
+        )
+        conn.commit()
+        return status
+    try:
+        expected = parse_sha256sum(checksum.payload.decode("utf-8", errors="replace"), url)
+    except ValueError as exc:
+        _fail_file(
+            conn,
+            replace(checksum, url=url, payload=None, sha256=None, checksum_status="malformed"),
+            f"checksum_malformed:{exc}",
+        )
+        return "error"
+    try:
+        fetched = fetcher(url, limiter)
+    except (OSError, URLError, TimeoutError, HTTPError) as exc:
+        _fail_file(
+            conn,
+            FetchResult(url, "error", None, 0, None, None, _clock_ms(), None, expected, "fetch_error"),
+            f"zip_fetch:{type(exc).__name__}",
+        )
+        return "error"
+    if not isinstance(fetched, FetchResult):
+        _fail_file(
+            conn,
+            FetchResult(url, "error", None, 0, None, None, _clock_ms(), None, expected, "fetch_error"),
+            "zip_fetch:bad_result",
+        )
+        return "error"
+    if fetched.status != "ok" or fetched.payload is None or fetched.sha256 is None:
+        status = "missing" if fetched.status == "missing" else "error"
+        detail = "zip_404" if status == "missing" else (fetched.detail or fetched.status)
+        _record_file(
+            conn,
+            replace(
+                fetched,
+                url=url,
+                status=status,
+                detail=detail,
+                payload=None,
+                checksum_sha256=expected,
+                checksum_status="parsed_zip_absent",
+            ),
+            0,
+        )
+        conn.commit()
+        return status
+    if fetched.sha256.lower() != expected:
+        _record_file(
+            conn,
+            replace(
+                fetched,
+                status="error",
+                detail="checksum_mismatch",
+                payload=None,
+                checksum_sha256=expected,
+                checksum_status="mismatch",
+            ),
+            0,
+        )
+        conn.commit()
+        return "error"
+    verified = replace(fetched, checksum_sha256=expected, checksum_status="verified")
+    try:
+        ingest_zip(conn, kind, symbol, verified, availability_mode=availability_mode)
+    except Exception as exc:  # noqa: BLE001 — one bad file must not stop the plan
+        _fail_file(conn, replace(verified, payload=None), f"import:{type(exc).__name__}:{exc}")
+        return "error"
+    row = conn.execute("SELECT status FROM vision_files WHERE url = ?", (url,)).fetchone()
+    if row is None or row[0] != "ok":
+        return "error"
+    return "ok"
 
 
 def coverage_report(conn: sqlite3.Connection, symbols: Sequence[str]) -> dict[str, object]:
@@ -498,7 +826,7 @@ def coverage_report(conn: sqlite3.Connection, symbols: Sequence[str]) -> dict[st
             }
         )
     missing = [row for row in files if row["status"] == "missing"]
-    errors = [row for row in files if row["status"] == "error"]
+    errors = [row for row in files if row["status"] not in {"ok", "missing"}]
     return {
         "schema_version": SCHEMA_VERSION,
         "core_bases": list(CORE_BASES),
@@ -510,8 +838,22 @@ def coverage_report(conn: sqlite3.Connection, symbols: Sequence[str]) -> dict[st
             item["metrics_rows"] and item["kline_rows"] for item in per_symbol
         ),
         "book_depth_is_percentage_aggregate": True,
+        "book_depth_semantics": BOOK_DEPTH_SEMANTICS,
         "obi_top5_column": False,
         "metrics_columns_kept_separate": list(METRIC_COLUMNS),
+        "metric_label_convention": LABEL_CONVENTION,
+        "metric_label_availability": LABEL_AVAILABILITY,
+        "clocks": {
+            "create_time_ms": "CSV label parsed as UTC. Not an availability attestation.",
+            "create_time_raw": "Original metrics create_time text.",
+            "downloaded_at_ms": "When this process stored the HTTP response.",
+            "http_last_modified": "Publisher Last-Modified header when the server sent one.",
+            "feature_available_at_ms": (
+                "Null unless the operator set explicit_conservative_bin_end. "
+                "That research clock is label plus 5 minutes and is neither "
+                "download time nor publication time."
+            ),
+        },
     }
 
 

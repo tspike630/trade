@@ -24,7 +24,17 @@ Cloud probe already run, not the full window:
     --out /tmp/calib-probe --days 2 --end 2026-11-08 \
     --bases BTC,ETH --ccxt-days 1
 
-Full window on a machine that can reach the exchanges:
+Full window on a machine that can reach the exchanges. Use a new output
+directory. Do not point this at a backfill that is already running.
+Exit 0 only when every planned Vision file is ok and every CCXT venue
+status is ok. A 404, checksum mismatch, bad zip, or Bybit 403 leaves
+complete false and exit 2. The process still continues past a single
+bad file. Publisher .CHECKSUM is required before a zip is parsed.
+Metric create_time_ms is the CSV label parsed as UTC, with
+label_availability=unknown. It is not a confirmed bin edge.
+--metric-availability explicit_conservative_bin_end stores a separate
+research clock at label plus 5 minutes. That is not download time and
+not an official Binance convention.
 
   PYTHONPATH=. python3 scripts/run_public_backfill.py \
     --out /var/calib-public --days 45 --ccxt-days 30

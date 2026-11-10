@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 from decision_engine.core.ccxt_public_backfill import (
     PageResult,
     backfill_symbol,
+    closed_bar_opens,
     closed_pages,
     ensure_ccxt_ohlcv,
 )
@@ -27,17 +28,26 @@ from decision_engine.core.news_oos_calibration import (
     time_split,
 )
 from decision_engine.core.vision_backfill import (
+    BOOK_DEPTH_SEMANTICS,
+    LABEL_AVAILABILITY,
+    LABEL_CONVENTION,
+    METRIC_AVAILABILITY_BIN_END,
     FetchResult,
+    RateLimiter,
     connect,
     coverage_report,
     detect_epoch_unit,
     epoch_to_ms,
+    import_planned_file,
     ingest_zip,
     kline_requests,
     parse_book_depth_csv,
     parse_metrics_csv,
+    parse_sha256sum,
     parse_spot_kline_csv,
 )
+from scripts.run_public_backfill import main as backfill_main
+from scripts.run_public_backfill import overall_complete
 
 NOW = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
 
@@ -301,6 +311,302 @@ class NewsCalibrationTests(unittest.TestCase):
         stats = bootstrap_treated([("c1", True, 20.0), ("c2", False, 0.0)], reps=50, seed=1)
         self.assertAlmostEqual(float(stats["mean_diff_bps"]), 20.0)
         self.assertGreater(float(stats["clusters"]), 1)
+
+
+def _sha256(payload: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _checksum_result(url: str, payload: bytes) -> FetchResult:
+    name = url.rsplit("/", 1)[-1]
+    digest = _sha256(payload)
+    body = f"{digest}  {name}\n".encode()
+    return FetchResult(
+        url + ".CHECKSUM",
+        "ok",
+        _sha256(body),
+        len(body),
+        None,
+        body,
+        1_700_000_000_000,
+        "Tue, 10 Nov 2026 02:43:02 GMT",
+    )
+
+
+_METRICS_CSV = (
+    "create_time,symbol,sum_open_interest,sum_open_interest_value,"
+    "count_toptrader_long_short_ratio,sum_toptrader_long_short_ratio,"
+    "count_long_short_ratio,sum_taker_long_short_vol_ratio\n"
+    "2026-11-09 00:00:00,BTCUSDT,1,2,3.18550969,1.99021200,2.85595208,0.95567800\n"
+)
+
+
+class SupplyIngestTests(unittest.TestCase):
+    def test_closed_window_excludes_the_forming_edge_and_names_holes(self) -> None:
+        step = 300_000
+        start = 1_000
+        end = start + step * 6
+        expected = closed_bar_opens(start, end, step)
+        forming = ((end - step) // step) * step + step
+        self.assertNotIn(forming, expected)
+        self.assertEqual(len(expected), 5)
+        self.assertNotEqual(len(expected), (end - start) // step)
+        with TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(Path(tmp) / "ccxt.db")
+            ensure_ccxt_ohlcv(conn)
+
+            def fetch_page(timeframe: str, since: int, limit: int) -> PageResult:
+                del timeframe, since, limit
+                rows = [[stamp, 1, 2, 0.5, 1.5, 3] for stamp in expected]
+                rows.append([forming, 9, 9, 9, 9, 9])
+                hole = expected[1]
+                rows = [row for row in rows if row[0] != hole]
+                return PageResult(rows, None)
+
+            result = backfill_symbol(
+                conn,
+                "okx",
+                "BTC",
+                start_ms=start,
+                end_ms=end,
+                fetch_page=fetch_page,
+                limit=10,
+            )
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["expected_closed_bars"], 5)
+            self.assertEqual(result["missing_timestamps_ms"], [expected[1]])
+            self.assertNotIn(forming, result["missing_timestamps_ms"])
+            stored = {
+                row[0]
+                for row in conn.execute("SELECT ts FROM ccxt_ohlcv")
+            }
+            self.assertNotIn(forming, stored)
+
+    def test_checksum_mismatch_and_bad_zip_do_not_import_and_later_file_continues(self) -> None:
+        good_url = "https://data.binance.vision/data/futures/um/daily/metrics/BTCUSDT/BTCUSDT-metrics-2026-11-09.zip"
+        bad_url = "https://data.binance.vision/data/futures/um/daily/metrics/ETHUSDT/ETHUSDT-metrics-2026-11-09.zip"
+        mismatch_url = "https://data.binance.vision/data/futures/um/daily/metrics/SOLUSDT/SOLUSDT-metrics-2026-11-09.zip"
+        good_zip = _zip_bytes("BTCUSDT-metrics-2026-11-09.csv", _METRICS_CSV)
+        bad_zip = b"not a zip"
+        mismatch_zip = _zip_bytes("SOLUSDT-metrics-2026-11-09.csv", _METRICS_CSV.replace("BTCUSDT", "SOLUSDT"))
+        calls: list[str] = []
+
+        def fetcher(url: str, limiter: object) -> FetchResult:
+            del limiter
+            calls.append(url)
+            if url == good_url + ".CHECKSUM":
+                return _checksum_result(good_url, good_zip)
+            if url == good_url:
+                return FetchResult(url, "ok", _sha256(good_zip), len(good_zip), None, good_zip, 50, "Tue, 10 Nov 2026 07:24:21 GMT")
+            if url == bad_url + ".CHECKSUM":
+                return _checksum_result(bad_url, bad_zip)
+            if url == bad_url:
+                return FetchResult(url, "ok", _sha256(bad_zip), len(bad_zip), None, bad_zip, 60, None)
+            if url == mismatch_url + ".CHECKSUM":
+                return FetchResult(
+                    url,
+                    "ok",
+                    "abc",
+                    8,
+                    None,
+                    b"0000000000000000000000000000000000000000000000000000000000000000  SOLUSDT-metrics-2026-11-09.zip\n",
+                    70,
+                    None,
+                )
+            if url == mismatch_url:
+                return FetchResult(
+                    url, "ok", _sha256(mismatch_zip), len(mismatch_zip), None, mismatch_zip, 71, None
+                )
+            if url.endswith("XRPUSDT-metrics-2026-11-09.zip") or url.endswith("XRPUSDT-metrics-2026-11-09.zip.CHECKSUM"):
+                return FetchResult(url, "missing", None, 0, "404", None, 80, None)
+            if "network" in url:
+                return FetchResult(url, "error", None, 0, "URLError", None, 90, None)
+            raise AssertionError(url)
+
+        with TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "vision.db")
+            limiter = RateLimiter(0)
+            bad = import_planned_file(conn, "metrics", "ETHUSDT", bad_url, fetcher, limiter)
+            mismatch = import_planned_file(conn, "metrics", "SOLUSDT", mismatch_url, fetcher, limiter)
+            missing = import_planned_file(
+                conn,
+                "metrics",
+                "XRPUSDT",
+                "https://data.binance.vision/data/futures/um/daily/metrics/XRPUSDT/XRPUSDT-metrics-2026-11-09.zip",
+                fetcher,
+                limiter,
+            )
+            network = import_planned_file(
+                conn,
+                "metrics",
+                "BNBUSDT",
+                "https://data.binance.vision/data/futures/um/daily/metrics/BNBUSDT/BNBUSDT-metrics-network.zip",
+                fetcher,
+                limiter,
+            )
+            good = import_planned_file(conn, "metrics", "BTCUSDT", good_url, fetcher, limiter)
+            again = import_planned_file(conn, "metrics", "BTCUSDT", good_url, fetcher, limiter)
+            self.assertEqual(bad, "error")
+            self.assertEqual(mismatch, "error")
+            self.assertEqual(missing, "missing")
+            self.assertEqual(network, "error")
+            self.assertEqual(good, "ok")
+            self.assertEqual(again, "skipped_stored")
+            self.assertEqual(calls.count(good_url), 1)
+            rows = conn.execute(
+                "SELECT symbol, create_time_raw, create_time_unit, label_convention, "
+                "label_availability, feature_available_at_ms, feature_availability_basis, "
+                "downloaded_at_ms, http_last_modified, count_toptrader_long_short_ratio, "
+                "sum_toptrader_long_short_ratio, count_long_short_ratio "
+                "FROM vision_metrics ORDER BY symbol"
+            ).fetchall()
+            self.assertEqual([row[0] for row in rows], ["BTCUSDT"])
+            label_ms = int(datetime(2026, 11, 9, tzinfo=timezone.utc).timestamp() * 1000)
+            stored_ms = conn.execute("SELECT create_time_ms FROM vision_metrics").fetchone()[0]
+            self.assertEqual(stored_ms, label_ms)
+            self.assertEqual(rows[0][1], "2026-11-09 00:00:00")
+            self.assertEqual(rows[0][2], "civil_utc_second")
+            self.assertEqual(rows[0][3], LABEL_CONVENTION)
+            self.assertEqual(rows[0][4], LABEL_AVAILABILITY)
+            self.assertIsNone(rows[0][5])
+            self.assertEqual(rows[0][6], "unknown")
+            self.assertEqual(rows[0][7], 50)
+            self.assertEqual(rows[0][8], "Tue, 10 Nov 2026 07:24:21 GMT")
+            self.assertNotEqual(rows[0][9], rows[0][10])
+            self.assertNotEqual(rows[0][10], rows[0][11])
+            statuses = {
+                row[0].rsplit("/", 1)[-1]: (row[1], row[2])
+                for row in conn.execute("SELECT url, status, detail FROM vision_files")
+            }
+            self.assertEqual(statuses["ETHUSDT-metrics-2026-11-09.zip"][0], "error")
+            self.assertIn("bad_zip", statuses["ETHUSDT-metrics-2026-11-09.zip"][1])
+            self.assertEqual(statuses["SOLUSDT-metrics-2026-11-09.zip"][1], "checksum_mismatch")
+            self.assertEqual(statuses["XRPUSDT-metrics-2026-11-09.zip"][0], "missing")
+            self.assertEqual(statuses["BNBUSDT-metrics-network.zip"][0], "error")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(vision_book_depth)")}
+            self.assertNotIn("obi_top5", columns)
+            self.assertIn("depth_semantics", columns)
+            report = coverage_report(conn, ["BTCUSDT"])
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["metric_label_availability"], "unknown")
+            self.assertTrue(report["book_depth_is_percentage_aggregate"])
+            self.assertEqual(report["book_depth_semantics"], BOOK_DEPTH_SEMANTICS)
+
+    def test_explicit_bin_end_is_not_the_label_or_the_download_clock(self) -> None:
+        url = "https://data.binance.vision/data/futures/um/daily/metrics/BTCUSDT/BTCUSDT-metrics-2026-11-09.zip"
+        payload = _zip_bytes("BTCUSDT-metrics-2026-11-09.csv", _METRICS_CSV)
+
+        def fetcher(request: str, limiter: object) -> FetchResult:
+            del limiter
+            if request.endswith(".CHECKSUM"):
+                return _checksum_result(url, payload)
+            return FetchResult(request, "ok", _sha256(payload), len(payload), None, payload, 50, "Tue, 10 Nov 2026 07:24:21 GMT")
+
+        with TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "vision.db")
+            outcome = import_planned_file(
+                conn,
+                "metrics",
+                "BTCUSDT",
+                url,
+                fetcher,
+                RateLimiter(0),
+                availability_mode=METRIC_AVAILABILITY_BIN_END,
+            )
+            self.assertEqual(outcome, "ok")
+            label_ms, feature_ms, basis, availability, downloaded = conn.execute(
+                "SELECT create_time_ms, feature_available_at_ms, feature_availability_basis, "
+                "label_availability, downloaded_at_ms FROM vision_metrics"
+            ).fetchone()
+            self.assertEqual(feature_ms, label_ms + 300_000)
+            self.assertNotEqual(feature_ms, downloaded)
+            self.assertEqual(basis, METRIC_AVAILABILITY_BIN_END)
+            self.assertEqual(availability, "unknown")
+
+    def test_old_vision_rows_survive_added_columns(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vision.db"
+            old = sqlite3.connect(path)
+            old.execute(
+                """
+                CREATE TABLE vision_metrics (
+                    symbol TEXT NOT NULL,
+                    create_time_ms INTEGER NOT NULL,
+                    count_toptrader_long_short_ratio REAL,
+                    sum_toptrader_long_short_ratio REAL,
+                    count_long_short_ratio REAL,
+                    sum_taker_long_short_vol_ratio REAL,
+                    source_url TEXT NOT NULL,
+                    PRIMARY KEY (symbol, create_time_ms)
+                )
+                """
+            )
+            old.execute(
+                "INSERT INTO vision_metrics VALUES ('BTCUSDT', 1, 3.1, 1.9, 2.8, 0.4, 'old')"
+            )
+            old.commit()
+            old.close()
+            conn = connect(path)
+            kept = conn.execute(
+                "SELECT count_toptrader_long_short_ratio, sum_toptrader_long_short_ratio, "
+                "count_long_short_ratio, create_time_raw FROM vision_metrics"
+            ).fetchone()
+            self.assertEqual(kept[0], 3.1)
+            self.assertEqual(kept[1], 1.9)
+            self.assertEqual(kept[2], 2.8)
+            self.assertIsNone(kept[3])
+            self.assertNotIn(
+                "obi_top5",
+                {row[1] for row in conn.execute("PRAGMA table_info(vision_metrics)")},
+            )
+
+    def test_partial_403_and_404_are_not_a_successful_exit(self) -> None:
+        self.assertEqual(
+            parse_sha256sum(
+                "ab" * 32 + "  BTCUSDT-metrics-2026-11-09.zip\n",
+                "https://data.binance.vision/data/x/BTCUSDT-metrics-2026-11-09.zip",
+            ),
+            "ab" * 32,
+        )
+        vision = {"complete": False, "missing": [{"status": "missing"}], "errors": []}
+        ccxt = {
+            "venues": [
+                {"exchange": "okx", "status": "ok", "detail": None},
+                {
+                    "exchange": "bybit",
+                    "status": "error",
+                    "detail": "blocked:RateLimitExceeded:403 CloudFront",
+                    "rows": 0,
+                },
+            ]
+        }
+        self.assertFalse(overall_complete(vision, ccxt))
+        self.assertFalse(overall_complete({"complete": True}, ccxt))
+        self.assertEqual(ccxt["venues"][1]["status"], "error")
+        self.assertIn("403", str(ccxt["venues"][1]["detail"]))
+        import scripts.run_public_backfill as runner
+
+        def fake_vision(args: object, out: Path, fetcher: object = None) -> dict[str, object]:
+            del args, out, fetcher
+            return {"complete": False, "missing": [{"status": "missing", "detail": "404"}], "errors": []}
+
+        def fake_ccxt(args: object, out: Path) -> dict[str, object]:
+            del args, out
+            return ccxt
+
+        original_vision = runner.run_vision
+        original_ccxt = runner.run_ccxt
+        runner.run_vision = fake_vision
+        runner.run_ccxt = fake_ccxt
+        try:
+            with TemporaryDirectory() as tmp:
+                code = backfill_main(["--out", tmp, "--bases", "BTC", "--ccxt-days", "1"])
+        finally:
+            runner.run_vision = original_vision
+            runner.run_ccxt = original_ccxt
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":

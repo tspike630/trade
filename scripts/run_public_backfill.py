@@ -31,12 +31,14 @@ from decision_engine.core.cross_venue_deviation import (
     summarize_pairs,
 )
 from decision_engine.core.vision_backfill import (
+    METRIC_AVAILABILITY_BIN_END,
+    METRIC_AVAILABILITY_UNKNOWN,
     RateLimiter,
     connect,
     coverage_report,
     core_usdt_symbols,
     fetch_bytes,
-    ingest_zip,
+    import_planned_file,
     iter_plan,
     write_manifest,
     closed_utc_days,
@@ -49,20 +51,45 @@ def _end_date(value: str | None) -> date:
     return datetime.now(timezone.utc).date() - timedelta(days=1)
 
 
-def run_vision(args: argparse.Namespace, out: Path) -> dict[str, object]:
+def run_vision(
+    args: argparse.Namespace,
+    out: Path,
+    fetcher: object = fetch_bytes,
+) -> dict[str, object]:
     symbols = core_usdt_symbols(tuple(args.bases.split(",")))
     dates = closed_utc_days(_end_date(args.end), args.days)
     db = connect(out / "vision.db")
     limiter = RateLimiter(args.min_interval)
+    mode = getattr(args, "metric_availability", METRIC_AVAILABILITY_UNKNOWN)
     for kind, symbol, url in iter_plan(symbols, dates):
-        fetched = fetch_bytes(url, limiter)
-        ingest_zip(db, kind, symbol, fetched)
-        print(f"{fetched.status} {kind} {symbol} {url} {fetched.detail or fetched.byte_count}")
+        outcome = import_planned_file(
+            db,
+            kind,
+            symbol,
+            url,
+            fetcher,
+            limiter,
+            availability_mode=mode,
+        )
+        print(f"{outcome} {kind} {symbol} {url}")
     report = coverage_report(db, symbols)
     report["dates"] = [item.isoformat() for item in dates]
+    report["metric_availability_requested"] = mode
     write_manifest(out / "vision_manifest.json", report)
     db.close()
     return report
+
+
+def overall_complete(vision: dict[str, object] | None, ccxt: dict[str, object] | None) -> bool:
+    """False when any planned file or venue failed. A Bybit 403 stays a failure."""
+    if vision is not None and not vision.get("complete"):
+        return False
+    if ccxt is None:
+        return True
+    venues = list(ccxt.get("venues") or [])
+    if not venues:
+        return False
+    return all(item.get("status") == "ok" for item in venues)
 
 
 def run_ccxt(args: argparse.Namespace, out: Path) -> dict[str, object]:
@@ -159,16 +186,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ccxt-limit", type=int, default=100)
     parser.add_argument("--skip-vision", action="store_true")
     parser.add_argument("--skip-ccxt", action="store_true")
+    parser.add_argument(
+        "--metric-availability",
+        choices=(METRIC_AVAILABILITY_UNKNOWN, METRIC_AVAILABILITY_BIN_END),
+        default=METRIC_AVAILABILITY_UNKNOWN,
+        help=(
+            "unknown leaves metric feature availability unset. "
+            "explicit_conservative_bin_end stores label plus 5 minutes as a "
+            "research clock and does not attest the CSV label."
+        ),
+    )
     args = parser.parse_args(argv)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    summary: dict[str, object] = {"bases": args.bases}
+    vision = None
+    ccxt_report = None
     if not args.skip_vision:
-        summary["vision"] = run_vision(args, out)
+        vision = run_vision(args, out)
     if not args.skip_ccxt:
-        summary["ccxt"] = run_ccxt(args, out)
-    print(json.dumps({"wrote": str(out), "complete": True}, indent=2))
-    return 0
+        ccxt_report = run_ccxt(args, out)
+    complete = overall_complete(vision, ccxt_report)
+    print(json.dumps({"wrote": str(out), "complete": complete}, indent=2))
+    return 0 if complete else 2
 
 
 if __name__ == "__main__":

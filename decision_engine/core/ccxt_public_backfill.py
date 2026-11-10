@@ -64,6 +64,35 @@ def ensure_ccxt_ohlcv(conn: sqlite3.Connection) -> None:
     )
 
 
+def closed_bar_opens(start_ms: int, end_ms: int, step_ms: int = STEP_MS) -> list[int]:
+    """Open times of bars that are fully closed inside ``[start_ms, end_ms]``.
+
+    The bar that contains ``end_ms`` is still forming and is not an expected
+    slot, so it is not reported as missing.
+    """
+    if step_ms <= 0 or end_ms <= start_ms:
+        return []
+    if start_ms % step_ms == 0:
+        first = start_ms
+    else:
+        first = ((start_ms // step_ms) + 1) * step_ms
+    last = ((end_ms - step_ms) // step_ms) * step_ms
+    if last < first:
+        return []
+    count = ((last - first) // step_ms) + 1
+    return [first + index * step_ms for index in range(count)]
+
+
+def missing_closed_opens(
+    start_ms: int,
+    end_ms: int,
+    observed: Sequence[int],
+    step_ms: int = STEP_MS,
+) -> list[int]:
+    have = {int(stamp) for stamp in observed}
+    return [stamp for stamp in closed_bar_opens(start_ms, end_ms, step_ms) if stamp not in have]
+
+
 def closed_pages(
     fetch_page: Fetcher,
     *,
@@ -189,7 +218,8 @@ def backfill_symbol(
     written = insert_closed_bars(conn, exchange_id, symbol, rows) if rows else 0
     status = "ok" if error is None else "partial" if rows else "error"
     record_status(conn, exchange_id, symbol, status, error, len(rows), start_ms, end_ms)
-    expected = max(0, (end_ms - start_ms) // STEP_MS)
+    expected_opens = closed_bar_opens(start_ms, end_ms)
+    missing = missing_closed_opens(start_ms, end_ms, [int(row[0]) for row in rows])
     return {
         "exchange": exchange_id,
         "base": base,
@@ -197,8 +227,9 @@ def backfill_symbol(
         "quote": quote_for(exchange_id),
         "rows": len(rows),
         "inserted": written,
-        "expected_closed_bars": expected,
-        "missing_bars": expected - len(rows),
+        "expected_closed_bars": len(expected_opens),
+        "missing_bars": len(missing),
+        "missing_timestamps_ms": missing,
         "status": status,
         "detail": error,
         "history_covers_requested_start": bool(rows) and int(rows[0][0]) <= start_ms + STEP_MS,
