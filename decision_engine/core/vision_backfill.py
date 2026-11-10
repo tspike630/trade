@@ -17,6 +17,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import sqlite3
 import time
 import zipfile
@@ -259,6 +260,36 @@ def daily_urls(kind: str, symbol: str, dates: Sequence[date]) -> tuple[str, ...]
     )
 
 
+def _optional_finite(text: str, *, minimum: float | None = None) -> float | None:
+    """Blank is a schema null. A non-finite token is invalid data."""
+    raw = text.strip()
+    if raw == "":
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"invalid_data:not_a_number:{raw}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"invalid_data:non_finite:{raw}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"invalid_data:below_{minimum}:{raw}")
+    return value
+
+
+def _require_finite(text: str, *, minimum: float | None = None) -> float:
+    value = _optional_finite(text, minimum=minimum)
+    if value is None:
+        raise ValueError("invalid_data:required_number_blank")
+    return value
+
+
+def _require_positive(text: str) -> float:
+    value = _require_finite(text)
+    if value <= 0:
+        raise ValueError(f"invalid_data:ohlc_not_positive:{text}")
+    return value
+
+
 def parse_utc_text(value: str) -> int:
     text = value.strip().replace("Z", "")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
@@ -299,8 +330,7 @@ def parse_metrics_csv(text: str) -> list[dict[str, object]]:
             "label_availability": LABEL_AVAILABILITY,
         }
         for column in METRIC_COLUMNS:
-            text_value = (raw.get(column) or "").strip()
-            item[column] = float(text_value) if text_value else None
+            item[column] = _optional_finite(str(raw.get(column) or ""))
         rows.append(item)
     return rows
 
@@ -317,9 +347,9 @@ def parse_book_depth_csv(text: str, symbol: str) -> list[dict[str, object]]:
             {
                 "symbol": symbol.upper(),
                 "timestamp_ms": parse_utc_text(str(raw["timestamp"])),
-                "percentage": float(raw["percentage"]),
-                "depth": float(raw["depth"]) if str(raw["depth"]).strip() else None,
-                "notional": float(raw["notional"]) if str(raw["notional"]).strip() else None,
+                "percentage": _require_finite(str(raw["percentage"])),
+                "depth": _optional_finite(str(raw.get("depth") or ""), minimum=0.0),
+                "notional": _optional_finite(str(raw.get("notional") or ""), minimum=0.0),
             }
         )
     return rows
@@ -342,20 +372,26 @@ def parse_spot_kline_csv(text: str, symbol: str) -> list[dict[str, object]]:
         span = close_ms - open_ms
         if span not in (299_999, 300_000):
             raise ValueError(f"not a closed 5m span: {span}")
+        open_px = _require_positive(raw[1])
+        high_px = _require_positive(raw[2])
+        low_px = _require_positive(raw[3])
+        close_px = _require_positive(raw[4])
+        if high_px < low_px or high_px < open_px or high_px < close_px or low_px > open_px or low_px > close_px:
+            raise ValueError("invalid_data:ohlc_order")
         rows.append(
             {
                 "symbol": symbol.upper(),
                 "interval": "5m",
                 "open_time_ms": open_ms,
                 "close_time_ms": close_ms,
-                "open": float(raw[1]),
-                "high": float(raw[2]),
-                "low": float(raw[3]),
-                "close": float(raw[4]),
-                "volume": float(raw[5]),
-                "quote_volume": float(raw[7]),
-                "taker_buy_base_volume": float(raw[9]),
-                "taker_buy_quote_volume": float(raw[10]),
+                "open": open_px,
+                "high": high_px,
+                "low": low_px,
+                "close": close_px,
+                "volume": _optional_finite(raw[5], minimum=0.0),
+                "quote_volume": _optional_finite(raw[7], minimum=0.0),
+                "taker_buy_base_volume": _optional_finite(raw[9], minimum=0.0),
+                "taker_buy_quote_volume": _optional_finite(raw[10], minimum=0.0),
                 "timestamp_unit": unit,
             }
         )
@@ -429,6 +465,66 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def trusted_verified_cache(
+    conn: sqlite3.Connection,
+    cache_dir: Path,
+    url: str,
+) -> FetchResult | None:
+    """Reuse bytes only when a verified checksum and the cached zip agree.
+
+    A legacy ``ok`` row with a null checksum is not trusted.
+    """
+    row = conn.execute(
+        """
+        SELECT sha256, checksum_sha256, checksum_status, status,
+               downloaded_at_ms, http_last_modified
+        FROM vision_files WHERE url = ?
+        """,
+        (url,),
+    ).fetchone()
+    if row is None or row[3] != "ok" or row[2] != "verified":
+        return None
+    sha = str(row[0] or "")
+    checksum = str(row[1] or "")
+    if not sha or sha.lower() != checksum.lower():
+        return None
+    cached = cache_dir / f"{sha.lower()}.zip"
+    if not cached.is_file():
+        return None
+    payload = cached.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != sha.lower():
+        return None
+    return FetchResult(
+        url,
+        "ok",
+        sha.lower(),
+        len(payload),
+        "reused_verified_cache",
+        payload,
+        row[4],
+        row[5],
+        checksum.lower(),
+        "verified",
+    )
+
+
+def cached_fetch(
+    conn: sqlite3.Connection,
+    cache_dir: Path,
+    url: str,
+    limiter: RateLimiter,
+) -> FetchResult:
+    """Return a verified cache hit, otherwise download. Never bless an old manifest row."""
+    trusted = trusted_verified_cache(conn, cache_dir, url)
+    if trusted is not None:
+        return trusted
+    fetched = fetch_bytes(url, limiter)
+    if fetched.payload is not None and fetched.sha256:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / f"{fetched.sha256}.zip").write_bytes(fetched.payload)
+    return fetched
+
+
 def already_stored(conn: sqlite3.Connection, url: str, sha256: str | None) -> bool:
     row = conn.execute(
         "SELECT sha256, status FROM vision_files WHERE url = ?",
@@ -438,12 +534,16 @@ def already_stored(conn: sqlite3.Connection, url: str, sha256: str | None) -> bo
 
 
 def stored_ok(conn: sqlite3.Connection, url: str) -> bool:
-    """True when this URL was imported. A later run must not download it again."""
+    """True only for a verified import. Legacy rows without a checksum are not ok."""
     row = conn.execute(
-        "SELECT status, sha256 FROM vision_files WHERE url = ?",
+        "SELECT status, sha256, checksum_sha256, checksum_status FROM vision_files WHERE url = ?",
         (url,),
     ).fetchone()
-    return bool(row and row[0] == "ok" and row[1])
+    if row is None or row[0] != "ok" or row[3] != "verified":
+        return False
+    sha = str(row[1] or "")
+    checksum = str(row[2] or "")
+    return bool(sha) and sha.lower() == checksum.lower()
 
 
 def _clock_ms() -> int:
@@ -554,6 +654,9 @@ def ingest_zip(
     *,
     availability_mode: str = METRIC_AVAILABILITY_UNKNOWN,
 ) -> int:
+    if fetched.detail in {"reused_manifest", "reused_local_cache"} and fetched.checksum_status != "verified":
+        _fail_file(conn, fetched, "unverified_cache")
+        return 0
     if fetched.status != "ok" or fetched.payload is None or fetched.sha256 is None:
         _record_file(conn, fetched, 0)
         conn.commit()
@@ -656,14 +759,38 @@ def ingest_zip(
                     written += 1
         else:
             raise ValueError(kind)
-    except (zipfile.BadZipFile, zipfile.LargeZipFile, ValueError, UnicodeError, OSError) as exc:
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, UnicodeError, OSError) as exc:
         conn.rollback()
-        detail = f"bad_zip:{type(exc).__name__}:{exc}"
+        _fail_file(conn, fetched, f"bad_zip:{type(exc).__name__}:{exc}")
+        return 0
+    except ValueError as exc:
+        conn.rollback()
+        text = str(exc)
+        detail = text if text.startswith("invalid_data:") else f"bad_zip:ValueError:{exc}"
         _fail_file(conn, fetched, detail)
+        return 0
+    if written <= 0:
+        conn.rollback()
+        _record_file(
+            conn,
+            replace(fetched, status="empty", detail="zero_rows", payload=None),
+            0,
+        )
+        conn.commit()
         return 0
     _record_file(conn, fetched, written)
     conn.commit()
     return written
+
+
+def _remember_cache(cache_dir: Path | None, payload: bytes, digest: str) -> None:
+    if cache_dir is None:
+        return
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target = cache_dir / f"{digest.lower()}.zip"
+    temporary = cache_dir / f".{digest.lower()}.zip.tmp"
+    temporary.write_bytes(payload)
+    temporary.replace(target)
 
 
 def import_planned_file(
@@ -675,13 +802,17 @@ def import_planned_file(
     limiter: RateLimiter,
     *,
     availability_mode: str = METRIC_AVAILABILITY_UNKNOWN,
+    cache_dir: Path | None = None,
 ) -> str:
     """Verify the publisher checksum, then import. One file cannot stop the run.
 
-    A URL already stored as ``ok`` is not downloaded again.
+    Only a verified checksum plus matching cached bytes skips the network.
+    A legacy ok row with a null checksum is fetched again.
     """
-    if stored_ok(conn, url):
-        return "skipped_stored"
+    if cache_dir is not None:
+        trusted = trusted_verified_cache(conn, cache_dir, url)
+        if trusted is not None:
+            return "skipped_stored"
     get = getattr(fetcher, "__call__", None)
     if get is None:
         raise TypeError("fetcher must be callable")
@@ -778,15 +909,17 @@ def import_planned_file(
         conn.commit()
         return "error"
     verified = replace(fetched, checksum_sha256=expected, checksum_status="verified")
+    if verified.payload is not None:
+        _remember_cache(cache_dir, verified.payload, expected)
     try:
         ingest_zip(conn, kind, symbol, verified, availability_mode=availability_mode)
     except Exception as exc:  # noqa: BLE001 — one bad file must not stop the plan
         _fail_file(conn, replace(verified, payload=None), f"import:{type(exc).__name__}:{exc}")
         return "error"
     row = conn.execute("SELECT status FROM vision_files WHERE url = ?", (url,)).fetchone()
-    if row is None or row[0] != "ok":
+    if row is None:
         return "error"
-    return "ok"
+    return "ok" if row[0] == "ok" else str(row[0])
 
 
 def coverage_report(conn: sqlite3.Connection, symbols: Sequence[str]) -> dict[str, object]:
@@ -834,9 +967,10 @@ def coverage_report(conn: sqlite3.Connection, symbols: Sequence[str]) -> dict[st
         "files": len(files),
         "missing": missing,
         "errors": errors,
-        "complete": not missing and not errors and all(
-            item["metrics_rows"] and item["kline_rows"] for item in per_symbol
-        ),
+        "complete": not missing and not errors and bool(per_symbol) and all(
+            item["metrics_rows"] and item["book_depth_rows"] and item["kline_rows"]
+            for item in per_symbol
+        ) and all(int(row["row_count"] or 0) > 0 for row in files),
         "book_depth_is_percentage_aggregate": True,
         "book_depth_semantics": BOOK_DEPTH_SEMANTICS,
         "obi_top5_column": False,
@@ -858,7 +992,11 @@ def coverage_report(conn: sqlite3.Connection, symbols: Sequence[str]) -> dict[st
 
 
 def write_manifest(path: Path, report: Mapping[str, object]) -> None:
-    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(blob, encoding="utf-8")
+    temporary.replace(path)
 
 
 def iter_plan(symbols: Iterable[str], dates: Sequence[date]) -> list[tuple[str, str, str]]:

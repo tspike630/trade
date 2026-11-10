@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
+import subprocess
+import sys
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from decision_engine.core.ccxt_public_backfill import (
     PageResult,
@@ -16,6 +20,7 @@ from decision_engine.core.ccxt_public_backfill import (
     ensure_ccxt_ohlcv,
 )
 from decision_engine.core.cross_venue_deviation import gap_counts, pair_exact_bars
+from decision_engine.core.cross_venue_calibration import evaluate_cross_venue, usd_not_calibrated
 from decision_engine.core.news_oos_calibration import (
     ARCHIVE_SERIES,
     audit_news_rows,
@@ -24,7 +29,8 @@ from decision_engine.core.news_oos_calibration import (
     dedup_events,
     evaluate_study,
     feature_is_known,
-    load_unlocked_calibration,
+    partial_taker_record,
+    taker_buy_quote_share,
     time_split,
 )
 from decision_engine.core.vision_backfill import (
@@ -34,6 +40,7 @@ from decision_engine.core.vision_backfill import (
     METRIC_AVAILABILITY_BIN_END,
     FetchResult,
     RateLimiter,
+    cached_fetch,
     connect,
     coverage_report,
     detect_epoch_unit,
@@ -126,6 +133,29 @@ class VisionTests(unittest.TestCase):
             self.assertFalse(report["complete"])
             self.assertFalse(report["obi_top5_column"])
 
+    def test_legacy_ok_without_checksum_is_not_reused(self) -> None:
+        url = "https://example.test/legacy.zip"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conn = connect(root / "vision.db")
+            conn.execute(
+                """
+                INSERT INTO vision_files (
+                    url, sha256, byte_count, row_count, status, detail, schema_version, checksum_status
+                ) VALUES (?, 'abc', 3, 1, 'ok', NULL, 'vision_backfill_v1', NULL)
+                """,
+                (url,),
+            )
+            conn.commit()
+            with patch(
+                "decision_engine.core.vision_backfill.fetch_bytes",
+                return_value=FetchResult(url, "missing", None, 0, "404", None),
+            ) as fetch:
+                again = cached_fetch(conn, root / "cache", url, limiter=RateLimiter(0))
+            self.assertGreaterEqual(fetch.call_count, 1)
+            self.assertNotEqual(again.detail, "reused_manifest")
+            self.assertNotEqual(again.detail, "reused_verified_cache")
+
 
 class CcxtTests(unittest.TestCase):
     def test_pagination_stops_and_does_not_invent_missing_minutes(self) -> None:
@@ -170,6 +200,27 @@ class CcxtTests(unittest.TestCase):
             self.assertEqual(result["rows"], 0)
             self.assertEqual(result["status"], "error")
             self.assertIn("blocked", str(result["detail"]))
+
+    def test_stored_prefix_is_not_requested_again(self) -> None:
+        with TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(Path(tmp) / "ccxt.db")
+            ensure_ccxt_ohlcv(conn)
+            calls: list[int] = []
+
+            def fetch_page(timeframe: str, since: int, limit: int) -> PageResult:
+                del timeframe, limit
+                calls.append(since)
+                return PageResult([[since, 1, 1, 1, 1, 1]], None)
+
+            backfill_symbol(
+                conn, "okx", "BTC", start_ms=0, end_ms=900_000, fetch_page=fetch_page, limit=1
+            )
+            calls.clear()
+            second = backfill_symbol(
+                conn, "okx", "BTC", start_ms=0, end_ms=900_000, fetch_page=fetch_page, limit=1
+            )
+            self.assertEqual(calls, [])
+            self.assertEqual(second["status"], "skipped_covered")
 
 
 class NewsCalibrationTests(unittest.TestCase):
@@ -253,9 +304,14 @@ class NewsCalibrationTests(unittest.TestCase):
             synthetic=False,
         )
         self.assertFalse(report["unlock"])
-        self.assertEqual(report["status"], "not_transferable")
+        self.assertFalse(report["live_gate_unlock"])
+        self.assertTrue(report["will_not_fully_unlock_onchain_calibration"])
+        self.assertIn("obi_top5", report["cannot_identify"])
+        self.assertIn("heat_evolution", report["cannot_identify"])
+        self.assertEqual(report["status"], "partial_taker_only")
+        self.assertFalse(report["partial_taker_evidence"]["applied_to_live_gate"])
         self.assertIsNone(report["false_positive_rate"])
-        self.assertIsNone(load_unlocked_calibration(report))
+        self.assertIsNotNone(partial_taker_record(report))
 
     def test_synthetic_evidence_stays_locked_and_a_real_gate_record_can_open(self) -> None:
         synthetic = evaluate_study(
@@ -269,7 +325,8 @@ class NewsCalibrationTests(unittest.TestCase):
             synthetic=True,
         )
         self.assertFalse(synthetic["unlock"])
-        self.assertIsNone(load_unlocked_calibration(synthetic))
+        self.assertFalse(synthetic["live_gate_unlock"])
+        self.assertIsNone(partial_taker_record(synthetic))
         attested = evaluate_study(
             predictive_rows=100,
             test_clusters=40,
@@ -280,10 +337,10 @@ class NewsCalibrationTests(unittest.TestCase):
             split_times={"train_end": "a", "validation_end": "b", "test_end": "c"},
             synthetic=False,
         )
-        loaded = load_unlocked_calibration(attested)
-        self.assertIsNotNone(loaded)
-        assert loaded is not None
-        self.assertEqual(loaded.min_heat_delta, 1)
+        self.assertFalse(attested["live_gate_unlock"])
+        self.assertIsNone(attested["partial_taker_evidence"])
+        self.assertIsNone(taker_buy_quote_share(10, 15))
+        self.assertAlmostEqual(taker_buy_quote_share(10, 6) or 0, 0.6)
 
     def test_split_purges_the_label_window(self) -> None:
         rows = []
@@ -311,6 +368,80 @@ class NewsCalibrationTests(unittest.TestCase):
         stats = bootstrap_treated([("c1", True, 20.0), ("c2", False, 0.0)], reps=50, seed=1)
         self.assertAlmostEqual(float(stats["mean_diff_bps"]), 20.0)
         self.assertGreater(float(stats["clusters"]), 1)
+
+    def test_delay_sensitivity_is_not_the_old_inventory(self) -> None:
+        rows = [
+            {
+                "published_at": "2026-11-01T00:00:00Z",
+                "fetched_at": "2026-11-01T03:00:00Z",
+            }
+        ]
+        audit = audit_news_rows(rows)
+        self.assertEqual(audit["sensitivity_by_cutoff_minutes"]["90"]["late_archive_excluded"], 1)
+        self.assertEqual(audit["sensitivity_by_cutoff_minutes"]["180"]["late_archive_excluded"], 0)
+        self.assertFalse(audit["reference_counts_not_used"]["used_as_this_result"])
+        self.assertNotEqual(audit["rows_in_input"], 1906)
+        self.assertNotEqual(audit["rows_in_input"], 1859)
+
+
+class CrossVenueTests(unittest.TestCase):
+    def test_one_venue_and_usd_stay_uncalibrated(self) -> None:
+        usd = usd_not_calibrated("no second USD venue")
+        self.assertEqual(usd["status"], "not_calibrated")
+        self.assertFalse(usd["unlock_news_gate"])
+        thin = evaluate_cross_venue(
+            {0: {"open": 1, "high": 1, "low": 1, "close": 1}},
+            {0: {"open": 1, "high": 1, "low": 1, "close": 1}},
+            quote="USDT",
+        )
+        self.assertEqual(thin["status"], "insufficient")
+        self.assertFalse(thin["unlock_news_gate"])
+
+    def test_aligned_wick_needs_the_peer_and_a_forward_bar(self) -> None:
+        left = {}
+        right = {}
+        for index in range(40):
+            open_ms = index * 300_000
+            left[open_ms] = {"open": 100, "high": 100, "low": 100, "close": 100}
+            right[open_ms] = {"open": 100, "high": 100, "low": 100, "close": 100}
+        left[20 * 300_000]["high"] = 101
+        report = evaluate_cross_venue(left, right, quote="USDT")
+        self.assertGreater(report["gaps"]["aligned"], 0)
+        self.assertEqual(report["gaps"]["filled_by_interpolation"], 0)
+        self.assertFalse(report["unlock_news_gate"])
+
+
+class CleanPackageTests(unittest.TestCase):
+    def test_empty_directory_imports_and_runs_the_offline_fixture(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        names = [
+            "decision_engine/__init__.py",
+            "decision_engine/core/__init__.py",
+            "decision_engine/core/vision_backfill.py",
+            "decision_engine/core/ccxt_public_backfill.py",
+            "decision_engine/core/cross_venue_deviation.py",
+            "decision_engine/core/cross_venue_calibration.py",
+            "decision_engine/core/news_oos_calibration.py",
+            "packaging/calib_backfill/selfcheck_offline.py",
+            "packaging/calib_backfill/requirements.txt",
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in names:
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(repo / name, target)
+            self.assertFalse((root / "decision_engine/core/news_shock_gate.py").exists())
+            completed = subprocess.run(
+                [sys.executable, str(root / "packaging/calib_backfill/selfcheck_offline.py")],
+                cwd=root,
+                env={"PYTHONPATH": str(root), "PATH": "/usr/bin:/bin"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertIn("OFFLINE_OK", completed.stdout)
 
 
 def _sha256(payload: bytes) -> str:
@@ -374,7 +505,8 @@ class SupplyIngestTests(unittest.TestCase):
                 fetch_page=fetch_page,
                 limit=10,
             )
-            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["status"], "partial")
+            self.assertEqual(result["coverage"], "partial")
             self.assertEqual(result["expected_closed_bars"], 5)
             self.assertEqual(result["missing_timestamps_ms"], [expected[1]])
             self.assertNotIn(forming, result["missing_timestamps_ms"])
@@ -446,8 +578,13 @@ class SupplyIngestTests(unittest.TestCase):
                 fetcher,
                 limiter,
             )
-            good = import_planned_file(conn, "metrics", "BTCUSDT", good_url, fetcher, limiter)
-            again = import_planned_file(conn, "metrics", "BTCUSDT", good_url, fetcher, limiter)
+            cache = Path(tmp) / "cache"
+            good = import_planned_file(
+                conn, "metrics", "BTCUSDT", good_url, fetcher, limiter, cache_dir=cache
+            )
+            again = import_planned_file(
+                conn, "metrics", "BTCUSDT", good_url, fetcher, limiter, cache_dir=cache
+            )
             self.assertEqual(bad, "error")
             self.assertEqual(mismatch, "error")
             self.assertEqual(missing, "missing")
@@ -607,6 +744,133 @@ class SupplyIngestTests(unittest.TestCase):
             runner.run_vision = original_vision
             runner.run_ccxt = original_ccxt
         self.assertEqual(code, 2)
+
+    def test_empty_fetch_and_interior_gap_are_not_complete(self) -> None:
+        with TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(Path(tmp) / "ccxt.db")
+            ensure_ccxt_ohlcv(conn)
+            empty = backfill_symbol(
+                conn,
+                "okx",
+                "BTC",
+                start_ms=0,
+                end_ms=900_000,
+                fetch_page=lambda timeframe, since, limit: PageResult([], None),
+                limit=10,
+            )
+            self.assertEqual(empty["status"], "missing")
+            self.assertEqual(empty["coverage"], "missing")
+            self.assertEqual(empty["rows"], 0)
+            self.assertEqual(empty["expected_closed_bars"], 3)
+            self.assertEqual(empty["missing_timestamps_ms"], [0, 300_000, 600_000])
+            self.assertFalse(overall_complete({"complete": True}, {"venues": [empty]}))
+
+            def hole(timeframe: str, since: int, limit: int) -> PageResult:
+                del timeframe, since, limit
+                return PageResult([[0, 1, 1, 1, 1, 1], [600_000, 1, 1, 1, 1, 1]], None)
+
+            conn.execute("DELETE FROM ccxt_ohlcv")
+            gap = backfill_symbol(
+                conn, "okx", "ETH", start_ms=0, end_ms=900_000, fetch_page=hole, limit=10
+            )
+            self.assertEqual(gap["status"], "partial")
+            self.assertEqual(gap["coverage"], "partial")
+            self.assertEqual(gap["missing_timestamps_ms"], [300_000])
+            self.assertNotEqual(gap["coverage"], "unsupported")
+            unsupported = {
+                "status": "unsupported",
+                "coverage": "unsupported",
+                "rows": 0,
+                "missing_bars": None,
+                "missing_timestamps_ms": [],
+                "detail": "absent from public markets",
+            }
+            self.assertNotEqual(unsupported["coverage"], gap["coverage"])
+            self.assertFalse(overall_complete({"complete": True}, {"venues": [unsupported]}))
+            self.assertFalse(overall_complete({"complete": True}, {"venues": [gap]}))
+
+    def test_header_only_book_and_nan_quote_are_not_success(self) -> None:
+        book_url = "https://data.binance.vision/data/futures/um/daily/bookDepth/BTCUSDT/BTCUSDT-bookDepth-2026-11-09.zip"
+        kline_url = "https://data.binance.vision/data/spot/daily/klines/BTCUSDT/5m/BTCUSDT-5m-2026-11-09.zip"
+        header = "timestamp,percentage,depth,notional\n"
+        nan_row = (
+            "1794096000000000,75867.58,75867.59,75822.94,75822.95,17.26852,"
+            "1794096299999999,nan,3243,5.64092,427747.05,0\n"
+        )
+        blank_row = (
+            "1794096000000000,75867.58,75867.59,75822.94,75822.95,17.26852,"
+            "1794096299999999,,3243,5.64092,427747.05,0\n"
+        )
+        book_zip = _zip_bytes("BTCUSDT-bookDepth-2026-11-09.csv", header)
+        nan_zip = _zip_bytes("BTCUSDT-5m-2026-11-09.csv", nan_row)
+        blank_zip = _zip_bytes("BTCUSDT-5m-blank.csv", blank_row)
+
+        def fetcher(url: str, limiter: object) -> FetchResult:
+            del limiter
+            mapping = {
+                book_url: book_zip,
+                kline_url: nan_zip,
+                kline_url + "-blank": blank_zip,
+            }
+            base = url[: -len(".CHECKSUM")] if url.endswith(".CHECKSUM") else url
+            payload = mapping[base if base in mapping else url]
+            if url.endswith(".CHECKSUM"):
+                return _checksum_result(base, payload)
+            return FetchResult(url, "ok", _sha256(payload), len(payload), None, payload, 10, None)
+
+        with TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "vision.db")
+            limiter = RateLimiter(0)
+            empty = import_planned_file(conn, "bookDepth", "BTCUSDT", book_url, fetcher, limiter)
+            nan = import_planned_file(conn, "klines", "BTCUSDT", kline_url, fetcher, limiter)
+            blank_url = kline_url + "-blank"
+            blank = import_planned_file(conn, "klines", "BTCUSDT", blank_url, fetcher, limiter)
+            self.assertEqual(empty, "empty")
+            self.assertEqual(nan, "error")
+            self.assertEqual(blank, "ok")
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM vision_book_depth").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM vision_spot_klines WHERE source_url = ?", (kline_url,)).fetchone()[0],
+                0,
+            )
+            quote = conn.execute(
+                "SELECT quote_volume FROM vision_spot_klines WHERE source_url = ?",
+                (blank_url,),
+            ).fetchone()
+            self.assertIsNone(quote[0])
+            details = {
+                row[0]: (row[1], row[2])
+                for row in conn.execute("SELECT url, status, detail FROM vision_files")
+            }
+            self.assertEqual(details[book_url][0], "empty")
+            self.assertEqual(details[book_url][1], "zero_rows")
+            self.assertEqual(details[kline_url][0], "error")
+            self.assertIn("invalid_data", details[kline_url][1])
+            report = coverage_report(conn, ["BTCUSDT"])
+            self.assertFalse(report["complete"])
+            self.assertFalse(overall_complete(report, None))
+
+    def test_busy_writer_lock_leaves_existing_rows(self) -> None:
+        from scripts.run_public_backfill import OutputWriterLock
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = sqlite3.connect(root / "vision.db")
+            db.execute("CREATE TABLE sentinel (id INTEGER)")
+            db.execute("INSERT INTO sentinel VALUES (7)")
+            db.commit()
+            db.close()
+            held = OutputWriterLock(root, wait_s=0)
+            self.assertTrue(held.acquire())
+            try:
+                code = backfill_main(
+                    ["--out", str(root), "--skip-vision", "--skip-ccxt", "--lock-wait", "0", "--bases", "BTC"]
+                )
+            finally:
+                held.release()
+            kept = sqlite3.connect(root / "vision.db")
+            self.assertEqual(kept.execute("SELECT id FROM sentinel").fetchone()[0], 7)
+            self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":

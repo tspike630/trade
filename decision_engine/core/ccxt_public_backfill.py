@@ -203,6 +203,59 @@ def make_ccxt_fetcher(exchange: Any, symbol: str, limiter: RateLimiter) -> Fetch
     return fetch_page
 
 
+def resume_open_ms(
+    conn: sqlite3.Connection,
+    exchange: str,
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+) -> int:
+    """First missing closed open. A stored prefix is not requested again."""
+    ensure_ccxt_ohlcv(conn)
+    stored = [
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT ts FROM ccxt_ohlcv
+            WHERE exchange = ? AND symbol = ? AND timeframe = '5m' AND ts >= ? AND ts < ?
+            ORDER BY ts
+            """,
+            (exchange, symbol, start_ms, end_ms),
+        )
+    ]
+    cursor = int(start_ms)
+    for ts in stored:
+        if ts != cursor:
+            break
+        cursor += STEP_MS
+    return cursor
+
+
+def _ccxt_coverage_status(
+    *,
+    error: str | None,
+    expected: int,
+    missing: list[int],
+    stored: int,
+    resume: int,
+    end_ms: int,
+    fetched: list[list[float]],
+) -> tuple[str, str]:
+    """Separate a real hole from an unsupported market. Empty is not success."""
+    if error:
+        blocked = error.startswith("blocked:") or "403" in error or "CloudFront" in error
+        if stored:
+            return "partial", "blocked" if blocked else "partial"
+        return "error", "blocked" if blocked else "error"
+    if expected <= 0 or not stored:
+        return "missing", "missing"
+    if missing:
+        return "partial", "partial"
+    if resume >= end_ms and not fetched:
+        return "skipped_covered", "complete"
+    return "ok", "complete"
+
+
 def backfill_symbol(
     conn: sqlite3.Connection,
     exchange_id: str,
@@ -214,25 +267,53 @@ def backfill_symbol(
     limit: int = 100,
 ) -> dict[str, object]:
     symbol = symbol_for(exchange_id, base)
-    rows, error = closed_pages(fetch_page, start_ms=start_ms, end_ms=end_ms, limit=limit)
-    written = insert_closed_bars(conn, exchange_id, symbol, rows) if rows else 0
-    status = "ok" if error is None else "partial" if rows else "error"
-    record_status(conn, exchange_id, symbol, status, error, len(rows), start_ms, end_ms)
+    resume = resume_open_ms(conn, exchange_id, symbol, start_ms, end_ms)
+    fetched: list[list[float]] = []
+    error = None
+    if resume < end_ms:
+        fetched, error = closed_pages(fetch_page, start_ms=resume, end_ms=end_ms, limit=limit)
+    written = insert_closed_bars(conn, exchange_id, symbol, fetched) if fetched else 0
+    stored_rows = [
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT ts FROM ccxt_ohlcv
+            WHERE exchange = ? AND symbol = ? AND timeframe = '5m' AND ts >= ? AND ts < ?
+            ORDER BY ts
+            """,
+            (exchange_id, symbol, start_ms, end_ms),
+        )
+    ]
     expected_opens = closed_bar_opens(start_ms, end_ms)
-    missing = missing_closed_opens(start_ms, end_ms, [int(row[0]) for row in rows])
+    missing = [stamp for stamp in expected_opens if stamp not in set(stored_rows)]
+    status, coverage = _ccxt_coverage_status(
+        error=error,
+        expected=len(expected_opens),
+        missing=missing,
+        stored=len(stored_rows),
+        resume=resume,
+        end_ms=end_ms,
+        fetched=fetched,
+    )
+    record_status(conn, exchange_id, symbol, status, error, len(stored_rows), start_ms, end_ms)
     return {
         "exchange": exchange_id,
         "base": base,
         "symbol": symbol,
         "quote": quote_for(exchange_id),
-        "rows": len(rows),
+        "rows": len(stored_rows),
+        "fetched_rows": len(fetched),
+        "resume_open_ms": resume,
         "inserted": written,
         "expected_closed_bars": len(expected_opens),
         "missing_bars": len(missing),
         "missing_timestamps_ms": missing,
         "status": status,
+        "coverage": coverage,
         "detail": error,
-        "history_covers_requested_start": bool(rows) and int(rows[0][0]) <= start_ms + STEP_MS,
+        "history_covers_requested_start": resume > start_ms or (
+            bool(fetched) and int(fetched[0][0]) <= start_ms + STEP_MS
+        ),
     }
 
 

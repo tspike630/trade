@@ -1,56 +1,56 @@
-Public backfill and news out-of-sample study
-Schema vision_backfill_v1 / news_oos_v1 / ccxt_public_5m_v1
+Self-contained public calibration package
+Does not start a trader, does not edit environment variables, and does not
+replace the live engine. It does not import decision_engine.core.news_shock_gate.
 
-This does not start a trader, does not edit environment variables, and does
-not replace the live engine. The calibrator stays disabled. An evidence file
-unlocks OnchainCalibration only when it is non-synthetic, names the gate
-series (obi_top5, taker_buy_ratio, whale_retail_divergence, heat_evolution),
-has heat history, clears the frozen Holm tests, and carries the news db
-hash plus split times. Vision bookDepth and top-trader ratios are not those
-series. x_watch history stays closed.
+Create an isolated environment from this directory:
 
-Core bases, fixed before measuring returns:
-BTC ETH BNB SOL XRP DOGE ADA AVAX LINK LTC
-Binance symbols are BASEUSDT. OKX and Bybit are BASE/USDT. Coinbase Exchange
-is BASE/USD and is not pooled with USDT.
+  python3 -m venv .venv
+  .venv/bin/pip install -r packaging/calib_backfill/requirements.txt
+  .venv/bin/python -m unittest decision_engine.tests.test_public_backfill_calibration
 
-Acceptance, from the repo root, without a production database:
+Offline fixture, no network:
 
-  python3 -m unittest decision_engine.tests.test_public_backfill_calibration
+  PYTHONPATH=. python3 packaging/calib_backfill/selfcheck_offline.py
 
-Cloud probe already run, not the full window:
+Full collection stays on the machine that can reach the exchanges. This cloud
+run is not that collection.
 
-  PYTHONPATH=. python3 scripts/run_public_backfill.py \
-    --out /tmp/calib-probe --days 2 --end 2026-11-08 \
-    --bases BTC,ETH --ccxt-days 1
-
-Full window on a machine that can reach the exchanges. Use a new output
-directory. Do not point this at a backfill that is already running.
-Exit 0 only when every planned Vision file is ok and every CCXT venue
-status is ok. A 404, checksum mismatch, bad zip, or Bybit 403 leaves
-complete false and exit 2. The process still continues past a single
-bad file. Publisher .CHECKSUM is required before a zip is parsed.
-Metric create_time_ms is the CSV label parsed as UTC, with
+Exit 0 only when every planned Vision file has rows and every CCXT venue
+coverage is complete. A 404, empty file, checksum mismatch, bad zip, NaN
+field, interior gap, unsupported market, or Bybit 403 leaves complete false
+and exit 2. One bad file does not stop the others. Publisher .CHECKSUM is
+required before a zip is parsed. A legacy manifest row with a null checksum
+is not reused. Metric create_time_ms is the CSV label parsed as UTC, with
 label_availability=unknown. It is not a confirmed bin edge.
 --metric-availability explicit_conservative_bin_end stores a separate
-research clock at label plus 5 minutes. That is not download time and
-not an official Binance convention.
+research clock at label plus 5 minutes. That is not download time and not
+an official Binance convention. Use a new output directory. A second process
+exits while the writer lock is held and does not change the database.
 
-  PYTHONPATH=. python3 scripts/run_public_backfill.py \
+  PYTHONPATH=. .venv/bin/python scripts/run_public_backfill.py \
     --out /var/calib-public --days 45 --ccxt-days 30
-
-News, read-only. Omit --news-db when the file is not on this machine.
-
-  PYTHONPATH=. python3 scripts/run_news_oos_calibration.py \
-    --news-db /path/news_events.db --vision-db /var/calib-public/vision.db \
+  PYTHONPATH=. .venv/bin/python scripts/run_news_oos_calibration.py \
+    --news-db /path/news_events.db \
+    --vision-db /var/calib-public/vision.db \
     --out /var/calib-public/news_oos.json
 
-Desensitized export the study can consume if the raw db must stay put:
-schema news_export_v1
-columns: id, source, source_tier, published_at, fetched_at, onchain_status,
-url_sha256, title_sha256, title_bases
-Clock is fetched_at. Do not send raw titles or URLs. Do not substitute
-published_at. 1859 and 164 are not constants.
+A second run skips a Vision url whose manifest sha256 matches the local cache,
+and skips a CCXT prefix that is already stored.
 
-Dependency: Python 3.12 and ccxt>=4.5 for the CCXT leg. Vision uses the
-standard library. The previous cloud image had ccxt 4.5.92.
+News clock is fetched_at. A row is late when fetched_at - published_at is more
+than 90 minutes. The output also counts the same rows at 60, 180, and 360
+minutes. 1906 / 1325 / 581 is a parent pre-count under the 90-minute rule and
+is not the result. 1859 / 164 is an older inventory and is not this count.
+
+The live OnchainCalibration is not constructed. Current archives cannot
+identify heat_evolution, obi_top5, or whale_retail_divergence. Book depth is
+not top-5. Top-trader ratio is not the whale/retail divergence. Only
+taker_buy_quote_volume / quote_volume matches the live taker_buy_ratio
+definition, and even a significant result stays partial: the live judgment
+still requires the missing series.
+
+Coinbase USD is not pooled with USDT. Without a second USD venue or a
+timestamped USDTUSD series it stays not_calibrated. OKX/Bybit wick and
+breakout labels use a frozen 30 bp wick, a quiet peer, a 12-bar breakout,
+three bars forward, and 10 bp round-trip cost. Fewer than 30 test clusters
+returns insufficient.
