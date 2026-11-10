@@ -256,6 +256,35 @@ class PublishedSignalTests(unittest.TestCase):
             self.assertEqual(rows[1]["size_pct"], 0.10)
             self.assertNotIn("recommended_order_type", sell)
 
+    def test_finite_values_already_on_the_signal_are_not_overwritten(self) -> None:
+        routed, _counts = apply_five_state_regime_router(
+            [{
+                "action": "buy",
+                "binance_symbol": "SOLUSDT",
+                "token_address": "SOLUSDT",
+                "size_pct": 0.05,
+                "obi_top5": 0.40,
+                "obi_top5_source_ts_ms": 50,
+                "volume_z": 1.10,
+            }],
+            [{
+                "binance_symbol": "SOLUSDT",
+                "xs_breadth_1h": 0.80,
+                "xs_rank_pct_1h": 0.90,
+                "obi_top5": -0.10,
+                "obi_top5_source_ts_ms": 999,
+                "volume_z": 2.50,
+                "orderbook_imbalance_20": -0.80,
+            }],
+        )
+        self.assertEqual(len(routed), 1)
+        row = routed[0]
+        self.assertEqual(row["recommended_order_type"], "LIMIT_MAKER")
+        self.assertEqual(row["obi_top5"], 0.40)
+        self.assertEqual(row["obi_top5_source_ts_ms"], 50)
+        self.assertEqual(row["volume_z"], 1.10)
+        self.assertNotIn("orderbook_imbalance_20", row)
+
 
 if __name__ == "__main__":
     unittest.main()

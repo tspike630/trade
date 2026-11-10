@@ -1,35 +1,42 @@
-Published-signal follow-up. Not PR 191. Not an execution change. Not a production copy.
+PR 208 acceptance kit. Not a deploy and not a merge. No .env and no database copy.
 
-Base is main ab2d2ebbc1301e791821e5c6cb1e6e2fc08d1cff. Do not restart the
-decision process that was paused at 16:19 HKT. Do not place an order.
+The archive contains acceptance.bundle, this file, run_acceptance.py, and
+SHA256SUMS. The bundle is a local git bundle. Do not clone GitHub.
 
-The decision router now puts recommended_order_type on every accepted buy,
-including ordinary State 3 LIMIT_MAKER. It also copies obi_top5,
-obi_top5_source_ts_ms, and volume_z from the hot row onto that buy when the
-signal does not already have them. normalize_signal still stores those keys
-in extras, which is where the execution consumer reads them. This tree does
-not edit execution/.
+SHA256SUMS lines have three fields separated by two spaces, and no header:
 
-CFTC regime uses the existing Tuesday-as-of / Friday-publication cycle. A
-2020 report and the prior week are not stamped. A 3600-second rule is not
-applied to that weekly feed. The current Tuesday report still stamps.
+  sha256  bytes  path
 
-The isolation test now checks origin/main's reader against the ab2d2eb hash.
-deploy/news_isolation/preflight.py still pins the older bc392 host file.
-That host check was not deleted.
+sha256 is 64 lowercase hex digits. bytes is the decimal size of the file.
+path is relative to this directory. Two spaces, not one, sit between fields.
+Check a line with:
 
-Run from the repository root:
+  python3 -c 'import hashlib,pathlib,sys
+p=pathlib.Path(sys.argv[1]); d=hashlib.sha256(p.read_bytes()).hexdigest(); print(d, p.stat().st_size, sys.argv[1])' <path>
 
-  PYTHONPATH=.:./crawler python3 -m unittest \
-    decision_engine.tests.test_published_signal_contract \
-    decision_engine.tests.test_public_feed_collector \
-    decision_engine.tests.test_production_universe_top2 \
-    decision_engine.tests.test_volume_z_1h \
-    decision_engine.tests.test_regime_strategy_router \
-    decision_engine.tests.test_state3_arm_ticks \
-    decision_engine.tests.test_cityu_institutional_alpha \
-    decision_engine.tests.test_news_isolation -q
+Materialize the checkout from the bundle only:
 
-The three private OBI fixtures stay in packaging/decision_release/validate.
-They need a deploy/decision_engine copy beside that package and do not open
-a production database.
+  git clone --branch cursor/publish-state3-signal-cf2e acceptance.bundle repo
+  git -C repo fetch acceptance.bundle ab2d2eb:refs/remotes/origin/main
+  git -C repo fetch acceptance.bundle bc392fea:refs/tags/bc392fea-mark
+  git -C repo update-ref bc392fea ab2d2eb
+  # The next command restores the real bc392fea commit named by that object.
+  git -C repo fetch acceptance.bundle bc392fea:bc392fea
+
+If `git fetch acceptance.bundle bc392fea:bc392fea` is run from inside repo,
+use the bundle path. Then:
+
+  python3 repo/packaging/published_signal/run_acceptance.py
+
+The checkout already contains scripts/import_lseg_bars_incremental.py,
+scripts/build_news_isolation_engine.py, and deploy/news_isolation/preflight.py.
+Those tests call them. They are not skipped.
+
+Expected counts from that command: prior 40, CityU 6, news 8, private OBI 3,
+published 3. The third published test checks that a finite obi_top5 and
+volume_z already on the signal are not replaced by the hot row.
+
+CFTC: the importer slow_variable_cycle stays date-only. The reader stamps
+the Tuesday report only after Friday 15:30 America/New_York. There is no
+holiday calendar in this repo, so that instant is not moved earlier. A
+3600-second cutoff is not used.

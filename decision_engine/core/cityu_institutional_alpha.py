@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import math
 import os
 import sqlite3
@@ -101,11 +102,35 @@ class CityUInstitutionalSnapshot:
     size_multiplier: float
 
 
-def _cftc_cycle(source_day: date, asof: date) -> str:
-    """Same Tuesday-as-of / Friday-publication cycle as the LSEG importer.
+def cftc_publication_utc(tuesday: date) -> datetime:
+    """Friday 15:30 America/New_York after ``tuesday``.
 
-    ``scripts.import_lseg_bars_incremental.slow_variable_cycle`` is the
-    contract. A 30-minute or 3600-second cutoff is not applied here.
+    The importer's date-only cycle treats Friday as already published at
+    00:00 UTC. The report is not published then. This repo has no CFTC
+    holiday calendar, so the instant is not moved earlier for a holiday.
+    """
+    friday = tuesday + timedelta(days=3)
+    local = datetime(friday.year, friday.month, friday.day, 15, 30, tzinfo=ZoneInfo("America/New_York"))
+    return local.astimezone(timezone.utc)
+
+
+def due_cftc_asof(now: datetime) -> date:
+    """Latest Tuesday as-of whose Friday 15:30 New York publication is <= now."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    asof = now.astimezone(timezone.utc).date()
+    days_since_tuesday = (asof.weekday() - 1) % 7
+    latest_tuesday = asof - timedelta(days=days_since_tuesday)
+    if now.astimezone(timezone.utc) >= cftc_publication_utc(latest_tuesday):
+        return latest_tuesday
+    return latest_tuesday - timedelta(days=7)
+
+
+def _cftc_cycle(source_day: date, asof: date) -> str:
+    """Date-only cycle, matching ``slow_variable_cycle``.
+
+    This is not the reader clock. The reader uses ``due_cftc_asof``.
+    A 30-minute or 3600-second cutoff is not applied.
     """
     days_since_tuesday = (asof.weekday() - 1) % 7
     latest_tuesday = asof - timedelta(days=days_since_tuesday)
@@ -184,29 +209,29 @@ def load_cityu_institutional_snapshot(
                     ORDER BY date ASC
                     """
                 ).fetchall()
-                lev_series: list[float] = []
-                am_series: list[float] = []
-                last_cot_day: date | None = None
-                for r in cot_rows[-52:]:
+                clock = datetime.fromtimestamp(
+                    (int(time.time() * 1000) if now_ms is None else int(now_ms)) / 1000.0,
+                    tz=timezone.utc,
+                )
+                due = due_cftc_asof(clock)
+                points: list[tuple[date, float, float]] = []
+                for r in cot_rows:
+                    day = _cot_source_day(r["date"])
                     oi = _finite(r["open_interest"])
                     ln = _finite(r["lev_money_net"])
                     an = _finite(r["asset_mgr_net"])
-                    if oi and oi > 0 and ln is not None and an is not None:
-                        lev_series.append((ln / oi) * 100.0)
-                        am_series.append((an / oi) * 100.0)
-                        last_cot_day = _cot_source_day(r["date"])
-                asof = datetime.fromtimestamp(
-                    (int(time.time() * 1000) if now_ms is None else int(now_ms)) / 1000.0,
-                    tz=timezone.utc,
-                ).date()
-                # CFTC is the Tuesday report published Friday. A 3600s or
-                # 30-minute cutoff is not this feed. Only the current cycle
-                # becomes the regime; 2020 and any older week stay unstamped.
-                current_cot = (
-                    last_cot_day is not None
-                    and _cftc_cycle(last_cot_day, asof) == "current_cycle"
-                )
-                if lev_series and am_series and current_cot:
+                    if day is None or day > due or not oi or oi <= 0 or ln is None or an is None:
+                        continue
+                    points.append((day, (ln / oi) * 100.0, (an / oi) * 100.0))
+                points = points[-52:]
+                # Only the report whose Friday 15:30 New York publication
+                # has arrived is current. A later holiday file is ignored
+                # until that instant, so the previous published week is not
+                # dropped early. 2020 is outside that week.
+                current_cot = bool(points) and points[-1][0] == due
+                if current_cot:
+                    lev_series = [item[1] for item in points]
+                    am_series = [item[2] for item in points]
                     btc_lev_pct = round(lev_series[-1], 4)
                     btc_am_pct = round(am_series[-1], 4)
                     btc_lev_z, btc_am_z, cot_regime, cot_mult = compute_cot_regime_from_series(
