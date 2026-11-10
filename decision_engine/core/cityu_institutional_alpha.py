@@ -35,9 +35,11 @@ from dataclasses import dataclass
 import math
 import os
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from decision_engine.core.macro_circuit_breaker import MAX_CROSS_ASSET_AGE_MS
 from decision_engine.core.portfolio_clusters import symbol_sector_cluster
 
 CITYU_INST_DB_ENV = "CITYU_INSTITUTIONAL_DB_PATH"
@@ -253,22 +255,25 @@ def load_cityu_institutional_snapshot(
         try:
             lconn = sqlite3.connect(f"file:{lseg_p.resolve().as_posix()}?mode=ro", uri=True, timeout=3.0)
             lconn.row_factory = sqlite3.Row
-            upper_ms = int(now_ms) if now_ms is not None else 9_999_999_999_999
+            upper_ms = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+            oldest_ms = upper_ms - MAX_CROSS_ASSET_AGE_MS
 
             def _ret_1h(ric: str) -> float | None:
                 rows = lconn.execute(
                     """
-                    SELECT close FROM cross_asset_bars
+                    SELECT utc_ms, close FROM cross_asset_bars
                     WHERE ric = ? AND interval = '5min' AND utc_ms <= ? AND close IS NOT NULL
                     ORDER BY utc_ms DESC LIMIT 13
                     """,
                     (ric, upper_ms),
                 ).fetchall()
-                if len(rows) >= 13 and float(rows[-1]["close"]) > 0:
-                    c_now = float(rows[0]["close"])
-                    c_prev = float(rows[-1]["close"])
-                    return round(((c_now - c_prev) / c_prev) * 100.0, 4)
-                return None
+                if len(rows) < 13 or float(rows[-1]["close"]) <= 0:
+                    return None
+                if int(rows[0]["utc_ms"]) < oldest_ms:
+                    return None
+                c_now = float(rows[0]["close"])
+                c_prev = float(rows[-1]["close"])
+                return round(((c_now - c_prev) / c_prev) * 100.0, 4)
 
             nvda_1h = _ret_1h("NVDA.O")
             smh_1h = _ret_1h("SMH.O")
@@ -281,7 +286,13 @@ def load_cityu_institutional_snapshot(
                 "SELECT utc_ms, close FROM cross_asset_bars WHERE ric='BTCc2' AND interval='5min' AND utc_ms<=? ORDER BY utc_ms DESC LIMIT 1",
                 (upper_ms,),
             ).fetchone()
-            if c1 is not None and c2 is not None and float(c1["close"]) > 0:
+            if (
+                c1 is not None
+                and c2 is not None
+                and float(c1["close"]) > 0
+                and int(c1["utc_ms"]) >= oldest_ms
+                and int(c2["utc_ms"]) >= oldest_ms
+            ):
                 if abs(int(c1["utc_ms"]) - int(c2["utc_ms"])) <= 900_000:
                     cme_term_bps = round(
                         ((float(c2["close"]) - float(c1["close"])) / float(c1["close"])) * 10_000.0,

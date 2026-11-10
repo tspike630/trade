@@ -391,7 +391,9 @@ def _evaluate_dynamic_surprise(
         min_f = float(r["min_forecast"]) if (has_bounds and r["min_forecast"] is not None) else None
         max_f = float(r["max_forecast"]) if (has_bounds and r["max_forecast"] is not None) else None
 
-        # Pre-release SmartEconomics Predicted Surprise Alert (ev_ms > now_ms)
+        # utc_ms still ahead of now: calendar risk only.
+        # actual/surprise on that row are not a released print. The stamp may
+        # be a period label rather than a release clock, so they are not used.
         if ev_ms > now_ms:
             if pred_surp is not None and poll is not None:
                 rel_pred = abs(pred_surp) / max(abs(poll), 0.1)

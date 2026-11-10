@@ -44,9 +44,13 @@ derivatives-aware, market-neutral statistical arbitrage desk:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import math
 import os
+import sqlite3
+import time
+from pathlib import Path
 from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -54,6 +58,7 @@ from urllib.request import Request, urlopen
 
 from logging_setup import get_logger
 
+from decision_engine.core.binance_indicators import binance_indicators_fresh_sec
 from decision_engine.core.portfolio_clusters import symbol_sector_cluster
 
 log = get_logger("decision_engine.perp_beta_hedge")
@@ -576,23 +581,79 @@ def portfolio_beta_exposure_block(
 PUBLIC_DERIVATIVES_DB_ENV = "PUBLIC_DERIVATIVES_DB_PATH"
 
 
+# Collector blackout: hours_to_unlock in [-48, +72] and at least 2% of supply.
+# hours_to_unlock is unlock_time minus now, so this is 72h before through 48h after.
+_UNLOCK_HOURS_AFTER = 48.0
+_UNLOCK_HOURS_BEFORE = 72.0
+_UNLOCK_MIN_PCT = 2.0
+
+
+def _ts_is_fresh(ts_ms: object, now_ms: int) -> bool:
+    """Same window as indicator freshness. A missing or future stamp is not fresh."""
+    try:
+        ts = int(ts_ms)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    window_ms = binance_indicators_fresh_sec() * 1000
+    if window_ms <= 0:
+        return True
+    age = int(now_ms) - ts
+    return 0 <= age <= window_ms
+
+
+def _hours_until_unlock(next_unlock_utc: object, now_ms: int) -> float | None:
+    if not isinstance(next_unlock_utc, str) or not next_unlock_utc.strip():
+        return None
+    text = next_unlock_utc.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed.timestamp() * 1000.0 - float(now_ms)) / 3_600_000.0
+
+
+def _unlock_blackout_now(next_unlock_utc: object, pct: object, now_ms: int) -> int | None:
+    """Recompute the documented cliff window at ``now_ms``.
+
+    The stored ``hours_to_unlock`` and ``in_unlock_blackout`` are left unused.
+    They were frozen when the snapshot was written.
+    """
+    hours = _hours_until_unlock(next_unlock_utc, now_ms)
+    try:
+        pct_f = float(pct)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if hours is None or not math.isfinite(pct_f):
+        return None
+    inside = -_UNLOCK_HOURS_AFTER <= hours <= _UNLOCK_HOURS_BEFORE and pct_f >= _UNLOCK_MIN_PCT
+    return 1 if inside else 0
+
+
 def resolve_public_derivatives_db_path():
-    from pathlib import Path
     raw = os.environ.get(PUBLIC_DERIVATIVES_DB_ENV, "").strip()
     if raw:
         return Path(raw).expanduser()
     return Path(__file__).resolve().parents[2] / "data" / "counterparty" / "public_derivatives.db"
 
 
-def attach_counterparty_context(rows, *, db_path=None):
-    """Enrich candidate rows in-place from ``public_derivatives.db`` (Categories 6, 8, 9)."""
+def attach_counterparty_context(rows, *, db_path=None, now_ms=None):
+    """Copy counterparty fields that are still inside the indicator freshness window.
+
+    A latest ``ts_ms`` older than that window is not stamped. Unlock blackout
+    is recomputed from ``next_unlock_utc`` at ``now_ms``; the snapshot's
+    ``hours_to_unlock`` and ``in_unlock_blackout`` are not reused.
+    ``orderbook_imbalance_20`` is not read and is not renamed to ``obi_top5``.
+    """
     if not rows:
         return rows
-    from pathlib import Path
-    import sqlite3
     target = Path(db_path).expanduser() if db_path is not None else resolve_public_derivatives_db_path()
     if not target.is_file():
         return rows
+    clock = int(time.time() * 1000) if now_ms is None else int(now_ms)
     try:
         conn = sqlite3.connect(f"file:{target.resolve().as_posix()}?mode=ro", uri=True, timeout=3.0)
         conn.row_factory = sqlite3.Row
@@ -608,30 +669,46 @@ def attach_counterparty_context(rows, *, db_path=None):
                     SELECT symbol, MAX(ts_ms) AS max_ts FROM binance_perp_counterparty GROUP BY symbol
                 ) latest ON p.symbol = latest.symbol AND p.ts_ms = latest.max_ts
             """).fetchall():
+                if not _ts_is_fresh(r["ts_ms"], clock):
+                    continue
                 perp_by_sym[str(r["symbol"]).upper()] = r
         disloc_by_sym = {}
         if "cross_exchange_spot_baseline" in tables:
             for r in conn.execute("""
-                SELECT c.symbol, c.max_venue_dislocation_bps FROM cross_exchange_spot_baseline c
+                SELECT c.symbol, c.ts_ms, c.max_venue_dislocation_bps FROM cross_exchange_spot_baseline c
                 INNER JOIN (
                     SELECT symbol, MAX(ts_ms) AS max_ts FROM cross_exchange_spot_baseline GROUP BY symbol
                 ) latest ON c.symbol = latest.symbol AND c.ts_ms = latest.max_ts
             """).fetchall():
+                if not _ts_is_fresh(r["ts_ms"], clock):
+                    continue
                 val = _finite(r["max_venue_dislocation_bps"])
                 if val is not None:
                     disloc_by_sym[str(r["symbol"]).upper()] = val
         unlock_by_sym = {}
         if "token_unlock_schedule" in tables:
-            for r in conn.execute("SELECT symbol, in_unlock_blackout FROM token_unlock_schedule").fetchall():
-                unlock_by_sym[str(r["symbol"]).upper()] = int(r["in_unlock_blackout"] or 0)
+            have = {
+                str(item[1])
+                for item in conn.execute("PRAGMA table_info(token_unlock_schedule)").fetchall()
+            }
+            if {"symbol", "next_unlock_utc", "unlock_pct_circulating"}.issubset(have):
+                for r in conn.execute(
+                    "SELECT symbol, next_unlock_utc, unlock_pct_circulating FROM token_unlock_schedule"
+                ):
+                    flag = _unlock_blackout_now(
+                        r["next_unlock_utc"], r["unlock_pct_circulating"], clock
+                    )
+                    if flag is None:
+                        continue
+                    unlock_by_sym[str(r["symbol"]).upper()] = flag
         btc_gamma_regime = None
         btc_dvol_z = None
         if "deribit_options_gamma" in tables:
             opt_row = conn.execute("""
-                SELECT gamma_regime, dvol_zscore FROM deribit_options_gamma
+                SELECT ts_ms, gamma_regime, dvol_zscore FROM deribit_options_gamma
                 WHERE currency = "BTC" ORDER BY ts_ms DESC LIMIT 1
             """).fetchone()
-            if opt_row is not None:
+            if opt_row is not None and _ts_is_fresh(opt_row["ts_ms"], clock):
                 btc_gamma_regime = str(opt_row["gamma_regime"] or "") or None
                 btc_dvol_z = _finite(opt_row["dvol_zscore"])
         for row in rows:

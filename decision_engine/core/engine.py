@@ -157,7 +157,7 @@ class DecisionEngine:
                     attach_cityu_institutional_context,
                 )
 
-                hot = attach_counterparty_context(hot)
+                hot = attach_counterparty_context(hot, now_ms=now_ms)
                 hot = attach_cityu_institutional_context(hot, now_ms=now_ms)
         scanned = len(hot)
         if bnb_spot:
