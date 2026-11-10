@@ -1297,6 +1297,7 @@ def _result(
     return body
 
 
+from execution.binance_ws_stream import default_max_age_ms  # noqa: E402
 from execution.executors.binance_spot_gate import (  # noqa: E402
     REST_BOOK,
     account_book_block,
@@ -1568,6 +1569,71 @@ class BinanceSpotAdapter:
         if self.allow_rest_http:
             self.client = BinanceSpotHttpClient()
         return self.client
+
+    def _maker_top_of_book(
+        self, client: Any, symbol: str
+    ) -> tuple[str | None, str | None, str | None]:
+        """Fresh uncrossed bid/ask. A stale WebSocket quote does not beat REST.
+
+        Returns ``(bid, ask, error)``. Missing or crossed books do not invent
+        a price from the mark, and a maker order is not rewritten as MARKET.
+        """
+        saw_crossed = False
+        ws_cache = self._active_ws_cache()
+        if ws_cache is not None and callable(getattr(ws_cache, "get_ticker_price", None)):
+            ws_tick = ws_cache.get_ticker_price(symbol)
+            fresh = self._fresh_bbo(ws_tick)
+            if fresh == "crossed":
+                saw_crossed = True
+            elif isinstance(fresh, tuple):
+                return fresh[0], fresh[1], None
+        depth_fn = getattr(client, "order_book", None) if client is not None else None
+        if callable(depth_fn):
+            try:
+                depth = depth_fn(symbol, limit=5)
+            except Exception as exc:  # noqa: BLE001
+                if isinstance(exc, AssertionError):
+                    raise
+                depth = None
+            if isinstance(depth, dict):
+                bids = depth.get("bids") or []
+                asks = depth.get("asks") or []
+                if (
+                    bids
+                    and asks
+                    and isinstance(bids[0], (list, tuple))
+                    and isinstance(asks[0], (list, tuple))
+                ):
+                    fresh = self._fresh_bbo(
+                        {"best_bid": bids[0][0], "best_ask": asks[0][0]}
+                    )
+                    if isinstance(fresh, tuple):
+                        return fresh[0], fresh[1], None
+                    if fresh == "crossed":
+                        return None, None, "orderbook_crossed"
+        if saw_crossed:
+            return None, None, "orderbook_crossed"
+        return None, None, "maker_book_unavailable"
+
+    @staticmethod
+    def _fresh_bbo(payload: object) -> tuple[str, str] | str | None:
+        if not isinstance(payload, dict):
+            return None
+        age = payload.get("ws_age_ms")
+        if age is not None:
+            try:
+                age_ms = int(age)
+            except (TypeError, ValueError):
+                return None
+            if age_ms < 0 or age_ms > default_max_age_ms():
+                return None
+        bid = _to_decimal(payload.get("best_bid"))
+        ask = _to_decimal(payload.get("best_ask"))
+        if bid is None or ask is None:
+            return None
+        if ask <= bid:
+            return "crossed"
+        return str(payload.get("best_bid")).strip(), str(payload.get("best_ask")).strip()
 
     def _read_entry_mark(
         self, client: Any, symbol: str
@@ -2666,26 +2732,23 @@ class BinanceSpotAdapter:
                 order_type_now = "LIMIT_MAKER"
 
             if order_type_now == "LIMIT_MAKER":
-                best_bid_px = None
-                best_ask_px = None
-                ws_cache = self._active_ws_cache()
-                if ws_cache is not None and callable(getattr(ws_cache, "get_ticker_price", None)):
-                    ws_tick = ws_cache.get_ticker_price(symbol)
-                    if isinstance(ws_tick, dict):
-                        best_bid_px = ws_tick.get("best_bid")
-                        best_ask_px = ws_tick.get("best_ask")
-                if best_ask_px is None and callable(getattr(client, "order_book", None)):
-                    try:
-                        d_snap = client.order_book(symbol, limit=5)
-                        if isinstance(d_snap, dict):
-                            bids_l = d_snap.get("bids") or []
-                            asks_l = d_snap.get("asks") or []
-                            if bids_l and isinstance(bids_l[0], (list, tuple)):
-                                best_bid_px = bids_l[0][0]
-                            if asks_l and isinstance(asks_l[0], (list, tuple)):
-                                best_ask_px = asks_l[0][0]
-                    except Exception:  # noqa: BLE001
-                        pass
+                best_bid_px, best_ask_px, book_error = self._maker_top_of_book(client, symbol)
+                if book_error:
+                    return self._finish(
+                        _result(
+                            ok=False,
+                            dry_run=False,
+                            executed=0,
+                            submitted=False,
+                            error=book_error,
+                            symbol=symbol,
+                            order=None,
+                            exchange_order_id=None,
+                            gates=gates,
+                            exit_plan=plan,
+                            consumer_allowed=False,
+                        )
+                    )
                 raw_lim, _ = _chosen_limit_raw(extras)
                 filters = _symbol_filters(info, symbol) or []
                 pegged_px, was_clamped, peg_err = peg_maker_buy_price(

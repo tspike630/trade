@@ -688,8 +688,17 @@ def buy_exposure_block(
             continue
         if status == "qty_unconfirmed":
             return "parent_fill_incomplete"
-        if status in {"maker_resting", "maker_cancel_unknown"}:
+        if status == "maker_cancel_unknown":
             return "maker_resting_blocks_buy"
+        if status == "maker_resting":
+            if row_quote_usdt(row) is None:
+                return "maker_resting_blocks_buy"
+            filled = _decimal_text(row.get("quantity"))
+            if filled is not None and Decimal(filled) > 0:
+                return "unprotected_position_blocks_buy"
+            if _same_symbol_open_block(row, symbol):
+                return "maker_resting_blocks_buy"
+            continue
         if status == "time_stop_unknown":
             return "time_stop_unconfirmed_blocks_buy"
         if status in {"oco_failed", "oco_unknown"}:

@@ -31,9 +31,12 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     PURPOSE_LIVE_BNB_BOLL_FADE,
     REST_BOOK,
     buy_exposure_block,
+    funding_after_reservation,
+    reserved_quote_usdt,
     row_quote_usdt,
 )
 from execution.executors.binance_spot_protect import PROTECTION_EXCHANGE  # noqa: E402
+from decision_engine.core.regime_strategy_router import evaluate_five_state_regime  # noqa: E402
 from decision_engine.core.data_adapter import IndicatorDataAdapter  # noqa: E402
 from decision_engine.core.engine import DecisionEngine  # noqa: E402
 from decision_engine.core.risk_manager import RiskManager  # noqa: E402
@@ -451,8 +454,15 @@ class PersistenceSafetyTests(unittest.TestCase):
         self.assertIsNotNone(row_quote_usdt(armed))
         self.assertGreater(row_quote_usdt(armed) or 0, 0)
         self.assertEqual(
-            buy_exposure_block([armed], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+            buy_exposure_block([armed], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="BNBUSDT"),
             "maker_resting_blocks_buy",
+        )
+        self.assertIsNone(
+            buy_exposure_block([armed], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT")
+        )
+        self.assertGreater(
+            reserved_quote_usdt([armed]),
+            0,
         )
 
         pid = int(armed["id"])
@@ -1156,3 +1166,123 @@ class PersistenceSafetyTests(unittest.TestCase):
         self.assertEqual(Decimal(stored["quantity"]), Decimal("1.10"))
         self.assertEqual(len(client.sells), 1)
         self.assertLessEqual(Decimal(parse_qs(client.sells[0])["quantity"][0]), Decimal("1.50"))
+
+    def _maker_adapter(self, client: _Exchange, ws: object | None = None) -> BinanceSpotAdapter:
+        return BinanceSpotAdapter(
+            client=client,
+            api_key="k",
+            api_secret="s",
+            kill_switch_path=self.root / "no-kill",
+            clock_ms=lambda: 1_700_000_000_000,
+            account_snapshot=_BOUND,
+            production_book=REST_BOOK,
+            rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
+            post_only_limit=False,
+            ws_cache=ws,
+        )
+
+    def test_stale_ws_bid_does_not_override_a_fresh_rest_book(self) -> None:
+        client = _Exchange()
+        client.order_book = lambda symbol, limit=5: {  # type: ignore[method-assign]
+            "bids": [["100.70", "5"]],
+            "asks": [["100.80", "5"]],
+        }
+
+        class _Stale:
+            def get_ticker_price(self, symbol: str) -> dict[str, str | int]:
+                return {
+                    "best_bid": "100.10",
+                    "best_ask": "100.20",
+                    "price": "100.15",
+                    "ws_age_ms": 900_000,
+                }
+
+        result = self._maker_adapter(client, _Stale()).execute(
+            self._buy({"recommended_order_type": "LIMIT_MAKER", "price": "101"})
+        )
+        self.assertEqual(result["error"], "maker_entry_resting", result)
+        self.assertEqual(Decimal(parse_qs(client.orders[0])["price"][0]), Decimal("100.70"))
+        self.assertEqual(parse_qs(client.orders[0]).get("type"), ["LIMIT_MAKER"])
+
+    def test_crossed_or_missing_book_does_not_invent_a_maker_price(self) -> None:
+        crossed = _Exchange()
+        crossed.order_book = lambda symbol, limit=5: {  # type: ignore[method-assign]
+            "bids": [["100.20", "1"]],
+            "asks": [["100.10", "1"]],
+        }
+        class _NoWs:
+            pass
+
+        refused = self._maker_adapter(crossed, _NoWs()).execute(
+            self._buy({"recommended_order_type": "LIMIT_MAKER", "price": "100.79", "price_usd": "100.80"})
+        )
+        self.assertEqual(refused["error"], "orderbook_crossed")
+        self.assertEqual(crossed.orders, [])
+
+        missing = _Exchange()
+        missing.order_book = lambda symbol, limit=5: {}  # type: ignore[method-assign]
+        absent = self._maker_adapter(missing, _NoWs()).execute(
+            self._buy(
+                {"recommended_order_type": "LIMIT_MAKER", "price": "100.79", "price_usd": "100.80"},
+                74,
+            )
+        )
+        self.assertEqual(absent["error"], "maker_book_unavailable")
+        self.assertEqual(absent["submitted"], False)
+        self.assertEqual(missing.orders, [])
+
+        market = self._maker_adapter(missing, _NoWs()).execute(
+            self._buy({"order_type": "MARKET", "recommended_order_type": "NONE", "quote_order_qty": "20"}, 75, limit=False)
+        )
+        self.assertEqual(parse_qs(missing.orders[0]).get("type"), ["MARKET"])
+        self.assertNotEqual(market["error"], "maker_book_unavailable")
+
+    def test_unfilled_maker_reserves_its_symbol_and_not_another(self) -> None:
+        resting = {
+            "symbol": "BNBUSDT",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+            "status": "maker_resting",
+            "quantity": None,
+            "entry_order_id": "91001",
+            "entry_order_qty": "1",
+            "entry_limit_price": "99.95",
+            "entry_price": "99.95",
+            "protection": "maker_resting",
+        }
+        self.assertEqual(
+            buy_exposure_block([resting], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="BNBUSDT"),
+            "maker_resting_blocks_buy",
+        )
+        self.assertIsNone(
+            buy_exposure_block([resting], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT")
+        )
+        self.assertEqual(reserved_quote_usdt([resting]), Decimal("99.95"))
+        self.assertEqual(
+            funding_after_reservation("120", Decimal("20"), "99.95", Decimal("100")),
+            "funding_block",
+        )
+        naked = dict(resting, status="open", protection="held_position_exit", quantity="1")
+        self.assertEqual(
+            buy_exposure_block([naked], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+            "unprotected_position_blocks_buy",
+        )
+        unknown = dict(resting, status="maker_cancel_unknown", quantity="0.40")
+        self.assertEqual(
+            buy_exposure_block([unknown], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+            "maker_resting_blocks_buy",
+        )
+
+    def test_published_limit_maker_recommendation_covers_eligible_states(self) -> None:
+        cases = {
+            "state1": {},
+            "state2": {"funding_z": -2.0},
+            "state3": {"xs_breadth_1h": 0.80, "xs_rank_pct_1h": 0.90, "obi_top5": -0.10, "volume_z": 1.2},
+            "state4": {"funding_z": 1.9},
+        }
+        for name, row in cases.items():
+            decision = evaluate_five_state_regime(row)
+            self.assertTrue(decision.allow_buy, name)
+            self.assertEqual(decision.recommended_order_type, "LIMIT_MAKER", name)
+        halted = evaluate_five_state_regime({}, macro_halt="macro")
+        self.assertFalse(halted.allow_buy)
+        self.assertEqual(halted.recommended_order_type, "NONE")
