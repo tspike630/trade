@@ -43,6 +43,7 @@ from dashboard.parsing import (
     safe_float,
     validation_error_text,
 )
+from dashboard.spot_book import SpotBookView, spot_book_view
 from dashboard.settings import (
     EXECUTION_DB_ENV,
     _ReceiptFlags,
@@ -67,6 +68,7 @@ _TABLES = frozenset(
         "tokens",
         "run_checkpoint",
         "execution_log",
+        "binance_spot_positions",
         "account",
         "positions",
         "runs",
@@ -299,6 +301,8 @@ class SignalRow:
     executed: int | None
     executor: str
     exec_dup: bool
+    book_label: str = ""
+    book_tone: str = ""
 
 
 @dataclass(frozen=True)
@@ -320,6 +324,11 @@ class ExecutionRow:
     receipt_summary: str
     validation_ok: int | None = None
     validation_errors: str = ""
+    book_label: str = ""
+    book_tone: str = ""
+    filled_text: str = ""
+    order_text: str = ""
+    protection_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -1270,6 +1279,68 @@ def _age_seconds(ts: Any, now: datetime) -> float | None:
     except (TypeError, ValueError):
         return None
     return (now - stamp).total_seconds()
+
+
+_SPOT_BOOK_COLUMNS = (
+    "decision_log_id",
+    "status",
+    "quantity",
+    "protection",
+    "entry_order_id",
+    "exit_reason",
+    "oco_list_status",
+    "symbol",
+    "updated_at",
+)
+
+
+def _spot_book_index(
+    conn: sqlite3.Connection, decision_ids: list[int]
+) -> tuple[bool, dict[int, dict[str, Any]]]:
+    """Copy current spot rows. The bool is whether the table exists."""
+    if not _table_exists(conn, "binance_spot_positions"):
+        return False, {}
+    cols = _columns(conn, "binance_spot_positions")
+    if "decision_log_id" not in cols:
+        return False, {}
+    selected = [name for name in _SPOT_BOOK_COLUMNS if name in cols]
+    found: dict[int, dict[str, Any]] = {}
+    ids = [item for item in decision_ids if isinstance(item, int)]
+    if not ids:
+        return True, {}
+    for part in _chunks(ids, 400):
+        marks = ",".join("?" * len(part))
+        rows = _exec(
+            conn,
+            f"SELECT {', '.join(selected)} FROM binance_spot_positions "
+            f"WHERE decision_log_id IN ({marks})",
+            tuple(part),
+        ).fetchall()
+        for row in rows:
+            decision_id = _as_int(row["decision_log_id"])
+            if decision_id is None:
+                continue
+            found[decision_id] = {name: row[name] for name in selected}
+    return True, found
+
+
+def _execution_spot_view(
+    exec_row: sqlite3.Row | None,
+    decision_id: int | None,
+    table: bool,
+    positions: dict[int, dict[str, Any]],
+) -> SpotBookView | None:
+    if exec_row is None:
+        return None
+    receipt = parse_json(str(_cell(exec_row, "receipt_json") or ""))
+    status = _cell(exec_row, "status") if "status" in exec_row.keys() else None
+    position = positions.get(decision_id) if table and decision_id is not None else None
+    return spot_book_view(
+        receipt or None,
+        None if status is None else str(status),
+        position,
+        position_table=table,
+    )
 
 
 def _rejection_sql_clauses(cols: set[str]) -> list[str]:
@@ -2282,6 +2353,16 @@ class DataStore:
                     "ORDER BY id DESC LIMIT ?"
                 )
                 rows = _exec(conn, sql, (scan,)).fetchall()
+                decision_ids = [
+                    decision_id
+                    for decision_id in (
+                        _as_int(_cell(row, "decision_log_id"))
+                        for row in rows
+                        if "decision_log_id" in row.keys()
+                    )
+                    if decision_id is not None
+                ]
+                spot_table, spot_rows = _spot_book_index(conn, decision_ids)
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
         kept: list[FailureRow] = []
@@ -2289,11 +2370,18 @@ class DataStore:
             raw_errors = str(_cell(row, "validation_errors") or "")
             receipt = parse_json(str(_cell(row, "receipt_json") or ""))
             status_text = _cell(row, "status")
+            decision_id = (
+                _as_int(_cell(row, "decision_log_id"))
+                if "decision_log_id" in row.keys()
+                else None
+            )
             key = rejection_key(
                 _as_int(_cell(row, "validation_ok")),
                 raw_errors,
                 None if status_text is None else str(status_text),
                 receipt or None,
+                spot_position=spot_rows.get(decision_id) if decision_id is not None else None,
+                spot_table=spot_table,
             )
             if key is None:
                 continue
@@ -2588,6 +2676,7 @@ class DataStore:
 
         ids = [int(row["id"]) for row, _raw in parsed]
         latest, dups, exec_note = self._latest_execs(ids)
+        spot_table, spot_rows = self._spot_index_for(ids)
         quote_keys: list[tuple[str, str]] = []
         resolved_pairs: list[str] = []
         for row, raw in parsed:
@@ -2613,6 +2702,7 @@ class DataStore:
             reason = str(_cell(row, "reason") or "")
             pair = resolved_pairs[len(rows_out)]
             exec_row = latest.get(decision_id)
+            spot = _execution_spot_view(exec_row, decision_id, spot_table, spot_rows)
             strength = extract_jev_strength(raw, reason)
             if strength is None:
                 strength = strength_fallback.get((chain, token))
@@ -2641,6 +2731,8 @@ class DataStore:
                     executed=_as_int(_cell(exec_row, "executed")) if exec_row is not None else None,
                     executor=clip(_cell(exec_row, "executor"), 40) if exec_row is not None else "",
                     exec_dup=decision_id in dups,
+                    book_label="" if spot is None or spot.is_rejection else spot.label,
+                    book_tone="" if spot is None or spot.is_rejection else spot.tone,
                 )
             )
         return _ok(SignalPayload(tuple(rows_out), exec_note), started)
@@ -2672,6 +2764,7 @@ class DataStore:
                         "receipt_json",
                         "validation_ok",
                         "validation_errors",
+                        "status",
                     )
                     if name in cols
                 ]
@@ -2680,25 +2773,43 @@ class DataStore:
                     f"SELECT {', '.join(wanted)} FROM execution_log ORDER BY id DESC LIMIT ?",
                     (bounded,),
                 ).fetchall()
+                decision_ids = [
+                    decision_id
+                    for decision_id in (
+                        _as_int(_cell(row, "decision_log_id")) for row in rows
+                    )
+                    if decision_id is not None
+                ]
+                spot_table, spot_rows = _spot_book_index(conn, decision_ids)
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
-        payload = tuple(
-            ExecutionRow(
-                id=int(row["id"]),
-                ts=str(_cell(row, "ts") or ""),
-                decision_log_id=_text_id(_cell(row, "decision_log_id")),
-                strategy_id=clip(_cell(row, "strategy_id"), 40),
-                action=clip(_cell(row, "action"), 24),
-                token_address=str(_cell(row, "token_address") or ""),
-                executed=_as_int(_cell(row, "executed")),
-                executor=clip(_cell(row, "executor"), 40),
-                receipt_summary=receipt_summary(parse_json(str(_cell(row, "receipt_json") or ""))),
-                validation_ok=_as_int(_cell(row, "validation_ok")),
-                validation_errors=clip(_cell(row, "validation_errors"), 160),
+        built: list[ExecutionRow] = []
+        for row in rows:
+            decision_id = _as_int(_cell(row, "decision_log_id"))
+            receipt = parse_json(str(_cell(row, "receipt_json") or ""))
+            spot = _execution_spot_view(row, decision_id, spot_table, spot_rows)
+            summary = spot.summary if spot is not None else receipt_summary(receipt)
+            built.append(
+                ExecutionRow(
+                    id=int(row["id"]),
+                    ts=str(_cell(row, "ts") or ""),
+                    decision_log_id=_text_id(_cell(row, "decision_log_id")),
+                    strategy_id=clip(_cell(row, "strategy_id"), 40),
+                    action=clip(_cell(row, "action"), 24),
+                    token_address=str(_cell(row, "token_address") or ""),
+                    executed=_as_int(_cell(row, "executed")),
+                    executor=clip(_cell(row, "executor"), 40),
+                    receipt_summary=summary,
+                    validation_ok=_as_int(_cell(row, "validation_ok")),
+                    validation_errors=clip(_cell(row, "validation_errors"), 160),
+                    book_label="" if spot is None else spot.label,
+                    book_tone="" if spot is None else spot.tone,
+                    filled_text="" if spot is None else spot.filled_text,
+                    order_text="" if spot is None else spot.order_text,
+                    protection_text="" if spot is None else spot.protection_text,
+                )
             )
-            for row in rows
-        )
-        return _ok(payload, started)
+        return _ok(tuple(built), started)
 
     def _paper_signal_streaks(self, started: float, days: int) -> DataResult:
         path = self.paths.paper
@@ -3776,6 +3887,8 @@ class DataStore:
                 if absent:
                     return _unavail(f"{absent}（{path.name}）", started)
                 selected = ["ts", "validation_ok", "validation_errors"]
+                if "decision_log_id" in cols:
+                    selected.append("decision_log_id")
                 if "status" in cols:
                     selected.append("status")
                 if "receipt_json" in cols:
@@ -3785,6 +3898,16 @@ class DataStore:
                     f"SELECT {', '.join(selected)} FROM execution_log WHERE ts >= ?",
                     (lower,),
                 ).fetchall()
+                decision_ids = [
+                    decision_id
+                    for decision_id in (
+                        _as_int(_cell(row, "decision_log_id"))
+                        for row in rows
+                        if "decision_log_id" in row.keys()
+                    )
+                    if decision_id is not None
+                ]
+                spot_table, spot_rows = _spot_book_index(conn, decision_ids)
         except sqlite3.Error as exc:
             return _unavail(f"查询失败（{path.name}）：{_safe_exc(exc)}", started)
         counts: dict[str, int] = defaultdict(int)
@@ -3794,11 +3917,18 @@ class DataStore:
                 continue
             receipt = parse_json(str(_cell(row, "receipt_json") or ""))
             status_text = _cell(row, "status")
+            decision_id = (
+                _as_int(_cell(row, "decision_log_id"))
+                if "decision_log_id" in row.keys()
+                else None
+            )
             key = rejection_key(
                 _as_int(row["validation_ok"]),
                 str(row["validation_errors"] or ""),
                 None if status_text is None else str(status_text),
                 receipt or None,
+                spot_position=spot_rows.get(decision_id) if decision_id is not None else None,
+                spot_table=spot_table,
             )
             if key is None:
                 continue
@@ -4055,6 +4185,19 @@ class DataStore:
         ]
         return kept, ""
 
+    def _spot_index_for(
+        self, decision_ids: list[int]
+    ) -> tuple[bool, dict[int, dict[str, Any]]]:
+        path = self.paths.execution
+        if not decision_ids or not path.is_file():
+            return False, {}
+        try:
+            with ro_connect(path) as conn:
+                return _spot_book_index(conn, decision_ids)
+        except sqlite3.Error:
+            log.warning("spot book unreadable")
+            return False, {}
+
     def _latest_execs(
         self,
         decision_ids: list[int],
@@ -4087,6 +4230,7 @@ class DataStore:
                         "executor",
                         "pair_address",
                         "receipt_json",
+                        "status",
                     )
                     if name in cols
                 ]
