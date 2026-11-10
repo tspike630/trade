@@ -226,14 +226,25 @@ def evaluate_five_state_regime(
             recommended_order_type="NONE",
         )
 
-    # Move #4 (IMC Option Smile Parabola Residual): Early crash-insurance spike on OTM puts -> State 4 defensive
-    put_wing_res = _finite(row.get("put_wing_iv_residual_pct"))
+    # Move #4. Only a leave-one-out put-wing residual can open the defensive
+    # playbook. A 4-point in-sample residual is a different number and is not
+    # read. A bare ``put_wing_iv_residual_pct`` is not read unless its
+    # provenance says ``leave_one_out`` and no chain is present to recompute.
     opt_chain = row.get("option_chain")
     spot_px = _finite(row.get("spot_price") or row.get("last_price") or row.get("close"))
-    if put_wing_res is None and isinstance(opt_chain, Sequence) and spot_px is not None:
+    smile_snap = None
+    if isinstance(opt_chain, Sequence) and not isinstance(opt_chain, (str, bytes)) and spot_px is not None:
         smile_snap = fit_volatility_smile_residuals(opt_chain, spot_px)
-        if smile_snap is not None:
-            put_wing_res = smile_snap.max_put_wing_residual_pct
+    if smile_snap is not None:
+        put_wing_res = (
+            smile_snap.max_put_wing_residual_pct
+            if smile_snap.residual_provenance == "leave_one_out"
+            else None
+        )
+    elif str(row.get("put_wing_residual_provenance") or "").strip().lower() == "leave_one_out":
+        put_wing_res = _finite(row.get("put_wing_iv_residual_pct"))
+    else:
+        put_wing_res = None
 
     if put_wing_res is not None and put_wing_res >= 4.0:
         return RegimeRoutingDecision(

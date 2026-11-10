@@ -9,9 +9,10 @@ Implements two institutional/competition microstructure & cross-asset engines in
 2. Option Volatility Smile Parabola Residual (IMC Global #2 Round 3 ``vt - v_hat(mt)``):
    - Fits ``IV(m) = a * m^2 + b * m + c`` via exact 3x3 Gaussian elimination over log-moneyness
      ``m = ln(K / S) / sqrt(T)`` across option strikes.
-   - Isolates OTM put-wing crash-insurance spikes (``put_wing_iv_residual_pct >= +4.0`` -> early
-     warning that dealers/whales are bidding up OTM puts ahead of a spot dump -> State 4 defensive)
-     and OTM call-wing squeeze residuals.
+   - Isolates OTM put-wing crash-insurance spikes. Only a leave-one-out residual
+     (at least 5 points, each wing point scored on a fit that excludes it) can
+     set the warning. A 4-point in-sample residual is kept separately and cannot
+     raise that warning or the State 4 smile route.
 """
 
 from __future__ import annotations
@@ -36,11 +37,16 @@ class SmileResidualSnapshot:
     atm_fitted_iv_pct: float
     smile_curvature_a: float
     smile_skew_b: float
-    max_put_wing_residual_pct: float
-    max_call_wing_residual_pct: float
+    # Leave-one-out wing residual. None unless ``residual_provenance`` is
+    # ``leave_one_out``. An in-sample number is never stored here.
+    max_put_wing_residual_pct: float | None
+    max_call_wing_residual_pct: float | None
     put_crash_insurance_spike: bool
     call_squeeze_demand_spike: bool
     n_strikes: int
+    residual_provenance: str
+    in_sample_max_put_wing_residual_pct: float | None
+    in_sample_max_call_wing_residual_pct: float | None
 
 
 def _finite(val: object) -> float | None:
@@ -193,8 +199,12 @@ def fit_volatility_smile_residuals(
     When ``underlying``, ``expiry``, or ``iv_unit`` is present, every dict must
     carry the same value. ``iv_unit`` ``percent`` or ``decimal`` selects the
     scale. Without ``iv_unit``, a value below 3 is still multiplied by 100.
-    That heuristic is not an explicit unit. Leave-one-out starts at 5 points;
-    a 4-point residual includes the point in its own fit. No event time is read.
+    That heuristic is not an explicit unit. A fit exists from 4 points, but
+    that residual includes each point in its own parabola. It is stored on
+    ``in_sample_max_*`` with provenance ``in_sample`` and both spike flags
+    stay false. Leave-one-out wing residuals, and the crash-insurance flags,
+    exist only when at least 5 points produce a jackknife wing residual.
+    No event time is read.
     """
     s = _finite(spot_price)
     if s is None or s <= 0 or not isinstance(option_chain, Sequence) or isinstance(option_chain, (str, bytes)):
@@ -264,33 +274,58 @@ def fit_volatility_smile_residuals(
         return None
     c1, b1, a1 = pass1
 
-    # Leave-One-Out (Jackknife) wing residuals prevent high-leverage edge strikes
-    # from pulling the parabola up and masking their own IV spike.
-    put_res: list[float] = []
-    call_res: list[float] = []
+    # A 4-point residual is in-sample: the point helps fit the parabola that
+    # is then used to score it. Leave-one-out refits without that point, and
+    # only those wing residuals can raise a crash-insurance flag. A failed
+    # jackknife is omitted. It is not replaced with the in-sample residual.
+    in_put: list[float] = []
+    in_call: list[float] = []
+    loo_put: list[float] = []
+    loo_call: list[float] = []
     for idx, (m, iv) in enumerate(pts):
+        in_res = iv - (a1 * m * m + b1 * m + c1)
+        loo_res: float | None = None
         if len(pts) >= 5:
             others = pts[:idx] + pts[idx + 1 :]
             loo = _fit_quad(others)
-            c_fit, b_fit, a_fit = loo if loo is not None else (c1, b1, a1)
-        else:
-            c_fit, b_fit, a_fit = c1, b1, a1
-        res_iv = iv - (a_fit * m * m + b_fit * m + c_fit)
+            if loo is not None:
+                c_fit, b_fit, a_fit = loo
+                loo_res = iv - (a_fit * m * m + b_fit * m + c_fit)
         if m <= -0.05:
-            put_res.append(res_iv)
+            in_put.append(in_res)
+            if loo_res is not None:
+                loo_put.append(loo_res)
         elif m >= 0.05:
-            call_res.append(res_iv)
+            in_call.append(in_res)
+            if loo_res is not None:
+                loo_call.append(loo_res)
 
-    max_put_res = max(put_res) if put_res else 0.0
-    max_call_res = max(call_res) if call_res else 0.0
+    def _peak(values: list[float]) -> float | None:
+        if not values:
+            return None
+        return round(max(values), 4)
 
+    loo_put_peak = _peak(loo_put)
+    loo_call_peak = _peak(loo_call)
+    leave_one_out = loo_put_peak is not None or loo_call_peak is not None
     return SmileResidualSnapshot(
         atm_fitted_iv_pct=round(c1, 4),
         smile_curvature_a=round(a1, 4),
         smile_skew_b=round(b1, 4),
-        max_put_wing_residual_pct=round(max_put_res, 4),
-        max_call_wing_residual_pct=round(max_call_res, 4),
-        put_crash_insurance_spike=max_put_res >= residual_spike_pct,
-        call_squeeze_demand_spike=max_call_res >= residual_spike_pct,
+        max_put_wing_residual_pct=loo_put_peak,
+        max_call_wing_residual_pct=loo_call_peak,
+        put_crash_insurance_spike=(
+            leave_one_out
+            and loo_put_peak is not None
+            and loo_put_peak >= residual_spike_pct
+        ),
+        call_squeeze_demand_spike=(
+            leave_one_out
+            and loo_call_peak is not None
+            and loo_call_peak >= residual_spike_pct
+        ),
         n_strikes=len(pts),
+        residual_provenance="leave_one_out" if leave_one_out else "in_sample",
+        in_sample_max_put_wing_residual_pct=_peak(in_put),
+        in_sample_max_call_wing_residual_pct=_peak(in_call),
     )

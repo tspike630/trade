@@ -52,7 +52,10 @@ class SmileAndQuantileModelsTests(unittest.TestCase):
         snap = fit_volatility_smile_residuals(chain, spot)
         self.assertIsNotNone(snap)
         assert snap is not None
+        self.assertEqual(snap.residual_provenance, "leave_one_out")
         self.assertTrue(snap.put_crash_insurance_spike)
+        self.assertIsNotNone(snap.max_put_wing_residual_pct)
+        assert snap.max_put_wing_residual_pct is not None
         self.assertGreaterEqual(snap.max_put_wing_residual_pct, 6.5)
 
         # Router immediately shifts to State 4 defensive + Perp Beta Hedge!
@@ -107,6 +110,11 @@ class SmileAndQuantileModelsTests(unittest.TestCase):
         self.assertIsNotNone(fitted)
         assert fitted is not None
         self.assertEqual(fitted.n_strikes, 4)
+        self.assertEqual(fitted.residual_provenance, "in_sample")
+        self.assertIsNone(fitted.max_put_wing_residual_pct)
+        self.assertIsNone(fitted.max_call_wing_residual_pct)
+        self.assertFalse(fitted.put_crash_insurance_spike)
+        self.assertFalse(fitted.call_squeeze_demand_spike)
 
     def test_explicit_iv_unit_and_same_contract_labels(self) -> None:
         spot = 100.0
@@ -168,6 +176,80 @@ class SmileAndQuantileModelsTests(unittest.TestCase):
         plain = evaluate_five_state_regime({"symbol": "BTCUSDT", "spot_price": spot})
         self.assertEqual(plain.regime, REGIME_1_POSITIVE_GAMMA_PINNED)
         self.assertNotEqual(plain.playbook, "smile_put_wing_crash_insurance_defensive")
+
+    def test_four_point_in_sample_residual_cannot_raise_the_leave_one_out_alert(self) -> None:
+        spot = 100_000.0
+        tte = 7.0 / 365.0
+        clean = [94_000, 97_000, 100_000, 103_000, 106_000]
+        spiked_strike = 90_000
+
+        def _chain(strikes: list[int]) -> list[dict[str, float]]:
+            rows = []
+            for strike in strikes:
+                moneyness = math.log(strike / spot) / math.sqrt(tte)
+                iv = 50.0 + 2.0 * moneyness + 12.0 * moneyness * moneyness
+                if strike == spiked_strike:
+                    # Large enough that the shrunk 4-point residual still clears 4.
+                    # The old route treated that shrunk number as the leave-one-out alert.
+                    iv += 400.0
+                rows.append({"strike": float(strike), "iv_pct": iv, "tte_years": tte})
+            return rows
+
+        four_strikes = [spiked_strike, 97_000, 100_000, 106_000]
+        five_strikes = [spiked_strike, *clean[:4]]
+        four = fit_volatility_smile_residuals(_chain(four_strikes), spot)
+        five = fit_volatility_smile_residuals(_chain(five_strikes), spot)
+        self.assertIsNotNone(four)
+        self.assertIsNotNone(five)
+        assert four is not None and five is not None
+        self.assertEqual(four.n_strikes, 4)
+        self.assertEqual(four.residual_provenance, "in_sample")
+        self.assertIsNone(four.max_put_wing_residual_pct)
+        self.assertFalse(four.put_crash_insurance_spike)
+        self.assertIsNotNone(four.in_sample_max_put_wing_residual_pct)
+        assert four.in_sample_max_put_wing_residual_pct is not None
+        self.assertGreaterEqual(four.in_sample_max_put_wing_residual_pct, 4.0)
+
+        self.assertEqual(five.residual_provenance, "leave_one_out")
+        self.assertGreaterEqual(five.n_strikes, 5)
+        self.assertIsNotNone(five.max_put_wing_residual_pct)
+        self.assertIsNotNone(five.in_sample_max_put_wing_residual_pct)
+        assert five.max_put_wing_residual_pct is not None
+        assert five.in_sample_max_put_wing_residual_pct is not None
+        self.assertGreater(five.max_put_wing_residual_pct, five.in_sample_max_put_wing_residual_pct)
+        self.assertGreaterEqual(five.max_put_wing_residual_pct, 4.0)
+        self.assertTrue(five.put_crash_insurance_spike)
+
+        held = evaluate_five_state_regime(
+            {"symbol": "BTCUSDT", "spot_price": spot, "option_chain": _chain(four_strikes),
+             "put_wing_iv_residual_pct": 20.0, "put_wing_residual_provenance": "leave_one_out"}
+        )
+        self.assertNotEqual(held.playbook, "smile_put_wing_crash_insurance_defensive")
+        routed = evaluate_five_state_regime(
+            {"symbol": "BTCUSDT", "spot_price": spot, "option_chain": _chain(five_strikes)}
+        )
+        self.assertEqual(routed.playbook, "smile_put_wing_crash_insurance_defensive")
+
+        unlabeled = evaluate_five_state_regime(
+            {"symbol": "BTCUSDT", "put_wing_iv_residual_pct": 9.0}
+        )
+        in_sample_stamp = evaluate_five_state_regime(
+            {
+                "symbol": "BTCUSDT",
+                "put_wing_iv_residual_pct": 9.0,
+                "put_wing_residual_provenance": "in_sample",
+            }
+        )
+        loo_stamp = evaluate_five_state_regime(
+            {
+                "symbol": "BTCUSDT",
+                "put_wing_iv_residual_pct": 9.0,
+                "put_wing_residual_provenance": "leave_one_out",
+            }
+        )
+        self.assertNotEqual(unlabeled.playbook, "smile_put_wing_crash_insurance_defensive")
+        self.assertNotEqual(in_sample_stamp.playbook, "smile_put_wing_crash_insurance_defensive")
+        self.assertEqual(loo_stamp.playbook, "smile_put_wing_crash_insurance_defensive")
 
 
 if __name__ == "__main__":
