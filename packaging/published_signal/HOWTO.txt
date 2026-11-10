@@ -1,42 +1,36 @@
 PR 208 acceptance kit. Not a deploy and not a merge. No .env and no database copy.
+Do not clone GitHub. The only git object source is acceptance.bundle in this directory.
 
-The archive contains acceptance.bundle, this file, run_acceptance.py, and
-SHA256SUMS. The bundle is a local git bundle. Do not clone GitHub.
-
-SHA256SUMS lines have three fields separated by two spaces, and no header:
+SHA256SUMS has no header. Each line is three fields separated by two spaces:
 
   sha256  bytes  path
 
-sha256 is 64 lowercase hex digits. bytes is the decimal size of the file.
-path is relative to this directory. Two spaces, not one, sit between fields.
-Check a line with:
+sha256 is 64 lowercase hex digits. bytes is the decimal file size. path is
+relative to this directory and has no leading slash. Example check:
 
   python3 -c 'import hashlib,pathlib,sys
-p=pathlib.Path(sys.argv[1]); d=hashlib.sha256(p.read_bytes()).hexdigest(); print(d, p.stat().st_size, sys.argv[1])' <path>
+p=pathlib.Path(sys.argv[1])
+print(hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_size)' acceptance.bundle
 
-Materialize the checkout from the bundle only:
+Materialize the checkout:
 
   git clone --branch cursor/publish-state3-signal-cf2e acceptance.bundle repo
-  git -C repo fetch acceptance.bundle ab2d2eb:refs/remotes/origin/main
-  git -C repo fetch acceptance.bundle bc392fea:refs/tags/bc392fea-mark
-  git -C repo update-ref bc392fea ab2d2eb
-  # The next command restores the real bc392fea commit named by that object.
-  git -C repo fetch acceptance.bundle bc392fea:bc392fea
+  git -C repo fetch acceptance.bundle 'refs/remotes/origin/main:refs/remotes/origin/main'
 
-If `git fetch acceptance.bundle bc392fea:bc392fea` is run from inside repo,
-use the bundle path. Then:
+bc392fea is an ancestor in that bundle. Do not create a branch named
+bc392fea; the commit id is already reachable. Then:
 
   python3 repo/packaging/published_signal/run_acceptance.py
 
-The checkout already contains scripts/import_lseg_bars_incremental.py,
-scripts/build_news_isolation_engine.py, and deploy/news_isolation/preflight.py.
-Those tests call them. They are not skipped.
+The checkout contains scripts/import_lseg_bars_incremental.py,
+scripts/build_news_isolation_engine.py, deploy/news_isolation/preflight.py,
+and deploy/news_isolation/engine.py. The news and CityU tests call those
+files. Assertions are not skipped.
 
-Expected counts from that command: prior 40, CityU 6, news 8, private OBI 3,
-published 3. The third published test checks that a finite obi_top5 and
-volume_z already on the signal are not replaced by the hot row.
+Counts: prior 40 + CityU 6 = 46, news 8, private OBI 3, published 3.
+Published 3 is the original 2 plus the test that a finite obi_top5 and
+volume_z already on the signal are not overwritten. Sum 60.
 
-CFTC: the importer slow_variable_cycle stays date-only. The reader stamps
-the Tuesday report only after Friday 15:30 America/New_York. There is no
-holiday calendar in this repo, so that instant is not moved earlier. A
-3600-second cutoff is not used.
+The date-only importer still flips CFTC at Friday 00:00 UTC. The reader
+waits until Friday 15:30 America/New_York and does not move that instant
+earlier. This repo has no holiday calendar. A 3600-second cutoff is not used.
