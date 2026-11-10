@@ -323,6 +323,58 @@ class FactorWriteTests(unittest.TestCase):
             self.assertNotIn("CCCUSDT", [row["token_address"] for row in by_fade])
             conn.close()
 
+    def test_kline_refresh_keeps_columns_this_job_does_not_compute(self) -> None:
+        bars = _bars(n=25, last_close=10.0, quote=2000.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(Path(tmp) / "ind.db")
+            conn.execute(
+                "CREATE TABLE token_indicators (chain_id TEXT, token_address TEXT)"
+            )
+            conn.execute("INSERT INTO token_indicators VALUES ('solana', 'MintPaper')")
+            first = persist_klines_and_factors(
+                conn,
+                SpotSymbol("EDGEUSDT", "EDGE"),
+                bars,
+                now_ms=bars[-1].close_time_ms + 1,
+            )
+            self.assertIsNotNone(first)
+            conn.execute(
+                """
+                UPDATE binance_indicators
+                SET funding_rate = -0.0015,
+                    funding_z = -2.85,
+                    open_interest_change_1h = 3.2,
+                    perp_basis_bps = -40
+                WHERE symbol = 'EDGEUSDT'
+                """
+            )
+            conn.commit()
+            again = persist_klines_and_factors(
+                conn,
+                SpotSymbol("EDGEUSDT", "EDGE"),
+                bars,
+                now_ms=bars[-1].close_time_ms + 1,
+            )
+            self.assertIsNotNone(again)
+            kept = conn.execute(
+                """
+                SELECT funding_rate, funding_z, open_interest_change_1h, perp_basis_bps,
+                       quote_volume_24h, taker_buy_quote_volume
+                FROM binance_indicators WHERE symbol = 'EDGEUSDT'
+                """
+            ).fetchone()
+            self.assertEqual(kept[0], -0.0015)
+            self.assertEqual(kept[1], -2.85)
+            self.assertEqual(kept[2], 3.2)
+            self.assertEqual(kept[3], -40)
+            self.assertAlmostEqual(kept[4], 25 * 2000.0, places=4)
+            self.assertIsNone(kept[5])
+            self.assertEqual(
+                conn.execute("SELECT token_address FROM token_indicators").fetchall(),
+                [("MintPaper",)],
+            )
+            conn.close()
+
     def test_dry_run_reads_universe_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "universe.db"
