@@ -41,6 +41,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 BAR_FILENAMES = (
     "lseg_cityu_core_refresh_bars.csv",
@@ -135,13 +136,6 @@ SLOW_EXPORT_CONTRACTS: dict[str, dict[str, object]] = {
     },
 }
 
-_BAR_SQL = """
-    INSERT OR REPLACE INTO cross_asset_bars (
-        ric, interval, utc_ts, utc_ms, open, high, low, close, volume,
-        bid, ask, spread_bps, bid_nummov, ask_nummov, quote_imbalance, vwap
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-"""
-
 _US_CASH_SUFFIXES = (".O", ".P", ".K", ".Z", ".N")
 _CRYPTO_SPOT = frozenset({"BTC=", "ETH=", "SOL="})
 _FX = frozenset(
@@ -150,6 +144,22 @@ _FX = frozenset(
         "MXN=", "XAU=", "SOFR=", "USONFFE=",
     }
 )
+_NEW_YORK = ZoneInfo("America/New_York")
+_UPDATABLE_FIELDS = (
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "bid",
+    "ask",
+    "spread_bps",
+    "bid_nummov",
+    "ask_nummov",
+    "quote_imbalance",
+    "vwap",
+)
+_ADDED_COLUMNS = tuple((name, "REAL") for name in _UPDATABLE_FIELDS)
 
 
 @dataclass(frozen=True)
@@ -170,13 +180,7 @@ class BarRow:
     ask_nummov: float | None
     quote_imbalance: float | None
     vwap: float | None
-
-    def as_tuple(self) -> tuple[object, ...]:
-        return (
-            self.ric, self.interval, self.utc_ts, self.utc_ms, self.open, self.high,
-            self.low, self.close, self.volume, self.bid, self.ask, self.spread_bps,
-            self.bid_nummov, self.ask_nummov, self.quote_imbalance, self.vwap,
-        )
+    provided: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -240,9 +244,17 @@ def parse_source_timestamp(raw: object) -> tuple[str, int] | None:
             return None
         utc = parsed.astimezone(timezone.utc)
         return utc.strftime("%Y-%m-%dT%H:%M:%SZ"), int(utc.timestamp() * 1000)
-    for fmt, width in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10), ("%Y/%m/%d %H:%M:%S", 19), ("%Y/%m/%d", 10)):
+    # Full naive datetimes are UTC, matching the existing space-separated ingest.
+    # A ``T`` separator must not fall through to the date-only format.
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y/%m/%dT%H:%M:%S"):
         try:
-            naive = datetime.strptime(text[:width], fmt).replace(tzinfo=timezone.utc)
+            naive = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        return naive.strftime("%Y-%m-%dT%H:%M:%SZ"), int(naive.timestamp() * 1000)
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            naive = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
         return naive.strftime("%Y-%m-%dT%H:%M:%SZ"), int(naive.timestamp() * 1000)
@@ -266,36 +278,60 @@ def bar_from_csv_row(row: Mapping[str, str]) -> BarRow | None:
     if not ric or not interval or parsed is None:
         return None
     utc_ts, utc_ms = parsed
-    bid = _first(row, "BID")
-    ask = _first(row, "ASK")
-    bid_moves = _first(row, "BID_NUMMOV")
-    ask_moves = _first(row, "ASK_NUMMOV")
+    provided: set[str] = set()
+    open_px = _imported(row, provided, "open", "OPEN_PRC", "MID_OPEN", "OPEN_BID")
+    high = _imported(row, provided, "high", "HIGH_1", "MID_HIGH", "BID_HIGH_1")
+    low = _imported(row, provided, "low", "LOW_1", "MID_LOW", "BID_LOW_1")
+    close = _imported(row, provided, "close", "TRDPRC_1", "MID_PRICE")
+    volume = _imported(row, provided, "volume", "ACVOL_UNS", "NUM_MOVES")
+    bid = _imported(row, provided, "bid", "BID")
+    ask = _imported(row, provided, "ask", "ASK")
+    bid_moves = _imported(row, provided, "bid_nummov", "BID_NUMMOV")
+    ask_moves = _imported(row, provided, "ask_nummov", "ASK_NUMMOV")
+    vwap = _imported(row, provided, "vwap", "VWAP")
+    if close is None and "close" not in provided and bid is not None:
+        close = bid
+        provided.add("close")
     spread = None
     if bid is not None and ask is not None and bid > 0 and ask >= bid:
         mid = 0.5 * (bid + ask)
         if mid > 0:
             spread = round(((ask - bid) / mid) * 10_000.0, 4)
+            provided.add("spread_bps")
     imbalance = None
     if bid_moves is not None and ask_moves is not None and (bid_moves + ask_moves) > 0:
         imbalance = round((bid_moves - ask_moves) / (bid_moves + ask_moves), 4)
+        provided.add("quote_imbalance")
     return BarRow(
         ric=ric,
         interval=interval,
         utc_ts=utc_ts,
         utc_ms=utc_ms,
-        open=_first(row, "OPEN_PRC", "MID_OPEN", "OPEN_BID"),
-        high=_first(row, "HIGH_1", "MID_HIGH", "BID_HIGH_1"),
-        low=_first(row, "LOW_1", "MID_LOW", "BID_LOW_1"),
-        close=_first(row, "TRDPRC_1", "MID_PRICE", "BID"),
-        volume=_first(row, "ACVOL_UNS", "NUM_MOVES"),
+        open=open_px,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
         bid=bid,
         ask=ask,
         spread_bps=spread,
         bid_nummov=bid_moves,
         ask_nummov=ask_moves,
         quote_imbalance=imbalance,
-        vwap=_first(row, "VWAP"),
+        vwap=vwap,
+        provided=frozenset(provided),
     )
+
+
+def _imported(row: Mapping[str, str], provided: set[str], field: str, *names: str) -> float | None:
+    """Parse a value only when one of ``names`` is a real CSV column with a number."""
+    if not any(name in row for name in names):
+        return None
+    value = _first(row, *names)
+    if value is None:
+        return None
+    provided.add(field)
+    return value
 
 
 def read_bar_csv(path: Path) -> tuple[list[BarRow], int]:
@@ -327,36 +363,75 @@ def dedupe_bars(rows: Iterable[BarRow]) -> list[BarRow]:
 
 
 def ensure_bar_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cross_asset_bars (
-            ric TEXT NOT NULL,
-            interval TEXT NOT NULL,
-            utc_ts TEXT NOT NULL,
-            utc_ms INTEGER NOT NULL,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume REAL,
-            bid REAL,
-            ask REAL,
-            spread_bps REAL,
-            bid_nummov REAL,
-            ask_nummov REAL,
-            quote_imbalance REAL,
-            vwap REAL,
-            PRIMARY KEY (ric, interval, utc_ms)
+    """Create the bar table, or add missing value columns without dropping rows."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cross_asset_bars'"
+    ).fetchone()
+    if exists is None:
+        conn.execute(
+            """
+            CREATE TABLE cross_asset_bars (
+                ric TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                utc_ts TEXT NOT NULL,
+                utc_ms INTEGER NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL,
+                bid REAL,
+                ask REAL,
+                spread_bps REAL,
+                bid_nummov REAL,
+                ask_nummov REAL,
+                quote_imbalance REAL,
+                vwap REAL,
+                PRIMARY KEY (ric, interval, utc_ms)
+            )
+            """
         )
-        """
-    )
+    else:
+        have = {str(row[1]) for row in conn.execute("PRAGMA table_info(cross_asset_bars)")}
+        for name, col_type in _ADDED_COLUMNS:
+            if name not in have:
+                conn.execute(f"ALTER TABLE cross_asset_bars ADD COLUMN {name} {col_type}")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_cab_ric_int_ms ON cross_asset_bars(ric, interval, utc_ms DESC)"
     )
 
 
 def _upsert_bars(conn: sqlite3.Connection, rows: Sequence[BarRow]) -> None:
-    conn.executemany(_BAR_SQL, [row.as_tuple() for row in rows])
+    """Insert or update only columns the CSV actually carried.
+
+    ``INSERT OR REPLACE`` deletes the row and would null ``open_interest``,
+    ``block_volume``, and any other column this import does not own.
+    """
+    if not rows:
+        return
+    have = {str(row[1]) for row in conn.execute("PRAGMA table_info(cross_asset_bars)")}
+    grouped: dict[tuple[str, ...], list[BarRow]] = {}
+    for row in rows:
+        fields = tuple(
+            name
+            for name in _UPDATABLE_FIELDS
+            if name in row.provided and name in have and getattr(row, name) is not None
+        )
+        grouped.setdefault(fields, []).append(row)
+    for fields, group in grouped.items():
+        cols = ["ric", "interval", "utc_ms", "utc_ts", *fields]
+        assignments = ["utc_ts=excluded.utc_ts", *[f"{name}=excluded.{name}" for name in fields]]
+        sql = (
+            f"INSERT INTO cross_asset_bars ({', '.join(cols)}) "
+            f"VALUES ({', '.join('?' for _ in cols)}) "
+            f"ON CONFLICT(ric, interval, utc_ms) DO UPDATE SET {', '.join(assignments)}"
+        )
+        payload = []
+        for row in group:
+            values: list[object] = [row.ric, row.interval, row.utc_ms, row.utc_ts]
+            values.extend(getattr(row, name) for name in fields)
+            payload.append(values)
+        conn.executemany(sql, payload)
 
 
 def verify_bars(conn: sqlite3.Connection, rows: Sequence[BarRow]) -> int:
@@ -394,20 +469,26 @@ def session_family(ric: str) -> str:
     return "unclassified"
 
 
+def _ny(moment: datetime) -> datetime:
+    return moment.astimezone(_NEW_YORK)
+
+
 def _us_cash_open(moment: datetime) -> bool:
-    if moment.weekday() >= 5:
+    """US cash session in America/New_York, so EST and EDT both map to 09:30–16:00."""
+    local = _ny(moment)
+    if local.weekday() >= 5:
         return False
-    minutes = moment.hour * 60 + moment.minute
-    return 13 * 60 + 30 <= minutes < 20 * 60
+    minutes = local.hour * 60 + local.minute
+    return 9 * 60 + 30 <= minutes < 16 * 60
 
 
 def _last_us_session_date(moment: datetime) -> date:
+    local = _ny(moment)
     if _us_cash_open(moment):
-        return moment.date()
-    cursor = moment
-    if cursor.weekday() < 5 and (cursor.hour * 60 + cursor.minute) >= 20 * 60:
-        return cursor.date()
-    cursor = cursor - timedelta(days=1)
+        return local.date()
+    if local.weekday() < 5 and (local.hour * 60 + local.minute) >= 16 * 60:
+        return local.date()
+    cursor = local - timedelta(days=1)
     while cursor.weekday() >= 5:
         cursor -= timedelta(days=1)
     return cursor.date()
@@ -496,10 +577,11 @@ def _last_weekday(day: date, weekday: int) -> date:
 def _bar_in_last_closed_session(family: str, latest: datetime, now: datetime) -> bool:
     if family == "us_cash":
         session_day = _last_us_session_date(now)
-        if latest.date() != session_day:
+        local = _ny(latest)
+        if local.date() != session_day:
             return False
-        minutes = latest.hour * 60 + latest.minute
-        return 13 * 60 + 30 <= minutes <= 20 * 60
+        minutes = local.hour * 60 + local.minute
+        return 9 * 60 + 30 <= minutes <= 16 * 60
     if family in ("fx", "listed_session"):
         return _fx_open(latest) and (now - latest) <= timedelta(days=3)
     return False

@@ -8,6 +8,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 
+from decision_engine.core.macro_circuit_breaker import MAX_CROSS_ASSET_AGE_MS
 from scripts import import_lseg_bars_incremental as imp
 
 
@@ -26,12 +27,17 @@ class ImportLsegBarsTest(unittest.TestCase):
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def test_timestamp_offset_is_utc_and_naive_stays_utc(self) -> None:
-        offset = imp.parse_source_timestamp("2026-11-10 09:30:00-04:00")
-        naive = imp.parse_source_timestamp("2026-11-10 13:30:00")
-        assert offset is not None and naive is not None
+        spaced = imp.parse_source_timestamp("2026-11-10 13:30:00")
+        tee = imp.parse_source_timestamp("2026-11-10T13:30:00")
+        offset = imp.parse_source_timestamp("2026-11-10T08:30:00-05:00")
+        assert spaced is not None and tee is not None and offset is not None
+        self.assertEqual(spaced[0], "2026-11-10T13:30:00Z")
+        self.assertEqual(tee[0], "2026-11-10T13:30:00Z")
+        self.assertNotEqual(tee[0], "2026-11-10T00:00:00Z")
         self.assertEqual(offset[0], "2026-11-10T13:30:00Z")
-        self.assertEqual(naive[0], "2026-11-10T13:30:00Z")
-        self.assertEqual(offset[1], naive[1])
+        self.assertEqual(spaced[1], tee[1])
+        self.assertEqual(spaced[1], offset[1])
+        self.assertEqual(MAX_CROSS_ASSET_AGE_MS, 30 * 60 * 1000)
 
     def test_import_is_idempotent_and_keeps_unrelated_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -220,6 +226,130 @@ class ImportLsegBarsTest(unittest.TestCase):
         etf = imp.contract_for_filename("lseg_cityu_etf_flows_nav.csv")
         assert etf is not None
         self.assertIn("NAV", str(etf["blocked_because"]))
+
+    def test_update_keeps_columns_the_csv_did_not_carry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "lseg_macro.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                CREATE TABLE cross_asset_bars (
+                    ric TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    utc_ts TEXT NOT NULL,
+                    utc_ms INTEGER NOT NULL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume REAL,
+                    bid REAL,
+                    open_interest REAL,
+                    block_volume REAL,
+                    PRIMARY KEY (ric, interval, utc_ms)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO cross_asset_bars (
+                    ric, interval, utc_ts, utc_ms, open, high, low, close, volume,
+                    bid, open_interest, block_volume
+                ) VALUES ('NVDA.O', '5min', '2026-11-10T13:30:00Z', ?, 1, 1, 1, 1, 9, 3.5, 80, 12)
+                """,
+                (imp.parse_source_timestamp("2026-11-10T13:30:00")[1],),
+            )
+            conn.execute(
+                """
+                INSERT INTO cross_asset_bars (
+                    ric, interval, utc_ts, utc_ms, open, high, low, close, volume,
+                    bid, open_interest, block_volume
+                ) VALUES ('KEEP', '1d', '2020-01-01T00:00:00Z', 1, 1, 1, 1, 7, NULL, 4, 5, 6)
+                """
+            )
+            conn.commit()
+            conn.close()
+            csv_path = root / "lseg_cityu_core_refresh_bars.csv"
+            self._write(
+                csv_path,
+                [{
+                    "Timestamp": "2026-11-10T13:30:00",
+                    "ric": "NVDA.O",
+                    "interval": "5min",
+                    "TRDPRC_1": "101",
+                }],
+            )
+            result = imp.import_lseg_bars(db, files=[csv_path])
+            self.assertTrue(result.ok, result.message)
+            conn = sqlite3.connect(db)
+            nvda = conn.execute(
+                "SELECT close, bid, open_interest, block_volume FROM cross_asset_bars WHERE ric='NVDA.O'"
+            ).fetchone()
+            keep = conn.execute(
+                "SELECT close, bid, open_interest, block_volume FROM cross_asset_bars WHERE ric='KEEP'"
+            ).fetchone()
+            conn.close()
+            self.assertEqual(nvda, (101, 3.5, 80, 12))
+            self.assertEqual(keep, (7, 4, 5, 6))
+
+    def test_old_bar_table_without_bid_column_keeps_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "lseg_macro.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                CREATE TABLE cross_asset_bars (
+                    ric TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    utc_ts TEXT NOT NULL,
+                    utc_ms INTEGER NOT NULL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL NOT NULL,
+                    volume REAL,
+                    yield_val REAL,
+                    desc TEXT,
+                    PRIMARY KEY (ric, interval, utc_ms)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO cross_asset_bars (
+                    ric, interval, utc_ts, utc_ms, open, high, low, close, volume, yield_val, desc
+                ) VALUES ('KEEP', '1d', '2020-01-01T00:00:00Z', 1, 1, 2, 0.5, 1.5, 8, 4.25, 'note')
+                """
+            )
+            conn.commit()
+            conn.close()
+            csv_path = root / "lseg_cityu_incremental_bars.csv"
+            self._write(
+                csv_path,
+                [{
+                    "Timestamp": "2026-11-10 13:30:00",
+                    "ric": "SMH.O",
+                    "interval": "5min",
+                    "TRDPRC_1": "50",
+                }],
+            )
+            result = imp.import_lseg_bars(db, files=[csv_path])
+            self.assertTrue(result.ok, result.message)
+            conn = sqlite3.connect(db)
+            keep = conn.execute(
+                "SELECT close, yield_val, desc FROM cross_asset_bars WHERE ric='KEEP'"
+            ).fetchone()
+            smh = conn.execute(
+                "SELECT close FROM cross_asset_bars WHERE ric='SMH.O'"
+            ).fetchone()
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(cross_asset_bars)")}
+            conn.close()
+            self.assertEqual(keep, (1.5, 4.25, "note"))
+            self.assertEqual(smh[0], 50)
+            self.assertIn("bid", cols)
+            self.assertIn("yield_val", cols)
 
     def test_module_does_not_log_in_or_reload_the_institutional_library(self) -> None:
         text = Path(imp.__file__).read_text(encoding="utf-8")
