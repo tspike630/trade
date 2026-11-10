@@ -1,8 +1,8 @@
 # 新闻旁路（News Sidechannel）
 
-> 状态：脚手架落地（2026-10-10）  
-> 范围：低成本公开 RSS 拉取 → 独立库观察入库  
-> **严格旁路**：不接决策引擎、不改 JEV、不碰 paper/live、不写 `decision_log`
+> 状态：只读门控已接入五态路由；历史阈值**未校准**（2026-11-10）  
+> 范围：公开 RSS → 独立库；白名单危机词 / Fed 鹰派只读叠加  
+> **不写** `decision_log`，不下单，不把 `require_perp_beta_hedge` 当成已经对冲
 
 ---
 
@@ -38,7 +38,7 @@
 
 | tier | 含义 | 当前示例 |
 |------|------|----------|
-| `whitelist` | 主流公开媒体 RSS | CoinDesk / The Block / Cointelegraph / DL News / Decrypt |
+| `whitelist` | 主流公开媒体 RSS 与官方 Fed | CoinDesk / The Block / Cointelegraph / DL News / Decrypt / `fed_monetary` / `fed_speeches` |
 | `rumor` | 低置信度观察源 | NewsBTC（只记，不得单独升格） |
 
 - DefiLlama 主站无公开 RSS；同系 **DL News**（`dlnews.com`）RSS 作为 DefiLlama 新闻旁路入口。
@@ -69,15 +69,15 @@
 ## 4. 事件流水线（设计；本脚手架只做第 1 步）
 
 ```
-新闻 RSS 入库 (onchain_status=pending)
+新闻 RSS 入库 (onchain_status 仍写 pending)
         │
         ▼
-   链上验证（未实现）
-   · 价格/成交量/流动性/大额转出等与标题方向对照
+   只读验证（无校准配置时不改标签）
+   · 热度演变 + obi + taker + whale 齐全才允许 aligned / divergent
         │
-        ├─ aligned   → 候选（candidate）
-        ├─ divergent → 疑似出货（suspected dump）
-        └─ none      → 只记（record-only）
+        ├─ 证据不全或未校准 → pending
+        ├─ 显式校准且同向 → aligned（只参与已有龙头排序）
+        └─ 显式校准且反向 → divergent（仅在状态 3 拒买）
 ```
 
 ### 三机制（跨门槛前一律观察）
@@ -99,9 +99,9 @@
 |------|------|
 | JEV (`sources.jev` / `jev_signals`) | **并行不冲突**；新闻旁路不读不写 JEV 表 |
 | Indicators 旁路 | 互不依赖；新闻不写 `token_indicators` |
-| Decision engine / `decision_log` | **禁止写入**；本模块无任何交易信号出口 |
-| paper / live / execution | **不碰** |
-| 复盘周检门槛 | 历史与信号质量**跨门槛后**，才考虑把「候选」接到决策输入（另立 RFC，不在本脚手架） |
+| Decision engine / `decision_log` | 拉取仍不写 `decision_log`。五态路由只读消费近 90 分钟白名单标题；缺库、锁库、超时、坏表都放行，并在 `news_gate` 里留下原因 |
+| paper / live / execution | 本改动不启动交易、不读密钥、不把对冲标签当成已成交 |
+| 排序权重 | `aligned_rank_weight` 默认关闭。链上 `aligned` / `divergent` 在没有显式校准对象时保持 `pending` |
 
 原则：**先观察、再验证、后候选；跨门槛后再接决策。**
 
@@ -113,4 +113,19 @@
 - [x] `news_events.db` 可查（`SELECT COUNT(*) FROM news_events`）
 - [x] url 去重幂等
 - [x] 单源失败不拖垮整轮
-- [x] 未改 JEV / decision / paper / live 代码路径
+- [x] 未改 JEV / paper / live 执行器；决策侧只增加只读快照
+- [ ] 历史收益、误报率、置信区间**尚未**用生产库校准，禁止把描述统计打开成权重
+
+官方源：`fed_monetary` = `https://www.federalreserve.gov/feeds/press_monetary.xml`，`fed_speeches` = `https://www.federalreserve.gov/feeds/speeches.xml`。
+
+可交易时间是 `fetched_at`。`published_at` 比入库早超过 90 分钟的迟到旧稿不触发。链上判断要本 tick 的 `obi_top5`（没有这一列时不能用 `orderbook_imbalance_20` 顶替）、`taker_buy_ratio`（不用 `perp_taker_buy_sell_ratio`）和 `whale_retail_divergence`，再加上热度演变。缺任何一项保持 `pending`。
+
+2026-11-10 14:37:32 HKT 的本机只读盘点（云端没有这些库，数字是引用不是重算）：`news_events` 1869 条，whitelist 1645 / rumor 224，`onchain_status` 全部 pending，所以误报率不算。没有独立 X 新闻库。`x_watch` 64 条且停在 2026-10-31。币安 5m 只能对齐 375 条，OKX 窗口另有 723 条，两个场所不拼接。币安 BTCUSDT 描述均值约 +5m -0.069%、+1h -0.116%（n=372）、+24h -0.395%（n=245）。可对齐窗口里危机词 0 条、鹰派/Fed 词 1 条。这些数字不启用阈值。
+
+审计（只出报告，不写阈值）：
+
+```bash
+python3 -m decision_engine.core.news_shock_audit --news-db news_events.db
+```
+
+时间按 `published_at` 切 60/20/20，url 与 6 小时内同题去重，Wilson 区间，短语族 × 15/60/240 分钟要做多重检验校正。特征时间必须不晚于新闻，价格开盘时间必须不早于新闻。没有币种映射时不猜测标的。

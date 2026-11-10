@@ -27,6 +27,11 @@ from decision_engine.core.macro_circuit_breaker import (
     evaluate_macro_gate,
     resolve_macro_db_path,
 )
+from decision_engine.core.news_shock_gate import (
+    error_snapshot,
+    load_news_snapshot,
+    snapshot_observation,
+)
 from decision_engine.core.protection_halt import (
     ProtectionBook,
     purpose_halt_reason,
@@ -246,15 +251,29 @@ class DecisionEngine:
             macro_halt=macro_halt,
         )
         top_report: dict[str, Any] | None = None
+        news_snapshot = None
         if bnb_spot:
             from decision_engine.core.regime_strategy_router import (
                 apply_five_state_regime_router,
             )
 
+            symbols: list[str] = []
+            for sig in passed:
+                if str(sig.get("action") or "").strip().lower() != "buy":
+                    continue
+                symbol = str(sig.get("binance_symbol") or sig.get("symbol") or "").strip()
+                if symbol:
+                    symbols.append(symbol)
+            try:
+                news_snapshot = load_news_snapshot(symbols=symbols)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("news shock snapshot failed")
+                news_snapshot = error_snapshot(f"{type(exc).__name__}:{exc}")
             passed, _ = apply_five_state_regime_router(
                 passed,
                 hot,
                 macro_halt=macro_halt,
+                news_snapshot=news_snapshot,
             )
             passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
         emitted = self.bus.publish_many(passed)
@@ -276,6 +295,7 @@ class DecisionEngine:
             protection_halt=guard_report.get("protection_halt") or protection_halt,
             macro_halt=guard_report.get("macro_halt") or macro_halt,
             stop_gap_rejected=int(guard_report.get("stop_gap_rejected") or 0),
+            news_gate=None if news_snapshot is None else snapshot_observation(news_snapshot),
         )
 
     def _tick_payload(
@@ -292,6 +312,7 @@ class DecisionEngine:
         protection_halt: str | None = None,
         macro_halt: str | None = None,
         stop_gap_rejected: int = 0,
+        news_gate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "tick": self.tick_count,
@@ -314,6 +335,8 @@ class DecisionEngine:
             payload["macro_halt"] = macro_halt
         if stop_gap_rejected:
             payload["stop_gap_rejected"] = stop_gap_rejected
+        if news_gate is not None:
+            payload["news_gate"] = news_gate
         return payload
 
     def _protection_snapshot(self) -> ProtectionBook:
