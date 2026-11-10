@@ -116,7 +116,9 @@
 - [x] 未改 JEV / paper / live 执行器；决策侧只增加只读快照
 - [ ] 历史收益、误报率、置信区间**尚未**用生产库校准，禁止把描述统计打开成权重
 
-官方源：`fed_monetary` = `https://www.federalreserve.gov/feeds/press_monetary.xml`，`fed_speeches` = `https://www.federalreserve.gov/feeds/speeches.xml`。
+官方源：`fed_monetary` = `https://www.federalreserve.gov/feeds/press_monetary.xml`，`fed_speeches` = `https://www.federalreserve.gov/feeds/speeches.xml`。现有入口仍是 `python -m sources.news --once`，不带 `--sources` 时会拉这两路。不要再挂第二个定时器。
+
+每次轮询把见到的新闻行写到独立的 `news_feature_observation_log.db`（可用 `NEWS_FEATURE_OBS_LOG` 改路径）。源库只读查询，不改 `onchain_status`，不改权重。没有币种就不猜。没有 X 新闻库就记 `unavailable`，不造 X 事件。`orderbook_imbalance_20` 与 `perp_taker_buy_sell_ratio` 各写各的列。两周只是积样，不自动开参数。
 
 可交易时间是 `fetched_at`。`published_at` 比入库早超过 90 分钟的迟到旧稿不触发。链上判断要本 tick 的 `obi_top5`（没有这一列时不能用 `orderbook_imbalance_20` 顶替）、`taker_buy_ratio`（不用 `perp_taker_buy_sell_ratio`）和 `whale_retail_divergence`，再加上热度演变。缺任何一项保持 `pending`。
 

@@ -27,11 +27,16 @@ from decision_engine.core.macro_circuit_breaker import (
     evaluate_macro_gate,
     resolve_macro_db_path,
 )
+from decision_engine.core.ccxt_listing_guard import (
+    apply_ccxt_listing_guard,
+    load_ccxt_guard,
+)
 from decision_engine.core.news_shock_gate import (
     error_snapshot,
     load_news_snapshot,
     snapshot_observation,
 )
+from decision_engine.core.shadow_stop_prone_oos import annotate_shadow_stop_prone
 from decision_engine.core.protection_halt import (
     ProtectionBook,
     purpose_halt_reason,
@@ -252,6 +257,8 @@ class DecisionEngine:
         )
         top_report: dict[str, Any] | None = None
         news_snapshot = None
+        ccxt_report = None
+        shadow_report = None
         if bnb_spot:
             from decision_engine.core.regime_strategy_router import (
                 apply_five_state_regime_router,
@@ -275,6 +282,21 @@ class DecisionEngine:
                 macro_halt=macro_halt,
                 news_snapshot=news_snapshot,
             )
+            try:
+                ccxt_snapshot = load_ccxt_guard(symbols=symbols, now_ms=now_ms)
+                passed, ccxt_report = apply_ccxt_listing_guard(passed, ccxt_snapshot, now_ms=now_ms)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("ccxt listing guard failed")
+                ccxt_report = {"availability": "error", "detail": str(exc), "dropped_chase_buys": 0}
+            try:
+                passed, shadow_report = annotate_shadow_stop_prone(
+                    passed,
+                    availability="observe_only",
+                    detail="block_enabled is false; change_1h<0 does not reject state 1",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("shadow stop-prone annotation failed")
+                shadow_report = {"availability": "error", "detail": str(exc), "block_enabled": False}
             passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
         emitted = self.bus.publish_many(passed)
         log.info(
@@ -296,6 +318,8 @@ class DecisionEngine:
             macro_halt=guard_report.get("macro_halt") or macro_halt,
             stop_gap_rejected=int(guard_report.get("stop_gap_rejected") or 0),
             news_gate=None if news_snapshot is None else snapshot_observation(news_snapshot),
+            ccxt_guard=ccxt_report,
+            shadow_stop_prone=shadow_report,
         )
 
     def _tick_payload(
@@ -313,6 +337,8 @@ class DecisionEngine:
         macro_halt: str | None = None,
         stop_gap_rejected: int = 0,
         news_gate: dict[str, Any] | None = None,
+        ccxt_guard: dict[str, Any] | None = None,
+        shadow_stop_prone: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "tick": self.tick_count,
@@ -337,6 +363,10 @@ class DecisionEngine:
             payload["stop_gap_rejected"] = stop_gap_rejected
         if news_gate is not None:
             payload["news_gate"] = news_gate
+        if ccxt_guard is not None:
+            payload["ccxt_guard"] = ccxt_guard
+        if shadow_stop_prone is not None:
+            payload["shadow_stop_prone"] = shadow_stop_prone
         return payload
 
     def _protection_snapshot(self) -> ProtectionBook:
