@@ -280,7 +280,188 @@ class HourlyKlineCollectorTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(row, (new_open + 3_599_999, 6.0))
 
-    def test_invalid_latest_closed_bar_is_a_failure(self) -> None:
+    def test_loop_tracks_universe_additions_and_removals(self) -> None:
+        import indicators.binance_spot_1h_klines as mod
+
+        now = 30 * 3_600_000
+        expected = (now - 3_599_999) // 3_600_000 * 3_600_000
+        calls = {"n": 0}
+        fetched: list[str] = []
+
+        def load(paths=None):
+            del paths
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return (
+                    [SpotSymbol("BTCUSDT", "BTC"), SpotSymbol("ETHUSDT", "ETH")],
+                    Path("universe-round-1"),
+                )
+            return (
+                [
+                    SpotSymbol("BTCUSDT", "BTC"),
+                    SpotSymbol("PYTHUSDT", "PYTH"),
+                    SpotSymbol("ACTUSDT", "ACT"),
+                ],
+                Path("universe-round-2"),
+            )
+
+        def fetcher(url: str):
+            fetched.append(url)
+            start = expected - 20 * 3_600_000
+            return _window(start, 21, 8.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dex.db"
+            sqlite3.connect(db).close()
+            original = (mod.load_primary_universe, mod.fetch_json, mod.time.sleep)
+            mod.load_primary_universe = load
+            mod.fetch_json = fetcher
+            mod.time.sleep = lambda _seconds: None
+            try:
+                code = mod.main(
+                    [
+                        "--db",
+                        str(db),
+                        "--loop",
+                        "--sleep-sec",
+                        "300",
+                        "--max-rounds",
+                        "2",
+                        "--now-ms",
+                        str(now),
+                    ]
+                )
+            finally:
+                mod.load_primary_universe, mod.fetch_json, mod.time.sleep = original
+            conn = sqlite3.connect(db)
+            counts = dict(
+                conn.execute(
+                    "SELECT symbol, COUNT(*) FROM binance_klines WHERE interval='1h' GROUP BY symbol"
+                ).fetchall()
+            )
+            pyth_tip = conn.execute(
+                "SELECT MAX(open_time_ms), MAX(close_time_ms) FROM binance_klines WHERE symbol='PYTHUSDT'"
+            ).fetchone()
+            act_n = conn.execute(
+                "SELECT COUNT(*) FROM binance_klines WHERE symbol='ACTUSDT' AND interval='1h'"
+            ).fetchone()[0]
+            eth_n = conn.execute(
+                "SELECT COUNT(*) FROM binance_klines WHERE symbol='ETHUSDT' AND interval='1h'"
+            ).fetchone()[0]
+            conn.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(counts["PYTHUSDT"], 21)
+        self.assertEqual(act_n, 21)
+        self.assertEqual(eth_n, 21)
+        self.assertEqual(pyth_tip, (expected, expected + 3_599_999))
+        round2 = fetched[2:]
+        self.assertTrue(any("symbol=PYTHUSDT" in url for url in round2))
+        self.assertTrue(any("symbol=ACTUSDT" in url for url in round2))
+        self.assertFalse(any("symbol=ETHUSDT" in url for url in round2))
+
+    def test_universe_read_error_does_not_reuse_the_previous_symbols(self) -> None:
+        import indicators.binance_spot_1h_klines as mod
+
+        now = 30 * 3_600_000
+        calls = {"n": 0}
+        fetched: list[str] = []
+
+        def load(paths=None):
+            del paths
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [SpotSymbol("BTCUSDT", "BTC")], Path("universe-ok")
+            raise OSError("universe file replaced")
+
+        def fetcher(url: str):
+            fetched.append(url)
+            expected = (now - 3_599_999) // 3_600_000 * 3_600_000
+            return _window(expected - 20 * 3_600_000, 21, 4.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dex.db"
+            sqlite3.connect(db).close()
+            original = (mod.load_primary_universe, mod.fetch_json, mod.time.sleep)
+            mod.load_primary_universe = load
+            mod.fetch_json = fetcher
+            mod.time.sleep = lambda _seconds: None
+            try:
+                code = mod.main(
+                    [
+                        "--db",
+                        str(db),
+                        "--loop",
+                        "--sleep-sec",
+                        "300",
+                        "--max-rounds",
+                        "2",
+                        "--now-ms",
+                        str(now),
+                    ]
+                )
+            finally:
+                mod.load_primary_universe, mod.fetch_json, mod.time.sleep = original
+            conn = sqlite3.connect(db)
+            btc = conn.execute(
+                "SELECT COUNT(*) FROM binance_klines WHERE symbol='BTCUSDT'"
+            ).fetchone()[0]
+            conn.close()
+        self.assertEqual(code, 2)
+        self.assertEqual(len(fetched), 1)
+        self.assertIn("symbol=BTCUSDT", fetched[0])
+        self.assertEqual(btc, 21)
+
+    def test_explicit_symbol_allowlist_waits_for_the_live_universe(self) -> None:
+        import indicators.binance_spot_1h_klines as mod
+
+        now = 30 * 3_600_000
+        calls = {"n": 0}
+        fetched: list[str] = []
+
+        def load(paths=None):
+            del paths
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [SpotSymbol("BTCUSDT", "BTC")], Path("universe-round-1")
+            return (
+                [SpotSymbol("BTCUSDT", "BTC"), SpotSymbol("PYTHUSDT", "PYTH")],
+                Path("universe-round-2"),
+            )
+
+        def fetcher(url: str):
+            fetched.append(url)
+            expected = (now - 3_599_999) // 3_600_000 * 3_600_000
+            return _window(expected - 20 * 3_600_000, 21, 2.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dex.db"
+            sqlite3.connect(db).close()
+            original = (mod.load_primary_universe, mod.fetch_json, mod.time.sleep)
+            mod.load_primary_universe = load
+            mod.fetch_json = fetcher
+            mod.time.sleep = lambda _seconds: None
+            try:
+                code = mod.main(
+                    [
+                        "--db",
+                        str(db),
+                        "--loop",
+                        "--sleep-sec",
+                        "300",
+                        "--max-rounds",
+                        "2",
+                        "--now-ms",
+                        str(now),
+                        "--symbol",
+                        "PYTHUSDT",
+                    ]
+                )
+            finally:
+                mod.load_primary_universe, mod.fetch_json, mod.time.sleep = original
+        self.assertEqual(code, 0)
+        self.assertEqual(len(fetched), 1)
+        self.assertIn("symbol=PYTHUSDT", fetched[0])
+        self.assertNotIn("symbol=BTCUSDT", fetched[0])
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "dex.db"
             conn = sqlite3.connect(db)
