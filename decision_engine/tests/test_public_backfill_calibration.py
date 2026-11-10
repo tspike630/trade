@@ -42,6 +42,7 @@ from decision_engine.core.vision_backfill import (
     RateLimiter,
     cached_fetch,
     connect,
+    expected_closed_5m_opens,
     coverage_report,
     detect_epoch_unit,
     epoch_to_ms,
@@ -127,7 +128,7 @@ class VisionTests(unittest.TestCase):
             second = ingest_zip(conn, "metrics", "BTCUSDT", fetched)
             count = conn.execute("SELECT COUNT(*) FROM vision_metrics").fetchone()[0]
             self.assertEqual(first, 1)
-            self.assertEqual(second, 0)
+            self.assertEqual(second, 1)
             self.assertEqual(count, 1)
             report = coverage_report(conn, ["BTCUSDT", "SOLUSDT"])
             self.assertFalse(report["complete"])
@@ -871,6 +872,172 @@ class SupplyIngestTests(unittest.TestCase):
             kept = sqlite3.connect(root / "vision.db")
             self.assertEqual(kept.execute("SELECT id FROM sentinel").fetchone()[0], 7)
             self.assertEqual(code, 2)
+
+    def test_legacy_matching_sha_reparses_and_invalid_zip_is_not_blessed(self) -> None:
+        day = date(2026, 11, 9)
+        open_us = 1794182400000000
+        close_us = open_us + 299_999_999
+        good_csv = (
+            f"{open_us},100,101,99,100.5,1,{close_us},40.5,1,0.4,40,0\n"
+        )
+        bad_csv = (
+            f"{open_us},100,101,99,100.5,1,{close_us},nan,1,0.4,40,0\n"
+        )
+        good_url = "https://data.binance.vision/data/spot/daily/klines/BTCUSDT/5m/BTCUSDT-5m-2026-11-09.zip"
+        other_url = "https://data.binance.vision/data/spot/daily/klines/ETHUSDT/5m/ETHUSDT-5m-2026-11-09.zip"
+        good_zip = _zip_bytes("BTCUSDT-5m-2026-11-09.csv", good_csv)
+        bad_zip = _zip_bytes("BTCUSDT-5m-2026-11-09.csv", bad_csv)
+
+        def seed(conn: sqlite3.Connection, url: str, digest: str, quote: float) -> None:
+            conn.execute(
+                """
+                INSERT INTO vision_files (
+                    url, sha256, byte_count, row_count, status, detail, schema_version,
+                    checksum_sha256, checksum_status
+                ) VALUES (?, ?, 10, 1, 'ok', NULL, 'vision_backfill_v1', NULL, NULL)
+                """,
+                (url, digest),
+            )
+            conn.execute(
+                """
+                INSERT INTO vision_spot_klines (
+                    symbol, interval, open_time_ms, close_time_ms, open, high, low, close,
+                    volume, quote_volume, taker_buy_base_volume, taker_buy_quote_volume,
+                    timestamp_unit, source_url
+                ) VALUES ('BTCUSDT', '5m', ?, ?, 100, 101, 99, 100.5, 1, ?, 0.4, 40, 'us', ?)
+                """,
+                (open_us // 1000, close_us // 1000, quote, url),
+            )
+            conn.execute(
+                """
+                INSERT INTO vision_spot_klines (
+                    symbol, interval, open_time_ms, close_time_ms, open, high, low, close,
+                    volume, quote_volume, taker_buy_base_volume, taker_buy_quote_volume,
+                    timestamp_unit, source_url
+                ) VALUES ('ETHUSDT', '5m', ?, ?, 100, 101, 99, 100.5, 1, 12.5, 0.4, 40, 'us', ?)
+                """,
+                (open_us // 1000, close_us // 1000, other_url),
+            )
+            conn.commit()
+
+        def serve(url: str, payload: bytes):
+            def fetcher(request: str, limiter: object) -> FetchResult:
+                del limiter
+                if request.endswith(".CHECKSUM"):
+                    return _checksum_result(url, payload)
+                return FetchResult(
+                    request, "ok", _sha256(payload), len(payload), None, payload, 80, "Tue, 10 Nov 2026 02:43:02 GMT"
+                )
+            return fetcher
+
+        with TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "good.db")
+            seed(conn, good_url, _sha256(good_zip), 999.0)
+            outcome = import_planned_file(
+                conn, "klines", "BTCUSDT", good_url, serve(good_url, good_zip), RateLimiter(0)
+            )
+            self.assertEqual(outcome, "ok")
+            quote, checksum_status, status = conn.execute(
+                """
+                SELECT k.quote_volume, f.checksum_status, f.status
+                FROM vision_spot_klines AS k
+                JOIN vision_files AS f ON f.url = k.source_url
+                WHERE k.source_url = ?
+                """,
+                (good_url,),
+            ).fetchone()
+            self.assertEqual(quote, 40.5)
+            self.assertEqual(checksum_status, "verified")
+            self.assertEqual(status, "ok")
+            other = conn.execute(
+                "SELECT quote_volume FROM vision_spot_klines WHERE source_url = ?",
+                (other_url,),
+            ).fetchone()
+            self.assertEqual(other[0], 12.5)
+
+        with TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "bad.db")
+            seed(conn, good_url, _sha256(bad_zip), 999.0)
+            outcome = import_planned_file(
+                conn, "klines", "BTCUSDT", good_url, serve(good_url, bad_zip), RateLimiter(0)
+            )
+            self.assertEqual(outcome, "error")
+            file_row = conn.execute(
+                "SELECT status, checksum_status FROM vision_files WHERE url = ?",
+                (good_url,),
+            ).fetchone()
+            self.assertEqual(file_row[0], "error")
+            self.assertNotEqual(file_row[1], "verified")
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT quote_volume FROM vision_spot_klines WHERE source_url = ?",
+                    (good_url,),
+                ).fetchone()
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT quote_volume FROM vision_spot_klines WHERE source_url = ?",
+                    (other_url,),
+                ).fetchone()[0],
+                12.5,
+            )
+            report = coverage_report(conn, ["BTCUSDT"], [day])
+            self.assertFalse(report["complete"])
+            self.assertFalse(report["files_downloaded_ok"])
+
+    def test_one_kline_row_does_not_cover_the_requested_day(self) -> None:
+        day = date(2026, 11, 9)
+        opens = expected_closed_5m_opens([day])
+        self.assertEqual(len(opens), 288)
+        open_us = opens[0] * 1000
+        close_us = open_us + 299_999_999
+        csv_text = f"{open_us},100,101,99,100.5,1,{close_us},40.5,1,0.4,40,0\n"
+        url = "https://data.binance.vision/data/spot/daily/klines/BTCUSDT/5m/BTCUSDT-5m-2026-11-09.zip"
+        payload = _zip_bytes("BTCUSDT-5m-2026-11-09.csv", csv_text)
+
+        def fetcher(request: str, limiter: object) -> FetchResult:
+            del limiter
+            if request.endswith(".CHECKSUM"):
+                return _checksum_result(url, payload)
+            return FetchResult(request, "ok", _sha256(payload), len(payload), None, payload, 5, None)
+
+        with TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "vision.db")
+            outcome = import_planned_file(conn, "klines", "BTCUSDT", url, fetcher, RateLimiter(0))
+            self.assertEqual(outcome, "ok")
+            report = coverage_report(conn, ["BTCUSDT"], [day])
+            slot = report["kline_slots"][0]
+            self.assertEqual(slot["present_bars"], 1)
+            self.assertEqual(slot["missing_count"], 287)
+            self.assertIn(opens[1], slot["missing_timestamps_ms"])
+            self.assertNotIn(opens[0], slot["missing_timestamps_ms"])
+            self.assertTrue(report["files_downloaded_ok"])
+            self.assertFalse(report["kline_slots_complete"])
+            self.assertFalse(report["archive_rows_complete"])
+            self.assertFalse(report["complete"])
+            conn.execute(
+                "INSERT INTO vision_metrics (symbol, create_time_ms, source_url) VALUES ('BTCUSDT', ?, 'm')",
+                (opens[0],),
+            )
+            conn.execute(
+                "INSERT INTO vision_metrics (symbol, create_time_ms, source_url) VALUES ('BTCUSDT', ?, 'm')",
+                (opens[0] + 300_000,),
+            )
+            conn.execute(
+                "INSERT INTO vision_metrics (symbol, create_time_ms, source_url) VALUES ('BTCUSDT', ?, 'm')",
+                (opens[0] + 900_000,),
+            )
+            conn.execute(
+                "INSERT INTO vision_book_depth (symbol, timestamp_ms, percentage, source_url) VALUES ('BTCUSDT', ?, -1, 'b')",
+                (opens[0],),
+            )
+            conn.commit()
+            observed = coverage_report(conn, ["BTCUSDT"], [day])
+            metrics_day = observed["metrics_by_date"][0]["dates"][0]
+            self.assertEqual(metrics_day["cadence"], "unverified")
+            self.assertEqual(metrics_day["rows"], 3)
+            self.assertTrue(any(gap["delta_ms"] == 600_000 for gap in metrics_day["sampling_gaps"]))
+            self.assertNotIn("expected_count", metrics_day)
 
 
 if __name__ == "__main__":

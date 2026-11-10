@@ -78,7 +78,7 @@ def run_vision(
             cache_dir=cache_dir,
         )
         print(f"{outcome} {kind} {symbol} {url}")
-    report = coverage_report(db, symbols)
+    report = coverage_report(db, symbols, dates)
     report["dates"] = [item.isoformat() for item in dates]
     report["metric_availability_requested"] = mode
     write_manifest(out / "vision_manifest.json", report)

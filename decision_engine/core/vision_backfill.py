@@ -525,12 +525,19 @@ def cached_fetch(
     return fetched
 
 
-def already_stored(conn: sqlite3.Connection, url: str, sha256: str | None) -> bool:
-    row = conn.execute(
-        "SELECT sha256, status FROM vision_files WHERE url = ?",
-        (url,),
-    ).fetchone()
-    return bool(row and row[1] == "ok" and sha256 is not None and row[0] == sha256)
+def _source_table(kind: str) -> str:
+    if kind == "metrics":
+        return "vision_metrics"
+    if kind == "bookDepth":
+        return "vision_book_depth"
+    if kind == "klines":
+        return "vision_spot_klines"
+    raise ValueError(kind)
+
+
+def _delete_source_rows(conn: sqlite3.Connection, kind: str, url: str) -> None:
+    """Drop rows from this archive URL only. Other URLs stay."""
+    conn.execute(f"DELETE FROM {_source_table(kind)} WHERE source_url = ?", (url,))
 
 
 def stored_ok(conn: sqlite3.Connection, url: str) -> bool:
@@ -661,125 +668,139 @@ def ingest_zip(
         _record_file(conn, fetched, 0)
         conn.commit()
         return 0
-    if already_stored(conn, fetched.url, fetched.sha256):
-        return 0
+    # A matching sha on an unverified legacy row is not a reason to skip.
+    # The payload is parsed and the same source_url is replaced in one transaction.
     try:
         texts = _zip_texts(fetched.payload)
-        written = 0
+        parsed: list[dict[str, object]] = []
         if kind == "metrics":
             for _name, text in texts:
-                for row in parse_metrics_csv(text):
-                    feature_ms, feature_basis = metric_feature_clock(
-                        int(row["create_time_ms"]), availability_mode
-                    )
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO vision_metrics (
-                            symbol, create_time_ms, count_toptrader_long_short_ratio,
-                            sum_toptrader_long_short_ratio, count_long_short_ratio,
-                            sum_taker_long_short_vol_ratio, source_url,
-                            create_time_raw, create_time_unit, label_convention,
-                            label_availability, feature_available_at_ms,
-                            feature_availability_basis, downloaded_at_ms, http_last_modified
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            row["symbol"],
-                            row["create_time_ms"],
-                            row["count_toptrader_long_short_ratio"],
-                            row["sum_toptrader_long_short_ratio"],
-                            row["count_long_short_ratio"],
-                            row["sum_taker_long_short_vol_ratio"],
-                            fetched.url,
-                            row["create_time_raw"],
-                            row["create_time_unit"],
-                            row["label_convention"],
-                            row["label_availability"],
-                            feature_ms,
-                            feature_basis,
-                            fetched.downloaded_at_ms,
-                            fetched.http_last_modified,
-                        ),
-                    )
-                    written += 1
+                parsed.extend(parse_metrics_csv(text))
         elif kind == "bookDepth":
             for _name, text in texts:
-                for row in parse_book_depth_csv(text, symbol):
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO vision_book_depth (
-                            symbol, timestamp_ms, percentage, depth, notional, source_url,
-                            depth_semantics, downloaded_at_ms, http_last_modified
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            row["symbol"],
-                            row["timestamp_ms"],
-                            row["percentage"],
-                            row["depth"],
-                            row["notional"],
-                            fetched.url,
-                            BOOK_DEPTH_SEMANTICS,
-                            fetched.downloaded_at_ms,
-                            fetched.http_last_modified,
-                        ),
-                    )
-                    written += 1
+                parsed.extend(parse_book_depth_csv(text, symbol))
         elif kind == "klines":
             for _name, text in texts:
-                for row in parse_spot_kline_csv(text, symbol):
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO vision_spot_klines (
-                            symbol, interval, open_time_ms, close_time_ms,
-                            open, high, low, close, volume, quote_volume,
-                            taker_buy_base_volume, taker_buy_quote_volume,
-                            timestamp_unit, source_url, downloaded_at_ms, http_last_modified
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            row["symbol"],
-                            row["interval"],
-                            row["open_time_ms"],
-                            row["close_time_ms"],
-                            row["open"],
-                            row["high"],
-                            row["low"],
-                            row["close"],
-                            row["volume"],
-                            row["quote_volume"],
-                            row["taker_buy_base_volume"],
-                            row["taker_buy_quote_volume"],
-                            row["timestamp_unit"],
-                            fetched.url,
-                            fetched.downloaded_at_ms,
-                            fetched.http_last_modified,
-                        ),
-                    )
-                    written += 1
+                parsed.extend(parse_spot_kline_csv(text, symbol))
         else:
             raise ValueError(kind)
     except (zipfile.BadZipFile, zipfile.LargeZipFile, UnicodeError, OSError) as exc:
-        conn.rollback()
+        _delete_source_rows(conn, kind, fetched.url)
         _fail_file(conn, fetched, f"bad_zip:{type(exc).__name__}:{exc}")
         return 0
     except ValueError as exc:
-        conn.rollback()
+        _delete_source_rows(conn, kind, fetched.url)
         text = str(exc)
         detail = text if text.startswith("invalid_data:") else f"bad_zip:ValueError:{exc}"
-        _fail_file(conn, fetched, detail)
+        _fail_file(conn, replace(fetched, checksum_status="rejected"), detail)
         return 0
-    if written <= 0:
-        conn.rollback()
+    if not parsed:
+        _delete_source_rows(conn, kind, fetched.url)
         _record_file(
             conn,
-            replace(fetched, status="empty", detail="zero_rows", payload=None),
+            replace(fetched, status="empty", detail="zero_rows", payload=None, checksum_status="rejected"),
             0,
         )
         conn.commit()
         return 0
-    _record_file(conn, fetched, written)
-    conn.commit()
+    try:
+        _delete_source_rows(conn, kind, fetched.url)
+        written = 0
+        if kind == "metrics":
+            for row in parsed:
+                feature_ms, feature_basis = metric_feature_clock(
+                    int(row["create_time_ms"]), availability_mode
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO vision_metrics (
+                        symbol, create_time_ms, count_toptrader_long_short_ratio,
+                        sum_toptrader_long_short_ratio, count_long_short_ratio,
+                        sum_taker_long_short_vol_ratio, source_url,
+                        create_time_raw, create_time_unit, label_convention,
+                        label_availability, feature_available_at_ms,
+                        feature_availability_basis, downloaded_at_ms, http_last_modified
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["symbol"],
+                        row["create_time_ms"],
+                        row["count_toptrader_long_short_ratio"],
+                        row["sum_toptrader_long_short_ratio"],
+                        row["count_long_short_ratio"],
+                        row["sum_taker_long_short_vol_ratio"],
+                        fetched.url,
+                        row["create_time_raw"],
+                        row["create_time_unit"],
+                        row["label_convention"],
+                        row["label_availability"],
+                        feature_ms,
+                        feature_basis,
+                        fetched.downloaded_at_ms,
+                        fetched.http_last_modified,
+                    ),
+                )
+                written += 1
+        elif kind == "bookDepth":
+            for row in parsed:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO vision_book_depth (
+                        symbol, timestamp_ms, percentage, depth, notional, source_url,
+                        depth_semantics, downloaded_at_ms, http_last_modified
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["symbol"],
+                        row["timestamp_ms"],
+                        row["percentage"],
+                        row["depth"],
+                        row["notional"],
+                        fetched.url,
+                        BOOK_DEPTH_SEMANTICS,
+                        fetched.downloaded_at_ms,
+                        fetched.http_last_modified,
+                    ),
+                )
+                written += 1
+        else:
+            for row in parsed:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO vision_spot_klines (
+                        symbol, interval, open_time_ms, close_time_ms,
+                        open, high, low, close, volume, quote_volume,
+                        taker_buy_base_volume, taker_buy_quote_volume,
+                        timestamp_unit, source_url, downloaded_at_ms, http_last_modified
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["symbol"],
+                        row["interval"],
+                        row["open_time_ms"],
+                        row["close_time_ms"],
+                        row["open"],
+                        row["high"],
+                        row["low"],
+                        row["close"],
+                        row["volume"],
+                        row["quote_volume"],
+                        row["taker_buy_base_volume"],
+                        row["taker_buy_quote_volume"],
+                        row["timestamp_unit"],
+                        fetched.url,
+                        fetched.downloaded_at_ms,
+                        fetched.http_last_modified,
+                    ),
+                )
+                written += 1
+        _record_file(conn, fetched, written)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        _delete_source_rows(conn, kind, fetched.url)
+        _fail_file(conn, replace(fetched, checksum_status="rejected"), "invalid_data:replace_failed")
+        return 0
     return written
 
 
@@ -922,7 +943,73 @@ def import_planned_file(
     return "ok" if row[0] == "ok" else str(row[0])
 
 
-def coverage_report(conn: sqlite3.Connection, symbols: Sequence[str]) -> dict[str, object]:
+def expected_closed_5m_opens(days: Sequence[date]) -> list[int]:
+    """Closed 5-minute opens for the requested UTC dates. No other days are filled."""
+    step = 300_000
+    opens: list[int] = []
+    for day in days:
+        start = int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp() * 1000)
+        end = start + 86_400_000
+        last = ((end - step) // step) * step
+        count = ((last - start) // step) + 1
+        opens.extend(start + index * step for index in range(count))
+    return opens
+
+
+def _day_of_ms(stamp: int) -> date:
+    return datetime.fromtimestamp(stamp / 1000.0, tz=timezone.utc).date()
+
+
+def _sampling_gaps(stamps: Sequence[int]) -> list[dict[str, int]]:
+    """Holes relative to the smallest observed spacing. Not an official cadence."""
+    ordered = sorted(set(int(stamp) for stamp in stamps))
+    if len(ordered) < 2:
+        return []
+    deltas = [right - left for left, right in zip(ordered, ordered[1:])]
+    step = min(delta for delta in deltas if delta > 0)
+    gaps: list[dict[str, int]] = []
+    for left, right, delta in zip(ordered, ordered[1:], deltas):
+        if delta > step:
+            gaps.append(
+                {
+                    "from_ms": left,
+                    "to_ms": right,
+                    "delta_ms": delta,
+                    "observed_min_step_ms": step,
+                }
+            )
+    return gaps
+
+
+def _per_date_observations(
+    stamps: Sequence[int],
+    requested: Sequence[date] | None,
+) -> list[dict[str, object]]:
+    by_day: dict[date, list[int]] = {}
+    for stamp in stamps:
+        by_day.setdefault(_day_of_ms(int(stamp)), []).append(int(stamp))
+    days = list(requested) if requested is not None else sorted(by_day)
+    report: list[dict[str, object]] = []
+    for day in days:
+        found = by_day.get(day, [])
+        report.append(
+            {
+                "date": day.isoformat(),
+                "rows": len(found),
+                "min_event_ms": min(found) if found else None,
+                "max_event_ms": max(found) if found else None,
+                "sampling_gaps": _sampling_gaps(found),
+                "cadence": "unverified",
+            }
+        )
+    return report
+
+
+def coverage_report(
+    conn: sqlite3.Connection,
+    symbols: Sequence[str],
+    dates: Sequence[date] | None = None,
+) -> dict[str, object]:
     files = [
         dict(zip(("url", "status", "detail", "row_count"), row))
         for row in conn.execute(
@@ -960,6 +1047,63 @@ def coverage_report(conn: sqlite3.Connection, symbols: Sequence[str]) -> dict[st
         )
     missing = [row for row in files if row["status"] == "missing"]
     errors = [row for row in files if row["status"] not in {"ok", "missing"}]
+    requested = list(dates) if dates is not None else None
+    expected_opens = expected_closed_5m_opens(requested) if requested is not None else []
+    kline_slots: list[dict[str, object]] = []
+    metrics_by_date: list[dict[str, object]] = []
+    book_by_date: list[dict[str, object]] = []
+    for symbol in symbols:
+        present = {
+            int(row[0])
+            for row in conn.execute(
+                "SELECT open_time_ms FROM vision_spot_klines WHERE symbol = ?",
+                (symbol,),
+            )
+        }
+        missing_opens = [stamp for stamp in expected_opens if stamp not in present]
+        kline_slots.append(
+            {
+                "symbol": symbol,
+                "expected_closed_bars": len(expected_opens),
+                "present_bars": len(expected_opens) - len(missing_opens),
+                "missing_count": len(missing_opens),
+                "missing_timestamps_ms": missing_opens,
+            }
+        )
+        metric_stamps = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT create_time_ms FROM vision_metrics WHERE symbol = ? AND create_time_ms IS NOT NULL",
+                (symbol,),
+            )
+        ]
+        book_stamps = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT timestamp_ms FROM vision_book_depth WHERE symbol = ? AND timestamp_ms IS NOT NULL",
+                (symbol,),
+            )
+        ]
+        metrics_by_date.append({"symbol": symbol, "dates": _per_date_observations(metric_stamps, requested)})
+        book_by_date.append({"symbol": symbol, "dates": _per_date_observations(book_stamps, requested)})
+    files_downloaded_ok = bool(files) and all(
+        row["status"] == "ok" and int(row["row_count"] or 0) > 0 for row in files
+    )
+    kline_slots_complete = requested is not None and bool(symbols) and all(
+        item["missing_count"] == 0 and int(item["expected_closed_bars"]) > 0 for item in kline_slots
+    )
+    def _dates_present(groups: list[dict[str, object]]) -> bool:
+        if requested is None or not groups:
+            return False
+        for group in groups:
+            days = list(group["dates"])
+            if len(days) != len(requested) or any(int(day["rows"]) <= 0 for day in days):
+                return False
+        return True
+
+    metrics_dates_present = _dates_present(metrics_by_date)
+    book_dates_present = _dates_present(book_by_date)
+    archive_rows_complete = kline_slots_complete and metrics_dates_present and book_dates_present
     return {
         "schema_version": SCHEMA_VERSION,
         "core_bases": list(CORE_BASES),
@@ -967,10 +1111,18 @@ def coverage_report(conn: sqlite3.Connection, symbols: Sequence[str]) -> dict[st
         "files": len(files),
         "missing": missing,
         "errors": errors,
-        "complete": not missing and not errors and bool(per_symbol) and all(
-            item["metrics_rows"] and item["book_depth_rows"] and item["kline_rows"]
-            for item in per_symbol
-        ) and all(int(row["row_count"] or 0) > 0 for row in files),
+        "files_downloaded_ok": files_downloaded_ok,
+        "archive_rows_complete": archive_rows_complete,
+        "kline_slots_complete": kline_slots_complete,
+        "kline_slots": kline_slots,
+        "metrics_by_date": metrics_by_date,
+        "book_depth_by_date": book_by_date,
+        "complete": (
+            not missing
+            and not errors
+            and files_downloaded_ok
+            and archive_rows_complete
+        ),
         "book_depth_is_percentage_aggregate": True,
         "book_depth_semantics": BOOK_DEPTH_SEMANTICS,
         "obi_top5_column": False,
