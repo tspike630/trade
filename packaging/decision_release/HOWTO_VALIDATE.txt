@@ -1,0 +1,25 @@
+Validation for this release. Run it before anyone copies deploy/ onto the runtime tree.
+
+From the extracted release root, with no production database and no .env:
+
+  PYTHONDONTWRITEBYTECODE=1 python3 validate/run_acceptance.py
+
+That command builds a temporary tree. The temporary tree contains deploy/decision_engine plus the isolation copies under validate/isolation: logging_setup.py, the public-feed script, execution gate, protect, spot helpers, and binance_ws_stream.py. config.py and execution/executors/__init__.py in that tree are validation files. They are not the production crawler config and not the production executors package init. The production init imports the paper ledger; the validation init does not.
+
+The run executes the five modules that make the claimed 40 tests, with their assertions intact, and then the private OBI fixture module. It sets PYTHONDONTWRITEBYTECODE, points HOME and TMPDIR at the temporary directory, sets LOG_HANDLER=stdout, and blocks socket connections. It does not pass through DECISION_DB_PATH, DB_PATH, BINANCE_API_KEY, or a .env file.
+
+Private fixtures, still with no production file:
+
+  PYTHONDONTWRITEBYTECODE=1 python3 validate/test_obi_private_fixtures.py -q
+
+Consumer proof against an explicit database. Both flags are required. The process clock is not used. The command opens the file with mode=ro and PRAGMA query_only, attempts a CREATE TABLE, and continues only when that write is rejected. It imports attach_counterparty_context from deploy/decision_engine after installing a logger stub, so crawler config and .env are not imported.
+
+  python3 validate/prove_obi_consumer.py --db <path-to-public_derivatives.db> --now-ms <explicit-unix-ms>
+
+Stdout is one JSON object. kind is obi_consumer_attach. exit 0 means the stamp matches the reader contract (fresh finite obi_top5 with an empty error is stamped from obi_top5_source_ts_ms; stale, future, missing, and a newest error row are not stamped; orderbook_imbalance_20 is not copied). coverage_complete is false when any symbol is unstamped. Do not treat a raw SQL listing, including the 15:49:15 HKT query, as this report.
+
+Reader compare, read-only:
+
+  python3 validate/check_reader_preserved.py --installed <file> --release-root <release> --expect match
+
+--expect differ is the pre-copy check. --expect match is the post-copy check. The pinned bytes are deploy/READER_SHA256.

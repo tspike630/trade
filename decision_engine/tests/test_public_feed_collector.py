@@ -15,6 +15,7 @@ from pathlib import Path
 from decision_engine.core.perp_microstructure_and_beta_hedge import (
     attach_counterparty_context,
 )
+from decision_engine.core.regime_strategy_router import evaluate_five_state_regime
 from scripts import fetch_public_derivatives_and_counterparty as feed
 
 
@@ -461,7 +462,7 @@ class PublicFeedCollectorTest(unittest.TestCase):
             db = Path(tmp) / "public_derivatives.db"
             self.assertEqual(feed.round_exit_code(self._collect(db)), 0)
             rows = [{"binance_symbol": "PEPEUSDT", "taker_buy_ratio": 0.61}]
-            attach_counterparty_context(rows, db_path=db)
+            attach_counterparty_context(rows, db_path=db, now_ms=111000)
             row = rows[0]
             self.assertAlmostEqual(row["funding_rate"], 0.0001)
             self.assertAlmostEqual(row["obi_top5"], round((50 - 55) / 105, 4))
@@ -473,8 +474,39 @@ class PublicFeedCollectorTest(unittest.TestCase):
             self.assertNotIn("vol_z_1h", row)
 
             preset = [{"binance_symbol": "PEPEUSDT", "obi_top5": 0.5}]
-            attach_counterparty_context(preset, db_path=db)
+            attach_counterparty_context(preset, db_path=db, now_ms=111000)
             self.assertEqual(preset[0]["obi_top5"], 0.5)
+
+    def test_stale_source_clock_is_not_stamped_and_missing_obi_still_allows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "public_derivatives.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                CREATE TABLE binance_spot_microstructure (
+                    symbol TEXT, ts_ms INTEGER, orderbook_imbalance_20 REAL,
+                    obi_top5 REAL, obi_top5_source_ts_ms INTEGER, obi_top5_error TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO binance_spot_microstructure VALUES (
+                    'BTCUSDT', 1, -0.5013, -0.2432, 5000, NULL
+                )
+                """
+            )
+            conn.commit()
+            conn.close()
+            stale = [{"binance_symbol": "BTCUSDT"}]
+            attach_counterparty_context(stale, db_path=db, now_ms=5000 + 3_600_000 + 1)
+            self.assertNotIn("obi_top5", stale[0])
+            self.assertNotIn("orderbook_imbalance_20", stale[0])
+        allowed = evaluate_five_state_regime(
+            {"xs_breadth_1h": 0.75, "xs_rank_pct_1h": 0.90}
+        )
+        self.assertTrue(allowed.allow_buy)
+        self.assertIsNone(allowed.reject_reason)
 
     def test_public_client_has_no_order_route_or_private_key(self) -> None:
         headers = feed.public_request_headers("application/json")

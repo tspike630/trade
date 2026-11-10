@@ -257,10 +257,9 @@ def evaluate_five_state_regime(
                 require_perp_beta_hedge=False,
                 recommended_order_type="NONE",
             )
-        # 2. 看封板/承接质量: Reject bull-trap breakouts with thin L2 bid support & weak taker buy flow
+        # AGENTS.md: reject obi_top5 <= -0.25. A missing book does not reject.
         obi_top5 = _finite(row.get("obi_top5") or row.get("spot_obi_top5"))
-        taker_buy = _finite(row.get("taker_buy_ratio") or row.get("spot_taker_buy_ratio"))
-        if obi_top5 is not None and obi_top5 <= -0.25 and (taker_buy is None or taker_buy <= 0.45):
+        if obi_top5 is not None and obi_top5 <= -0.25:
             return RegimeRoutingDecision(
                 regime=REGIME_3_CROSS_ASSET_BULL_PULLBACK,
                 playbook="xs_leader_thin_book_reject",
@@ -272,9 +271,13 @@ def evaluate_five_state_regime(
                 require_perp_beta_hedge=False,
                 recommended_order_type="NONE",
             )
-        # 3. 看换手量能: Reject climax blow-off volume when whales are distributing into retail
+        # Threshold 3.8 is the manual. The series is the 2026-11-10 collection
+        # contract in volume_z_1h.py: closed 1h USDT quote volume versus the
+        # previous 20 closed hours, current bar excluded, sample std n-1.
+        # vol_z_1h is that same key when a row already carries the alias.
+        # A missing value does not reject.
         vol_z = _finite(row.get("volume_z") or row.get("vol_z_1h"))
-        if vol_z is not None and vol_z >= 3.8 and whale_div is not None and whale_div <= 0.65:
+        if vol_z is not None and vol_z >= 3.8:
             return RegimeRoutingDecision(
                 regime=REGIME_3_CROSS_ASSET_BULL_PULLBACK,
                 playbook="xs_leader_climax_volume_reject",

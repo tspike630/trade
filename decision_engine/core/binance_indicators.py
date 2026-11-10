@@ -85,6 +85,10 @@ _OPTIONAL_COLS = (
     "funding_z",
     "open_interest_change_1h",
     "perp_basis_bps",
+    "xs_breadth_1h",
+    "xs_rank_pct_1h",
+    "nvda_1h_ret_pct",
+    "smh_1h_ret_pct",
 )
 
 

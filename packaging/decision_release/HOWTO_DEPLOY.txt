@@ -1,0 +1,44 @@
+Decision deploy from this release. Pause the decision process, replace code, do not start it.
+
+This file is the procedure. It does not itself copy files or signal a process.
+
+Do not use scripts/sync_deploy.sh for this tree. That script refuses any commit that is not origin/main, and this release is the PR197 head recorded in DEPLOY_SHA. Do not merge pull request 191. Do not start an order process. Do not copy a database.
+
+Do not copy repo deploy/news_isolation/engine.py over this payload. That file is the bc392fea production patch from main 0b63ebf. It calls apply_news_isolation and does not call the five-state router. This payload keeps the router, the hourly volume_z writer, and the PR200 top-5 reader. The isolation function stays in news_shock_gate.py for that other patch and is not called from this engine.
+
+1. Read DEPLOY_SHA and PROVENANCE.txt. The deploy payload is deploy/decision_engine only. validate/ is not copied onto the runtime tree. execution/, crawler/logging_setup.py, and scripts/fetch_public_derivatives_and_counterparty.py stay the copies already on the box.
+
+2. Pause only the process whose command is python -m decision_engine.run for the live Binance spot arms. Do not stop the public-derivatives collector. Do not stop the execution service. Do not start the decision process at the end of this procedure.
+
+3. Code backup, no database copy. From the runtime root (the tree that contains decision_engine/):
+
+   tar -C <runtime-root> -czf <backup-dir>/decision_engine-pre-pr197-$(date -u +%Y%m%dT%H%M%SZ).tar.gz \
+     --exclude='__pycache__' --exclude='*.pyc' --exclude='*.db' --exclude='*.db-*' \
+     --exclude='.env' --exclude='.env.*' \
+     decision_engine
+
+   Confirm the backup archive contains no *.db member. Leave public_derivatives.db, the indicator database, and the hourly kline store where they are.
+
+4. Before replacing files, record the installed reader and expect it to differ from this bundle:
+
+   python3 <release>/validate/check_reader_preserved.py \
+     --installed <runtime-root>/decision_engine/core/perp_microstructure_and_beta_hedge.py \
+     --release-root <release> \
+     --expect differ
+
+   A difference here is the current production file. It is not a reason to skip the compare after the copy.
+
+5. Copy only paths listed in MANIFEST with role deploy. Do not copy validate/, __pycache__, or *.pyc. Do not delete a database. If the rejected ff1962d archive was unpacked into the runtime tree, delete decision_engine/**/__pycache__ left by that unpack, including tests/__pycache__/test_obi_top5_reader*.pyc. Do not recreate test_obi_top5_reader.py.
+
+6. After the copy:
+
+   python3 <release>/validate/check_reader_preserved.py \
+     --installed <runtime-root>/decision_engine/core/perp_microstructure_and_beta_hedge.py \
+     --release-root <release> \
+     --expect match
+
+   The match requires the same bytes as deploy/READER_SHA256, the MAX(obi_top5_source_ts_ms) selection, and the freshness check on that event-E clock. orderbook_imbalance_20 is not a substitute.
+
+7. Leave LIVE_BNB_TOP_BUYS and BINANCE_SPOT_MIN_QUOTE_VOLUME unset. Leave the decision process paused. The hourly 1h book of 507 symbols by 30 bars at close 14:59:59.999 HKT stays inside the 3600 second window until 16:00:00.000 HKT. This procedure does not write that book and does not invent the 16:00 bar.
+
+8. The 15:49:15 HKT top-5 listing (15 fresh rows, age 287-623 seconds, BTC event 15:42:57.614, top5 -0.0001, top20 -0.0409) was a query. It becomes a consumer proof only when validate/prove_obi_consumer.py is pointed at that database with an explicit --now-ms. Exit 0 from that command means the reader contract held. coverage_complete is a separate field. FET, WLD, ENA, and TIA remain unstamped while their streams are down.
