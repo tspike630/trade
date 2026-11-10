@@ -1,4 +1,33 @@
-Historical backfill and calibration. Not PR 191. Not PR 208. No orders.
+Candidate decision-side package. Not PR 191. Not PR 208. No orders.
+
+Collection owns the official archive and CCXT downloads
+(bc-f2da23e7-bde3-5b87-b5e6-e4061c5a0599). Review owns the out-of-sample
+statistics (bc-7434c0fb-a9ec-5496-a406-5767f0851cd2). This package does not
+start those downloads and does not write the shared ccxt.db. Do not treat
+observed_2026-11-09.json as their result. It is one closed BTCUSDT day
+already cached on the authoring VM. The CHECKSUM sibling text was not kept;
+the sha256 values are of the zip bytes that were stored after that check.
+
+No git checkout is required. Unpack the source tar, then:
+
+  PYTHONPATH=. python3 -m research.hist_calibration analyze --news-db /path/to/news_events.db --out /tmp/hist-report.json
+  PYTHONPATH=. python3 -m unittest research.tests.test_hist_calibration research.tests.test_onchain_contract -q
+
+analyze is read-only on news_events.db. activate exits 3 while the gates
+fail. x_watch is not enabled. bookDepth is not obi_top5.
+
+Stage tables, for the collection agent to fill, are created by stage-init
+and by the CCXT stage helper. They are not the live feed tables.
+
+  um_metrics(symbol, create_time_ms, account_long_short, position_long_short, source_url)
+  um_book_depth_band(symbol, ts_ms, percentage, depth, notional, source_url)
+  spot_klines(symbol, interval, open_time_ms, close_time_ms, quote_volume, taker_buy_quote, source_url)
+  hist_ccxt_ohlcv(exchange, symbol, quote, comparable_to_usdt, timeframe, ts, open, high, low, close, volume, source)
+
+account_long_short is count_toptrader_long_short_ratio.
+position_long_short is sum_toptrader_long_short_ratio.
+Spot open times above 1e14 are microseconds and are stored as milliseconds.
+
 
 Run from the repository root. The package does not import an executor and
 does not read a .env file. News on the box is not on this VM, so analyze
