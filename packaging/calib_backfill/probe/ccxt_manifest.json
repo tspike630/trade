@@ -1,0 +1,117 @@
+{
+  "core_bases": [
+    "BTC",
+    "ETH",
+    "BNB",
+    "SOL",
+    "XRP",
+    "DOGE",
+    "ADA",
+    "AVAX",
+    "LINK",
+    "LTC"
+  ],
+  "requested_bases": [
+    "BTC",
+    "ETH"
+  ],
+  "ccxt_days": 1,
+  "venues": [
+    {
+      "exchange": "okx",
+      "base": "BTC",
+      "symbol": "BTC/USDT",
+      "quote": "USDT",
+      "rows": 287,
+      "inserted": 0,
+      "expected_closed_bars": 288,
+      "missing_bars": 1,
+      "status": "ok",
+      "detail": null,
+      "history_covers_requested_start": true
+    },
+    {
+      "exchange": "okx",
+      "base": "ETH",
+      "symbol": "ETH/USDT",
+      "quote": "USDT",
+      "rows": 287,
+      "inserted": 0,
+      "expected_closed_bars": 288,
+      "missing_bars": 1,
+      "status": "ok",
+      "detail": null,
+      "history_covers_requested_start": true
+    },
+    {
+      "exchange": "bybit",
+      "base": "BTC",
+      "status": "error",
+      "detail": "RateLimitExceeded:bybit GET https://api.bybit.com/v5/market/instruments-info?category=spot 403 Forbidden {\n    error:The Amazon CloudFront distribution is configured to block access from your countr",
+      "rows": 0
+    },
+    {
+      "exchange": "bybit",
+      "base": "ETH",
+      "status": "error",
+      "detail": "RateLimitExceeded:bybit GET https://api.bybit.com/v5/market/instruments-info?category=spot 403 Forbidden {\n    error:The Amazon CloudFront distribution is configured to block access from your countr",
+      "rows": 0
+    },
+    {
+      "exchange": "coinbaseexchange",
+      "base": "BTC",
+      "symbol": "BTC/USD",
+      "quote": "USD",
+      "rows": 287,
+      "inserted": 188,
+      "expected_closed_bars": 288,
+      "missing_bars": 1,
+      "status": "ok",
+      "detail": null,
+      "history_covers_requested_start": true
+    },
+    {
+      "exchange": "coinbaseexchange",
+      "base": "ETH",
+      "symbol": "ETH/USD",
+      "quote": "USD",
+      "rows": 287,
+      "inserted": 188,
+      "expected_closed_bars": 288,
+      "missing_bars": 1,
+      "status": "ok",
+      "detail": null,
+      "history_covers_requested_start": true
+    }
+  ],
+  "usdt_pairs": [
+    {
+      "base": "BTC",
+      "quote": "USDT",
+      "left": "okx",
+      "right": "bybit",
+      "aligned": 0,
+      "only_left": 287,
+      "only_right": 0,
+      "filled_by_interpolation": 0,
+      "n": 0,
+      "median_abs_bps": null,
+      "p95_abs_bps": null
+    },
+    {
+      "base": "ETH",
+      "quote": "USDT",
+      "left": "okx",
+      "right": "bybit",
+      "aligned": 0,
+      "only_left": 287,
+      "only_right": 0,
+      "filled_by_interpolation": 0,
+      "n": 0,
+      "median_abs_bps": null,
+      "p95_abs_bps": null
+    }
+  ],
+  "usd_not_pooled_with_usdt": true,
+  "interpolation": "none"
+}

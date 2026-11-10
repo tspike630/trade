@@ -1,0 +1,59 @@
+{
+  "book_depth_is_percentage_aggregate": true,
+  "complete": true,
+  "core_bases": [
+    "BTC",
+    "ETH",
+    "BNB",
+    "SOL",
+    "XRP",
+    "DOGE",
+    "ADA",
+    "AVAX",
+    "LINK",
+    "LTC"
+  ],
+  "dates": [
+    "2026-11-07",
+    "2026-11-08"
+  ],
+  "errors": [],
+  "files": 12,
+  "metrics_columns_kept_separate": [
+    "count_toptrader_long_short_ratio",
+    "sum_toptrader_long_short_ratio",
+    "count_long_short_ratio",
+    "sum_taker_long_short_vol_ratio"
+  ],
+  "missing": [],
+  "obi_top5_column": false,
+  "schema_version": "vision_backfill_v1",
+  "symbols": [
+    {
+      "book_depth_end_ms": 1794182372000,
+      "book_depth_rows": 69120,
+      "book_depth_start_ms": 1794009601000,
+      "kline_end_ms": 1794182100000,
+      "kline_rows": 576,
+      "kline_start_ms": 1794009600000,
+      "listed_in_plan": true,
+      "metrics_end_ms": 1794182100000,
+      "metrics_rows": 576,
+      "metrics_start_ms": 1794009600000,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "book_depth_end_ms": 1794182372000,
+      "book_depth_rows": 69120,
+      "book_depth_start_ms": 1794009601000,
+      "kline_end_ms": 1794182100000,
+      "kline_rows": 576,
+      "kline_start_ms": 1794009600000,
+      "listed_in_plan": true,
+      "metrics_end_ms": 1794182100000,
+      "metrics_rows": 576,
+      "metrics_start_ms": 1794009600000,
+      "symbol": "ETHUSDT"
+    }
+  ]
+}

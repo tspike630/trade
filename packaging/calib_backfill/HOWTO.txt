@@ -1,0 +1,46 @@
+Public backfill and news out-of-sample study
+Schema vision_backfill_v1 / news_oos_v1 / ccxt_public_5m_v1
+
+This does not start a trader, does not edit environment variables, and does
+not replace the live engine. The calibrator stays disabled. An evidence file
+unlocks OnchainCalibration only when it is non-synthetic, names the gate
+series (obi_top5, taker_buy_ratio, whale_retail_divergence, heat_evolution),
+has heat history, clears the frozen Holm tests, and carries the news db
+hash plus split times. Vision bookDepth and top-trader ratios are not those
+series. x_watch history stays closed.
+
+Core bases, fixed before measuring returns:
+BTC ETH BNB SOL XRP DOGE ADA AVAX LINK LTC
+Binance symbols are BASEUSDT. OKX and Bybit are BASE/USDT. Coinbase Exchange
+is BASE/USD and is not pooled with USDT.
+
+Acceptance, from the repo root, without a production database:
+
+  python3 -m unittest decision_engine.tests.test_public_backfill_calibration
+
+Cloud probe already run, not the full window:
+
+  PYTHONPATH=. python3 scripts/run_public_backfill.py \
+    --out /tmp/calib-probe --days 2 --end 2026-11-08 \
+    --bases BTC,ETH --ccxt-days 1
+
+Full window on a machine that can reach the exchanges:
+
+  PYTHONPATH=. python3 scripts/run_public_backfill.py \
+    --out /var/calib-public --days 45 --ccxt-days 30
+
+News, read-only. Omit --news-db when the file is not on this machine.
+
+  PYTHONPATH=. python3 scripts/run_news_oos_calibration.py \
+    --news-db /path/news_events.db --vision-db /var/calib-public/vision.db \
+    --out /var/calib-public/news_oos.json
+
+Desensitized export the study can consume if the raw db must stay put:
+schema news_export_v1
+columns: id, source, source_tier, published_at, fetched_at, onchain_status,
+url_sha256, title_sha256, title_bases
+Clock is fetched_at. Do not send raw titles or URLs. Do not substitute
+published_at. 1859 and 164 are not constants.
+
+Dependency: Python 3.12 and ccxt>=4.5 for the CCXT leg. Vision uses the
+standard library. The previous cloud image had ccxt 4.5.92.
