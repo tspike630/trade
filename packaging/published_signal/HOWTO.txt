@@ -1,36 +1,33 @@
-PR 208 acceptance kit. Not a deploy and not a merge. No .env and no database copy.
-Do not clone GitHub. The only git object source is acceptance.bundle in this directory.
+PR 208 acceptance kit. Not a deploy and not a merge. No git command is required.
 
-SHA256SUMS has no header. Each line is three fields separated by two spaces:
+Unpack the tar and run:
 
-  sha256  bytes  path
+  python3 packaging/published_signal/run_acceptance.py
 
-sha256 is 64 lowercase hex digits. bytes is the decimal file size. path is
-relative to this directory and has no leading slash. Example check:
+The tree already contains the import dependencies and the packed blobs:
 
-  python3 -c 'import hashlib,pathlib,sys
-p=pathlib.Path(sys.argv[1])
-print(hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_size)' acceptance.bundle
+  scripts/import_lseg_bars_incremental.py
+  scripts/build_news_isolation_engine.py
+  deploy/news_isolation/preflight.py
+  deploy/news_isolation/engine.py
+  decision_engine/tests/fixtures/news_isolation/bc392fea-engine.py
+  decision_engine/tests/fixtures/news_isolation/bc392fea.tar.gz
+  decision_engine/tests/fixtures/news_isolation/ab2d2eb-perp.py
+  decision_engine/tests/fixtures/news_isolation/ab2d2eb-clusters.py
+  crawler/logging_setup.py
 
-Materialize the checkout:
+The news tests read those files. They do not call git. The same hash checks remain:
+bc392fea engine sha256 612bd80af39ca2f6061229a67b39a14cd71cb91661947d8936c48bb101dd9d1f
+and length 18185; ab2d2eb perp 2965309802aa1bb1c6be151f99119c93ab75f4426c19b651997563d7a59c8237;
+clusters 5dbd84373298ecd7df2480e4766c79d0b037663afa60e29fa21768303aec26d1;
+bc392 guards 4ff94eb982a5afc1c60d919d9ba9557fcb10e42d157d18a20891ab61b4b8d9cc.
 
-  git clone --branch cursor/publish-state3-signal-cf2e acceptance.bundle repo
-  git -C repo fetch acceptance.bundle 'refs/remotes/origin/main:refs/remotes/origin/main'
+SHA256SUMS, if present beside this file in an outer archive, has no header.
+Each line is sha256, two spaces, decimal byte size, two spaces, relative path.
 
-bc392fea is an ancestor in that bundle. Do not create a branch named
-bc392fea; the commit id is already reachable. Then:
+Expected counts: prior 40 + CityU 6 = 46, news 8, private OBI 3, published 3.
+Sum 60. Published 3 includes the test that a finite obi_top5 and volume_z
+already on the signal are not overwritten.
 
-  python3 repo/packaging/published_signal/run_acceptance.py
-
-The checkout contains scripts/import_lseg_bars_incremental.py,
-scripts/build_news_isolation_engine.py, deploy/news_isolation/preflight.py,
-and deploy/news_isolation/engine.py. The news and CityU tests call those
-files. Assertions are not skipped.
-
-Counts: prior 40 + CityU 6 = 46, news 8, private OBI 3, published 3.
-Published 3 is the original 2 plus the test that a finite obi_top5 and
-volume_z already on the signal are not overwritten. Sum 60.
-
-The date-only importer still flips CFTC at Friday 00:00 UTC. The reader
-waits until Friday 15:30 America/New_York and does not move that instant
-earlier. This repo has no holiday calendar. A 3600-second cutoff is not used.
+CFTC reader policy is unchanged by this kit: Friday 15:30 America/New_York,
+no holiday calendar, no 3600-second cutoff.

@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ from decision_engine.core.regime_strategy_router import (
 from scripts.build_news_isolation_engine import ENGINE_BEFORE, patch_engine
 
 REPO = Path(__file__).resolve().parents[2]
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "news_isolation"
 NOW = datetime(2026, 11, 10, 7, 0, tzinfo=timezone.utc)
 # Reader on main ab2d2eb. The bc392 host pin remains in
 # deploy/news_isolation/preflight.py and is not this check.
@@ -325,12 +327,17 @@ class TestNewsIsolation(unittest.TestCase):
         self.assertFalse(timed_report["candidates_changed"])
 
 
+def _fixture_bytes(name: str) -> bytes:
+    path = FIXTURES / name
+    if not path.is_file():
+        raise AssertionError(f"missing packed fixture {path}")
+    return path.read_bytes()
+
+
 class TestIsolatedEngineBlob(unittest.TestCase):
     def test_patch_matches_the_shipped_file_and_leaves_main_engine_on_the_router(self) -> None:
-        base = subprocess.check_output(
-            ["git", "cat-file", "blob", "bc392fea:decision_engine/core/engine.py"],
-            cwd=REPO,
-        )
+        base = _fixture_bytes("bc392fea-engine.py")
+        self.assertEqual(len(base), 18185)
         self.assertEqual(hashlib.sha256(base).hexdigest(), ENGINE_BEFORE)
         patched = patch_engine(base.decode("utf-8")).encode("utf-8")
         shipped = (REPO / "deploy" / "news_isolation" / "engine.py").read_bytes()
@@ -352,21 +359,17 @@ class TestIsolatedEngineBlob(unittest.TestCase):
     def test_mixed_tree_imports_isolated_engine_beside_production_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            archive = subprocess.check_output(["git", "archive", "bc392fea"], cwd=REPO)
-            subprocess.run(["tar", "-x", "-C", str(root)], input=archive, check=True)
+            with tarfile.open(FIXTURES / "bc392fea.tar.gz", "r:gz") as archive:
+                archive.extractall(root, filter="data")
+            packed_engine = (root / "decision_engine" / "core" / "engine.py").read_bytes()
+            self.assertEqual(hashlib.sha256(packed_engine).hexdigest(), ENGINE_BEFORE)
             (root / "decision_engine" / "core" / "engine.py").write_bytes(
                 (REPO / "deploy" / "news_isolation" / "engine.py").read_bytes()
             )
             gate = REPO / "decision_engine" / "core" / "news_shock_gate.py"
             (root / "decision_engine" / "core" / "news_shock_gate.py").write_bytes(gate.read_bytes())
-            perp = subprocess.check_output(
-                ["git", "show", "origin/main:decision_engine/core/perp_microstructure_and_beta_hedge.py"],
-                cwd=REPO,
-            )
-            clusters = subprocess.check_output(
-                ["git", "show", "origin/main:decision_engine/core/portfolio_clusters.py"],
-                cwd=REPO,
-            )
+            perp = _fixture_bytes("ab2d2eb-perp.py")
+            clusters = _fixture_bytes("ab2d2eb-clusters.py")
             (root / "decision_engine" / "core" / "perp_microstructure_and_beta_hedge.py").write_bytes(perp)
             (root / "decision_engine" / "core" / "portfolio_clusters.py").write_bytes(clusters)
             self.assertEqual(hashlib.sha256(perp).hexdigest(), APPROVED_MAIN_PERP)

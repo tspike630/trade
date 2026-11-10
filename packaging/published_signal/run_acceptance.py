@@ -36,31 +36,21 @@ GROUPS = (
 )
 
 
-def _git(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-
-def _require_git() -> None:
-    if _git("rev-parse", "--is-inside-work-tree").returncode != 0:
-        raise SystemExit("this directory is not a git checkout; use the local bundle in HOWTO.txt")
-    if _git("cat-file", "-e", "bc392fea^{commit}").returncode != 0:
-        raise SystemExit("git object bc392fea is missing; fetch it from the local bundle, not from GitHub")
-    if _git("rev-parse", "--verify", "refs/remotes/origin/main").returncode != 0:
-        raise SystemExit("refs/remotes/origin/main is missing; point it at ab2d2eb from the local bundle")
-    for rel in (
+def _require_sources() -> None:
+    required = (
         "scripts/import_lseg_bars_incremental.py",
         "scripts/build_news_isolation_engine.py",
         "deploy/news_isolation/preflight.py",
         "deploy/news_isolation/engine.py",
-    ):
-        if not (ROOT / rel).is_file():
-            raise SystemExit(f"missing {rel}")
+        "decision_engine/tests/fixtures/news_isolation/bc392fea-engine.py",
+        "decision_engine/tests/fixtures/news_isolation/bc392fea.tar.gz",
+        "decision_engine/tests/fixtures/news_isolation/ab2d2eb-perp.py",
+        "decision_engine/tests/fixtures/news_isolation/ab2d2eb-clusters.py",
+        "crawler/logging_setup.py",
+    )
+    missing = [rel for rel in required if not (ROOT / rel).is_file()]
+    if missing:
+        raise SystemExit("missing source files: " + ", ".join(missing))
 
 
 def _run(modules: str) -> tuple[int, str]:
@@ -116,7 +106,7 @@ def _count(text: str) -> int | None:
 
 
 def main() -> int:
-    _require_git()
+    _require_sources()
     failed = 0
     totals = {}
     for name, expected, modules in GROUPS:
