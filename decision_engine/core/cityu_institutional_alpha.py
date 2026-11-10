@@ -32,6 +32,7 @@ Connects the 613 MB ``data/cityu/cityu_institutional.db`` and 171 MB
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 import math
 import os
 import sqlite3
@@ -100,6 +101,31 @@ class CityUInstitutionalSnapshot:
     size_multiplier: float
 
 
+def _cftc_cycle(source_day: date, asof: date) -> str:
+    """Same Tuesday-as-of / Friday-publication cycle as the LSEG importer.
+
+    ``scripts.import_lseg_bars_incremental.slow_variable_cycle`` is the
+    contract. A 30-minute or 3600-second cutoff is not applied here.
+    """
+    days_since_tuesday = (asof.weekday() - 1) % 7
+    latest_tuesday = asof - timedelta(days=days_since_tuesday)
+    publication = latest_tuesday + timedelta(days=3)
+    current = latest_tuesday - timedelta(days=7) if asof < publication else latest_tuesday
+    if source_day == current:
+        return "current_cycle"
+    if source_day == current - timedelta(days=7):
+        return "prior_cycle"
+    return "outside_cycle"
+
+
+def _cot_source_day(value: object) -> date | None:
+    text = str(value or "").strip()[:10]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def compute_cot_regime_from_series(
     lev_pct_series: Sequence[float],
     asset_mgr_pct_series: Sequence[float],
@@ -160,6 +186,7 @@ def load_cityu_institutional_snapshot(
                 ).fetchall()
                 lev_series: list[float] = []
                 am_series: list[float] = []
+                last_cot_day: date | None = None
                 for r in cot_rows[-52:]:
                     oi = _finite(r["open_interest"])
                     ln = _finite(r["lev_money_net"])
@@ -167,7 +194,19 @@ def load_cityu_institutional_snapshot(
                     if oi and oi > 0 and ln is not None and an is not None:
                         lev_series.append((ln / oi) * 100.0)
                         am_series.append((an / oi) * 100.0)
-                if lev_series and am_series:
+                        last_cot_day = _cot_source_day(r["date"])
+                asof = datetime.fromtimestamp(
+                    (int(time.time() * 1000) if now_ms is None else int(now_ms)) / 1000.0,
+                    tz=timezone.utc,
+                ).date()
+                # CFTC is the Tuesday report published Friday. A 3600s or
+                # 30-minute cutoff is not this feed. Only the current cycle
+                # becomes the regime; 2020 and any older week stay unstamped.
+                current_cot = (
+                    last_cot_day is not None
+                    and _cftc_cycle(last_cot_day, asof) == "current_cycle"
+                )
+                if lev_series and am_series and current_cot:
                     btc_lev_pct = round(lev_series[-1], 4)
                     btc_am_pct = round(am_series[-1], 4)
                     btc_lev_z, btc_am_z, cot_regime, cot_mult = compute_cot_regime_from_series(

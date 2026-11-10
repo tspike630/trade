@@ -24,7 +24,9 @@ from scripts.build_news_isolation_engine import ENGINE_BEFORE, patch_engine
 
 REPO = Path(__file__).resolve().parents[2]
 NOW = datetime(2026, 11, 10, 7, 0, tzinfo=timezone.utc)
-PROD_PERP = "ea3d43afcb4e5aa6388c69e698742ac04b6ff3d10c27fa7a3f5dc8072c619a34"
+# Reader on main ab2d2eb. The bc392 host pin remains in
+# deploy/news_isolation/preflight.py and is not this check.
+APPROVED_MAIN_PERP = "2965309802aa1bb1c6be151f99119c93ab75f4426c19b651997563d7a59c8237"
 PROD_CLUSTERS = "5dbd84373298ecd7df2480e4766c79d0b037663afa60e29fa21768303aec26d1"
 PROD_GUARDS = "4ff94eb982a5afc1c60d919d9ba9557fcb10e42d157d18a20891ab61b4b8d9cc"
 
@@ -367,7 +369,7 @@ class TestIsolatedEngineBlob(unittest.TestCase):
             )
             (root / "decision_engine" / "core" / "perp_microstructure_and_beta_hedge.py").write_bytes(perp)
             (root / "decision_engine" / "core" / "portfolio_clusters.py").write_bytes(clusters)
-            self.assertEqual(hashlib.sha256(perp).hexdigest(), PROD_PERP)
+            self.assertEqual(hashlib.sha256(perp).hexdigest(), APPROVED_MAIN_PERP)
             self.assertEqual(hashlib.sha256(clusters).hexdigest(), PROD_CLUSTERS)
             guards = (root / "decision_engine" / "core" / "live_buy_guards.py").read_bytes()
             self.assertEqual(hashlib.sha256(guards).hexdigest(), PROD_GUARDS)

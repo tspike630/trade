@@ -1,0 +1,35 @@
+Published-signal follow-up. Not PR 191. Not an execution change. Not a production copy.
+
+Base is main ab2d2ebbc1301e791821e5c6cb1e6e2fc08d1cff. Do not restart the
+decision process that was paused at 16:19 HKT. Do not place an order.
+
+The decision router now puts recommended_order_type on every accepted buy,
+including ordinary State 3 LIMIT_MAKER. It also copies obi_top5,
+obi_top5_source_ts_ms, and volume_z from the hot row onto that buy when the
+signal does not already have them. normalize_signal still stores those keys
+in extras, which is where the execution consumer reads them. This tree does
+not edit execution/.
+
+CFTC regime uses the existing Tuesday-as-of / Friday-publication cycle. A
+2020 report and the prior week are not stamped. A 3600-second rule is not
+applied to that weekly feed. The current Tuesday report still stamps.
+
+The isolation test now checks origin/main's reader against the ab2d2eb hash.
+deploy/news_isolation/preflight.py still pins the older bc392 host file.
+That host check was not deleted.
+
+Run from the repository root:
+
+  PYTHONPATH=.:./crawler python3 -m unittest \
+    decision_engine.tests.test_published_signal_contract \
+    decision_engine.tests.test_public_feed_collector \
+    decision_engine.tests.test_production_universe_top2 \
+    decision_engine.tests.test_volume_z_1h \
+    decision_engine.tests.test_regime_strategy_router \
+    decision_engine.tests.test_state3_arm_ticks \
+    decision_engine.tests.test_cityu_institutional_alpha \
+    decision_engine.tests.test_news_isolation -q
+
+The three private OBI fixtures stay in packaging/decision_release/validate.
+They need a deploy/decision_engine copy beside that package and do not open
+a production database.
