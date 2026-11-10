@@ -396,6 +396,29 @@ def _rerank_state3_leaders(
     return out
 
 
+def _copy_source_observation(out_sig: dict[str, Any], base_row: dict[str, Any]) -> None:
+    """Keep the book and volume values the router just evaluated.
+
+    ``orderbook_imbalance_20`` is not copied. A value already on the signal
+    stays. ``vol_z_1h`` is only the read alias; the published key is ``volume_z``.
+    """
+    if _finite(out_sig.get("obi_top5")) is None and _finite(out_sig.get("spot_obi_top5")) is None:
+        obi = _finite(base_row.get("obi_top5"))
+        if obi is None:
+            obi = _finite(base_row.get("spot_obi_top5"))
+        if obi is not None:
+            out_sig["obi_top5"] = obi
+            source_ts = base_row.get("obi_top5_source_ts_ms")
+            if source_ts is not None and "obi_top5_source_ts_ms" not in out_sig:
+                out_sig["obi_top5_source_ts_ms"] = source_ts
+    if _finite(out_sig.get("volume_z")) is None:
+        volume_z = _finite(base_row.get("volume_z"))
+        if volume_z is None:
+            volume_z = _finite(base_row.get("vol_z_1h"))
+        if volume_z is not None:
+            out_sig["volume_z"] = volume_z
+
+
 def apply_five_state_regime_router(
     candidates: Sequence[dict[str, Any]],
     hot_rows: Sequence[dict[str, Any]],
@@ -407,9 +430,11 @@ def apply_five_state_regime_router(
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Route candidate signals through the 5-State Market Regime Router.
 
-    - Stamps ``market_regime``, ``regime_playbook``, ``regime_size_multiplier``,
-      ``regime_tp_multiplier``, ``enable_trailing_ratchet``, and ``require_perp_beta_hedge``
-      onto each accepted BUY signal.
+    - Stamps ``market_regime``, ``regime_playbook``, ``recommended_order_type``,
+      ``regime_size_multiplier``, ``regime_tp_multiplier``, ``enable_trailing_ratchet``,
+      and ``require_perp_beta_hedge`` onto each accepted BUY signal. ``obi_top5``
+      and ``volume_z`` are copied from the hot row when the signal does not
+      already carry them.
     - Scales ``size_pct`` by ``decision.size_multiplier`` when the signal was not already
       scaled by the same regime.
     - Filters out BUY signals rejected by their regime playbook (while never blocking SELLs).
@@ -471,8 +496,11 @@ def apply_five_state_regime_router(
             out_sig["xs_rank_pct_1h"] = base_row.get("xs_rank_pct_1h")
         if news_meta is not None:
             out_sig.update(news_meta)
-            if news_meta.get("news_shock_applied"):
-                out_sig["recommended_order_type"] = decision.recommended_order_type
+        # The order type is part of the routing decision for every accepted
+        # buy. A news overlay may replace the decision first; the published
+        # field is that result, including an ordinary State 3 LIMIT_MAKER.
+        out_sig["recommended_order_type"] = decision.recommended_order_type
+        _copy_source_observation(out_sig, base_row)
         out_sig["market_regime"] = decision.regime
         out_sig["regime_playbook"] = decision.playbook
         out_sig["regime_size_multiplier"] = decision.size_multiplier
