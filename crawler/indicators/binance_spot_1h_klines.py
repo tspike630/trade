@@ -15,12 +15,23 @@ quote volume is finite and nonnegative. The current unclosed hour is dropped.
 The latest stored run must be 21 contiguous closed hours so the decision
 engine can compute ``volume_z`` later. This module does not define or write Z.
 
-Run from the repo root:
+Repo checkout:
 
 ```bash
 PYTHONPATH=crawler python -m indicators.binance_spot_1h_klines --once --db crawler/dexscreener.db
 PYTHONPATH=crawler python -m indicators.binance_spot_1h_klines --loop --sleep-sec 300 --db crawler/dexscreener.db
 ```
+
+Flattened deploy root (``indicators/`` next to ``exports/binance_spot_universe.db``):
+
+```bash
+cd /workspace/dexscreener-crawler
+PYTHONPATH=. python -m indicators.binance_spot_1h_klines --once --db dexscreener.db
+PYTHONPATH=. python -m indicators.binance_spot_1h_klines --loop --sleep-sec 300 --db dexscreener.db
+```
+
+``BINANCE_SPOT_UNIVERSE_DB`` still wins when it is set. This module does not
+change the 5m wrapper that already exports that variable.
 
 ``--db`` is the indicator sqlite that already holds ``binance_klines``.
 One process holds ``<db>.binance-1h-klines.lock``. A second start exits 3.
@@ -32,6 +43,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import math
+import os
 import sqlite3
 import sys
 import time
@@ -49,6 +61,9 @@ from indicators.binance_spot import (
     parse_kline_row,
     upsert_klines,
 )
+
+_UNIVERSE_DB_NAME = "binance_spot_universe.db"
+_UNIVERSE_JSON_NAME = "binance_spot_usdt_trading_2026-11-05.json"
 
 HOUR_MS = 3_600_000
 BAR_DURATION_MS = 3_599_999
@@ -81,24 +96,42 @@ def validate_closed_1h_bar(bar: SpotKline, now_ms: int) -> str | None:
     return None
 
 
+def latest_closed_open_ms(now_ms: int) -> int:
+    """Open time of the newest 1h bar whose close is already due."""
+    latest = int(now_ms) - BAR_DURATION_MS
+    if latest < 0:
+        return 0
+    return (latest // HOUR_MS) * HOUR_MS
+
+
 def contiguous_closed_1h(
     bars: Sequence[SpotKline],
     *,
     now_ms: int,
 ) -> tuple[list[SpotKline], str | None]:
-    """Trailing run of valid closed hours. Shorter than 21 is not stored."""
-    valid = [
-        bar
-        for bar in sorted(bars, key=lambda item: item.open_time_ms)
-        if validate_closed_1h_bar(bar, now_ms) is None
-    ]
-    if not valid:
-        return [], "no_closed_1h"
-    tail = [valid[-1]]
-    for bar in reversed(valid[:-1]):
-        if tail[0].open_time_ms - bar.open_time_ms != HOUR_MS:
+    """Closed hours ending at the latest hour that should already be closed.
+
+    An older run of 21 bars is not a substitute. If that latest bar is missing
+    or invalid, nothing is stored.
+    """
+    expected = latest_closed_open_ms(now_ms)
+    by_open: dict[int, SpotKline] = {}
+    for bar in bars:
+        by_open[int(bar.open_time_ms)] = bar
+    latest = by_open.get(expected)
+    if latest is None:
+        return [], "missing_latest_closed_hour"
+    reason = validate_closed_1h_bar(latest, now_ms)
+    if reason is not None:
+        return [], f"invalid_latest_closed_hour:{reason}"
+    tail = [latest]
+    cursor = expected
+    while True:
+        prev = by_open.get(cursor - HOUR_MS)
+        if prev is None or validate_closed_1h_bar(prev, now_ms) is not None:
             break
-        tail.insert(0, bar)
+        tail.insert(0, prev)
+        cursor -= HOUR_MS
     if len(tail) < MIN_CLOSED_BARS:
         return [], "need_21_contiguous_closed_1h"
     return tail, None
@@ -175,6 +208,54 @@ def ingest_closed_1h_klines(
         "errors": errors,
         "indicators": 0,
     }
+
+
+def hourly_universe_paths(module_file: Path | None = None) -> list[Path]:
+    """Universe files for a repo checkout and a flattened deploy root.
+
+    ``indicators/binance_spot.py`` resolves the repo as its grandparent, which
+    is correct in this checkout and wrong when the package sits directly in
+    ``/workspace/dexscreener-crawler``. This list checks the directory that
+    contains ``indicators/`` first.
+    """
+    here = (module_file or Path(__file__)).resolve()
+    package_parent = here.parents[1]
+    above = here.parents[2]
+    paths: list[Path] = []
+    env_db = os.environ.get("BINANCE_SPOT_UNIVERSE_DB", "").strip()
+    env_json = os.environ.get("BINANCE_SPOT_UNIVERSE_JSON", "").strip()
+    if env_db:
+        paths.append(Path(env_db))
+    paths.extend(
+        (
+            package_parent / "exports" / _UNIVERSE_DB_NAME,
+            above / "exports" / _UNIVERSE_DB_NAME,
+            above / "crawler" / "exports" / _UNIVERSE_DB_NAME,
+        )
+    )
+    if env_json:
+        paths.append(Path(env_json))
+    paths.extend(
+        (
+            package_parent / "exports" / "reports" / _UNIVERSE_JSON_NAME,
+            above / "exports" / "reports" / _UNIVERSE_JSON_NAME,
+            above / "crawler" / "exports" / "reports" / _UNIVERSE_JSON_NAME,
+        )
+    )
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
+def load_hourly_universe(
+    module_file: Path | None = None,
+) -> tuple[list[SpotSymbol], Path | None]:
+    return load_primary_universe(hourly_universe_paths(module_file))
 
 
 def acquire_hourly_lock(db_path: Path):
@@ -273,7 +354,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.sleep_sec < 1:
         parser.error("--sleep-sec must be >= 1")
-    symbols, source = load_primary_universe()
+    symbols, source = load_hourly_universe()
     if not symbols or source is None:
         print("binance primary universe missing", file=sys.stderr)
         return PARTIAL_EXIT
@@ -281,7 +362,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not chosen:
         print("no universe symbols selected", file=sys.stderr)
         return PARTIAL_EXIT
-    now_ms = int(args.now_ms) if int(args.now_ms) > 0 else int(time.time() * 1000)
+    # None means each loop round reads the process clock. A value captured
+    # once would keep treating the next closed hour as still open.
+    now_ms = int(args.now_ms) if int(args.now_ms) > 0 else None
     return run_hourly_collector(
         Path(args.db),
         chosen,

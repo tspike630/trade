@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -228,7 +229,159 @@ class HourlyKlineCollectorTest(unittest.TestCase):
         parsed = [parse_kline_row(row) for row in rows]
         accepted, reason = contiguous_closed_1h(parsed, now_ms=21 * 3_600_000)
         self.assertEqual(accepted, [])
-        self.assertEqual(reason, "need_21_contiguous_closed_1h")
+        self.assertEqual(reason, "invalid_latest_closed_hour:quote")
+
+    def test_loop_reads_the_clock_again_after_sleep(self) -> None:
+        import indicators.binance_spot_1h_klines as mod
+
+        state = {"ms": 1_800_000_000_000}
+        new_open = 1_800_000_000_000
+
+        def fake_time() -> float:
+            return state["ms"] / 1000.0
+
+        def fake_sleep(seconds: float) -> None:
+            self.assertGreaterEqual(seconds, 300)
+            state["ms"] += 3_600_000
+
+        def fetcher(url: str):
+            del url
+            now = int(mod.time.time() * 1000)
+            expected = (now - 3_599_999) // 3_600_000 * 3_600_000
+            start = expected - 20 * 3_600_000
+            return _window(start, 21, 6.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dex.db"
+            sqlite3.connect(db).close()
+            original = (mod.time.time, mod.time.sleep, mod.load_primary_universe, mod.fetch_json)
+            mod.time.time = fake_time
+            mod.time.sleep = fake_sleep
+            mod.fetch_json = fetcher
+            mod.load_primary_universe = lambda paths=None: (
+                [SpotSymbol("BTCUSDT", "BTC")],
+                Path("universe"),
+            )
+            try:
+                code = mod.main(
+                    ["--db", str(db), "--loop", "--sleep-sec", "300", "--max-rounds", "2"]
+                )
+            finally:
+                mod.time.time, mod.time.sleep, mod.load_primary_universe, mod.fetch_json = original
+            conn = sqlite3.connect(db)
+            row = conn.execute(
+                """
+                SELECT close_time_ms, quote_volume FROM binance_klines
+                WHERE symbol='BTCUSDT' AND interval='1h' AND open_time_ms=?
+                """,
+                (new_open,),
+            ).fetchone()
+            conn.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(row, (new_open + 3_599_999, 6.0))
+
+    def test_invalid_latest_closed_bar_is_a_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dex.db"
+            conn = sqlite3.connect(db)
+            ensure_schema(conn)
+            now = 30 * 3_600_000
+            latest_open = 29 * 3_600_000
+            upsert_klines(conn, "BTCUSDT", "1h", [parse_kline_row(_bar(latest_open, 42.0))])
+            conn.commit()
+            rows = _window(0, 30, 10.0)
+            rows[-1][7] = "-5"
+            stats = ingest_closed_1h_klines(
+                conn,
+                [SpotSymbol("BTCUSDT", "BTC")],
+                fetcher=lambda url: rows,
+                now_ms=now,
+            )
+            code = run_hourly_collector(
+                db,
+                [SpotSymbol("BTCUSDT", "BTC")],
+                fetcher=lambda url: rows,
+                now_ms=now,
+            )
+            stored = conn.execute(
+                """
+                SELECT open_time_ms, quote_volume FROM binance_klines
+                WHERE symbol='BTCUSDT' AND interval='1h' ORDER BY open_time_ms
+                """
+            ).fetchall()
+            conn.close()
+        self.assertEqual(stats["symbols"], 0)
+        self.assertEqual(stats["klines"], 0)
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["errors"][0]["error"], "invalid_latest_closed_hour:quote")
+        self.assertEqual(code, 2)
+        self.assertEqual(stored, [(latest_open, 42.0)])
+
+    def test_stale_21_bar_window_is_not_a_fresh_hour(self) -> None:
+        now = 30 * 3_600_000
+        expected = 29 * 3_600_000
+        stale_end = expected - 5 * 3_600_000
+        rows = _window(stale_end - 20 * 3_600_000, 21, 3.0)
+        accepted, reason = contiguous_closed_1h(
+            [parse_kline_row(row) for row in rows],
+            now_ms=now,
+        )
+        self.assertEqual(accepted, [])
+        self.assertEqual(reason, "missing_latest_closed_hour")
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dex.db"
+            conn = sqlite3.connect(db)
+            ensure_schema(conn)
+            stats = ingest_closed_1h_klines(
+                conn,
+                [SpotSymbol("BTCUSDT", "BTC")],
+                fetcher=lambda url: rows,
+                now_ms=now,
+            )
+            count = conn.execute("SELECT COUNT(*) FROM binance_klines").fetchone()[0]
+            conn.close()
+        self.assertEqual(stats["symbols"], 0)
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(count, 0)
+
+    def test_flattened_deploy_root_finds_exports_universe(self) -> None:
+        from indicators.binance_spot_1h_klines import hourly_universe_paths, load_hourly_universe
+
+        saved_env = os.environ.pop("BINANCE_SPOT_UNIVERSE_DB", None)
+        saved_json = os.environ.pop("BINANCE_SPOT_UNIVERSE_JSON", None)
+        flat = Path("/workspace/dexscreener-crawler/indicators/binance_spot_1h_klines.py")
+        paths = hourly_universe_paths(flat)
+        self.assertEqual(
+            paths[0],
+            flat.resolve().parents[1] / "exports" / "binance_spot_universe.db",
+        )
+        try:
+            self._flat_universe_file()
+        finally:
+            if saved_env is not None:
+                os.environ["BINANCE_SPOT_UNIVERSE_DB"] = saved_env
+            if saved_json is not None:
+                os.environ["BINANCE_SPOT_UNIVERSE_JSON"] = saved_json
+
+    def _flat_universe_file(self) -> None:
+        from indicators.binance_spot_1h_klines import load_hourly_universe
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "dexscreener-crawler"
+            (root / "exports").mkdir(parents=True)
+            (root / "indicators").mkdir()
+            db = root / "exports" / "binance_spot_universe.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "CREATE TABLE symbols (symbol TEXT, base_asset TEXT, quote_asset TEXT, status TEXT)"
+            )
+            conn.execute("INSERT INTO symbols VALUES ('BTCUSDT', 'BTC', 'USDT', 'TRADING')")
+            conn.commit()
+            conn.close()
+            module = root / "indicators" / "binance_spot_1h_klines.py"
+            rows, source = load_hourly_universe(module)
+        self.assertEqual(source, db)
+        self.assertEqual([item.symbol for item in rows], ["BTCUSDT"])
 
     def test_second_collector_does_not_take_the_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
