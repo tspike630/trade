@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
 from indicators.binance_spot import SpotSymbol, ensure_schema, parse_kline_row, upsert_indicator, upsert_klines
@@ -46,6 +48,22 @@ def mod_file() -> Path:
 
 def _window(start_open: int, count: int, quote: float = 10.0) -> list[list]:
     return [_bar(start_open + i * 3_600_000, quote) for i in range(count)]
+
+
+def _write_universe(path: Path, names: list[tuple[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE symbols (symbol TEXT, base_asset TEXT, quote_asset TEXT, status TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO symbols VALUES (?, ?, 'USDT', 'TRADING')",
+        names,
+    )
+    conn.commit()
+    conn.close()
 
 
 class HourlyKlineCollectorTest(unittest.TestCase):
@@ -253,21 +271,25 @@ class HourlyKlineCollectorTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "dex.db"
+            universe = Path(tmp) / "universe.db"
             sqlite3.connect(db).close()
-            original = (mod.time.time, mod.time.sleep, mod.load_primary_universe, mod.fetch_json)
+            _write_universe(universe, [("BTCUSDT", "BTC")])
+            original = (mod.time.time, mod.time.sleep, mod.fetch_json)
+            saved_env = os.environ.get("BINANCE_SPOT_UNIVERSE_DB")
             mod.time.time = fake_time
             mod.time.sleep = fake_sleep
             mod.fetch_json = fetcher
-            mod.load_primary_universe = lambda paths=None: (
-                [SpotSymbol("BTCUSDT", "BTC")],
-                Path("universe"),
-            )
+            os.environ["BINANCE_SPOT_UNIVERSE_DB"] = str(universe)
             try:
                 code = mod.main(
                     ["--db", str(db), "--loop", "--sleep-sec", "300", "--max-rounds", "2"]
                 )
             finally:
-                mod.time.time, mod.time.sleep, mod.load_primary_universe, mod.fetch_json = original
+                mod.time.time, mod.time.sleep, mod.fetch_json = original
+                if saved_env is None:
+                    os.environ.pop("BINANCE_SPOT_UNIVERSE_DB", None)
+                else:
+                    os.environ["BINANCE_SPOT_UNIVERSE_DB"] = saved_env
             conn = sqlite3.connect(db)
             row = conn.execute(
                 """
@@ -279,6 +301,330 @@ class HourlyKlineCollectorTest(unittest.TestCase):
             conn.close()
         self.assertEqual(code, 0)
         self.assertEqual(row, (new_open + 3_599_999, 6.0))
+
+    def test_loop_tracks_universe_additions_and_removals(self) -> None:
+        import indicators.binance_spot_1h_klines as mod
+
+        now = 30 * 3_600_000
+        expected = (now - 3_599_999) // 3_600_000 * 3_600_000
+        fetched: list[str] = []
+
+        def fetcher(url: str):
+            fetched.append(url)
+            start = expected - 20 * 3_600_000
+            return _window(start, 21, 8.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dex.db"
+            universe = Path(tmp) / "universe.db"
+            sqlite3.connect(db).close()
+            _write_universe(universe, [("BTCUSDT", "BTC"), ("ETHUSDT", "ETH")])
+            saved_env = os.environ.get("BINANCE_SPOT_UNIVERSE_DB")
+            os.environ["BINANCE_SPOT_UNIVERSE_DB"] = str(universe)
+            original = (mod.fetch_json, mod.time.sleep)
+            mod.fetch_json = fetcher
+
+            def _sleep(_seconds: float) -> None:
+                _write_universe(
+                    universe,
+                    [("BTCUSDT", "BTC"), ("PYTHUSDT", "PYTH"), ("ACTUSDT", "ACT")],
+                )
+
+            mod.time.sleep = _sleep
+            try:
+                code = mod.main(
+                    [
+                        "--db",
+                        str(db),
+                        "--loop",
+                        "--sleep-sec",
+                        "300",
+                        "--max-rounds",
+                        "2",
+                        "--now-ms",
+                        str(now),
+                    ]
+                )
+            finally:
+                mod.fetch_json, mod.time.sleep = original
+                if saved_env is None:
+                    os.environ.pop("BINANCE_SPOT_UNIVERSE_DB", None)
+                else:
+                    os.environ["BINANCE_SPOT_UNIVERSE_DB"] = saved_env
+            conn = sqlite3.connect(db)
+            counts = dict(
+                conn.execute(
+                    "SELECT symbol, COUNT(*) FROM binance_klines WHERE interval='1h' GROUP BY symbol"
+                ).fetchall()
+            )
+            pyth_tip = conn.execute(
+                "SELECT MAX(open_time_ms), MAX(close_time_ms) FROM binance_klines WHERE symbol='PYTHUSDT'"
+            ).fetchone()
+            act_n = conn.execute(
+                "SELECT COUNT(*) FROM binance_klines WHERE symbol='ACTUSDT' AND interval='1h'"
+            ).fetchone()[0]
+            eth_n = conn.execute(
+                "SELECT COUNT(*) FROM binance_klines WHERE symbol='ETHUSDT' AND interval='1h'"
+            ).fetchone()[0]
+            conn.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(counts["PYTHUSDT"], 21)
+        self.assertEqual(act_n, 21)
+        self.assertEqual(eth_n, 21)
+        self.assertEqual(pyth_tip, (expected, expected + 3_599_999))
+        round2 = fetched[2:]
+        self.assertTrue(any("symbol=PYTHUSDT" in url for url in round2))
+        self.assertTrue(any("symbol=ACTUSDT" in url for url in round2))
+        self.assertFalse(any("symbol=ETHUSDT" in url for url in round2))
+
+    def test_universe_read_error_does_not_reuse_the_previous_symbols(self) -> None:
+        import indicators.binance_spot_1h_klines as mod
+
+        now = 30 * 3_600_000
+        fetched: list[str] = []
+
+        def fetcher(url: str):
+            fetched.append(url)
+            expected = (now - 3_599_999) // 3_600_000 * 3_600_000
+            return _window(expected - 20 * 3_600_000, 21, 4.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dex.db"
+            universe = Path(tmp) / "universe.db"
+            sqlite3.connect(db).close()
+            _write_universe(universe, [("BTCUSDT", "BTC")])
+            saved_env = os.environ.get("BINANCE_SPOT_UNIVERSE_DB")
+            os.environ["BINANCE_SPOT_UNIVERSE_DB"] = str(universe)
+            original = (mod.fetch_json, mod.time.sleep)
+            mod.fetch_json = fetcher
+            mod.time.sleep = lambda _seconds: universe.unlink()
+            try:
+                code = mod.main(
+                    [
+                        "--db",
+                        str(db),
+                        "--loop",
+                        "--sleep-sec",
+                        "300",
+                        "--max-rounds",
+                        "2",
+                        "--now-ms",
+                        str(now),
+                    ]
+                )
+            finally:
+                mod.fetch_json, mod.time.sleep = original
+                if saved_env is None:
+                    os.environ.pop("BINANCE_SPOT_UNIVERSE_DB", None)
+                else:
+                    os.environ["BINANCE_SPOT_UNIVERSE_DB"] = saved_env
+            conn = sqlite3.connect(db)
+            btc = conn.execute(
+                "SELECT COUNT(*) FROM binance_klines WHERE symbol='BTCUSDT'"
+            ).fetchone()[0]
+            conn.close()
+        self.assertEqual(code, 2)
+        self.assertEqual(len(fetched), 1)
+        self.assertIn("symbol=BTCUSDT", fetched[0])
+        self.assertEqual(btc, 21)
+
+    def test_pinned_canonical_does_not_read_a_stale_parent_mirror(self) -> None:
+        import indicators.binance_spot_1h_klines as mod
+        from indicators.binance_spot import load_primary_universe, symbols_from_sqlite
+
+        now = 30 * 3_600_000
+        expected = (now - 3_599_999) // 3_600_000 * 3_600_000
+        phase = {"n": 0}
+        fetched: list[tuple[int, str]] = []
+
+        def fetcher(url: str) -> list[list]:
+            fetched.append((phase["n"], url))
+            return _window(expected - 20 * 3_600_000, 21, 5.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "dexscreener-crawler"
+            module = root / "indicators" / "binance_spot_1h_klines.py"
+            canonical = root / "exports" / "binance_spot_universe.db"
+            mirror = Path(tmp) / "exports" / "binance_spot_universe.db"
+            _write_universe(canonical, [("BTCUSDT", "BTC"), ("PYTHUSDT", "PYTH")])
+            _write_universe(mirror, [("ETHUSDT", "ETH")])
+            db = Path(tmp) / "dex.db"
+            sqlite3.connect(db).close()
+
+            def sleeper(_seconds: float) -> None:
+                phase["n"] += 1
+                if phase["n"] == 1:
+                    canonical.write_bytes(b"not a sqlite database")
+                elif phase["n"] == 2:
+                    canonical.unlink()
+                elif phase["n"] == 3:
+                    _write_universe(canonical, [])
+                elif phase["n"] == 4:
+                    _write_universe(canonical, [("BTCUSDT", "BTC"), ("ACTUSDT", "ACT")])
+
+            saved_db = os.environ.pop("BINANCE_SPOT_UNIVERSE_DB", None)
+            saved_json = os.environ.pop("BINANCE_SPOT_UNIVERSE_JSON", None)
+            errors = io.StringIO()
+            try:
+                with redirect_stderr(errors):
+                    # The shared 5m walker still skips a bad file. This loop must not.
+                    canonical.write_bytes(b"not a sqlite database")
+                    fallen, fallen_path = load_primary_universe([canonical, mirror])
+                    canonical.write_bytes(b"")
+                    _write_universe(canonical, [("BTCUSDT", "BTC"), ("PYTHUSDT", "PYTH")])
+                    code = run_hourly_collector(
+                        db,
+                        fetcher=fetcher,
+                        now_ms=now,
+                        loop=True,
+                        sleep_sec=300,
+                        max_rounds=5,
+                        sleeper=sleeper,
+                        universe_loader=mod.StickyHourlyUniverse(module),
+                    )
+            finally:
+                if saved_db is not None:
+                    os.environ["BINANCE_SPOT_UNIVERSE_DB"] = saved_db
+                if saved_json is not None:
+                    os.environ["BINANCE_SPOT_UNIVERSE_JSON"] = saved_json
+            text = errors.getvalue()
+            conn = sqlite3.connect(db)
+            counts = dict(
+                conn.execute(
+                    "SELECT symbol, COUNT(*) FROM binance_klines WHERE interval='1h' GROUP BY symbol"
+                ).fetchall()
+            )
+            conn.close()
+            mirror_names = [item.symbol for item in symbols_from_sqlite(mirror)]
+        self.assertEqual([item.symbol for item in fallen], ["ETHUSDT"])
+        self.assertEqual(fallen_path, mirror)
+        self.assertEqual(code, 0)
+        self.assertEqual(mirror_names, ["ETHUSDT"])
+        self.assertFalse(any("symbol=ETHUSDT" in url for _phase, url in fetched))
+        opened = [url for seen, url in fetched if seen == 0]
+        self.assertEqual(len(opened), 2)
+        self.assertTrue(any("symbol=BTCUSDT" in url for url in opened))
+        self.assertTrue(any("symbol=PYTHUSDT" in url for url in opened))
+        self.assertEqual([seen for seen, _url in fetched if seen in (1, 2, 3)], [])
+        recovery = [url for seen, url in fetched if seen == 4]
+        self.assertEqual(len(recovery), 2)
+        self.assertTrue(any("symbol=BTCUSDT" in url for url in recovery))
+        self.assertTrue(any("symbol=ACTUSDT" in url for url in recovery))
+        self.assertFalse(any("symbol=PYTHUSDT" in url for url in recovery))
+        self.assertIn("universe_read_error:", text)
+        self.assertIn("universe_missing:", text)
+        self.assertIn("universe_empty:", text)
+        self.assertEqual(counts["PYTHUSDT"], 21)
+        self.assertEqual(counts["ACTUSDT"], 21)
+        self.assertNotIn("ETHUSDT", counts)
+
+    def test_explicit_universe_db_does_not_fall_back_to_the_mirror(self) -> None:
+        import indicators.binance_spot_1h_klines as mod
+
+        now = 30 * 3_600_000
+        expected = (now - 3_599_999) // 3_600_000 * 3_600_000
+        phase = {"n": 0}
+        fetched: list[tuple[int, str]] = []
+
+        def fetcher(url: str) -> list[list]:
+            fetched.append((phase["n"], url))
+            return _window(expected - 20 * 3_600_000, 21, 3.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "dexscreener-crawler"
+            module = root / "indicators" / "binance_spot_1h_klines.py"
+            mirror = root / "exports" / "binance_spot_universe.db"
+            chosen = Path(tmp) / "operator" / "binance_spot_universe.db"
+            _write_universe(mirror, [("ETHUSDT", "ETH")])
+            _write_universe(chosen, [("BTCUSDT", "BTC")])
+            db = Path(tmp) / "dex.db"
+            sqlite3.connect(db).close()
+
+            def sleeper(_seconds: float) -> None:
+                phase["n"] += 1
+                if phase["n"] == 1:
+                    chosen.write_bytes(b"not a sqlite database")
+                elif phase["n"] == 2:
+                    _write_universe(chosen, [("PYTHUSDT", "PYTH")])
+
+            saved_db = os.environ.get("BINANCE_SPOT_UNIVERSE_DB")
+            saved_json = os.environ.pop("BINANCE_SPOT_UNIVERSE_JSON", None)
+            os.environ["BINANCE_SPOT_UNIVERSE_DB"] = str(chosen)
+            try:
+                code = run_hourly_collector(
+                    db,
+                    fetcher=fetcher,
+                    now_ms=now,
+                    loop=True,
+                    sleep_sec=300,
+                    max_rounds=3,
+                    sleeper=sleeper,
+                    universe_loader=mod.StickyHourlyUniverse(module),
+                )
+            finally:
+                if saved_db is None:
+                    os.environ.pop("BINANCE_SPOT_UNIVERSE_DB", None)
+                else:
+                    os.environ["BINANCE_SPOT_UNIVERSE_DB"] = saved_db
+                if saved_json is not None:
+                    os.environ["BINANCE_SPOT_UNIVERSE_JSON"] = saved_json
+        self.assertEqual(code, 0)
+        self.assertTrue(any(seen == 0 and "symbol=BTCUSDT" in url for seen, url in fetched))
+        self.assertFalse(any(seen == 1 for seen, _url in fetched))
+        self.assertTrue(any(seen == 2 and "symbol=PYTHUSDT" in url for seen, url in fetched))
+        self.assertFalse(any("symbol=ETHUSDT" in url for _seen, url in fetched))
+
+    def test_explicit_symbol_allowlist_waits_for_the_live_universe(self) -> None:
+        import indicators.binance_spot_1h_klines as mod
+
+        now = 30 * 3_600_000
+        fetched: list[str] = []
+
+        def fetcher(url: str):
+            fetched.append(url)
+            expected = (now - 3_599_999) // 3_600_000 * 3_600_000
+            return _window(expected - 20 * 3_600_000, 21, 2.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dex.db"
+            universe = Path(tmp) / "universe.db"
+            sqlite3.connect(db).close()
+            _write_universe(universe, [("BTCUSDT", "BTC")])
+            saved_env = os.environ.get("BINANCE_SPOT_UNIVERSE_DB")
+            os.environ["BINANCE_SPOT_UNIVERSE_DB"] = str(universe)
+            original = (mod.fetch_json, mod.time.sleep)
+            mod.fetch_json = fetcher
+
+            def _sleep(_seconds: float) -> None:
+                _write_universe(universe, [("BTCUSDT", "BTC"), ("PYTHUSDT", "PYTH")])
+
+            mod.time.sleep = _sleep
+            try:
+                code = mod.main(
+                    [
+                        "--db",
+                        str(db),
+                        "--loop",
+                        "--sleep-sec",
+                        "300",
+                        "--max-rounds",
+                        "2",
+                        "--now-ms",
+                        str(now),
+                        "--symbol",
+                        "PYTHUSDT",
+                    ]
+                )
+            finally:
+                mod.fetch_json, mod.time.sleep = original
+                if saved_env is None:
+                    os.environ.pop("BINANCE_SPOT_UNIVERSE_DB", None)
+                else:
+                    os.environ["BINANCE_SPOT_UNIVERSE_DB"] = saved_env
+        self.assertEqual(code, 0)
+        self.assertEqual(len(fetched), 1)
+        self.assertIn("symbol=PYTHUSDT", fetched[0])
+        self.assertNotIn("symbol=BTCUSDT", fetched[0])
 
     def test_invalid_latest_closed_bar_is_a_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
