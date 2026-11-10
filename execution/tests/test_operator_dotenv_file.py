@@ -36,12 +36,69 @@ _FILE = (
     "EXECUTION_RISK_ENABLED=1\n"
     "PM_ENABLED=1\n"
 )
-_SKIP = {".git", ".venv", "__pycache__", ".env"}
+# Code the child imports. The deployment root also holds database backups.
+_RUNTIME_DIRS = ("execution",)
+_CRAWLER_MODULES = (
+    "config.py",
+    "history.py",
+    "logging_setup.py",
+    "paper_trade.py",
+    "store.py",
+)
+_SKIP_NAMES = {
+    ".git",
+    ".venv",
+    "__pycache__",
+    ".env",
+    "backups",
+    "config-backup",
+    "data",
+    "exports",
+    "logs",
+    "secrets",
+    "tests",
+    "proxies.txt",
+    "LIVE_TRADING_DISABLED",
+}
+_SKIP_SUFFIXES = (
+    ".pyc",
+    ".db",
+    ".db-wal",
+    ".db-shm",
+    ".db-journal",
+    ".sqlite",
+    ".sqlite3",
+)
 
 
-def _ignore(path: str, names: list[str]) -> set[str]:
+def _ignore_runtime(path: str, names: list[str]) -> set[str]:
     del path
-    return {name for name in names if name in _SKIP or name.endswith(".pyc")}
+    return {
+        name
+        for name in names
+        if name in _SKIP_NAMES or name.endswith(_SKIP_SUFFIXES)
+    }
+
+
+def _copy_runtime_fixture(src: Path, dst: Path) -> None:
+    """Copy the import closure, not the deployment data directory."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for rel in _RUNTIME_DIRS:
+        source = src / rel
+        if not source.is_dir():
+            continue
+        shutil.copytree(
+            source,
+            dst / rel,
+            symlinks=True,
+            ignore=_ignore_runtime,
+        )
+    crawler_dst = dst / "crawler"
+    crawler_dst.mkdir(parents=True, exist_ok=True)
+    for name in _CRAWLER_MODULES:
+        source = src / "crawler" / name
+        if source.is_file():
+            shutil.copy2(source, crawler_dst / name)
 
 
 def _fingerprint(path: Path) -> tuple[int, int, int, bool] | None:
@@ -152,8 +209,12 @@ class OperatorDotenvFileTests(unittest.TestCase):
     def test_crawler_dotenv_reloads_after_a_clean_child_unless_guarded(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dotenv-fixture-") as tmp:
             tree = Path(tmp).resolve() / "tree"
-            shutil.copytree(ROOT, tree, symlinks=True, ignore=_ignore)
+            _copy_runtime_fixture(ROOT, tree)
             _flat_runtime(tree)
+            self.assertFalse((tree / "data").exists())
+            self.assertFalse((tree / "backups").exists())
+            self.assertFalse((tree / "crawler" / "data").exists())
+            self.assertFalse(any(path.suffix == ".db" for path in tree.rglob("*") if path.is_file()))
             self.assertTrue((tree / "config.py").is_file())
             self.assertTrue((tree / "crawler" / "config.py").is_file())
             self.assertFalse((tree / ".env").exists())
@@ -190,3 +251,33 @@ class OperatorDotenvFileTests(unittest.TestCase):
             )
             injected = self._run(tree, explicit, cwd=tree)
             self._expect(injected, tree, "False", "250")
+
+    def test_runtime_fixture_leaves_sentinel_backups_and_secrets_behind(self) -> None:
+        token = b"SENTINEL-DB-BACKUP-DO-NOT-COPY"
+        with tempfile.TemporaryDirectory(prefix="dotenv-sentinel-") as tmp:
+            src = Path(tmp) / "src"
+            backup = src / "data" / "backups"
+            backup.mkdir(parents=True)
+            (backup / "ledger-backup.db").write_bytes(token + b"\n" + b"X" * (256 * 1024))
+            (src / ".env").write_text("BINANCE_API_SECRET=hidden\n", encoding="utf-8")
+            (src / "secrets").mkdir()
+            (src / "secrets" / "api.key").write_text("secret-material", encoding="utf-8")
+            (src / "execution").mkdir()
+            (src / "execution" / "__init__.py").write_text("__version__ = 'fixture'\n", encoding="utf-8")
+            (src / "execution" / "nested.db").write_bytes(token)
+            (src / "crawler").mkdir()
+            (src / "crawler" / "config.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (src / "crawler" / "data").mkdir()
+            (src / "crawler" / "data" / "cityu.db").write_bytes(token)
+            dst = Path(tmp) / "dst"
+            _copy_runtime_fixture(src, dst)
+            copied = b"".join(path.read_bytes() for path in dst.rglob("*") if path.is_file())
+            self.assertNotIn(token, copied)
+            self.assertFalse((dst / "data").exists())
+            self.assertFalse((dst / ".env").exists())
+            self.assertFalse((dst / "secrets").exists())
+            self.assertFalse((dst / "crawler" / "data").exists())
+            self.assertFalse(list(dst.rglob("*.db")))
+            self.assertTrue((dst / "execution" / "__init__.py").is_file())
+            self.assertTrue((dst / "crawler" / "config.py").is_file())
+            self.assertTrue((backup / "ledger-backup.db").is_file())
