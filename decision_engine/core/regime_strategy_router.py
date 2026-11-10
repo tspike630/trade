@@ -263,7 +263,9 @@ def evaluate_five_state_regime(
                 require_perp_beta_hedge=False,
                 recommended_order_type="NONE",
             )
-        # AGENTS.md: reject volume_z >= 3.8. A missing volume z-score does not reject.
+        # AGENTS.md states the threshold only. The window, closed-bar cadence,
+        # and std convention for volume_z / vol_z_1h are not defined here.
+        # A missing value does not reject, and no series is synthesized.
         vol_z = _finite(row.get("volume_z") or row.get("vol_z_1h"))
         if vol_z is not None and vol_z >= 3.8:
             return RegimeRoutingDecision(
