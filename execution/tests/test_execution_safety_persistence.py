@@ -877,6 +877,43 @@ class PersistenceSafetyTests(unittest.TestCase):
         )
         self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["MARKET"])
 
+        from decision_engine.core.signal_bus import normalize_signal
+
+        norm = normalize_signal(
+            {
+                "action": "buy",
+                "strategy_id": "tech",
+                "token_address": "BNBUSDT",
+                "binance_symbol": "BNBUSDT",
+                "size_pct": 0.1,
+                "recommended_order_type": "LIMIT_MAKER",
+                "volume_z": 1.2,
+                "stop_price": "90",
+                "take_profit_price": "120",
+                "quantity": "1",
+                "price": "99.90",
+                "price_usd": "100",
+                "entry_reason": "large_trade_market",
+            },
+            purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+        )
+        extras = norm["_extras"]
+        self.assertEqual(extras.get("recommended_order_type"), "LIMIT_MAKER")
+        self.assertEqual(extras.get("volume_z"), 1.2)
+        self.assertNotIn("order_type", extras)
+        carried = adapter.execute(
+            {
+                "decision_log_id": 73,
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "mode": "live_stub",
+                "action": "buy",
+                "token_address": "BNBUSDT",
+                "extras": extras,
+            }
+        )
+        self.assertEqual(carried["error"], "maker_entry_resting")
+        self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["LIMIT_MAKER"])
+
     def _held_qty(self, ledger: ExecutionLedger, qty: str, decision_id: int = 61) -> tuple[int, BinanceSpotAdapter, _Exchange]:
         row = self._held(ledger, decision_id)
         pid = int(row["id"])
