@@ -130,3 +130,22 @@ Prophet Arena、LiveTradeBench、When Agents Trade、FinPos、PredictionMarketBe
 | 现网锚 tech_boll_fade | 旁证 | +117.56% n30 未满窗不冠；TP 集中 + OOS EV↓ + 止损占负≈82% → #72，勿写成信号死 |
 
 全文：`docs/QUANT_DECAY_FRONTIER_WEEKLY_DECISION_2026-11-04.md`。零改闸；不接 high_bot_skip；不上 LLM 主路径。
+
+
+## 2026-11-11 · 决策失效周研增量（相对 11-04）
+
+| 源 | 状态 | 决策侧映射（观察脚注，不算有效性） |
+|----|------|-------------------------------------|
+| [Hard to Fool 2611.06607](https://arxiv.org/abs/2611.06607) | 已打开 | 一次性 holdout + 合取绝对门；验证 Sharpe 2.94/3.34 → holdout 0.26 → 对照 `promo_cpcv_gate_v0`/#90 冠名（满窗∧n≥30/50·跨窗·首笔 fill），非权重门禁；与 11-11 最小 SL% 影验证 IS 改善、OOS 更差同构；n=10 不够花 holdout |
+| [EOD 预注册 2611.09286](https://arxiv.org/abs/2611.09286) | 已打开 | 分窗、衰减检验要有势（50% 真衰减击中「减弱」约 6%）；成本前数 bps、机制检验未过、不对净收益声称；不把子集存活写成全局有效 |
+| [Factor Portfolios 2611.09834](https://arxiv.org/abs/2611.09834) | 已打开 | 高阶交互换手吃净溢价（价差后 58/24/6%）；毛预测关系仍在 ≠ 可交易 → #72；拒绝把比例拷进 meme 或堆交叉规则 |
+| [Propagator 2611.10574](https://arxiv.org/abs/2611.10574) | 已打开 | 推断冲击衰减不可识别；勿把核当退出冲击已测或写入 SL/hold；因果执行需额外识别假设 |
+| [Pump.fun 跟队 2611.11436](https://arxiv.org/abs/2611.11436) | 已打开 | 权益≠可用现金；资金图不是 wash 检测器；不接 `high_bot_skip`；不更新既有洗盘率点估计 |
+| [LLM judges 2611.04070](https://arxiv.org/abs/2611.04070) | 已打开 | LLM 代理是偏自由检验，无信号仍虚报；决策规则与密封 holdout 须在代理之外；不上 LLM 有效性裁决，也不上 LLM 主路径 |
+| [Track or Follow 2611.10414](https://arxiv.org/abs/2611.10414) | 已打开 | Web 新闻多滞后；发布后关联塌掉，周频相对代码特征无增量。**文中 Jev（jev-1.13.0）≠ 本系统 JEV**；不写本系统 JEV 证伪；新闻不上主路径 |
+| [Wallet identity 2611.05218](https://arxiv.org/abs/2611.05218) | 已打开 | 秒级身份特征可有增量预测，作者自限不可执行；与 hold60 错配；禁止跟庄/skip |
+| [执行迁移 2611.08701](https://arxiv.org/abs/2611.08701) | 已打开（边界） | 执行策略可迁移 ≠ 信号仍在；不改执行闸 |
+| [Predicting Factor Decay 2611.03668](https://arxiv.org/abs/2611.03668) | 已打开·不进主结论数字 | C-index≈0.93 事件极少、作者自限非确认；主信号破裂后不复制 — 禁止写成预警门 |
+| 现网锚 live fade 自动 OCO | 旁证 | n=10 EV−0.059、止损占负 100%、最小 SL% OOS 更差 → #72，勿写成信号死；不升格不接 live |
+
+全文：`docs/QUANT_DECAY_FRONTIER_WEEKLY_DECISION_2026-11-11.md`。零改闸；不接 high_bot_skip；不上 LLM 主路径。
