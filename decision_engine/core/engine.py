@@ -226,6 +226,16 @@ class DecisionEngine:
             )
 
         if not candidates:
+            perp_short_report = (
+                self._maybe_run_perp_short(
+                    hot=hot,
+                    protection_book=protection_book,
+                    accepted_buys=[],
+                    macro_halt=macro_halt,
+                )
+                if bnb_spot
+                else None
+            )
             log.info("tick#%s 无信号 (no candidates)", self.tick_count)
             return self._tick_payload(
                 hot_loaded=scanned,
@@ -237,6 +247,7 @@ class DecisionEngine:
                 turnover_report=turnover_report,
                 protection_halt=protection_halt,
                 macro_halt=macro_halt,
+                perp_short=perp_short_report,
             )
 
         # Shared buy choke point: every strategy's candidates pass through
@@ -284,6 +295,17 @@ class DecisionEngine:
             )
             passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
         emitted = self.bus.publish_many(passed)
+        eff_macro_halt = guard_report.get("macro_halt") or macro_halt
+        perp_short_report = (
+            self._maybe_run_perp_short(
+                hot=hot,
+                protection_book=protection_book,
+                accepted_buys=passed,
+                macro_halt=eff_macro_halt,
+            )
+            if bnb_spot
+            else None
+        )
         log.info(
             "tick#%s candidates=%s emitted=%s",
             self.tick_count,
@@ -300,10 +322,39 @@ class DecisionEngine:
             turnover_report=turnover_report,
             top_report=top_report,
             protection_halt=guard_report.get("protection_halt") or protection_halt,
-            macro_halt=guard_report.get("macro_halt") or macro_halt,
+            macro_halt=eff_macro_halt,
             stop_gap_rejected=int(guard_report.get("stop_gap_rejected") or 0),
             news_gate=None if news_snapshot is None else snapshot_observation(news_snapshot),
+            perp_short=perp_short_report,
         )
+
+    def _maybe_run_perp_short(
+        self,
+        *,
+        hot: list[dict[str, Any]],
+        protection_book: ProtectionBook,
+        accepted_buys: list[dict[str, Any]],
+        macro_halt: str | None,
+    ) -> dict[str, Any] | None:
+        from decision_engine.core.perp_short_alpha_engine import (
+            is_perp_short_engine_enabled,
+            run_perp_short_tick,
+        )
+
+        if not is_perp_short_engine_enabled():
+            return None
+        try:
+            sink_db = getattr(self.bus, "db_path", getattr(self.adapter, "db_path", None))
+            return run_perp_short_tick(
+                hot_rows=hot,
+                open_spot_positions=list(protection_book.positions),
+                accepted_spot_buys=accepted_buys,
+                macro_halt=macro_halt,
+                db_path=sink_db,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("perp_short_alpha_engine failed closed: %s", exc)
+            return {"enabled": True, "error": f"{type(exc).__name__}:{exc}"}
 
     def _tick_payload(
         self,
@@ -320,6 +371,7 @@ class DecisionEngine:
         macro_halt: str | None = None,
         stop_gap_rejected: int = 0,
         news_gate: dict[str, Any] | None = None,
+        perp_short: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "tick": self.tick_count,
@@ -344,6 +396,8 @@ class DecisionEngine:
             payload["stop_gap_rejected"] = stop_gap_rejected
         if news_gate is not None:
             payload["news_gate"] = news_gate
+        if perp_short is not None:
+            payload["perp_short"] = perp_short
         return payload
 
     def _protection_snapshot(self) -> ProtectionBook:
