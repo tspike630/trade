@@ -316,7 +316,15 @@ class TestPerpShortAlphaEngineAndExecutor(unittest.TestCase):
                 patch.object(engine, "_load_live_bnb_hot", return_value=(crash_hot, "binance_indicators")),
                 patch("decision_engine.core.engine.filter_live_bnb_hot", return_value=(crash_hot, {"kept": 1})),
                 patch("decision_engine.core.engine.evaluate_macro_gate") as mock_macro,
-                patch.dict(os.environ, {"ENABLE_PERP_SHORT_ENGINE": "1", "CITYU_INSTITUTIONAL_DB_PATH": str(self.root / "none.db")}, clear=False),
+                patch.dict(
+                    os.environ,
+                    {
+                        "ENABLE_PERP_SHORT_ENGINE": "1",
+                        "BINANCE_SPOT_BOOK_USDT": "320",
+                        "CITYU_INSTITUTIONAL_DB_PATH": str(self.root / "none.db"),
+                    },
+                    clear=False,
+                ),
             ):
                 mock_macro.return_value = MagicMock(halt_reason=None)
                 out_on = engine.tick()
@@ -342,6 +350,72 @@ class TestPerpShortAlphaEngineAndExecutor(unittest.TestCase):
                 out_off = engine.tick()
             self.assertNotIn("perp_short", out_off)
         adapter.conn.close()
+
+    def test_missing_book_or_taker_does_not_open_and_same_spot_symbol_is_blocked(self) -> None:
+        crash = {
+            "binance_symbol": "FETUSDT",
+            "price_usd": 1.50,
+            "nvda_1h_ret_pct": -2.6,
+            "taker_buy_ratio": 0.40,
+        }
+        saved_book = os.environ.get("BINANCE_SPOT_BOOK_USDT")
+        try:
+            os.environ.pop("BINANCE_SPOT_BOOK_USDT", None)
+            self.assertEqual(evaluate_directional_short_candidates([crash], book_usdt=None), [])
+            self.assertEqual(evaluate_directional_short_candidates([crash]), [])
+        finally:
+            if saved_book is None:
+                os.environ.pop("BINANCE_SPOT_BOOK_USDT", None)
+            else:
+                os.environ["BINANCE_SPOT_BOOK_USDT"] = saved_book
+
+        missing_taker = evaluate_directional_short_candidates(
+            [{
+                "binance_symbol": "ALTXYZUSDT",
+                "price_usd": 2.0,
+                "in_unlock_blackout": 1,
+                "obi_top5": -0.40,
+            }],
+            book_usdt=320.0,
+        )
+        self.assertEqual(missing_taker, [])
+
+        held = evaluate_directional_short_candidates(
+            [crash],
+            book_usdt=320.0,
+            blocked_spot_symbols={"FETUSDT"},
+        )
+        self.assertEqual(held, [])
+        sized = evaluate_directional_short_candidates([crash], book_usdt=320.0)
+        self.assertEqual(len(sized), 1)
+        self.assertAlmostEqual(sized[0].notional_usdt or 0.0, 48.0, places=2)
+
+    def test_explicit_dry_run_false_cannot_bypass_the_live_switches(self) -> None:
+        saved_live = os.environ.get("BINANCE_PERP_SHORT_LIVE_ENABLED")
+        saved_kill = os.environ.get("LIVE_TRADING_DISABLED")
+        try:
+            os.environ.pop("BINANCE_PERP_SHORT_LIVE_ENABLED", None)
+            os.environ["LIVE_TRADING_DISABLED"] = "0"
+            blocked = BinancePerpShortAdapter(self.root / "perp-blocked.db", dry_run=False, book_usdt=320.0)
+            self.assertTrue(blocked.dry_run)
+
+            os.environ["BINANCE_PERP_SHORT_LIVE_ENABLED"] = "1"
+            os.environ["LIVE_TRADING_DISABLED"] = "1"
+            killed = BinancePerpShortAdapter(self.root / "perp-killed.db", dry_run=False, book_usdt=320.0)
+            self.assertTrue(killed.dry_run)
+
+            os.environ["LIVE_TRADING_DISABLED"] = "0"
+            opened = BinancePerpShortAdapter(self.root / "perp-open.db", dry_run=False, book_usdt=320.0)
+            self.assertFalse(opened.dry_run)
+        finally:
+            if saved_live is None:
+                os.environ.pop("BINANCE_PERP_SHORT_LIVE_ENABLED", None)
+            else:
+                os.environ["BINANCE_PERP_SHORT_LIVE_ENABLED"] = saved_live
+            if saved_kill is None:
+                os.environ.pop("LIVE_TRADING_DISABLED", None)
+            else:
+                os.environ["LIVE_TRADING_DISABLED"] = saved_kill
 
 
 if __name__ == "__main__":

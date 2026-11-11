@@ -19,6 +19,7 @@ from decision_engine.core.drawdown_and_kelly_budget import (
 from decision_engine.core.perp_microstructure_and_beta_hedge import (
     compute_portfolio_beta_and_hedge,
     portfolio_beta_exposure_block,
+    portfolio_beta_gate_enabled,
 )
 from decision_engine.core.portfolio_clusters import cluster_open_exposure_block
 from decision_engine.core.protection_halt import ProtectionBook, purpose_halt_reason
@@ -234,3 +235,49 @@ def apply_live_buy_guards(
         report["macro_halt"] = macro_halt
         report["macro_dropped"] = macro_dropped
     return kept, report
+
+
+def recheck_portfolio_beta_after_sizing(
+    signals: list[dict[str, Any]],
+    *,
+    purpose: str,
+    book: ProtectionBook,
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop buys whose post-router size breaches the portfolio beta cap.
+
+    The pre-router guard sees the strategy size. One-shot Kelly replaces that
+    size later. When the beta gate is off this is a no-op. Sells stay.
+    """
+    if purpose not in LIVE_BNB_SPOT_PURPOSES or not portfolio_beta_gate_enabled():
+        return signals, 0
+    kept: list[dict[str, Any]] = []
+    accepted_buys: list[dict[str, Any]] = []
+    dropped = 0
+    for signal in signals:
+        if str(signal.get("action") or "").lower() != "buy":
+            kept.append(signal)
+            continue
+        symbol = signal_symbol(signal)
+        if symbol is None:
+            dropped += 1
+            log.info("portfolio_beta_halt purpose=%s symbol= reason=missing_symbol_after_sizing", purpose)
+            continue
+        reason = portfolio_beta_exposure_block(
+            list(book.positions),
+            purpose=purpose,
+            symbol=symbol,
+            candidate_size_pct=signal.get("size_pct"),
+            accepted_signals=accepted_buys,
+        )
+        if reason is not None:
+            dropped += 1
+            log.info(
+                "portfolio_beta_halt purpose=%s symbol=%s reason=%s stage=after_sizing",
+                purpose,
+                symbol,
+                reason,
+            )
+            continue
+        accepted_buys.append(signal)
+        kept.append(signal)
+    return kept, dropped

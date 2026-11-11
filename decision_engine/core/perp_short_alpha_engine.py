@@ -48,6 +48,9 @@ from decision_engine.core.wall_mid_pricing import extract_wall_mid_from_row
 PERP_SHORT_ENGINE_ENV = "ENABLE_PERP_SHORT_ENGINE"
 MAX_DIRECTIONAL_SHORTS_ENV = "MAX_CONCURRENT_PERP_SHORTS"
 DEFAULT_MAX_DIRECTIONAL_SHORTS = 2
+_BOOK_ENV = "BINANCE_SPOT_BOOK_USDT"
+_MIN_OPEN_NOTIONAL_USDT = 20.0
+_TERMINAL_SPOT_STATUSES = frozenset({"closed", "closed_dust", "flat", "oco_filled"})
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _SPOT_TO_USDM_PERP_MAP: dict[str, str] = {
@@ -73,6 +76,40 @@ def _finite(val: object) -> float | None:
 def is_perp_short_engine_enabled(environ: dict[str, str] | None = None) -> bool:
     env = os.environ if environ is None else environ
     return str(env.get(PERP_SHORT_ENGINE_ENV, "")).strip().lower() in _TRUTHY
+
+
+def resolve_perp_book_usdt(book_usdt: float | None = None) -> float | None:
+    """Positive spot book, or None when the caller and the env are both silent.
+
+    A missing book is not replaced with a constant. Directional notionals stay
+    unsent until a real book is supplied.
+    """
+    if book_usdt is not None:
+        num = _finite(book_usdt)
+        return num if num is not None and num > 0 else None
+    num = _finite(os.environ.get(_BOOK_ENV))
+    return num if num is not None and num > 0 else None
+
+
+def open_spot_symbols(positions: Sequence[dict[str, Any]]) -> set[str]:
+    """Spot symbols with a non-terminal row. A missing status counts as open."""
+    held: set[str] = set()
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        status = str(pos.get("status") or "open").strip().lower()
+        if status in _TERMINAL_SPOT_STATUSES:
+            continue
+        sym = str(pos.get("symbol") or pos.get("binance_symbol") or "").strip().upper()
+        if sym:
+            held.add(sym)
+    return held
+
+
+def _marked_spot_notional(pos: dict[str, Any]) -> bool:
+    qty = _finite(pos.get("quantity"))
+    px = _finite(pos.get("entry_price"))
+    return qty is not None and px is not None and qty > 0 and px > 0
 
 
 def map_spot_to_usdm_perp(symbol: str) -> tuple[str, float]:
@@ -135,7 +172,8 @@ def _put_wing_spike(row: dict[str, Any], spot_px: float) -> bool:
     if isinstance(opt_chain, Sequence) and not isinstance(opt_chain, (str, bytes)):
         snap = fit_volatility_smile_residuals(opt_chain, spot_px)
         if snap is not None and snap.residual_provenance == "leave_one_out":
-            return snap.max_put_wing_residual_pct >= 4.0
+            peak = snap.max_put_wing_residual_pct
+            return peak is not None and peak >= 4.0
     if str(row.get("put_wing_residual_provenance") or "").strip().lower() == "leave_one_out":
         res = _finite(row.get("put_wing_iv_residual_pct"))
         return res is not None and res >= 4.0
@@ -148,13 +186,15 @@ def evaluate_directional_short_candidates(
     book_usdt: float | None = None,
     max_shorts: int | None = None,
     macro_halt: str | None = None,
+    blocked_spot_symbols: set[str] | None = None,
 ) -> list[PerpShortSignal]:
-    """Scan ``hot_rows`` for high-asymmetry 1x isolated perpetual short setups & squeeze exits."""
-    resolved_book = (
-        float(book_usdt)
-        if book_usdt is not None and book_usdt > 0
-        else (_finite(os.environ.get("BINANCE_SPOT_BOOK_USDT")) or 320.0)
-    )
+    """Scan ``hot_rows`` for high-asymmetry 1x isolated perpetual short setups & squeeze exits.
+
+    Missing book, missing taker/book weakness, or an already-open spot symbol
+    does not open a short. Squeeze exits still emit.
+    """
+    resolved_book = resolve_perp_book_usdt(book_usdt)
+    blocked = {str(sym).strip().upper() for sym in (blocked_spot_symbols or set()) if str(sym).strip()}
     cap_count = (
         int(max_shorts)
         if max_shorts is not None and max_shorts > 0
@@ -197,6 +237,9 @@ def evaluate_directional_short_candidates(
                 )
             continue
 
+        if sym in blocked:
+            continue
+
         spot_px = _resolve_spot_price(row)
         if spot_px is None or spot_px <= 0:
             continue
@@ -225,8 +268,10 @@ def evaluate_directional_short_candidates(
         reason = ""
 
         # Spear 1: VC/Team Cliff Unlock Dump on Speculative Altcoins
+        obi_weak = obi_top5 is not None and obi_top5 <= -0.10
+        taker_unlock_weak = taker_buy is not None and taker_buy <= 0.46
         if in_unlock and conv_tier == "SPECULATIVE":
-            if (obi_top5 is None or obi_top5 <= -0.10) and (taker_buy is None or taker_buy <= 0.46):
+            if obi_weak and taker_unlock_weak:
                 playbook = "unlock_cliff_short"
                 size_pct = 0.15
                 stop_dist_pct = 0.022
@@ -240,7 +285,7 @@ def evaluate_directional_short_candidates(
             funding_rate is not None and funding_rate >= 0.00035
         )
         if playbook is None and (is_retail_trap or (is_extreme_pos_funding and (whale_div is None or whale_div <= 0.65))):
-            if taker_buy is None or taker_buy <= 0.48:
+            if taker_buy is not None and taker_buy <= 0.48:
                 playbook = "crowded_long_funding_carry_short"
                 size_pct = 0.20
                 stop_dist_pct = 0.018
@@ -258,7 +303,7 @@ def evaluate_directional_short_candidates(
             or bool(macro_halt and "oob" in str(macro_halt).lower())
         )
         if playbook is None and is_macro_or_tech_crash:
-            if taker_buy is None or taker_buy <= 0.45:
+            if taker_buy is not None and taker_buy <= 0.45:
                 playbook = "cross_asset_crash_contagion_short"
                 size_pct = 0.20 if conv_tier != "SPECULATIVE" else 0.15
                 stop_dist_pct = 0.020
@@ -266,7 +311,7 @@ def evaluate_directional_short_candidates(
                 score = 88.0 + abs(min(nvda_1h or 0.0, smh_1h or 0.0)) * 4.0
                 reason = "cross_asset_or_liquidation_waterfall_short"
 
-        if playbook is None or size_pct <= 0:
+        if playbook is None or size_pct <= 0 or resolved_book is None:
             continue
 
         # Prefer WallMid 1-tick frontrun in front of heavy ask wall when L2 book is available
@@ -288,8 +333,10 @@ def evaluate_directional_short_candidates(
             perp_stop = min(max_stop, max(min_stop, wall_stop))
         perp_tp = round(perp_entry * (1.0 - tp_dist_pct), 8)
 
-        notional = round(max(20.0, size_pct * resolved_book), 2) if resolved_book >= 100.0 else round(size_pct * resolved_book, 2)
-        eff_pct = round(min(0.35, notional / resolved_book), 6) if resolved_book > 0 else size_pct
+        notional = round(size_pct * resolved_book, 2)
+        if notional < _MIN_OPEN_NOTIONAL_USDT:
+            continue
+        eff_pct = round(min(0.35, notional / resolved_book), 6)
 
         scored_opens.append(
             (
@@ -348,16 +395,22 @@ def build_perp_beta_hedge_orders(
     hedge_ratio = 1.00 if has_state5 else 0.50
     regime_label = "state5_full_beta_lock_100pct" if has_state5 else "state4_defensive_beta_hedge_50pct"
 
-    resolved_book = (
-        float(book_usdt)
-        if book_usdt is not None and book_usdt > 0
-        else (_finite(os.environ.get("BINANCE_SPOT_BOOK_USDT")) or 320.0)
-    )
-    hedge_calc = compute_portfolio_beta_and_hedge(
-        open_spot_positions,
-        candidate_signals=accepted_spot_buys,
-        book_usdt=resolved_book,
-    )
+    resolved_book = resolve_perp_book_usdt(book_usdt)
+    if resolved_book is None:
+        # Quantity times entry is a marked notional. Candidate percents are not,
+        # and a stand-in book must not turn them into hedge size.
+        marked = [row for row in open_spot_positions if isinstance(row, dict) and _marked_spot_notional(row)]
+        hedge_calc = compute_portfolio_beta_and_hedge(
+            marked,
+            candidate_signals=(),
+            book_usdt=1.0,
+        )
+    else:
+        hedge_calc = compute_portfolio_beta_and_hedge(
+            open_spot_positions,
+            candidate_signals=accepted_spot_buys,
+            book_usdt=resolved_book,
+        )
     total_beta_usdt = float(hedge_calc.get("beta_weighted_usdt") or 0.0) * hedge_ratio
     if total_beta_usdt < 20.0:
         return []
@@ -390,7 +443,7 @@ def build_perp_beta_hedge_orders(
         ref_px = px_by_sym.get(sym)
         stop_px = round(ref_px * 1.030, 8) if ref_px is not None else None
         tp_px = round(ref_px * 0.940, 8) if ref_px is not None else None
-        pct = round(min(1.0, leg_usdt / resolved_book), 6) if resolved_book > 0 else 0.50
+        pct = round(min(1.0, leg_usdt / resolved_book), 6) if resolved_book else 0.0
         orders.append(
             PerpShortSignal(
                 action="open_short",
@@ -500,6 +553,7 @@ def run_perp_short_tick(
         hot_rows,
         book_usdt=book_usdt,
         macro_halt=macro_halt,
+        blocked_spot_symbols=open_spot_symbols(open_spot_positions),
     )
     combined = hedge_orders + directional_orders
     written = 0
