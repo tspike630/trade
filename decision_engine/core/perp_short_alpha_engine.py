@@ -135,7 +135,8 @@ def _put_wing_spike(row: dict[str, Any], spot_px: float) -> bool:
     if isinstance(opt_chain, Sequence) and not isinstance(opt_chain, (str, bytes)):
         snap = fit_volatility_smile_residuals(opt_chain, spot_px)
         if snap is not None and snap.residual_provenance == "leave_one_out":
-            return snap.max_put_wing_residual_pct >= 4.0
+            residual = snap.max_put_wing_residual_pct
+            return residual is not None and residual >= 4.0
     if str(row.get("put_wing_residual_provenance") or "").strip().lower() == "leave_one_out":
         res = _finite(row.get("put_wing_iv_residual_pct"))
         return res is not None and res >= 4.0
@@ -226,7 +227,13 @@ def evaluate_directional_short_candidates(
 
         # Spear 1: VC/Team Cliff Unlock Dump on Speculative Altcoins
         if in_unlock and conv_tier == "SPECULATIVE":
-            if (obi_top5 is None or obi_top5 <= -0.10) and (taker_buy is None or taker_buy <= 0.46):
+            # Missing book or taker is not a weak print. Both have to be present.
+            if (
+                obi_top5 is not None
+                and obi_top5 <= -0.10
+                and taker_buy is not None
+                and taker_buy <= 0.46
+            ):
                 playbook = "unlock_cliff_short"
                 size_pct = 0.15
                 stop_dist_pct = 0.022
