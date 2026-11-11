@@ -45,6 +45,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from typing import Any, Never, Sequence
 
 from decision_engine.core.news_shock_gate import (
@@ -628,24 +629,45 @@ def apply_five_state_regime_router(
 
         tier_cap = 0.35 if conv_tier == "SPECULATIVE" else 0.95
         cur_size = _finite(out_sig.get("size_pct"))
-        if bool(base_row.get("use_optimal_kelly_matrix", False)):
-            out_sig["size_pct"] = round(min(tier_cap, float(ratchet_info["target_cumulative_pct"])), 6)
+        kelly_enabled = is_optimal_kelly_enabled(base_row)
+        if kelly_enabled:
+            if conv_tier != "SPECULATIVE" and int(ratchet_info["pyramid_stage"]) == 1 and os.environ.get(OPTIMAL_KELLY_ENV, "").strip().lower() in _TRUTHY:
+                target_sz = TIER1_ONESHOT_MULTI_SYMBOL_PCT.get(state_id, float(ratchet_info["target_cumulative_pct"]))
+            else:
+                target_sz = float(ratchet_info["target_cumulative_pct"])
+            out_sig["size_pct"] = round(min(tier_cap, target_sz), 6)
         elif cur_size is not None and cur_size > 0 and decision.size_multiplier != 1.0:
             out_sig["size_pct"] = round(max(0.01, min(tier_cap, cur_size * decision.size_multiplier)), 6)
 
+        _expand_regime_take_profit(out_sig, base_row, decision, kelly_enabled=kelly_enabled)
         accepted.append(out_sig)
 
     accepted = _rerank_state3_leaders(accepted, aligned_rank_weight if news_snapshot is not None else None)
     return accepted, regime_counts
 
 
-# === Monte Carlo Optimal Kelly + 3-Stage Zero-Risk OCO Ratchet Matrix ===
+OPTIMAL_KELLY_ENV = "USE_OPTIMAL_KELLY_MATRIX"
+EXPAND_OCO_TP_ENV = "EXPAND_REGIME_OCO_TP"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+# Preserves legacy 3-stage base constants for backward-compatible contract stamps,
+# while TIER1_ONESHOT_MULTI_SYMBOL_PCT delivers 20% / 45% / 35% one-shot sizing
+# across 2 concurrent whitelist leaders (40% / 90% / 70% total) when USE_OPTIMAL_KELLY_MATRIX=1.
 OPTIMAL_FIVE_STATE_BASE_PCT = {
-    1: 0.185,  # State 1: 18.5% Full-Kelly Mean Reversion
-    2: 0.350,  # State 2: 35.0% Base -> 70.0% Stage 2 -> 95.0% Stage 3 Squeeze Pyramid
-    3: 0.300,  # State 3: 30.0% Base -> 60.0% Stage 2 -> 85.0% Stage 3 Tech Bull Pyramid
-    4: 0.050,  # State 4: 5.0% Deep-Wick Fade + 50% Perp Beta Hedge
-    5: 0.000,  # State 5: 0.0% Spot + 100% Perp Beta Lock
+    1: 0.185,
+    2: 0.350,
+    3: 0.300,
+    4: 0.050,
+    5: 0.000,
+}
+
+TIER1_ONESHOT_MULTI_SYMBOL_PCT = {
+    1: 0.200,  # State 1: 20.0% per leader (2 leaders = 40.0% calm mean-reversion)
+    2: 0.450,  # State 2: 45.0% per leader (2 leaders = 90.0% short-squeeze wave)
+    3: 0.350,  # State 3: 35.0% per leader (2 leaders = 70.0% cross-asset bull wave)
+    4: 0.050,  # State 4: 5.0% defensive deep-wick fade (+ 20 USDT floor lift)
+    5: 0.000,  # State 5: 0.0% crisis cash halt
 }
 
 OPTIMAL_FIVE_STATE_PYRAMID_MAX_PCT = {
@@ -655,6 +677,91 @@ OPTIMAL_FIVE_STATE_PYRAMID_MAX_PCT = {
     4: 0.050,
     5: 0.000,
 }
+
+
+def is_optimal_kelly_enabled(row: dict[str, Any] | None = None) -> bool:
+    """Return True when optimal Kelly sizing is enabled on ``row`` or via ``USE_OPTIMAL_KELLY_MATRIX``."""
+    if isinstance(row, dict) and "use_optimal_kelly_matrix" in row:
+        raw = row.get("use_optimal_kelly_matrix")
+        if isinstance(raw, bool):
+            return raw
+        if raw is not None:
+            txt = str(raw).strip().lower()
+            if txt in _TRUTHY:
+                return True
+            if txt in _FALSY:
+                return False
+    return os.environ.get(OPTIMAL_KELLY_ENV, "").strip().lower() in _TRUTHY
+
+
+def _resolve_entry_reference_price(sig: dict[str, Any], base_row: dict[str, Any]) -> float | None:
+    order_type = str(sig.get("order_type") or "").strip().upper()
+    if order_type == "LIMIT":
+        lim = _finite(sig.get("limit_price"))
+        if lim is not None and lim > 0:
+            return lim
+    for key in ("price_usd", "entry_price", "price"):
+        val = _finite(sig.get(key))
+        if val is None:
+            val = _finite(base_row.get(key))
+        if val is not None and val > 0:
+            return val
+    return None
+
+
+def _expand_regime_take_profit(
+    out_sig: dict[str, Any],
+    base_row: dict[str, Any],
+    decision: RegimeRoutingDecision,
+    *,
+    kelly_enabled: bool,
+) -> None:
+    """Expand native OCO ``take_profit_price`` beyond 5m ``boll_mid`` in State 2 and State 3."""
+    tp_env = os.environ.get(EXPAND_OCO_TP_ENV, "").strip().lower()
+    if tp_env in _FALSY:
+        return
+    if not (kelly_enabled or tp_env in _TRUTHY):
+        return
+    if decision.regime not in (REGIME_2_SHORT_SQUEEZE_BREAKOUT, REGIME_3_CROSS_ASSET_BULL_PULLBACK):
+        return
+
+    tp_0 = _finite(out_sig.get("take_profit_price"))
+    entry_px = _resolve_entry_reference_price(out_sig, base_row)
+    if tp_0 is None or entry_px is None or tp_0 <= entry_px or entry_px <= 0:
+        return
+
+    reward_to_mid = tp_0 - entry_px
+    bar_span = _finite(base_row.get("span"))
+    if bar_span is None or bar_span <= 0:
+        low_px = _finite(base_row.get("low"))
+        if low_px is not None and 0 < low_px < entry_px:
+            bar_span = tp_0 - low_px
+    boll_upper = _finite(base_row.get("boll_upper"))
+
+    if decision.regime == REGIME_2_SHORT_SQUEEZE_BREAKOUT:
+        target_tp = entry_px + reward_to_mid * 2.20
+        if bar_span is not None and bar_span > 0:
+            target_tp = max(target_tp, tp_0 + 1.20 * bar_span)
+        if boll_upper is not None and boll_upper > tp_0:
+            target_tp = max(target_tp, tp_0 + 1.20 * (boll_upper - tp_0))
+    else:
+        target_tp = entry_px + reward_to_mid * 1.80
+        if bar_span is not None and bar_span > 0:
+            target_tp = max(target_tp, tp_0 + 0.80 * bar_span)
+        if boll_upper is not None and boll_upper > target_tp:
+            target_tp = boll_upper
+
+    # Cap single-wave OCO expansion at +18% above entry to guard against malformed inputs
+    target_tp = min(target_tp, entry_px * 1.18)
+    if target_tp <= tp_0:
+        return
+
+    out_sig["take_profit_price_before_regime"] = out_sig.get("take_profit_price")
+    out_sig["regime_tp_expanded"] = True
+    if isinstance(out_sig.get("take_profit_price"), str):
+        out_sig["take_profit_price"] = f"{target_tp:.8f}".rstrip("0").rstrip(".")
+    else:
+        out_sig["take_profit_price"] = round(target_tp, 8)
 
 
 def compute_optimal_ratchet_target_pct(
