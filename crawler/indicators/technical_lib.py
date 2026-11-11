@@ -1,9 +1,12 @@
-"""pandas-ta thin wrapper for ADD-ON technical indicators (RSI/MACD/BOLL).
+"""pandas-ta thin wrapper for ADD-ON technical indicators (RSI/MACD/BOLL/ATR/ADX).
 
 Does NOT replace change_*/volatility_24h/volume_strength — those stay in
 indicators/technical.py. This module only computes library-backed fields
 from a close (price) series. No true OHLC available from pair_history;
-high/low default to close.
+high/low default to close (ATR/ADX then use H=L=close — limited fidelity).
+
+atr_14 / adx_14 are computed for downstream/compare use only — they are NOT
+in TOKEN_INDICATOR_COLS / SQL and must not be written to token_indicators.
 
 Import: pandas-ta-classic exposes ``pandas_ta_classic`` (not ``pandas_ta``).
 When ``pandas`` / ``pandas_ta`` are unavailable in a lightweight runtime,
@@ -163,12 +166,15 @@ def compute_pandas_ta(
     low: list[float] | None = None,
 ) -> dict[str, float | None]:
     """
-    Compute last-bar RSI(14) / MACD(12,26,9) / BOLL(20,2σ).
+    Compute last-bar RSI(14) / MACD(12,26,9) / BOLL(20,2σ) / ATR(14) / ADX(14).
 
-    Returns keys aligned with token_indicators columns:
+    Returns keys:
       rsi_14, macd, macd_signal, macd_hist,
-      boll_upper, boll_mid, boll_lower
-    Missing / insufficient history → None (never raises).
+      boll_upper, boll_mid, boll_lower,
+      atr_14, adx_14
+    rsi/macd/boll align with token_indicators columns; atr_14/adx_14 are
+    compute-only (not persisted). Missing / insufficient history → None
+    (never raises). high/low default to close when omitted.
     """
     empty: dict[str, float | None] = {
         "rsi_14": None,
@@ -178,6 +184,8 @@ def compute_pandas_ta(
         "boll_upper": None,
         "boll_mid": None,
         "boll_lower": None,
+        "atr_14": None,
+        "adx_14": None,
     }
     if not closes or len(closes) < 2:
         return dict(empty)
@@ -209,7 +217,6 @@ def compute_pandas_ta(
     close = pd.Series(closes, dtype="float64")
     hi = pd.Series(high if high is not None else closes, dtype="float64")
     lo = pd.Series(low if low is not None else closes, dtype="float64")
-    _ = hi, lo  # reserved for ATR / future OHLC indicators
     n = len(close)
     out = dict(empty)
 
@@ -290,12 +297,52 @@ def compute_pandas_ta(
     except Exception:  # noqa: BLE001
         pass
 
+    # --- ATR (14); Series named ATRr_14 (or similar) ---
+    try:
+        atr = ta.atr(hi, lo, close, length=14)
+        if atr is not None:
+            if isinstance(atr, pd.DataFrame):
+                atr_col = None
+                for c in atr.columns:
+                    cu = str(c).upper()
+                    if cu.startswith("ATR"):
+                        atr_col = c
+                        break
+                if atr_col is None and len(atr.columns):
+                    atr_col = atr.columns[0]
+                if atr_col is not None:
+                    out["atr_14"] = _finite_or_none(_align(atr[atr_col], n)[-1])
+            else:
+                out["atr_14"] = _finite_or_none(_align(atr, n)[-1])
+    except Exception:  # noqa: BLE001
+        out["atr_14"] = None
+
+    # --- ADX (14); map by ADX_ prefix (ignore DMP_/DMN_) ---
+    try:
+        adx_df = ta.adx(hi, lo, close, length=14)
+        if adx_df is not None and not getattr(adx_df, "empty", False):
+            if isinstance(adx_df, pd.Series):
+                out["adx_14"] = _finite_or_none(_align(adx_df, n)[-1])
+            else:
+                adx_col = None
+                for c in adx_df.columns:
+                    cu = str(c).upper()
+                    if cu.startswith("ADX"):
+                        adx_col = c
+                        break
+                if adx_col is None and len(adx_df.columns):
+                    adx_col = adx_df.columns[0]
+                if adx_col is not None:
+                    out["adx_14"] = _finite_or_none(_align(adx_df[adx_col], n)[-1])
+    except Exception:  # noqa: BLE001
+        out["adx_14"] = None
+
     return out
 
 
 # Aliases matching tutorial naming (boll_up / boll_low)
 def compute_technical_last(closes: list[float]) -> dict[str, float | None]:
-    """Same as compute_pandas_ta; also exposes boll_up/boll_low aliases."""
+    """Same as compute_pandas_ta; also exposes boll_up/boll_low aliases + atr/adx."""
     out = compute_pandas_ta(closes)
     out["boll_up"] = out.get("boll_upper")
     out["boll_low"] = out.get("boll_lower")
