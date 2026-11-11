@@ -312,14 +312,20 @@ class CollectorDoesNotSupplyState3FieldsTests(unittest.TestCase):
 
 class StateRoutingTests(unittest.TestCase):
     def test_state3_doc_thresholds_and_missing_fields(self) -> None:
-        thin = evaluate_five_state_regime(_bull(obi_top5=-0.25, taker_buy_ratio=0.80))
+        thin = evaluate_five_state_regime(_bull(obi_top5=-0.25, taker_buy_ratio=0.40))
         self.assertFalse(thin.allow_buy)
         self.assertEqual(thin.reject_reason, "regime3_thin_bid_book_trap")
+        strong_taker = evaluate_five_state_regime(_bull(obi_top5=-0.25, taker_buy_ratio=0.80))
+        self.assertTrue(strong_taker.allow_buy)
         climax = evaluate_five_state_regime(
-            _bull(volume_z=3.8, whale_retail_divergence=1.5)
+            _bull(volume_z=3.8, whale_retail_divergence=0.55)
         )
         self.assertFalse(climax.allow_buy)
         self.assertEqual(climax.reject_reason, "regime3_climax_volume_distribution_trap")
+        not_distributing = evaluate_five_state_regime(
+            _bull(volume_z=3.8, whale_retail_divergence=1.5)
+        )
+        self.assertTrue(not_distributing.allow_buy)
         absent = evaluate_five_state_regime(_bull())
         self.assertTrue(absent.allow_buy)
         self.assertIsNone(absent.reject_reason)

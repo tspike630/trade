@@ -177,29 +177,52 @@ class ProductionGateTests(unittest.TestCase):
         now_ms = int(time.time() * 1000)
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "book.db"
+            deriv = Path(tmp) / "deriv.db"
             _build(db, now_ms)
+            deriv_conn = sqlite3.connect(deriv)
+            deriv_conn.execute(
+                """
+                CREATE TABLE binance_perp_counterparty (
+                    symbol TEXT, ts_ms INTEGER, whale_retail_divergence REAL
+                )
+                """
+            )
+            deriv_conn.execute(
+                "INSERT INTO binance_perp_counterparty VALUES (?, ?, 0.55)",
+                (_HIGH_Z, now_ms),
+            )
+            deriv_conn.commit()
+            deriv_conn.close()
+            old_deriv = os.environ.get("PUBLIC_DERIVATIVES_DB_PATH")
+            os.environ["PUBLIC_DERIVATIVES_DB_PATH"] = str(deriv)
             adapter = IndicatorDataAdapter(db)
             bus = SignalBus(db, purpose=purpose)
-            engine = DecisionEngine(
-                adapter,
-                bus,
-                [get_strategy("tech_boll_fade_v1")],
-                risk=RiskManager(cooldown_sec=0),
-                hot_limit=20,
-                protection_book=_book(purpose),
-                macro_db=None,
-            )
-            payload = engine.tick()
-            symbols = [str(item.get("token_address") or "") for item in bus.emitted]
-            self.assertEqual(payload.get("emitted"), len(symbols))
-            top = payload.get("live_bnb_top_buys") or {}
-            self.assertEqual(top.get("limit"), 2)
-            stored = sqlite3.connect(db).execute(
-                "SELECT COUNT(*) FROM decision_volume_z"
-            ).fetchone()
-            self.assertEqual(int(stored[0]), len(_UNIVERSE) + len(_OUTSIDE))
-            bus.close()
-            adapter.close()
+            try:
+                engine = DecisionEngine(
+                    adapter,
+                    bus,
+                    [get_strategy("tech_boll_fade_v1")],
+                    risk=RiskManager(cooldown_sec=0),
+                    hot_limit=20,
+                    protection_book=_book(purpose),
+                    macro_db=None,
+                )
+                payload = engine.tick()
+                symbols = [str(item.get("token_address") or "") for item in bus.emitted]
+                self.assertEqual(payload.get("emitted"), len(symbols))
+                top = payload.get("live_bnb_top_buys") or {}
+                self.assertEqual(top.get("limit"), 2)
+                stored = sqlite3.connect(db).execute(
+                    "SELECT COUNT(*) FROM decision_volume_z"
+                ).fetchone()
+                self.assertEqual(int(stored[0]), len(_UNIVERSE) + len(_OUTSIDE))
+            finally:
+                bus.close()
+                adapter.close()
+                if old_deriv is None:
+                    os.environ.pop("PUBLIC_DERIVATIVES_DB_PATH", None)
+                else:
+                    os.environ["PUBLIC_DERIVATIVES_DB_PATH"] = old_deriv
         return symbols
 
     def test_both_arms_keep_universe_top2_floor_and_ledger(self) -> None:
