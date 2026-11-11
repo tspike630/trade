@@ -20,6 +20,7 @@ import os
 import sqlite3
 import sys
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -59,6 +60,13 @@ def default_db_path() -> str:
 
 _ROOT = repo_root()
 DEFAULT_DB_PATH = default_db_path()
+if str(_ROOT) not in sys.path:
+    sys.path.append(str(_ROOT))
+
+try:
+    from decision_engine.core.news_feature_observation_log import record_news_poll
+except ImportError:  # pragma: no cover
+    record_news_poll = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Source tiers (hardcoded table; override via --sources / env later)
@@ -371,6 +379,21 @@ class NewsStore:
             self._conn.rollback()
             return False
 
+    def rows_by_url(self, urls: list[str]) -> list[dict[str, Any]]:
+        """Read ids and timestamps. Does not update onchain_status."""
+        if not urls:
+            return []
+        marks = ",".join("?" for _ in urls)
+        rows = self._conn.execute(
+            f"""
+            SELECT id, source, source_tier, url, published_at, fetched_at, onchain_status
+            FROM news_events
+            WHERE url IN ({marks})
+            """,
+            urls,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS n FROM news_events").fetchone()
         return int(row["n"]) if row else 0
@@ -433,6 +456,8 @@ def run_once(
     db_path: str | None = None,
     source_ids: Optional[list[str]] = None,
     timeout_sec: float = REQUEST_TIMEOUT_SEC,
+    poll_id: str | None = None,
+    observation_log: str | None = None,
 ) -> dict[str, Any]:
     """
     Pull all enabled feeds once; upsert into news_events.
@@ -459,6 +484,8 @@ def run_once(
         "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
     }
 
+    seen_urls: list[str] = []
+    this_poll = poll_id or uuid.uuid4().hex
     with NewsStore(db_path) as store, httpx.Client(
         timeout=timeout_sec,
         follow_redirects=True,
@@ -475,6 +502,7 @@ def run_once(
             stats["sources_ok"] += 1
             for item in items:
                 stats["items_seen"] += 1
+                seen_urls.append(item.url)
                 if store.upsert_item(item, fetched_at=fetched_at):
                     stats["items_written"] += 1
                 else:
@@ -482,7 +510,32 @@ def run_once(
             # polite gap between hosts
             time.sleep(0.15)
         stats["db_total"] = store.count()
+        observed = store.rows_by_url(seen_urls)
+        onchain_before = {row["url"]: row["onchain_status"] for row in observed}
 
+    stats["poll_id"] = this_poll
+    if record_news_poll is None:
+        stats["observation_log"] = {"status": "unavailable", "x_news_status": "unavailable"}
+    else:
+        try:
+            stats["observation_log"] = record_news_poll(
+                observed,
+                poll_id=this_poll,
+                observed_at=fetched_at,
+                log_path=observation_log,
+            )
+            with NewsStore(db_path) as check:
+                after = {row["url"]: row["onchain_status"] for row in check.rows_by_url(seen_urls)}
+            if after != onchain_before:
+                stats["observation_log"]["source_onchain_status_changed"] = True
+        except Exception as exc:  # noqa: BLE001
+            # Lock, disk full, or a bad log path must not fail the RSS pull.
+            log.warning("observation log failed: %s", exc)
+            stats["observation_log"] = {
+                "status": "error",
+                "detail": str(exc),
+                "x_news_status": "unavailable",
+            }
     return stats
 
 
