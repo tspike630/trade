@@ -160,6 +160,7 @@ class OrderbookGateAndTcaTests(unittest.TestCase):
                 production_book=REST_BOOK,
                 rest_expected={"account_type": "SPOT", "usdt_free": "500"},
                 orderbook_gate=True,
+                auto_flatten_on_oco_fail=True,
             )
             res_blocked = adapter.execute(sig)
             self.assertFalse(res_blocked["ok"])

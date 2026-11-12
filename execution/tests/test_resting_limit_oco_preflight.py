@@ -942,7 +942,13 @@ class ClassicMarkBandTests(unittest.TestCase):
         self._net.stop()
         self._tmp.cleanup()
 
-    def _run(self, mark: str | None, *, ticker_error: Exception | None = None) -> tuple[dict[str, Any], _Book]:
+    def _run(
+        self,
+        mark: str | None,
+        *,
+        ticker_error: Exception | None = None,
+        auto_flatten: bool = False,
+    ) -> tuple[dict[str, Any], _Book]:
         marks = [] if mark is None else [mark]
         client = _Book(
             symbol="BNBUSDT",
@@ -966,6 +972,7 @@ class ClassicMarkBandTests(unittest.TestCase):
             account_snapshot=_BOUND,
             production_book=REST_BOOK,
             rest_expected=_EXPECTED,
+            auto_flatten_on_oco_fail=auto_flatten,
         )
         signal = {
             "decision_log_id": 148631,
@@ -995,13 +1002,21 @@ class ClassicMarkBandTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             return adapter.execute(signal), client
 
-    def test_classic_market_inside_the_band_is_protected(self) -> None:
+    def test_classic_market_inside_the_band_is_not_sent_under_defaults(self) -> None:
         result, client = self._run("102")
+        self.assertEqual(result["error"], "buy_protection_unconfigured", result)
+        self.assertTrue(result["oco_preflight"]["mark_inside_band"])
+        self.assertEqual(result["oco_preflight"]["reference"], "live_mark")
+        self.assertEqual(_names(client, "new_order"), [])
+        self.assertEqual(_names(client, "new_oco"), [])
+        self.assertEqual(result["exit_plan"]["price_source"], CLASSIC_EXIT_SHELL)
+
+    def test_classic_market_inside_the_band_posts_oco_when_flatten_is_configured(self) -> None:
+        result, client = self._run("102", auto_flatten=True)
         self.assertTrue(result["ok"], result)
+        self.assertEqual(result["protection_state"], "oco_working")
         self.assertEqual(_form(client, "new_order", side="BUY")["type"], ["MARKET"])
         self.assertEqual(_names(client, "new_oco"), ["new_oco"])
-        self.assertEqual(result["oco_preflight"]["reference"], "live_mark")
-        self.assertEqual(result["exit_plan"]["price_source"], CLASSIC_EXIT_SHELL)
 
     def test_classic_market_at_or_beyond_stop_or_target_refuses(self) -> None:
         for mark in ("95", "110", "94.99"):

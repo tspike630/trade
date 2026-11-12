@@ -215,6 +215,7 @@ class ResidualS6Tests(unittest.TestCase):
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
+            auto_flatten_on_oco_fail=True,
             account_snapshot={
                 "accountType": "SPOT",
                 "canTrade": True,
@@ -428,19 +429,13 @@ class ResidualS6Tests(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             with self._gateway() as gw:
                 opened = gw.process_one(_row())
-                # Inside the band: rejection is recorded and no market sell is forced.
-                quiet = tick_live_bnb_exits(
-                    gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "100"}
-                )
                 row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertFalse(quiet[0]["submitted"], quiet[0])
-        self.assertNotEqual(quiet[0]["protection"], "exchange_oco")
-        self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
-        assert row is not None
-        self.assertEqual(row["status"], "oco_failed")
-        self.assertNotEqual(row["protection"], "exchange_oco")
-        self.assertTrue(str(opened["error"]).startswith("oco_rejected:"), opened["error"])
         self.assertEqual(opened["executed"], 0)
+        assert row is not None
+        self.assertEqual(row["status"], "closed")
+        self.assertEqual(row["protection"], "auto_flatten")
+        self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
+        self.assertEqual(opened["exec_result"]["protection_state"], "exited")
 
     def test_exchange_fill_and_expiry_are_reconciled(self) -> None:
         env = _env(self.root, enabled="1")
@@ -549,12 +544,10 @@ class ResidualS6Tests(unittest.TestCase):
                     gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "100"}
                 )
                 woke_row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertEqual(woke[0]["book"], "oco_failed", woke[0])
         assert woke_row is not None
-        self.assertEqual(woke_row["status"], "oco_failed")
-        self.assertEqual(woke_row["last_error"], "oco_terminal_unfilled")
-        self.assertNotEqual(woke_row["protection"], "exchange_oco")
-        self.assertFalse(any(call[0] == "new_order" for call in self.client.calls))
+        self.assertEqual(woke_row["status"], "closed", woke)
+        self.assertEqual(woke_row["protection"], "auto_flatten")
+        self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
 
     def test_entry_floor_fee_and_dust_archive(self) -> None:
         self.assertEqual(ENTRY_MIN_NOTIONAL_USDT, 20)

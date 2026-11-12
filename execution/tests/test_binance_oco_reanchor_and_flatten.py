@@ -203,7 +203,7 @@ class OcoReanchorAndAutoFlattenTests(unittest.TestCase):
             os.environ,
             self._env(BINANCE_SPOT_REANCHOR_OCO_ON_FILL="1"),
         ):
-            res = adapter.execute(_dash_buy())
+            res = self._adapter(client, auto_flatten_on_oco_fail=True).execute(_dash_buy())
         self.assertTrue(res["ok"], res)
         self.assertEqual(res["executed"], 1)
         self.assertTrue(res["consumer_allowed"])

@@ -230,7 +230,7 @@ class SharedLedgerReservationTests(unittest.TestCase):
                 paper_enabled=False,
                 pm_enabled=False,
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
-                binance_spot=_adapter(self.root, client),
+                binance_spot=_adapter(self.root, client, auto_flatten_on_oco_fail=True),
             ) as gw:
                 opened = gw.process_one(_decision_row(mode="live_stub"))
         self.assertEqual(opened["executed"], 1, opened)
@@ -258,6 +258,7 @@ class SharedLedgerReservationTests(unittest.TestCase):
             account_snapshot=snapshot,
             production_book=REST_BOOK,
             rest_expected={"account_type": "SPOT", "usdt_free": "320.00"},
+            auto_flatten_on_oco_fail=True,
         )
         adapter.peer_buy_blocks = read_spot_buy_blocks_readonly(self.root / _FADE)
         extras = _classic_extras(quote_order_qty="30")

@@ -1732,6 +1732,34 @@ class BinanceSpotAdapter:
             )
         )
 
+    def _label_fill_protection(self, result: dict[str, Any], *, qty: str) -> dict[str, Any]:
+        """Name a filled buy that is not a verified OCO and not a filled exit.
+
+        Blocking another buy is not protection. An exchange reject can still
+        leave the coins; this only makes that state explicit.
+        """
+        if _to_decimal(qty) is None:
+            return result
+        arm = result.get("arm_position") if isinstance(result.get("arm_position"), dict) else {}
+        status = str(arm.get("status") or "")
+        protection = str(arm.get("protection") or "")
+        if status == "oco_working" and protection == PROTECTION_EXCHANGE:
+            result["protection_state"] = "oco_working"
+            return result
+        if status == "closed" and protection == PROTECTION_AUTO_FLATTEN:
+            result["protection_state"] = "exited"
+            return result
+        result["protection_state"] = "unprotected"
+        result["manual_action"] = "halt_new_buys_and_manually_close_or_protect_the_fill"
+        log.error(
+            "binance_spot_unprotected symbol=%s qty=%s status=%s error=%s",
+            result.get("symbol"),
+            qty,
+            status,
+            result.get("error"),
+        )
+        return result
+
     def _resting_limit_preflight(
         self,
         *,
@@ -2242,32 +2270,38 @@ class BinanceSpotAdapter:
                 for k in ("status", "protection", "exit_order_id", "exit_reason", "exit_client_order_id", "last_error"):
                     if row.get(k) is not None:
                         arm[k] = row[k]
-                return _result(
-                    ok=False,
-                    dry_run=False,
-                    executed=0,
-                    submitted=False,
-                    error=str(flat.get("error") or detail),
-                    exit_plan=plan,
-                    arm_position=arm,
-                    consumer_allowed=False,
-                    **common,
+                return self._label_fill_protection(
+                    _result(
+                        ok=False,
+                        dry_run=False,
+                        executed=0,
+                        submitted=False,
+                        error=str(flat.get("error") or detail),
+                        exit_plan=plan,
+                        arm_position=arm,
+                        consumer_allowed=False,
+                        **common,
+                    ),
+                    qty=str(arm.get("quantity") or ""),
                 )
             arm["status"] = "oco_failed"
             arm["protection"] = PROTECTION_PENDING
             row["status"] = "oco_failed"
             row["protection"] = PROTECTION_PENDING
             row["last_error"] = detail
-            return _result(
-                ok=False,
-                dry_run=False,
-                executed=0,
-                submitted=False,
-                error=detail,
-                exit_plan=plan,
-                arm_position=arm,
-                consumer_allowed=False,
-                **common,
+            return self._label_fill_protection(
+                _result(
+                    ok=False,
+                    dry_run=False,
+                    executed=0,
+                    submitted=False,
+                    error=detail,
+                    exit_plan=plan,
+                    arm_position=arm,
+                    consumer_allowed=False,
+                    **common,
+                ),
+                qty=str(arm.get("quantity") or ""),
             )
 
         if strict_fill:
@@ -2316,7 +2350,7 @@ class BinanceSpotAdapter:
             arm["status"] = "oco_working"
             arm["protection"] = PROTECTION_EXCHANGE
             arm["quantity"] = row.get("quantity") or qty
-            return _result(
+            covered_result = _result(
                 ok=True,
                 dry_run=False,
                 executed=1,
@@ -2328,6 +2362,8 @@ class BinanceSpotAdapter:
                 consumer_allowed=True,
                 **common,
             )
+            covered_result["protection_state"] = "oco_working"
+            return covered_result
         status = str(row.get("status") or "")
         if status in {"", "open"}:
             status = "oco_failed"
@@ -2355,31 +2391,37 @@ class BinanceSpotAdapter:
                     arm[k] = row[k]
             if row.get("last_error"):
                 oco_fields["last_error"] = row["last_error"]
-            return _result(
+            return self._label_fill_protection(
+                _result(
+                    ok=False,
+                    dry_run=False,
+                    executed=0,
+                    submitted=False,
+                    error=str(flat.get("error") or error),
+                    exit_plan=plan,
+                    arm_position=arm,
+                    oco_fields=oco_fields or None,
+                    exchange_error=exch_err,
+                    consumer_allowed=False,
+                    **common,
+                ),
+                qty=str(arm.get("quantity") or ""),
+            )
+        return self._label_fill_protection(
+            _result(
                 ok=False,
                 dry_run=False,
                 executed=0,
                 submitted=False,
-                error=str(flat.get("error") or error),
+                error=str(error),
                 exit_plan=plan,
                 arm_position=arm,
                 oco_fields=oco_fields or None,
                 exchange_error=exch_err,
                 consumer_allowed=False,
                 **common,
-            )
-        return _result(
-            ok=False,
-            dry_run=False,
-            executed=0,
-            submitted=False,
-            error=str(error),
-            exit_plan=plan,
-            arm_position=arm,
-            oco_fields=oco_fields or None,
-            exchange_error=exch_err,
-            consumer_allowed=False,
-            **common,
+            ),
+            qty=str(arm.get("quantity") or ""),
         )
 
     def _resting_maker_ack(
@@ -2963,6 +3005,27 @@ class BinanceSpotAdapter:
                             executed=0,
                             submitted=False,
                             error=pre_err,
+                            symbol=symbol,
+                            order=None,
+                            exchange_order_id=None,
+                            gates=gates,
+                            exit_plan=plan,
+                            consumer_allowed=False,
+                        )
+                    )
+                if not self._auto_flatten_enabled():
+                    # A MARKET fill can still be left naked if the OCO is
+                    # rejected. Deployed defaults do not sell that fill.
+                    # Do not send the buy. This does not enable auto-flatten.
+                    diag["protection_disposition"] = "unconfigured"
+                    self._oco_preflight = diag
+                    return self._finish(
+                        _result(
+                            ok=False,
+                            dry_run=False,
+                            executed=0,
+                            submitted=False,
+                            error="buy_protection_unconfigured",
                             symbol=symbol,
                             order=None,
                             exchange_order_id=None,

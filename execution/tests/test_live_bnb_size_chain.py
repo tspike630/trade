@@ -147,6 +147,7 @@ class SizeChainTests(unittest.TestCase):
         self.adapter = BinanceSpotAdapter(
             client=self.client,
             kill_switch_path=self.root / "absent-kill",
+            auto_flatten_on_oco_fail=True,
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
@@ -259,12 +260,11 @@ class SizeChainTests(unittest.TestCase):
                 )
             finally:
                 gw.__exit__(None, None, None)
-        self.assertFalse(stopped[0]["submitted"], stopped[0])
-        self.assertEqual(stopped[0]["position_status"], "oco_failed")
-        self.assertNotEqual(stopped[0]["protection"], "exchange_oco")
-        self.assertFalse(
+        self.assertEqual(receipt["exec_result"]["protection_state"], "exited", receipt)
+        self.assertTrue(
             any(c[0] == "new_order" and "side=SELL" in c[1] for c in self.client.calls)
         )
+        self.assertEqual(stopped, [])
 
     def test_long_book_quote_is_sent_at_exchange_precision(self) -> None:
         # 0.05 * 437.63809903 = 21.8819049515. Binance -1111 rejects >8 dp.

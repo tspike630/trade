@@ -378,6 +378,7 @@ class ReceiptPersistenceTests(unittest.TestCase):
             account_snapshot=_BOUND,
             production_book=REST_BOOK,
             rest_expected=_EXPECTED,
+            auto_flatten_on_oco_fail=True,
         )
 
     def test_http_400_is_one_post_and_lands_in_the_ledger(self) -> None:

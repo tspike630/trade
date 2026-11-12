@@ -203,6 +203,7 @@ class ProtectiveExitTests(unittest.TestCase):
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
+            auto_flatten_on_oco_fail=True,
             account_snapshot={
                 "accountType": "SPOT",
                 "canTrade": True,
@@ -442,12 +443,15 @@ class ProtectiveExitTests(unittest.TestCase):
         def new_order(signed_query: str, *, api_key: str) -> dict[str, Any]:
             self.client.calls.append(("new_order", signed_query, api_key))
             if "side=SELL" in signed_query:
-                return {"orderId": "77", "status": "FILLED"}
+                qty = parse_qs(signed_query).get("quantity", ["1.23"])[0]
+                return {"orderId": "77", "status": "FILLED", "executedQty": qty, "origQty": qty}
             return {"orderId": "99", "status": "NEW"}
 
         def get_order(signed_query: str, *, api_key: str) -> dict[str, Any]:
             self.client.calls.append(("get_order", signed_query, api_key))
             self.assertNotIn("test-secret", signed_query)
+            if "origClientOrderId" in signed_query:
+                raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
             return {"orderId": "99", "status": "FILLED", "executedQty": "1.239"}
 
         self.client.new_order = new_order  # type: ignore[method-assign]
@@ -465,14 +469,13 @@ class ProtectiveExitTests(unittest.TestCase):
                     {"BNBUSDT": "98"},
                 )
                 row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertEqual(exits[0]["position_status"], "oco_failed")
-        self.assertEqual(exits[0]["error"], "oco_price_restriction")
-        self.assertFalse(exits[0]["submitted"])
-        self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
+        self.assertEqual(exits[0]["position_status"], "closed", exits[0])
+        self.assertEqual(row["protection"], "auto_flatten")
+        self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
         assert row is not None
-        self.assertEqual(row["status"], "oco_failed")
+        self.assertEqual(row["status"], "closed")
         self.assertIn("orderId=99", next(call[1] for call in self.client.calls if call[0] == "get_order"))
-        self.assertEqual(_sell_forms(self.client), [])
+        self.assertEqual(_sell_forms(self.client)[0]["side"], ["SELL"])
 
     def test_http_failure_keeps_the_position_open_and_retries_one_client_id(self) -> None:
         self.client = _Client(fail_sells=1)
@@ -764,30 +767,10 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, env):
             filled = adapter.execute(self._dash_buy())
-        self.assertEqual(filled["error"], "oco_unprotectable:oco_price_restriction")
-        self.assertEqual(filled["arm_position"]["status"], "oco_failed")
-        self.assertEqual(filled["arm_position"]["stop_price"], "48.02605")
-        self.assertEqual(filled["arm_position"]["take_profit_price"], "48.2895")
-        self.assertEqual(filled["executed"], 0)
-        self.assertEqual(sum(1 for call in client.calls if call[0] == "new_order"), 1)
+        self.assertEqual(filled["error"], "buy_protection_unconfigured")
+        self.assertIsNone(filled.get("arm_position"))
+        self.assertFalse(any(call[0] == "new_order" for call in client.calls))
         self.assertFalse(any(call[0] == "new_oco" for call in client.calls))
-        adapter.buy_blocks = [filled["arm_position"]]
-        with mock.patch.dict(os.environ, env):
-            blocked = adapter.execute(
-                {
-                    **self._dash_buy(),
-                    "decision_log_id": 148593,
-                    "token_address": "ETHUSDT",
-                    "extras": {
-                        **self._dash_buy()["extras"],
-                        "binance_symbol": "ETHUSDT",
-                        "price_usd": "100",
-                        "stop_price": "90",
-                        "take_profit_price": "120",
-                    },
-                }
-            )
-        self.assertEqual(blocked["error"], "oco_failed_blocks_buy")
 
     def test_absent_list_code_is_not_a_working_oco_and_does_not_repost(self) -> None:
         class _Query:

@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "crawler"))
 from execution.executors.binance_mcp_broker import LiveMCPBroker  # noqa: E402
 from execution.executors.binance_spot import (  # noqa: E402
     CLASSIC_EXIT_SHELL,
+    BinanceRequestError,
     BinanceSpotAdapter,
 )
 from execution.executors.binance_spot_gate import (  # noqa: E402
@@ -190,7 +191,7 @@ def _decision_row(**overrides: Any) -> dict[str, Any]:
     }
 
 
-def _adapter(root: Path, client: _Client | None = None) -> BinanceSpotAdapter:
+def _adapter(root: Path, client: _Client | None = None, **kwargs: Any) -> BinanceSpotAdapter:
     return BinanceSpotAdapter(
         client=client if client is not None else _Client(),
         kill_switch_path=root / "absent-kill",
@@ -200,6 +201,7 @@ def _adapter(root: Path, client: _Client | None = None) -> BinanceSpotAdapter:
         account_snapshot=_BOUND,
         production_book=REST_BOOK,
         rest_expected=_EXPECTED,
+        **kwargs,
     )
 
 
@@ -265,7 +267,7 @@ class ClassicPurposeTests(unittest.TestCase):
 
     def test_live_buy_posts_native_oco_both_legs_from_signal_prices(self) -> None:
         client = _Client()
-        adapter = _adapter(self.root, client)
+        adapter = _adapter(self.root, client, auto_flatten_on_oco_fail=True)
         with mock.patch.dict(os.environ, _env(self.root)):
             covered = adapter.execute(
                 _sig(
@@ -391,7 +393,7 @@ class ClassicPurposeTests(unittest.TestCase):
         )
 
         client = _Client()
-        adapter = _adapter(self.root, client)
+        adapter = _adapter(self.root, client, auto_flatten_on_oco_fail=True)
         adapter.buy_blocks = [fade_open]
         with mock.patch.dict(os.environ, _env(self.root)):
             opened = adapter.execute(_sig(mode="live_stub"))
@@ -409,7 +411,7 @@ class ClassicPurposeTests(unittest.TestCase):
 
         # Fade holds CFGUSDT. A fade buy of BNBUSDT is another symbol on that arm.
         fade_client = _Client()
-        fade = _adapter(self.root, fade_client)
+        fade = _adapter(self.root, fade_client, auto_flatten_on_oco_fail=True)
         fade.buy_blocks = [fade_open]
         with mock.patch.dict(os.environ, _env(self.root)):
             fade_bnb = fade.execute(
@@ -460,6 +462,207 @@ class ClassicPurposeTests(unittest.TestCase):
             )
         self.assertEqual(refused["error"], "position_open_blocks_buy")
         self.assertEqual(off_client.calls, [])
+
+
+class ClassicMarketProtectionTests(unittest.TestCase):
+    """Deployed switches leave a rejected OCO unsold. Do not send the buy."""
+
+    def setUp(self) -> None:
+        self._net = mock.patch(
+            "execution.executors.binance_spot.urllib.request.urlopen",
+            side_effect=AssertionError("live binance HTTP is disabled in tests"),
+        )
+        self._net.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._net.stop()
+        self._tmp.cleanup()
+
+    def test_defaults_do_not_submit_the_classic_market_repro(self) -> None:
+        client = _Client()
+
+        def _reject_oco(signed_query: str, *, api_key: str) -> dict[str, Any]:
+            client.calls.append(("new_oco", signed_query, api_key))
+            raise BinanceRequestError(400, code=-2010, msg="Account has insufficient balance")
+
+        client.new_oco = _reject_oco  # type: ignore[method-assign]
+        adapter = _adapter(self.root, client)
+        with mock.patch.dict(os.environ, _env(self.root)):
+            result = adapter.execute(
+                _sig(
+                    mode="live_stub",
+                    extras=_classic_extras(price_usd="100", stop_price="95", take_profit_price="110"),
+                )
+            )
+        self.assertEqual(result["error"], "buy_protection_unconfigured", result)
+        self.assertFalse(result["submitted"])
+        self.assertIsNone(result.get("arm_position"))
+        self.assertEqual(result["oco_preflight"]["reference"], "live_mark")
+        self.assertEqual(result["oco_preflight"]["protection_disposition"], "unconfigured")
+        kinds = [call[0] for call in client.calls]
+        self.assertNotIn("new_order", kinds)
+        self.assertNotIn("new_oco", kinds)
+        self.assertNotIn("oco_failed", str(result["error"]))
+
+    def test_configured_flatten_sells_the_net_fill_after_oco_rejection(self) -> None:
+        class _Reject:
+            def __init__(self) -> None:
+                self.calls: list[tuple[Any, ...]] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                self.calls.append(("exchange_info", symbol))
+                return _INFO
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                self.calls.append(("ticker_price", symbol))
+                return {"symbol": symbol, "price": "102"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_order", signed_query, api_key))
+                form = parse_qs(signed_query)
+                if form.get("side") == ["SELL"]:
+                    return {
+                        "orderId": "7701",
+                        "status": "FILLED",
+                        "executedQty": form.get("quantity", ["0"])[0],
+                        "origQty": form.get("quantity", ["0"])[0],
+                        "symbol": "BNBUSDT",
+                    }
+                return {
+                    "orderId": "99",
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                    "cummulativeQuoteQty": "25.5",
+                    "fills": [
+                        {
+                            "commission": "0.001",
+                            "commissionAsset": "BNB",
+                            "qty": "0.25",
+                        }
+                    ],
+                    "symbol": "BNBUSDT",
+                }
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_oco", signed_query, api_key))
+                raise BinanceRequestError(400, code=-2010, msg="Account has insufficient balance")
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("get_order_list", signed_query, api_key))
+                raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+
+            def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("get_order", signed_query, api_key))
+                raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+
+        client = _Reject()
+        adapter = _adapter(self.root, client, auto_flatten_on_oco_fail=True)  # type: ignore[arg-type]
+        with mock.patch.dict(os.environ, _env(self.root)):
+            result = adapter.execute(
+                _sig(
+                    mode="live_stub",
+                    extras=_classic_extras(
+                        quote_order_qty="25",
+                        price_usd="100",
+                        stop_price="95",
+                        take_profit_price="110",
+                    ),
+                )
+            )
+        kinds = [call[0] for call in client.calls]
+        self.assertEqual(kinds.count("new_oco"), 1, kinds)
+        sells = [parse_qs(call[1]) for call in client.calls if call[0] == "new_order" and parse_qs(call[1]).get("side") == ["SELL"]]
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["type"], ["MARKET"])
+        self.assertEqual(sells[0]["quantity"], ["0.24"])
+        self.assertEqual(result["protection_state"], "exited", result)
+        self.assertEqual(result["arm_position"]["status"], "closed")
+        self.assertNotEqual(result["arm_position"]["status"], "oco_failed")
+
+    def test_oco_timeout_does_not_sell_or_repost_before_reconciliation(self) -> None:
+        class _Timeout:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _INFO
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_order")
+                return {
+                    "orderId": "99",
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                    "cummulativeQuoteQty": "25.5",
+                    "symbol": "BNBUSDT",
+                }
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_oco")
+                raise TimeoutError("timed out")
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("get_order_list")
+                raise TimeoutError("list timed out")
+
+        client = _Timeout()
+        adapter = _adapter(self.root, client, auto_flatten_on_oco_fail=True)  # type: ignore[arg-type]
+        with mock.patch.dict(os.environ, _env(self.root)):
+            result = adapter.execute(_sig(mode="live_stub"))
+        self.assertEqual(client.calls.count("new_oco"), 1)
+        self.assertEqual(client.calls.count("new_order"), 1)
+        self.assertEqual(result["protection_state"], "unprotected", result)
+        self.assertEqual(result["manual_action"], "halt_new_buys_and_manually_close_or_protect_the_fill")
+        self.assertIn("oco_submit_timeout", str(result["error"]))
+        self.assertFalse(result["consumer_allowed"])
+
+    def test_rejected_flatten_is_unprotected_not_a_blocked_buy(self) -> None:
+        class _SellReject:
+            def __init__(self) -> None:
+                self.sells = 0
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _INFO
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                form = parse_qs(signed_query)
+                if form.get("side") == ["SELL"]:
+                    self.sells += 1
+                    raise BinanceRequestError(400, code=-2010, msg="Account has insufficient balance")
+                return {
+                    "orderId": "99",
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                    "cummulativeQuoteQty": "25.5",
+                    "symbol": "BNBUSDT",
+                }
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise BinanceRequestError(400, code=-2010, msg="Account has insufficient balance")
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+
+            def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+
+        client = _SellReject()
+        adapter = _adapter(self.root, client, auto_flatten_on_oco_fail=True)  # type: ignore[arg-type]
+        with mock.patch.dict(os.environ, _env(self.root)):
+            result = adapter.execute(_sig(mode="live_stub"))
+        self.assertEqual(client.sells, 1)
+        self.assertEqual(result["protection_state"], "unprotected", result)
+        self.assertEqual(result["manual_action"], "halt_new_buys_and_manually_close_or_protect_the_fill")
+        self.assertFalse(result["consumer_allowed"])
+        self.assertNotEqual(result["arm_position"]["status"], "closed")
 
 
 class ClassicGatewayTests(unittest.TestCase):
@@ -548,7 +751,7 @@ class ClassicGatewayTests(unittest.TestCase):
                 paper_enabled=False,
                 pm_enabled=False,
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
-                binance_spot=_adapter(self.root, client),
+                binance_spot=_adapter(self.root, client, auto_flatten_on_oco_fail=True),
             ) as gw:
                 opened = gw.process_one(_decision_row(mode="live_stub"))
                 self.assertEqual(opened["executed"], 1, opened)

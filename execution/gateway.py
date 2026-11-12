@@ -187,6 +187,10 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
     preflight = result.get("oco_preflight")
     if isinstance(preflight, dict):
         published["oco_preflight"] = dict(preflight)
+    for key in ("protection_state", "manual_action"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            published[key] = value
     exchange_error = public_exchange_error(result.get("exchange_error"))
     if exchange_error is not None:
         published["exchange_error"] = exchange_error
