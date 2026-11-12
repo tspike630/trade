@@ -1803,15 +1803,15 @@ class BinanceSpotAdapter:
         if isinstance(diag, dict):
             diag["ask_age_ms"] = self._resting_ask_age_ms
         self._oco_preflight = diag
-        if pre_err is None and diag.get("mark_inside_band") is False and not self._auto_flatten_enabled():
-            # Deployed defaults leave reanchor and auto-flatten off. An
-            # above-band resting fill cannot host the original OCO, and
-            # blocking the next buy does not close the fill. Do not send
-            # the order unless the existing auto-flatten switch is on.
-            # Reanchor alone is not that switch: a failed OCO would still
-            # leave the coins. A flatten the exchange then rejects remains
-            # the existing emergency residual; this path stays shut until
-            # the operator sets BINANCE_SPOT_AUTO_FLATTEN_ON_OCO_FAIL.
+        if pre_err is None and not self._auto_flatten_enabled():
+            # Every resting buy can fill after the mark has left the original
+            # band, or the OCO can be rejected. Deployed defaults do not
+            # flatten that fill, and blocking the next buy does not close it.
+            # Do not send LIMIT or LIMIT_MAKER unless the existing
+            # auto-flatten switch is already on. Reanchor is not that switch.
+            # This does not turn the switch on. Resting entries stay
+            # unavailable until an operator makes that risk decision.
+            # MARKET is not decided here.
             return extras, plan, pairs, self._refuse_protected_buy(
                 error="resting_protection_unconfigured",
                 symbol=symbol,

@@ -200,6 +200,7 @@ class LimitMakerAndSorTests(unittest.TestCase):
                 production_book=REST_BOOK,
                 rest_expected={"account_type": "SPOT", "usdt_free": "500"},
                 post_only_limit=True,
+                auto_flatten_on_oco_fail=True,
             )
             res = adapter.execute(sig)
             self.assertTrue(res["ok"], res.get("error"))
@@ -244,6 +245,7 @@ class LimitMakerAndSorTests(unittest.TestCase):
                 rest_expected={"account_type": "SPOT", "usdt_free": "500"},
                 orderbook_gate=True,
                 sor_maker_fallback=True,
+                auto_flatten_on_oco_fail=True,
             )
             res = adapter.execute(sig)
             self.assertTrue(res["ok"], res.get("error"))

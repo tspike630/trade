@@ -422,6 +422,7 @@ class PersistenceSafetyTests(unittest.TestCase):
             rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
             post_only_limit=True,
             entry_ttl_sec=180,
+            auto_flatten_on_oco_fail=True,
         )
         result = adapter.execute(
             {
@@ -803,6 +804,7 @@ class PersistenceSafetyTests(unittest.TestCase):
             production_book=REST_BOOK,
             rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
             post_only_limit=True,
+            auto_flatten_on_oco_fail=True,
         )
         result = adapter.execute(
             {
@@ -868,6 +870,7 @@ class PersistenceSafetyTests(unittest.TestCase):
             production_book=REST_BOOK,
             rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
             post_only_limit=False,
+            auto_flatten_on_oco_fail=True,
         )
         result = adapter.execute(
             self._buy({"recommended_order_type": "LIMIT_MAKER", "enable_trailing_ratchet": True})
@@ -995,6 +998,21 @@ class PersistenceSafetyTests(unittest.TestCase):
             rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
             post_only_limit=False,
         )
+        blocked = adapter.execute(
+            {
+                "decision_log_id": 81,
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "mode": "live_stub",
+                "action": stored["action"],
+                "token_address": "FADEUSDT",
+                "size_pct": stored["size_pct"],
+                "extras": extras,
+            }
+        )
+        self.assertEqual(blocked["error"], "resting_protection_unconfigured")
+        self.assertEqual(client.orders, [])
+        self.assertEqual(client.ocos, [])
+        adapter.auto_flatten_on_oco_fail = True
         result = adapter.execute(
             {
                 "decision_log_id": int(stored["id"]) if "id" in stored.keys() else 80,
@@ -1180,6 +1198,7 @@ class PersistenceSafetyTests(unittest.TestCase):
             rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
             post_only_limit=False,
             ws_cache=ws,
+            auto_flatten_on_oco_fail=True,
         )
 
     def test_stale_ws_bid_does_not_override_a_fresh_rest_book(self) -> None:

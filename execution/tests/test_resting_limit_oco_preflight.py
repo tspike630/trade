@@ -436,20 +436,96 @@ class RestingLimitExecutionTests(unittest.TestCase):
         self.assertEqual(_names(client, "new_oco"), [])
         self.assertEqual(result["oco_preflight"]["ceiling_source"], "rest_book")
 
-    def test_in_band_passive_limit_still_rests_with_the_deployed_defaults(self) -> None:
+    def test_reviewer_in_band_rest_is_not_submitted_under_deployed_defaults(self) -> None:
+        """f88a645 admitted this bid, then reconcile at 0.15000 was oco_failed.
+
+        That receipt had no new_oco and no SELL. Deployed defaults must not
+        submit the order. oco_failed is not the success condition.
+        """
+        cases = (
+            ("in_band_then_through_tp", "0.13300", "0.13350"),
+            ("in_band_then_through_sl", "0.13300", "0.13350"),
+            ("partial_fill", "0.13300", "0.13350"),
+            ("full_fill", "0.13300", "0.13350"),
+            ("immediate_fill", "0.13300", "0.13350"),
+            ("missing_postfill_mark", "0.13300", "0.13350"),
+            ("oco_rejection", "0.13300", "0.13350"),
+            ("above_band", _MARK_ABOVE_TP, "0.15000"),
+        )
+        for name, mark, ask in cases:
+            client = _Book(
+                symbol="INITUSDT",
+                filters=_INIT_FILTERS,
+                marks=[mark],
+                asks=[[ask, "1000"]],
+                ack={
+                    "orderId": "810",
+                    "status": "FILLED",
+                    "executedQty": "295",
+                    "cummulativeQuoteQty": "38.9577",
+                    "symbol": "INITUSDT",
+                },
+            )
+            adapter = self._adapter(client, reanchor_oco_on_fill=False, auto_flatten_on_oco_fail=False)
+            with mock.patch.dict(os.environ, self._env()):
+                result = adapter.execute(self._limit_signal())
+            self.assertEqual(result["error"], "resting_protection_unconfigured", name)
+            self.assertFalse(result["submitted"], name)
+            self.assertIsNone(result.get("arm_position"), name)
+            self.assertEqual(_names(client, "new_order"), [], name)
+            self.assertEqual(_names(client, "new_oco"), [], name)
+            self.assertNotIn("oco_failed", str(result.get("error")), name)
+            if name == "above_band":
+                self.assertFalse(result["oco_preflight"]["mark_inside_band"])
+            else:
+                self.assertTrue(result["oco_preflight"]["mark_inside_band"], name)
+        maker = _Book(
+            symbol="INITUSDT",
+            filters=_INIT_FILTERS,
+            marks=["0.13300"],
+            asks=[["0.13350", "1000"]],
+        )
+        maker_adapter = self._adapter(maker)
+        with mock.patch.dict(os.environ, self._env()):
+            maker_result = maker_adapter.execute(self._limit_signal(order_type="LIMIT_MAKER"))
+        self.assertEqual(maker_result["error"], "resting_protection_unconfigured")
+        self.assertEqual(_names(maker, "new_order"), [])
+
+    def test_configured_flatten_sells_when_an_in_band_fill_later_leaves_the_band(self) -> None:
+        """The same 0.15000 reconcile sells only after the operator enables auto-flatten."""
         client = _Book(
             symbol="INITUSDT",
             filters=_INIT_FILTERS,
             marks=["0.13300"],
             asks=[["0.13350", "1000"]],
         )
-        adapter = self._adapter(client)
+        adapter = self._adapter(client, auto_flatten_on_oco_fail=True, reanchor_oco_on_fill=False)
         with mock.patch.dict(os.environ, self._env()):
-            result = adapter.execute(self._limit_signal())
-        self.assertEqual(result["error"], "maker_entry_resting", result)
-        self.assertEqual(_form(client, "new_order", side="BUY")["type"], ["LIMIT"])
+            rested = adapter.execute(self._limit_signal())
+        self.assertEqual(rested["error"], "maker_entry_resting", rested)
+        arm = dict(rested["arm_position"])
+        arm["id"] = 1
+
+        def _filled(signed_query: str, *, api_key: str) -> dict[str, Any]:
+            client.calls.append(("get_order", signed_query, api_key))
+            if "origClientOrderId" in parse_qs(signed_query):
+                raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+            return {
+                "orderId": "810",
+                "symbol": "INITUSDT",
+                "status": "FILLED",
+                "executedQty": "295",
+                "cummulativeQuoteQty": "38.9577",
+            }
+
+        client.get_order = _filled  # type: ignore[method-assign]
+        with mock.patch.dict(os.environ, self._env()):
+            through_tp = adapter.reconcile_resting_entry(arm, mark="0.15000", now_ms=1_700_000_010_000)
         self.assertEqual(_names(client, "new_oco"), [])
-        self.assertTrue(result["oco_preflight"]["mark_inside_band"])
+        self.assertEqual(_form(client, "new_order", side="SELL")["side"], ["SELL"])
+        self.assertEqual(_form(client, "new_order", side="SELL")["type"], ["MARKET"])
+        self.assertNotEqual(through_tp.get("book"), "oco_failed")
+        self.assertIn("auto_flatten", str(through_tp.get("error")))
 
     def test_last_above_the_limit_does_not_hide_an_ask_at_or_through_it(self) -> None:
         for ask in ("0.13206", "0.13200"):
