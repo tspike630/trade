@@ -35,7 +35,11 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
 )
 from execution.executors.binance_spot_protect import ENTRY_MIN_NOTIONAL_USDT  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
-from execution.ledger import ExecutionLedger, initialize_spot_ledger_binding  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 from execution.live_bnb_watchdog import preflight  # noqa: E402
 
 SECRET = "snapshot-secret-not-a-key"
@@ -455,6 +459,7 @@ class ProductionAssemblyTests(unittest.TestCase):
                     accept_purposes=frozenset({"live_bnb_boll_fade"}),
                 ) as gw:
                     initialize_spot_ledger_binding(ledger_path, "1275399777")
+                    bind_registry_membership("1275399777")
                     refused = gw.process_one(self._row())
         finally:
             self._net.start()

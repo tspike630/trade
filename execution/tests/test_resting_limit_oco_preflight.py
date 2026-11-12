@@ -38,7 +38,11 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     PROTECTION_AUTO_FLATTEN,
     buy_entry_oco_preflight,
 )
-from execution.ledger import ExecutionLedger, initialize_spot_ledger_binding  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 from execution.gateway import (  # noqa: E402
     _binance_public_result,
     ExecutionGateway,
@@ -932,6 +936,7 @@ class RestingLimitExecutionTests(unittest.TestCase):
                 binance_spot=adapter,
             ) as gw:
                 initialize_spot_ledger_binding(ledger_path, "424242")
+                bind_registry_membership("424242")
                 processed = gw.process_one(row)
                 stored = gw.ledger.conn.execute(
                     "SELECT receipt_json, executed FROM execution_log WHERE decision_log_id = ?",

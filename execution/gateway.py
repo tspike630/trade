@@ -68,6 +68,7 @@ from execution.ledger import (
     buy_reservation_lock,
     load_ledger_registry,
     read_ledger_account_uid,
+    read_ledger_membership,
     read_peer_spot_blocks,
     read_spot_buy_blocks_readonly,
 )
@@ -96,18 +97,26 @@ def _required_peer_books(
     if error or registry is None:
         return [], error or "ledger_registry_unmapped"
     current_path = Path(current).expanduser().resolve()
-    if current_path not in set(registry.values()):
-        return [], "ledger_registry_unmapped"
+    stored, digest, stored_error = read_ledger_membership(current_path)
+    if stored_error or stored is None or digest is None:
+        return [], stored_error or "ledger_registry_unbound"
+    file_books = {purpose: str(path) for purpose, path in registry.items()}
+    if file_books != stored or current_path.as_posix() not in set(stored.values()):
+        return [], "ledger_registry_incomplete"
     accepted = {str(item).strip() for item in (accept_purposes or set()) if str(item).strip()}
-    if any(item not in registry for item in accepted):
+    if any(item not in stored for item in accepted):
         return [], "ledger_registry_incomplete"
     peer_rows: list[dict[str, Any]] = []
-    for path in registry.values():
+    for path_text in stored.values():
+        path = Path(path_text)
         uid, uid_error = read_ledger_account_uid(path)
         if uid_error:
             return [], uid_error
         if uid != snapshot_uid:
             return [], "ledger_account_mismatch"
+        peer_books, peer_digest, peer_error = read_ledger_membership(path)
+        if peer_error or peer_digest != digest or peer_books != stored:
+            return [], peer_error or "ledger_registry_incomplete"
         if path == current_path:
             continue
         rows, read_error = read_peer_spot_blocks(path)
@@ -1200,6 +1209,16 @@ class ExecutionGateway:
             return
         try:
             armed = self.ledger.arm_binance_spot_position(held)
+            fill = exec_result.get("entry_fill")
+            if isinstance(fill, dict) and armed.get("id") is not None:
+                self.ledger.record_exchange_entry_origin(
+                    int(armed["id"]),
+                    symbol=str(armed.get("symbol") or ""),
+                    placed=fill,
+                )
+                refreshed = self.ledger.binance_spot_position_by_id(int(armed["id"]))
+                if isinstance(refreshed, dict):
+                    armed = refreshed
             oco_fields = exec_result.get("oco_fields")
             if isinstance(oco_fields, dict) and oco_fields and armed.get("id") is not None:
                 updated = self.ledger.update_binance_spot_position(int(armed["id"]), oco_fields)
@@ -1365,6 +1384,7 @@ class ExecutionGateway:
             # cannot spend the sealed free balance twice.
             adapter = self._binance_spot or default_live_bnb_adapter()
             self._binance_spot = adapter
+            adapter.record_entry_origin = self.ledger.record_exchange_entry_origin
             live_buy = action == "buy" and mode != "dry_run"
             reserve = buy_reservation_lock(self.ledger.path) if live_buy else nullcontext()
             with reserve:
@@ -1601,6 +1621,7 @@ class ExecutionGateway:
             return []
         adapter = self._binance_spot or default_live_bnb_adapter()
         self._binance_spot = adapter
+        adapter.record_entry_origin = self.ledger.record_exchange_entry_origin
         outcomes: list[dict[str, Any]] = []
         for row in positions:
             if row.get("status") == "qty_unconfirmed":

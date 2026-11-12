@@ -34,7 +34,11 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     classify_oco,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
-from execution.ledger import ExecutionLedger, initialize_spot_ledger_binding  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 from execution.run import tick_live_bnb_exits  # noqa: E402
 
 _FILTERS = [
@@ -273,6 +277,9 @@ class ResidualS6Tests(unittest.TestCase):
             bound = initialize_spot_ledger_binding(ledger_path, "424242")
             if bound:
                 raise RuntimeError(bound)
+            membership = bind_registry_membership("424242")
+            if membership:
+                raise RuntimeError(membership)
             yield gw
 
     def test_dry_run_submits_nothing(self) -> None:

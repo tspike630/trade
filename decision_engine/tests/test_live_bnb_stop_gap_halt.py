@@ -330,16 +330,15 @@ class ProtectionHaltTests(unittest.TestCase):
             purpose=_FADE,
             book=book,
         )
-        self.assertEqual(len(other), 1)
-        self.assertIsNone(other_report["protection_halt"])
+        self.assertEqual(other, [])
+        self.assertEqual(other_report["protection_halt"], "oco_readback_unverified")
         same, same_report = apply_live_buy_guards(
             [_market("CFGUSDT", 1.0, 0.95), _market("BNBUSDT", 100.0, 95.0)],
             purpose=_FADE,
             book=book,
         )
-        self.assertEqual([item["binance_symbol"] for item in same], ["BNBUSDT"])
-        self.assertIsNone(same_report["protection_halt"])
-        self.assertEqual(same_report["protection_dropped"], 1)
+        self.assertEqual(same, [])
+        self.assertEqual(same_report["protection_halt"], "oco_readback_unverified")
 
     def test_fade_failure_halts_classic_and_not_paper(self) -> None:
         book = ProtectionBook.ready([_held("oco_failed", "DASHUSDT", purpose=_FADE)], [])
@@ -387,7 +386,7 @@ class ProtectionHaltTests(unittest.TestCase):
         with patch.dict(os.environ, {"BINANCE_SPOT_ALLOW_MULTI_SYMBOL": "0"}):
             self.assertEqual(
                 purpose_halt_reason(_FADE, book),
-                "position_open_blocks_buy",
+                "oco_readback_unverified",
             )
 
     def test_ledger_read_is_the_execution_book(self) -> None:

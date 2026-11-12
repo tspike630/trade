@@ -35,7 +35,11 @@ from execution.executors.binance_spot import (  # noqa: E402
 )
 from execution.executors.binance_spot_gate import REST_BOOK  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
-from execution.ledger import ExecutionLedger, initialize_spot_ledger_binding  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 
 _API_KEY = "test-key"
 _API_SECRET = "test-secret"
@@ -422,6 +426,7 @@ class ReceiptPersistenceTests(unittest.TestCase):
                 binance_spot=adapter,
             ) as gw:
                 initialize_spot_ledger_binding(ledger_path, "424242")
+                bind_registry_membership("424242")
                 result = gw.process_one(_decision_row())
                 stored = gw.ledger.conn.execute(
                     "SELECT receipt_json, executed, status FROM execution_log WHERE decision_log_id = ?",

@@ -40,7 +40,11 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     resolve_entry_size,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
-from execution.ledger import ExecutionLedger, initialize_spot_ledger_binding  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 from execution.run import tick_live_bnb_exits  # noqa: E402
 
 _INFO = {
@@ -220,6 +224,9 @@ class SizeChainTests(unittest.TestCase):
         bound = initialize_spot_ledger_binding(ledger_path, "424242")
         if bound:
             raise RuntimeError(bound)
+        membership = bind_registry_membership("424242")
+        if membership:
+            raise RuntimeError(membership)
         self.assertFalse(gw.paper_enabled)
         stats = gw.process_pending()
         self.assertEqual(stats.processed, 1)

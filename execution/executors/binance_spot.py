@@ -1320,10 +1320,10 @@ from execution.binance_ws_stream import default_max_age_ms  # noqa: E402
 from execution.executors.binance_spot_gate import (  # noqa: E402
     REST_BOOK,
     account_book_block,
-    account_unresolved_halt,
     buy_exposure_block,
-    held_net_qty,
+    hard_unresolved_halt,
     oco_readback_covers,
+    row_unresolved_reason,
     cross_arm_symbol_block,
     funding_after_reservation,
     reserved_quote_usdt,
@@ -1979,7 +1979,8 @@ class BinanceSpotAdapter:
         if self.peer_book_error:
             return self.peer_book_error
         shared = list(self.buy_blocks) + list(self.peer_buy_blocks)
-        unresolved = account_unresolved_halt(shared + list(self.canonical_rows))
+        held_rows = shared + list(self.canonical_rows)
+        unresolved = hard_unresolved_halt(held_rows)
         if unresolved:
             return unresolved
         held = buy_exposure_block(
@@ -1993,9 +1994,6 @@ class BinanceSpotAdapter:
         other_arm = cross_arm_symbol_block(shared, purpose=purpose, symbol=symbol)
         if other_arm:
             return other_arm
-        readback = self._working_list_readback_block(shared)
-        if readback:
-            return readback
         planned = None
         if isinstance(self._size_plan, dict):
             planned = self._size_plan.get("quote_usdt")
@@ -2003,31 +2001,101 @@ class BinanceSpotAdapter:
             planned = sig.get("extras", {}).get("quote_order_qty") if isinstance(sig.get("extras"), dict) else None
             if planned in (None, "") and isinstance(sig.get("extras"), dict):
                 planned = sig["extras"].get("quoteOrderQty")
-        return funding_after_reservation(
+        funding = funding_after_reservation(
             snapshot_usdt_free(self.account_snapshot),
             ENTRY_MIN_NOTIONAL_USDT,
             planned,
             reserved_quote_usdt(shared),
         )
+        if funding:
+            return funding
+        return self._exchange_evidence_halt(held_rows)
 
-    def _working_list_readback_block(self, rows: list[dict[str, Any]]) -> str | None:
-        """Re-read each claimed working list in this process. Stored ids are not proof."""
+    def _exchange_evidence_halt(self, rows: list[dict[str, Any]]) -> str | None:
+        """Clear a working list or a zeroed exit only from this call's reads.
+
+        The entry net is the fee-net on the entry order. A local quantity is
+        not that net. A local ``exit_filled_qty`` is not a sell. Each OCO leg
+        must still cover whatever the entry read shows is unsold.
+        """
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            status = str(row.get("status") or "")
-            if status not in {"oco_working", "open"}:
+            purpose = str(row.get("purpose") or "").strip()
+            if purpose and purpose not in {
+                PURPOSE_LIVE_BNB_BOLL_FADE,
+                PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+            }:
                 continue
-            if str(row.get("protection") or "") != "exchange_oco":
+            reason = row_unresolved_reason(row)
+            if reason not in {"oco_readback_unverified", "exit_readback_unverified"}:
                 continue
-            if not self._current_list_covers(row):
-                return "oco_readback_unverified"
+            entry_net = self._live_order_net(
+                row,
+                order_id=str(row.get("entry_order_id") or ""),
+                side="BUY",
+            )
+            if entry_net is None:
+                return "entry_origin_unverified"
+            exit_id = str(row.get("exit_order_id") or "").strip()
+            if exit_id:
+                exit_net = self._live_order_net(row, order_id=exit_id, side="SELL")
+                if exit_net is None:
+                    return "exit_readback_unverified"
+            else:
+                exit_net = Decimal("0")
+            still = entry_net - exit_net
+            if still <= 0:
+                continue
+            if not self._current_list_covers(row, still):
+                return reason
         return None
 
-    def _current_list_covers(self, row: dict[str, Any]) -> bool:
+    def _live_order_net(self, row: dict[str, Any], *, order_id: str, side: str) -> Decimal | None:
+        symbol = str(row.get("symbol") or "").strip()
+        order_id = order_id.strip()
+        if not symbol or not order_id:
+            return None
+        client = self._trade_client()
+        query = getattr(client, "get_order", None) if client is not None else None
+        if not callable(query):
+            return None
+        key, secret = self._credentials()
+        if not key or not secret:
+            return None
+        pairs = [
+            ("symbol", symbol),
+            ("orderId", order_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            payload = query(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("symbol") or "").strip().upper() != symbol.upper():
+            return None
+        if str(payload.get("orderId") or "").strip() != order_id:
+            return None
+        if str(payload.get("side") or "").strip().upper() != side:
+            return None
+        if str(payload.get("status") or "").strip().upper() not in {"FILLED", "PARTIALLY_FILLED"}:
+            return None
+        net_text = sellable_base_qty(payload, symbol)
+        if net_text is None:
+            return None
+        net = Decimal(net_text)
+        if not net.is_finite() or net <= 0:
+            return None
+        return net
+
+    def _current_list_covers(self, row: dict[str, Any], held: Decimal) -> bool:
         list_id = str(row.get("oco_order_list_id") or "").strip()
         symbol = str(row.get("symbol") or "").strip()
-        held = held_net_qty(row)
         if not list_id or not symbol or held <= 0:
             return False
         client = self._trade_client()
@@ -2049,7 +2117,14 @@ class BinanceSpotAdapter:
             if isinstance(exc, AssertionError):
                 raise
             return False
-        return oco_readback_covers(payload, symbol=symbol, held_net=held, list_id=list_id)
+        return oco_readback_covers(
+            payload,
+            symbol=symbol,
+            held_net=held,
+            list_id=list_id,
+            above_id=row.get("oco_above_order_id"),
+            below_id=row.get("oco_below_order_id"),
+        )
 
     def _auto_flatten_naked_position(
         self,
@@ -3413,21 +3488,22 @@ class BinanceSpotAdapter:
                 )
             )
         if side_now == "BUY":
-            return self._finish(
-                self._buy_with_native_oco(
-                    sig,
-                    plan=plan,
-                    gates=gates,
-                    intent=intent,
-                    pairs=pairs,
-                    order_id=str(order_id),
-                    filled=filled,
-                    sellable=sellable,
-                    info=info,
-                    symbol=symbol,
-                    placed=placed,
-                )
+            bought = self._buy_with_native_oco(
+                sig,
+                plan=plan,
+                gates=gates,
+                intent=intent,
+                pairs=pairs,
+                order_id=str(order_id),
+                filled=filled,
+                sellable=sellable,
+                info=info,
+                symbol=symbol,
+                placed=placed,
             )
+            if isinstance(placed, dict):
+                bought["entry_fill"] = placed
+            return self._finish(bought)
         return self._finish(
             _result(
                 ok=True,
@@ -4105,6 +4181,13 @@ class BinanceSpotAdapter:
             if avg_px:
                 upd["entry_price"] = avg_px
             save(upd)
+            recorder = getattr(self, "record_entry_origin", None)
+            if callable(recorder) and row.get("id") is not None:
+                recorder(
+                    int(row["id"]),
+                    symbol=str(row.get("symbol") or ""),
+                    placed=payload if isinstance(payload, dict) else {},
+                )
             if _to_decimal(mark) is None:
                 detail = "oco_unprotectable:mark_unavailable"
                 if self._auto_flatten_enabled():

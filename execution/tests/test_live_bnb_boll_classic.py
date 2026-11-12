@@ -28,6 +28,7 @@ from execution.executors.binance_spot import (  # noqa: E402
     BinanceSpotAdapter,
 )
 from execution.executors.binance_spot_gate import (  # noqa: E402
+    row_unresolved_reason,  # noqa: E402
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
     REST_BOOK,
@@ -42,6 +43,7 @@ from execution.gateway import BINANCE_SPOT_EXECUTOR, ExecutionGateway  # noqa: E
 from execution.ledger import (  # noqa: E402
     ExecutionLedger,
     LEDGER_REGISTRY_ENV,
+    bind_registry_membership,
     initialize_spot_ledger_binding,
 )
 from execution.run import _peer_isolation_guard, tick_live_bnb_exits  # noqa: E402
@@ -122,8 +124,22 @@ class _Client:
         for report in body["orderReports"]:
             report["symbol"] = symbol
             report["origQty"] = "100"
+            report["executedQty"] = "0"
             report["status"] = "NEW"
         return body
+
+    def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        self.calls.append(("get_order", signed_query, api_key))
+        form = parse_qs(signed_query)
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["1"])[0]
+        return {
+            "symbol": symbol,
+            "orderId": int(order_id),
+            "side": "BUY",
+            "status": "FILLED",
+            "executedQty": "100",
+        }
 
     def ticker_price(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("ticker_price", symbol))
@@ -347,8 +363,8 @@ class ClassicPurposeTests(unittest.TestCase):
             "protection": "exchange_oco",
             "entry_order_id": "9",
             "oco_order_list_id": "3",
-            "oco_above_order_id": "4",
-            "oco_below_order_id": "5",
+            "oco_above_order_id": "11",
+            "oco_below_order_id": "10",
             "quantity": "1",
         }
         # No buy symbol: fail closed, same as the old one-open arm block.
@@ -794,6 +810,9 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
             bound = initialize_spot_ledger_binding(ledger_path, "424242")
             if bound:
                 raise RuntimeError(bound)
+            membership = bind_registry_membership("424242")
+            if membership:
+                raise RuntimeError(membership)
             yield gateway
 
     def test_dust_remainder_is_persisted_and_blocks_the_next_same_purpose_buy(self) -> None:
@@ -987,6 +1006,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 ),
             ) as gw:
                 initialize_spot_ledger_binding(classic, "424242")
+                bind_registry_membership("424242")
             client = _Client()
             with ExecutionGateway(
                 decision_db=self.root / "decision-classic.db",
@@ -1063,6 +1083,26 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 binance_spot=_adapter(self.root, _Client(), auto_flatten_on_oco_fail=True),
             ):
                 pass
+            ExecutionLedger(fade).close()
+            reg_path = self.root / "registry-missing.json"
+            reg_path.write_text(
+                json.dumps(
+                    {
+                        "required_purposes": [
+                            "live_bnb_boll_fade",
+                            "live_bnb_boll_classic",
+                        ],
+                        "purpose_ledgers": {
+                            "live_bnb_boll_fade": str(fade.resolve()),
+                            "live_bnb_boll_classic": str(classic.resolve()),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.environ[LEDGER_REGISTRY_ENV] = str(reg_path)
+            bind_registry_membership("424242")
+            fade.unlink()
             absent = _run(
                 classic,
                 {
@@ -1082,7 +1122,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
     def test_unreadable_peer_ledger_blocks_the_buy(self) -> None:
         classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
         fade = self.root / "execution_ledger_live_bnb_boll_fade.db"
-        fade.write_bytes(b"not a sqlite ledger")
+        ExecutionLedger(fade).close()
         snapshot = dict(_BOUND)
         snapshot["uid"] = 424242
         registry = self.root / "registry-bad.json"
@@ -1115,6 +1155,8 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 ),
             ) as gw:
                 initialize_spot_ledger_binding(classic, "424242")
+                bind_registry_membership("424242")
+                fade.write_bytes(b"not a sqlite ledger")
                 refused = gw.process_one(_decision_row(mode="live_stub"))
         self.assertEqual(refused["error"], "peer_ledger_unreadable", refused)
         self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
@@ -1151,6 +1193,17 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 if self.list_payload is not None:
                     return self.list_payload
                 raise TimeoutError("list timed out")
+
+            def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("get_order", signed_query))
+                form = parse_qs(signed_query)
+                return {
+                    "symbol": (form.get("symbol") or ["BNBUSDT"])[0],
+                    "orderId": int((form.get("orderId") or ["99"])[0]),
+                    "side": "BUY",
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                }
 
         client = _Timeout()
         purposes = frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSE_LIVE_BNB_BOLL_FADE})
@@ -1271,6 +1324,17 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 self.calls.append(("new_order", signed_query))
                 raise AssertionError("forged state must not buy")
 
+            def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("get_order", signed_query))
+                form = parse_qs(signed_query)
+                return {
+                    "symbol": (form.get("symbol") or ["BNBUSDT"])[0],
+                    "orderId": int((form.get("orderId") or ["99"])[0]),
+                    "side": "BUY",
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                }
+
             def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
                 self.calls.append(("get_order_list", signed_query))
                 form = parse_qs(signed_query)
@@ -1288,6 +1352,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                             "type": "LIMIT_MAKER",
                             "status": "NEW",
                             "origQty": "0.001",
+                            "executedQty": "0",
                         },
                         {
                             "symbol": "DOGEUSDT" if list_id == "999" else symbol,
@@ -1295,6 +1360,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                             "type": "STOP_LOSS_LIMIT",
                             "status": "NEW",
                             "origQty": "0.001",
+                            "executedQty": "0",
                         },
                     ],
                 }
@@ -1362,7 +1428,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 kept = gw.ledger.binance_spot_position_by_id(kept_id)
         self.assertEqual(after, before)
         self.assertEqual(forged["error"], "oco_readback_unverified", forged)
-        self.assertEqual(zeroed["error"], "unprotected_position_blocks_buy", zeroed)
+        self.assertEqual(zeroed["error"], "exit_readback_unverified", zeroed)
         self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
         self.assertFalse(
             oco_readback_covers(
@@ -1372,19 +1438,243 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                     "listOrderStatus": "EXECUTING",
                     "listStatusType": "EXEC_STARTED",
                     "orderReports": [
-                        {"symbol": "DOGEUSDT", "orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "origQty": "0.001"},
-                        {"symbol": "DOGEUSDT", "orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "origQty": "0.001"},
+                        {"symbol": "DOGEUSDT", "orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "origQty": "0.001", "executedQty": "0"},
+                        {"symbol": "DOGEUSDT", "orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "origQty": "0.001", "executedQty": "0"},
                     ],
                 },
                 symbol="BNBUSDT",
                 held_net=Decimal("0.25"),
                 list_id="999",
+                above_id="998",
+                below_id="997",
             )
         )
         assert kept is not None
         self.assertEqual(kept["symbol"], "BNBUSDT")
-        self.assertEqual(kept["entry_order_qty"], "0.25")
+        self.assertFalse(str(kept.get("entry_order_qty") or "").strip())
         self.assertEqual(kept["entry_order_id"], "99")
+
+    def test_origin_insert_update_and_leg_gaps_do_not_unlock(self) -> None:
+        ledger = ExecutionLedger(self.root / "origin.db")
+        overridden = ledger.arm_binance_spot_position(
+            {
+                "decision_log_id": 1,
+                "symbol": "BNBUSDT",
+                "purpose": PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+                "status": "open",
+                "quantity": "0.249",
+                "entry_order_qty": "0.25",
+                "stop_price": "95",
+                "take_profit_price": "110",
+                "entry_order_id": "99",
+                "protection": "exchange_oco",
+            }
+        )
+        self.assertEqual(overridden["quantity"], "0.249")
+        self.assertEqual(overridden["entry_order_qty"], "0.25")
+        self.assertEqual(
+            row_unresolved_reason({**overridden, "quantity": "-1"}),
+            "unprotected_position_blocks_buy",
+        )
+        self.assertEqual(
+            row_unresolved_reason({**overridden, "quantity": "NaN"}),
+            "unprotected_position_blocks_buy",
+        )
+        bare = ledger.arm_binance_spot_position(
+            {
+                "decision_log_id": 2,
+                "symbol": "ETHUSDT",
+                "purpose": PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+                "status": "open",
+                "quantity": "1",
+                "stop_price": "1",
+                "take_profit_price": "2",
+                "entry_order_id": "7",
+                "protection": "exchange_oco",
+            }
+        )
+        ledger.update_binance_spot_position(
+            int(bare["id"]),
+            {"entry_order_qty": "0.001", "gross_entry_qty": "0.001", "fee_net_qty": "0.001"},
+        )
+        bare = ledger.binance_spot_position_by_id(int(bare["id"]))
+        assert bare is not None
+        self.assertFalse(str(bare.get("entry_order_qty") or "").strip())
+        self.assertNotEqual(bare.get("entry_origin"), "exchange_fill")
+        placed = {
+            "orderId": "99",
+            "status": "FILLED",
+            "executedQty": "0.25",
+            "symbol": "BNBUSDT",
+            "fills": [{"commission": "0.001", "commissionAsset": "BNB"}],
+        }
+        self.assertIsNone(
+            ledger.record_exchange_entry_origin(int(overridden["id"]), symbol="BNBUSDT", placed=placed)
+        )
+        recorded = ledger.binance_spot_position_by_id(int(overridden["id"]))
+        assert recorded is not None
+        self.assertEqual(recorded["entry_origin"], "exchange_fill")
+        self.assertEqual(Decimal(recorded["gross_entry_qty"]), Decimal("0.25"))
+        self.assertEqual(Decimal(recorded["fee_net_qty"]), Decimal("0.249"))
+        ledger.record_exchange_entry_origin(
+            int(overridden["id"]),
+            symbol="BNBUSDT",
+            placed={**placed, "executedQty": "0.001"},
+        )
+        again = ledger.binance_spot_position_by_id(int(overridden["id"]))
+        assert again is not None
+        self.assertEqual(Decimal(again["gross_entry_qty"]), Decimal("0.25"))
+        ledger.close()
+
+        partial = {
+            "symbol": "BNBUSDT",
+            "orderListId": 42,
+            "listOrderStatus": "EXECUTING",
+            "listStatusType": "EXEC_STARTED",
+            "orderReports": [
+                {"symbol": "BNBUSDT", "orderId": 11, "type": "LIMIT_MAKER", "status": "PARTIALLY_FILLED", "origQty": "0.25", "executedQty": "0.249"},
+                {"symbol": "BNBUSDT", "orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "origQty": "0.25", "executedQty": "0"},
+            ],
+        }
+        self.assertFalse(
+            oco_readback_covers(partial, symbol="BNBUSDT", held_net=Decimal("0.25"), list_id="42", above_id="11", below_id="10")
+        )
+        asymmetric = {
+            "symbol": "BNBUSDT",
+            "orderListId": 42,
+            "listOrderStatus": "EXECUTING",
+            "listStatusType": "EXEC_STARTED",
+            "orderReports": [
+                {"symbol": "BNBUSDT", "orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "origQty": "0.25", "executedQty": "0"},
+                {"symbol": "BNBUSDT", "orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "origQty": "0.001", "executedQty": "0"},
+            ],
+        }
+        self.assertFalse(
+            oco_readback_covers(asymmetric, symbol="BNBUSDT", held_net=Decimal("0.25"), list_id="42", above_id="11", below_id="10")
+        )
+        mismatched = {
+            "symbol": "BNBUSDT",
+            "orderListId": 42,
+            "listOrderStatus": "EXECUTING",
+            "listStatusType": "EXEC_STARTED",
+            "orderReports": [
+                {"symbol": "BNBUSDT", "orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "origQty": "0.25", "executedQty": "0"},
+                {"symbol": "BNBUSDT", "orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "origQty": "0.25", "executedQty": "0"},
+            ],
+        }
+        self.assertFalse(
+            oco_readback_covers(mismatched, symbol="BNBUSDT", held_net=Decimal("0.25"), list_id="42", above_id="99", below_id="98")
+        )
+
+    def test_local_exit_equality_and_shrunk_registry_do_not_buy(self) -> None:
+        class _Exit:
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _trading_info(symbol)
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise AssertionError("local exit equality must not buy")
+
+            def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                form = parse_qs(signed_query)
+                order_id = (form.get("orderId") or ["0"])[0]
+                return {
+                    "symbol": (form.get("symbol") or ["BNBUSDT"])[0],
+                    "orderId": int(order_id),
+                    "side": "SELL" if order_id == "50" else "BUY",
+                    "status": "NEW" if order_id == "50" else "FILLED",
+                    "executedQty": "0.25",
+                }
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                form = parse_qs(signed_query)
+                symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+                return {
+                    "symbol": symbol,
+                    "orderListId": int((form.get("orderListId") or ["3"])[0]),
+                    "listOrderStatus": "EXECUTING",
+                    "listStatusType": "EXEC_STARTED",
+                    "orderReports": [
+                        {"symbol": symbol, "orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "origQty": "0.25", "executedQty": "0.249"},
+                        {"symbol": symbol, "orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "origQty": "0.001", "executedQty": "0"},
+                    ],
+                }
+
+        purposes = frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSE_LIVE_BNB_BOLL_FADE})
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(_Exit(), purposes) as gw:
+                armed = gw.ledger.arm_binance_spot_position(
+                    {
+                        "decision_log_id": 147970,
+                        "symbol": "BNBUSDT",
+                        "purpose": PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+                        "status": "oco_working",
+                        "quantity": "0.00",
+                        "stop_price": "95",
+                        "take_profit_price": "110",
+                        "entry_order_id": "99",
+                        "protection": "exchange_oco",
+                    }
+                )
+                gw.ledger.update_binance_spot_position(
+                    int(armed["id"]),
+                    {
+                        "exit_order_id": "50",
+                        "exit_filled_qty": "0.25",
+                        "residual_qty": "0.00",
+                        "oco_order_list_id": "3",
+                        "oco_above_order_id": "11",
+                        "oco_below_order_id": "10",
+                        "status": "closed",
+                        "quantity": "0E-8",
+                    },
+                )
+                blocked = gw.process_one(
+                    _decision_row(
+                        mode="live_stub",
+                        decision_log_id=147971,
+                        purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                        token_address="ETHUSDT",
+                        pair_address="ETH/USDT",
+                        extras=_classic_extras(binance_symbol="ETHUSDT"),
+                    )
+                )
+        self.assertIn(blocked["error"], {"exit_readback_unverified", "oco_readback_unverified"}, blocked)
+        self.assertNotEqual(blocked["error"], None)
+
+        shrunk = self.root / "shrunk.json"
+        shrunk.write_text(
+            json.dumps(
+                {
+                    "required_purposes": ["live_bnb_boll_fade"],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str((self.root / "ledger.db").resolve()),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.environ[LEDGER_REGISTRY_ENV] = str(shrunk)
+        with mock.patch.dict(os.environ, {**_env(self.root), LEDGER_REGISTRY_ENV: str(shrunk)}):
+            with ExecutionGateway(
+                decision_db=self.root / "decision-shrink.db",
+                ledger_path=self.root / "ledger.db",
+                paper_enabled=False,
+                pm_enabled=False,
+                accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
+                binance_spot=_adapter(
+                    self.root,
+                    _Client(),
+                    auto_flatten_on_oco_fail=True,
+                    account_snapshot={**_BOUND, "uid": 424242},
+                ),
+            ) as gw:
+                refused = gw.process_one(
+                    _decision_row(mode="live_stub", purpose=PURPOSE_LIVE_BNB_BOLL_FADE)
+                )
+        self.assertEqual(refused["error"], "ledger_registry_incomplete", refused)
 
     def test_one_ledger_registry_is_incomplete(self) -> None:
         ledger_path = self.root / "only-current.db"
@@ -1422,6 +1712,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 ),
             ) as gw:
                 initialize_spot_ledger_binding(ledger_path, "424242")
+                bind_registry_membership("424242")
                 refused = gw.process_one(_decision_row(mode="live_stub"))
         self.assertEqual(refused["error"], "ledger_registry_incomplete", refused)
         self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
@@ -1491,8 +1782,8 @@ class ClassicGatewayTests(unittest.TestCase):
             int(armed["id"]),
             {
                 "oco_order_list_id": "3",
-                "oco_above_order_id": "4",
-                "oco_below_order_id": "5",
+                "oco_above_order_id": "11",
+                "oco_below_order_id": "10",
                 "protection": "exchange_oco",
                 "status": "open",
             },
@@ -1545,6 +1836,7 @@ class ClassicGatewayTests(unittest.TestCase):
                 ),
             ) as gw:
                 initialize_spot_ledger_binding(ledger_path, "424242")
+                bind_registry_membership("424242")
                 opened = gw.process_one(_decision_row(mode="live_stub"))
                 self.assertEqual(opened["executed"], 1, opened)
                 self.assertEqual(opened["receipt"]["held_position"]["purpose"], PURPOSE_LIVE_BNB_BOLL_CLASSIC)

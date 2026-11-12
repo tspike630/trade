@@ -738,13 +738,28 @@ def buy_exposure_block(
     return None
 
 
+def hard_unresolved_halt(rows: object) -> str | None:
+    """Halt reasons that an exchange read on this call cannot clear."""
+    held = rows if isinstance(rows, list) else []
+    for row in held:
+        if not isinstance(row, dict):
+            continue
+        purpose = str(row.get("purpose") or "").strip()
+        if purpose and purpose not in LIVE_BNB_SPOT_PURPOSES:
+            continue
+        reason = row_unresolved_reason(row)
+        if reason and reason not in _EVIDENCE_REASONS:
+            return reason
+    return None
+
+
 def account_unresolved_halt(rows: object) -> str | None:
     """Block every new BUY while this account has an unresolved spot row.
 
-    A verified working OCO needs the list id, both leg ids, and a positive
-    quantity. A status write is not that evidence. A positive ``residual_qty``
-    stays unresolved under every status. There is no authenticated human-clear
-    record on this book, so a status change alone does not clear the halt.
+    Three stored ids are not a working list. A zero quantity is not a flat
+    exit. Decision uses this as a halt because it does not call the exchange.
+    Execution may clear only ``oco_readback_unverified`` and
+    ``exit_readback_unverified`` after a read on this call.
     """
     held = rows if isinstance(rows, list) else []
     for row in held:
@@ -753,27 +768,38 @@ def account_unresolved_halt(rows: object) -> str | None:
         purpose = str(row.get("purpose") or "").strip()
         if purpose and purpose not in LIVE_BNB_SPOT_PURPOSES:
             continue
-        reason = _unresolved_row_reason(row)
+        reason = row_unresolved_reason(row)
         if reason:
             return reason
     return None
 
 
-def _zeroed_entry(row: dict[str, Any]) -> bool:
-    """A local write of quantity 0 and no residual does not close an entry.
+def _qty_invalid(raw: object) -> bool:
+    """A present quantity that is not a finite non-negative decimal."""
+    if raw is None or isinstance(raw, bool):
+        return isinstance(raw, bool)
+    if isinstance(raw, str) and not raw.strip():
+        return False
+    return _decimal_text(raw) is None or Decimal(_decimal_text(raw) or "0") < 0
 
-    A real full exit has ``exit_filled_qty`` covering ``entry_order_qty``.
-    There is no separate human-clear record.
+
+def _qty_zero(raw: object) -> bool:
+    """``0``, ``0.00``, and ``0E-8`` are the same zero. Missing is not zero."""
+    text = _decimal_text(raw)
+    return text is not None and Decimal(text) == 0
+
+
+def _zeroed_entry(row: dict[str, Any]) -> bool:
+    """Quantity written as zero does not close an entry.
+
+    Local ``exit_filled_qty`` equal to the entry is not a sell fill. Every
+    zero spelling is the same. A verified exit is an exchange read, elsewhere.
     """
     if not str(row.get("entry_order_id") or "").strip():
         return False
-    if str(row.get("quantity") or "").strip() not in {"0", "0.0"}:
+    if not _qty_zero(row.get("quantity")):
         return False
     if _positive_qty(row.get("residual_qty")):
-        return False
-    original = _decimal_text(row.get("entry_order_qty"))
-    sold = _decimal_text(row.get("exit_filled_qty"))
-    if original is not None and sold is not None and Decimal(sold) >= Decimal(original):
         return False
     return True
 
@@ -784,6 +810,23 @@ def _positive_qty(raw: object) -> bool:
 
 
 _LIVE_LEG_STATUS = frozenset({"NEW", "PARTIALLY_FILLED", "PENDING_NEW"})
+_ABOVE_LEG_TYPES = frozenset({"LIMIT_MAKER", "TAKE_PROFIT_LIMIT"})
+_BELOW_LEG_TYPES = frozenset({"STOP_LOSS_LIMIT", "STOP_LOSS"})
+_EVIDENCE_REASONS = frozenset({"oco_readback_unverified", "exit_readback_unverified"})
+
+
+def _leg_remaining(leg: dict[str, Any]) -> Decimal | None:
+    """Open size of one leg. ``origQty`` alone is not the size still working."""
+    original = _decimal_text(leg.get("origQty"))
+    executed = _decimal_text(leg.get("executedQty"))
+    if original is None or executed is None:
+        return None
+    if Decimal(original) < 0 or Decimal(executed) < 0:
+        return None
+    remaining = Decimal(original) - Decimal(executed)
+    if remaining < 0:
+        return None
+    return remaining
 
 
 def oco_readback_covers(
@@ -792,12 +835,14 @@ def oco_readback_covers(
     symbol: str,
     held_net: Decimal,
     list_id: object,
+    above_id: object,
+    below_id: object,
 ) -> bool:
-    """True only for this call's exchange list, not for fields stored on the row.
+    """Each live protective leg must still cover ``held_net``.
 
-    The list must be working, name the same symbol, have two live legs, and
-    the leg quantity must cover ``held_net``. A smaller local quantity does
-    not lower that bar.
+    Coverage is ``origQty - executedQty`` on the above leg and again on the
+    below leg. The larger leg does not stand in for the smaller one, and the
+    two legs are not added. The response ids must be the recorded ids.
     """
     if not isinstance(payload, dict) or held_net <= 0:
         return False
@@ -810,6 +855,12 @@ def oco_readback_covers(
     reported = str(payload.get("symbol") or "").strip().upper()
     if not reported or reported != str(symbol or "").strip().upper():
         return False
+    wanted_above = str(above_id or "").strip()
+    wanted_below = str(below_id or "").strip()
+    if _nonneg_id(wanted_above) is None or _nonneg_id(wanted_below) is None:
+        return False
+    if wanted_above == wanted_below:
+        return False
     reports = payload.get("orderReports")
     if not isinstance(reports, list):
         return False
@@ -819,50 +870,51 @@ def oco_readback_covers(
         if not isinstance(row, dict):
             continue
         kind = str(row.get("type") or "").upper()
-        if above is None and kind == "LIMIT_MAKER":
+        if above is None and kind in _ABOVE_LEG_TYPES:
             above = row
-        if below is None and kind == "STOP_LOSS_LIMIT":
+        if below is None and kind in _BELOW_LEG_TYPES:
             below = row
     if above is None or below is None:
         return False
-    covered = Decimal("0")
+    if str(above.get("orderId") or "").strip() != wanted_above:
+        return False
+    if str(below.get("orderId") or "").strip() != wanted_below:
+        return False
     for leg in (above, below):
         if str(leg.get("symbol") or reported).strip().upper() != reported:
             return False
         if str(leg.get("status") or "").upper() not in _LIVE_LEG_STATUS:
             return False
-        if _nonneg_id(leg.get("orderId")) is None:
+        remaining = _leg_remaining(leg)
+        if remaining is None or remaining < held_net:
             return False
-        qty = _decimal_text(leg.get("origQty"))
-        if qty is None:
-            return False
-        covered = max(covered, Decimal(qty))
-    return covered >= held_net
+    return True
 
 
-def held_net_qty(row: dict[str, Any]) -> Decimal:
-    """Original net when it was recorded. A later local quantity is not the target."""
-    for key in ("entry_order_qty", "quantity"):
-        text = _decimal_text(row.get(key))
-        if text is not None and Decimal(text) > 0:
-            return Decimal(text)
-    return Decimal("0")
-
-
-def _unresolved_row_reason(row: dict[str, Any]) -> str | None:
+def row_unresolved_reason(row: dict[str, Any]) -> str | None:
+    """Why this row still blocks a buy. Local ids and local fills do not clear it."""
+    if any(
+        _qty_invalid(row.get(key))
+        for key in ("quantity", "residual_qty", "exit_filled_qty", "entry_order_qty")
+    ):
+        return "unprotected_position_blocks_buy"
     if _positive_qty(row.get("residual_qty")):
         return "unprotected_position_blocks_buy"
     if partial_dust_residual(row):
         return "unprotected_position_blocks_buy"
     status = str(row.get("status") or "")
     if _zeroed_entry(row):
-        return "unprotected_position_blocks_buy"
-    if status == "oco_working":
-        if _position_ids_verified(row) and str(row.get("protection") or "") == "exchange_oco" and _positive_qty(row.get("quantity")):
-            return None
+        return "exit_readback_unverified"
+    if status == "oco_working" or (
+        status == "open" and str(row.get("protection") or "") == "exchange_oco"
+    ):
+        if (
+            _position_ids_verified(row)
+            and str(row.get("protection") or "") == "exchange_oco"
+            and _positive_qty(row.get("quantity"))
+        ):
+            return "oco_readback_unverified"
         return "oco_failed_blocks_buy"
-    if status == "open" and _position_ids_verified(row) and str(row.get("protection") or "") == "exchange_oco" and _positive_qty(row.get("quantity")):
-        return None
     if status == "closed_canceled" and _positive_qty(row.get("quantity")):
         return "unprotected_position_blocks_buy"
     if not status or status in _TERMINAL_POSITION or status == "flat":

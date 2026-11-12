@@ -22,9 +22,10 @@ unsafe row blocks every new BUY on that purpose:
 - ``open`` that is not a verified exchange OCO
 - any other non-terminal protective status
 
-Execution clears the halt by moving the row to a terminal status
-(``closed``, ``closed_dust``, ``oco_filled``) or to a verified protected
-open. Decision does not clear it.
+Stored list ids are not a working OCO. Decision does not call the
+exchange, so a row that still needs an entry, list, or exit read halts
+the purpose. Execution is the only place that can clear those two
+read reasons, and only from a read on that call.
 
 Handoff path, first hit wins:
 

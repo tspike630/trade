@@ -36,6 +36,7 @@ from execution.ledger import (  # noqa: E402
     ExecutionLedger,
     LEDGER_REGISTRY_ENV,
     buy_reservation_lock,
+    bind_registry_membership,
     initialize_spot_ledger_binding,
     peer_live_bnb_ledger_path,
     read_spot_buy_blocks_readonly,
@@ -175,8 +176,8 @@ class SharedLedgerReservationTests(unittest.TestCase):
             {
                 "status": status,
                 "oco_order_list_id": "3",
-                "oco_above_order_id": "4",
-                "oco_below_order_id": "5",
+                "oco_above_order_id": "11",
+                "oco_below_order_id": "10",
             },
         )
         ledger.close()
@@ -202,6 +203,8 @@ class SharedLedgerReservationTests(unittest.TestCase):
         for path in paths:
             if path.is_file():
                 initialize_spot_ledger_binding(path, "424242")
+        if paths and all(path.is_file() for path in paths):
+            bind_registry_membership("424242")
         snapshot = {
             "accountType": "SPOT",
             "canTrade": True,
@@ -249,6 +252,7 @@ class SharedLedgerReservationTests(unittest.TestCase):
                 binance_spot=_adapter(self.root, _NoOrder(), account_snapshot=snapshot),
             ) as gw:
                 initialize_spot_ledger_binding(classic, "424242")
+                bind_registry_membership("424242")
                 refused = gw.process_one(
                     _decision_row(
                         mode="live_stub",
@@ -280,6 +284,7 @@ class SharedLedgerReservationTests(unittest.TestCase):
                 ),
             ) as gw:
                 initialize_spot_ledger_binding(classic, "424242")
+                bind_registry_membership("424242")
                 opened = gw.process_one(_decision_row(mode="live_stub"))
         self.assertEqual(opened["executed"], 1, opened)
         self.assertEqual(opened["receipt"]["held_position"]["symbol"], "BNBUSDT")
