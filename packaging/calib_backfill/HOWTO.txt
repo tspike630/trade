@@ -15,6 +15,18 @@ Offline fixture, no network:
 Full collection stays on the machine that can reach the exchanges. This cloud
 run is not that collection.
 
+Exit 0 only when every planned Vision file has rows and every CCXT venue
+coverage is complete. A 404, empty file, checksum mismatch, bad zip, NaN
+field, interior gap, unsupported market, or Bybit 403 leaves complete false
+and exit 2. One bad file does not stop the others. Publisher .CHECKSUM is
+required before a zip is parsed. A legacy manifest row with a null checksum
+is not reused. Metric create_time_ms is the CSV label parsed as UTC, with
+label_availability=unknown. It is not a confirmed bin edge.
+--metric-availability explicit_conservative_bin_end stores a separate
+research clock at label plus 5 minutes. That is not download time and not
+an official Binance convention. Use a new output directory. A second process
+exits while the writer lock is held and does not change the database.
+
   PYTHONPATH=. .venv/bin/python scripts/run_public_backfill.py \
     --out /var/calib-public --days 45 --ccxt-days 30
   PYTHONPATH=. .venv/bin/python scripts/run_news_oos_calibration.py \

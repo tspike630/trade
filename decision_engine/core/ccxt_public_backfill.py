@@ -64,6 +64,35 @@ def ensure_ccxt_ohlcv(conn: sqlite3.Connection) -> None:
     )
 
 
+def closed_bar_opens(start_ms: int, end_ms: int, step_ms: int = STEP_MS) -> list[int]:
+    """Open times of bars that are fully closed inside ``[start_ms, end_ms]``.
+
+    The bar that contains ``end_ms`` is still forming and is not an expected
+    slot, so it is not reported as missing.
+    """
+    if step_ms <= 0 or end_ms <= start_ms:
+        return []
+    if start_ms % step_ms == 0:
+        first = start_ms
+    else:
+        first = ((start_ms // step_ms) + 1) * step_ms
+    last = ((end_ms - step_ms) // step_ms) * step_ms
+    if last < first:
+        return []
+    count = ((last - first) // step_ms) + 1
+    return [first + index * step_ms for index in range(count)]
+
+
+def missing_closed_opens(
+    start_ms: int,
+    end_ms: int,
+    observed: Sequence[int],
+    step_ms: int = STEP_MS,
+) -> list[int]:
+    have = {int(stamp) for stamp in observed}
+    return [stamp for stamp in closed_bar_opens(start_ms, end_ms, step_ms) if stamp not in have]
+
+
 def closed_pages(
     fetch_page: Fetcher,
     *,
@@ -202,6 +231,31 @@ def resume_open_ms(
     return cursor
 
 
+def _ccxt_coverage_status(
+    *,
+    error: str | None,
+    expected: int,
+    missing: list[int],
+    stored: int,
+    resume: int,
+    end_ms: int,
+    fetched: list[list[float]],
+) -> tuple[str, str]:
+    """Separate a real hole from an unsupported market. Empty is not success."""
+    if error:
+        blocked = error.startswith("blocked:") or "403" in error or "CloudFront" in error
+        if stored:
+            return "partial", "blocked" if blocked else "partial"
+        return "error", "blocked" if blocked else "error"
+    if expected <= 0 or not stored:
+        return "missing", "missing"
+    if missing:
+        return "partial", "partial"
+    if resume >= end_ms and not fetched:
+        return "skipped_covered", "complete"
+    return "ok", "complete"
+
+
 def backfill_symbol(
     conn: sqlite3.Connection,
     exchange_id: str,
@@ -219,35 +273,43 @@ def backfill_symbol(
     if resume < end_ms:
         fetched, error = closed_pages(fetch_page, start_ms=resume, end_ms=end_ms, limit=limit)
     written = insert_closed_bars(conn, exchange_id, symbol, fetched) if fetched else 0
-    stored = conn.execute(
-        """
-        SELECT COUNT(*) FROM ccxt_ohlcv
-        WHERE exchange = ? AND symbol = ? AND timeframe = '5m' AND ts >= ? AND ts < ?
-        """,
-        (exchange_id, symbol, start_ms, end_ms),
-    ).fetchone()[0]
-    if resume >= end_ms and error is None:
-        status = "skipped_covered"
-    elif error is None:
-        status = "ok"
-    elif stored:
-        status = "partial"
-    else:
-        status = "error"
-    record_status(conn, exchange_id, symbol, status, error, int(stored), start_ms, end_ms)
-    expected = max(0, (end_ms - start_ms) // STEP_MS)
+    stored_rows = [
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT ts FROM ccxt_ohlcv
+            WHERE exchange = ? AND symbol = ? AND timeframe = '5m' AND ts >= ? AND ts < ?
+            ORDER BY ts
+            """,
+            (exchange_id, symbol, start_ms, end_ms),
+        )
+    ]
+    expected_opens = closed_bar_opens(start_ms, end_ms)
+    missing = [stamp for stamp in expected_opens if stamp not in set(stored_rows)]
+    status, coverage = _ccxt_coverage_status(
+        error=error,
+        expected=len(expected_opens),
+        missing=missing,
+        stored=len(stored_rows),
+        resume=resume,
+        end_ms=end_ms,
+        fetched=fetched,
+    )
+    record_status(conn, exchange_id, symbol, status, error, len(stored_rows), start_ms, end_ms)
     return {
         "exchange": exchange_id,
         "base": base,
         "symbol": symbol,
         "quote": quote_for(exchange_id),
-        "rows": int(stored),
+        "rows": len(stored_rows),
         "fetched_rows": len(fetched),
         "resume_open_ms": resume,
         "inserted": written,
-        "expected_closed_bars": expected,
-        "missing_bars": expected - int(stored),
+        "expected_closed_bars": len(expected_opens),
+        "missing_bars": len(missing),
+        "missing_timestamps_ms": missing,
         "status": status,
+        "coverage": coverage,
         "detail": error,
         "history_covers_requested_start": resume > start_ms or (
             bool(fetched) and int(fetched[0][0]) <= start_ms + STEP_MS
