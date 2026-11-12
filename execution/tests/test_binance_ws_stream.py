@@ -88,7 +88,7 @@ class _LatencyTrackingClient:
             "status": "FILLED",
             "executedQty": "1.00",
             "cummulativeQuoteQty": "100.00",
-            "fills": [],
+            "fills": [{"tradeId": 1, "qty": "1.00", "commission": "0", "commissionAsset": "SOL"}],
         }
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict:
@@ -257,6 +257,7 @@ class BinanceWsStreamTests(unittest.TestCase):
                 rest_expected={"account_type": "SPOT", "usdt_free": "500"},
                 orderbook_gate=True,
                 ws_cache=cache,
+                auto_flatten_on_oco_fail=True,
             )
             res = adapter.execute(sig)
             self.assertTrue(res["ok"], res.get("error"))

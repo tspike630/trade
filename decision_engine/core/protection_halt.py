@@ -22,9 +22,12 @@ unsafe row blocks every new BUY on that purpose:
 - ``open`` that is not a verified exchange OCO
 - any other non-terminal protective status
 
-Execution clears the halt by moving the row to a terminal status
-(``closed``, ``closed_dust``, ``oco_filled``) or to a verified protected
-open. Decision does not clear it.
+Stored list ids are not a working OCO. Decision does not call the
+exchange, so a row that still needs an entry, list, or exit read halts
+the purpose. That blocks every new buy on the purpose, including a
+second symbol. This is not a restored multi-coin book. Execution is
+the only place that can clear those two read reasons, and only from a
+read on that call. A stored fee or a stored exit id is not that read.
 
 Handoff path, first hit wins:
 
@@ -52,7 +55,10 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote
 
-from execution.executors.binance_spot_gate import buy_exposure_block
+from execution.executors.binance_spot_gate import (
+    account_unresolved_halt,
+    buy_exposure_block,
+)
 
 _LEDGER_ENV = (
     "DECISION_EXECUTION_LEDGER",
@@ -225,6 +231,9 @@ def purpose_halt_reason(purpose: str, book: ProtectionBook) -> str | None:
         return None
     if book.error:
         return "protection_status_unknown"
+    unresolved = account_unresolved_halt(list(book.positions) + list(book.canonical))
+    if unresolved:
+        return unresolved
     return buy_exposure_block(
         list(book.positions),
         list(book.canonical),

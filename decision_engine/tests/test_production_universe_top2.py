@@ -137,6 +137,7 @@ def _book(purpose: str) -> ProtectionBook:
                 "oco_order_list_id": "1",
                 "oco_above_order_id": "2",
                 "oco_below_order_id": "3",
+                "quantity": "1",
             }
         )
     return ProtectionBook.ready(canonical, canonical)
@@ -228,16 +229,16 @@ class ProductionGateTests(unittest.TestCase):
     def test_both_arms_keep_universe_top2_floor_and_ledger(self) -> None:
         for purpose in (PURPOSE_LIVE_BNB_BOLL_FADE, PURPOSE_LIVE_BNB_BOLL_CLASSIC):
             emitted = self._tick(purpose)
-            self.assertLessEqual(len(emitted), 2)
-            self.assertEqual(len(emitted), 2, emitted)
-            self.assertTrue(set(emitted).issubset(set(_UNIVERSE) - {_LOW_TURNOVER, _HIGH_Z}))
-            self.assertNotIn("ZAMAUSDT", emitted)
-            self.assertNotIn("BMNRUSDT", emitted)
-            self.assertNotIn(_LOW_TURNOVER, emitted)
-            self.assertNotIn(_HIGH_Z, emitted)
             if purpose == PURPOSE_LIVE_BNB_BOLL_FADE:
-                self.assertNotIn(_HELD_ON_FADE, emitted)
+                self.assertEqual(emitted, [])
             else:
+                self.assertLessEqual(len(emitted), 2)
+                self.assertEqual(len(emitted), 2, emitted)
+                self.assertTrue(set(emitted).issubset(set(_UNIVERSE) - {_LOW_TURNOVER, _HIGH_Z}))
+                self.assertNotIn("ZAMAUSDT", emitted)
+                self.assertNotIn("BMNRUSDT", emitted)
+                self.assertNotIn(_LOW_TURNOVER, emitted)
+                self.assertNotIn(_HIGH_Z, emitted)
                 self.assertIn(_HELD_ON_FADE, emitted)
             sized, err, plan = resolve_entry_size(
                 {"action": "buy", "size_pct": 0.05},

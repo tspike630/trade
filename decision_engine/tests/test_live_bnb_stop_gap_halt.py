@@ -92,6 +92,7 @@ def _held(
         "oco_order_list_id": "1" if verified else None,
         "oco_above_order_id": "2" if verified else None,
         "oco_below_order_id": "3" if verified else None,
+        "quantity": "1" if verified else None,
     }
 
 
@@ -329,26 +330,25 @@ class ProtectionHaltTests(unittest.TestCase):
             purpose=_FADE,
             book=book,
         )
-        self.assertEqual(len(other), 1)
-        self.assertIsNone(other_report["protection_halt"])
+        self.assertEqual(other, [])
+        self.assertEqual(other_report["protection_halt"], "oco_readback_unverified")
         same, same_report = apply_live_buy_guards(
             [_market("CFGUSDT", 1.0, 0.95), _market("BNBUSDT", 100.0, 95.0)],
             purpose=_FADE,
             book=book,
         )
-        self.assertEqual([item["binance_symbol"] for item in same], ["BNBUSDT"])
-        self.assertIsNone(same_report["protection_halt"])
-        self.assertEqual(same_report["protection_dropped"], 1)
+        self.assertEqual(same, [])
+        self.assertEqual(same_report["protection_halt"], "oco_readback_unverified")
 
-    def test_fade_failure_does_not_halt_classic_or_paper(self) -> None:
+    def test_fade_failure_halts_classic_and_not_paper(self) -> None:
         book = ProtectionBook.ready([_held("oco_failed", "DASHUSDT", purpose=_FADE)], [])
         classic, classic_report = apply_live_buy_guards(
             [_market("BNBUSDT", 100.0, 95.0)],
             purpose=_CLASSIC,
             book=book,
         )
-        self.assertEqual(len(classic), 1)
-        self.assertIsNone(classic_report["protection_halt"])
+        self.assertEqual(classic, [])
+        self.assertEqual(classic_report["protection_halt"], "oco_failed_blocks_buy")
         paper, paper_report = apply_live_buy_guards(
             [_market("BNBUSDT", 100.0, 95.0)],
             purpose=PURPOSE_RACE_TECH_BOLL_FADE,
@@ -362,7 +362,7 @@ class ProtectionHaltTests(unittest.TestCase):
             [],
         )
         self.assertEqual(purpose_halt_reason(_FADE, untagged), "oco_failed_blocks_buy")
-        self.assertIsNone(purpose_halt_reason(_CLASSIC, untagged))
+        self.assertEqual(purpose_halt_reason(_CLASSIC, untagged), "oco_failed_blocks_buy")
 
     def test_unknown_book_fails_closed_and_unwired_does_not(self) -> None:
         unknown = ProtectionBook.failed("ledger_unreadable:OperationalError")
@@ -386,7 +386,7 @@ class ProtectionHaltTests(unittest.TestCase):
         with patch.dict(os.environ, {"BINANCE_SPOT_ALLOW_MULTI_SYMBOL": "0"}):
             self.assertEqual(
                 purpose_halt_reason(_FADE, book),
-                "position_open_blocks_buy",
+                "oco_readback_unverified",
             )
 
     def test_ledger_read_is_the_execution_book(self) -> None:

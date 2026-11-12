@@ -67,6 +67,7 @@ DEFAULT_BASE_URL = "https://api.binance.com"
 ACCOUNT_PATH = "/api/v3/account"
 API_RESTRICTIONS_PATH = "/sapi/v1/account/apiRestrictions"
 SPOT_PATH = "/api/v3/order"
+TRADES_PATH = "/api/v3/myTrades"
 EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
 TICKER_PATH = "/api/v3/ticker/price"
 OCO_PATH = "/api/v3/orderList/oco"
@@ -575,6 +576,25 @@ def protective_exit_reason(
     return None
 
 
+def _protection_incident(state: str) -> dict[str, Any]:
+    """Local evidence only. Nothing is sent to an operator or an outside service.
+
+    The durable copy is the position row plus the gateway ``order_events``
+    ``rejected`` detail. A log line is not that record.
+    """
+    return {
+        "state": state,
+        "store": "binance_spot_positions",
+        "event": "rejected",
+        "delivered": False,
+        "transport": "none",
+        "integrations_required": (
+            "Read binance_spot_positions and order_events. "
+            "No webhook, email, or chat message is sent."
+        ),
+    }
+
+
 def filled_base_qty(placed: dict[str, Any] | None) -> str | None:
     """Base qty the exchange says filled. Quote notional is not converted."""
     if not isinstance(placed, dict):
@@ -802,9 +822,9 @@ def held_position_spec(
 ) -> dict[str, Any] | None:
     """Ledger row for a live buy that already has absolute stop and take-profit.
 
-    Dry-run and unfilled acks return None. Base size comes only from
-    ``filled_qty`` (exchange ``executedQty``). Missing size is recorded as
-    ``qty_unconfirmed`` and is not sellable.
+    Dry-run and unfilled acks return None. Base size comes from
+    ``sellable_qty``, the verified fee-net. Gross ``filled_qty`` is not a
+    substitute. Missing size is ``qty_unconfirmed`` and is not sellable.
     """
     arm = result.get("arm_position")
     if isinstance(arm, dict):
@@ -834,8 +854,6 @@ def held_position_spec(
         if raw_sellable not in (None, "")
         else None
     )
-    if qty is None:
-        qty = _positive_decimal(result.get("filled_qty"))
     return {
         "decision_log_id": int(str(sig.get("decision_log_id")).strip()),
         "symbol": symbol,
@@ -1045,6 +1063,27 @@ class BinanceSpotHttpClient:
         )
         status, body = self._opener(request, self.timeout)
         return _decode_ok(status, body, secrets=(api_key,))
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> Any:
+        """One page of ``GET /api/v3/myTrades``. The caller paginates."""
+        request = urllib.request.Request(
+            f"{self.base_url}{TRADES_PATH}?{signed_query}",
+            method="GET",
+            headers={
+                "User-Agent": "trade-binance-spot",
+                "X-MBX-APIKEY": api_key,
+            },
+        )
+        status, body = self._opener(request, self.timeout)
+        if status >= 400:
+            raise _rejection_from_body(status, body, (api_key,))
+        try:
+            parsed = json.loads(body.decode("utf-8")) if body else []
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BinanceRequestError(status) from exc
+        if not isinstance(parsed, list):
+            raise BinanceRequestError(status)
+        return parsed
 
     def cancel_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -1301,7 +1340,12 @@ from execution.binance_ws_stream import default_max_age_ms  # noqa: E402
 from execution.executors.binance_spot_gate import (  # noqa: E402
     REST_BOOK,
     account_book_block,
+    account_order_base,
     buy_exposure_block,
+    final_executed_qty,
+    hard_unresolved_halt,
+    oco_readback_covers,
+    row_unresolved_reason,
     cross_arm_symbol_block,
     funding_after_reservation,
     reserved_quote_usdt,
@@ -1339,6 +1383,7 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     sor_maker_fallback_spec,
     trailing_ratchet_enabled,
     protective_band_error,
+    buy_entry_oco_preflight,
     is_request_timeout,
     ENTRY_MIN_NOTIONAL_USDT,
     reanchor_oco_on_fill_enabled,
@@ -1410,6 +1455,29 @@ def _floor_limit_quantity(
     return floored, None
 
 
+def _exit_order_ids(row: dict[str, Any]) -> list[str]:
+    """Every exit order id recorded on the row. The latest id is not the only one."""
+    found: list[str] = []
+    raw = row.get("exit_order_ids")
+    parsed: object = None
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+    elif isinstance(raw, list):
+        parsed = raw
+    if isinstance(parsed, list):
+        for item in parsed:
+            text = str(item or "").strip()
+            if text and text not in found:
+                found.append(text)
+    one = str(row.get("exit_order_id") or "").strip()
+    if one and one not in found:
+        found.append(one)
+    return found
+
+
 class BinanceSpotAdapter:
     """Turn one ``live_bnb_boll_fade`` decision into a spot order, or refuse it."""
 
@@ -1459,11 +1527,16 @@ class BinanceSpotAdapter:
         self.max_hold_sec = max_hold_sec
         self.buy_blocks: list[dict[str, Any]] = []
         self.peer_buy_blocks: list[dict[str, Any]] = []
+        self.peer_book_error: str | None = None
         self.canonical_rows: list[dict[str, Any]] = []
         self._size_plan: dict[str, Any] | None = None
         self._entry_mark: str | None = None
         self._orderbook_metrics: dict[str, Any] | None = None
         self._mark_telemetry: dict[str, Any] | None = None
+        self._oco_preflight: dict[str, Any] | None = None
+        self._resting_ceiling: str | None = None
+        self._resting_ceiling_source: str | None = None
+        self._resting_ask_age_ms: int | None = None
 
     def _active_ws_cache(self) -> Any | None:
         if self.ws_cache is not None:
@@ -1586,6 +1659,8 @@ class BinanceSpotAdapter:
             if fresh == "crossed":
                 saw_crossed = True
             elif isinstance(fresh, tuple):
+                self._resting_ceiling_source = "ws_bbo"
+                self._resting_ask_age_ms = self._ws_age_ms(ws_tick) if isinstance(ws_tick, dict) else None
                 return fresh[0], fresh[1], None
         depth_fn = getattr(client, "order_book", None) if client is not None else None
         if callable(depth_fn):
@@ -1609,6 +1684,8 @@ class BinanceSpotAdapter:
                         require_age=False,
                     )
                     if isinstance(fresh, tuple):
+                        self._resting_ceiling_source = "rest_book"
+                        self._resting_ask_age_ms = None
                         return fresh[0], fresh[1], None
                     if fresh == "crossed":
                         return None, None, "orderbook_crossed"
@@ -1698,6 +1775,214 @@ class BinanceSpotAdapter:
         self._mark_telemetry = {"mark_source": "rest_fallback"}
         return str(mark).strip(), None
 
+    def _refuse_protected_buy(
+        self,
+        *,
+        error: str,
+        symbol: str,
+        gates: dict[str, Any],
+        plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Stop before ``new_order``. The receipt keeps the preflight, not a position."""
+        return self._finish(
+            _result(
+                ok=False,
+                dry_run=False,
+                executed=0,
+                submitted=False,
+                error=error,
+                symbol=symbol,
+                order=None,
+                exchange_order_id=None,
+                gates=gates,
+                exit_plan=plan,
+                consumer_allowed=False,
+            )
+        )
+
+    def _copy_exit_onto_arm(
+        self,
+        arm: dict[str, Any],
+        row: dict[str, Any],
+        oco_fields: dict[str, Any] | None = None,
+    ) -> None:
+        keys = (
+            "status",
+            "protection",
+            "quantity",
+            "exit_order_id",
+            "exit_reason",
+            "exit_client_order_id",
+            "exit_filled_qty",
+            "residual_qty",
+            "residual_quote",
+            "last_error",
+        )
+        for key in keys:
+            if row.get(key) is not None:
+                arm[key] = row[key]
+                if oco_fields is not None:
+                    oco_fields[key] = row[key]
+
+    def _label_fill_protection(self, result: dict[str, Any], *, qty: str) -> dict[str, Any]:
+        """Name a filled buy that is not a verified OCO and not a filled exit.
+
+        Blocking another buy is not protection. An exchange reject can still
+        leave the coins; this only makes that state explicit.
+        """
+        if _to_decimal(qty) is None:
+            return result
+        arm = result.get("arm_position") if isinstance(result.get("arm_position"), dict) else {}
+        status = str(arm.get("status") or "")
+        protection = str(arm.get("protection") or "")
+        if status == "oco_working" and protection == PROTECTION_EXCHANGE:
+            result["protection_state"] = "oco_working"
+            return result
+        if status == "closed_dust" or protection == PROTECTION_DUST:
+            result["protection_state"] = "dust_residual"
+            result["manual_action"] = "residual_below_min_is_not_a_complete_exit"
+            result["protection_incident"] = _protection_incident("dust_residual")
+            return result
+        residual = _to_decimal(arm.get("residual_qty"))
+        if status == "closed" and protection == PROTECTION_AUTO_FLATTEN and (
+            residual is None or residual <= Decimal("0.00000001")
+        ):
+            result["protection_state"] = "exited"
+            return result
+        result["protection_state"] = "unprotected"
+        result["protection_incident"] = _protection_incident("unprotected")
+        result["manual_action"] = "halt_new_buys_and_manually_close_or_protect_the_fill"
+        log.error(
+            "binance_spot_unprotected symbol=%s qty=%s status=%s error=%s",
+            result.get("symbol"),
+            qty,
+            status,
+            result.get("error"),
+        )
+        return result
+
+    def _resting_limit_preflight(
+        self,
+        *,
+        sig: dict[str, Any],
+        extras: dict[str, Any],
+        plan: dict[str, Any],
+        pairs: list[tuple[str, str]],
+        info: dict[str, Any],
+        symbol: str,
+        gates: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], list[tuple[str, str]], dict[str, Any] | None]:
+        """Bracket a resting buy by its planned entry. A refusal is already finished."""
+        order_type = _parse_order_type(
+            extras.get("order_type", extras.get("binance_order_type"))
+        )
+        raw_limit, price_error = _chosen_limit_raw(extras)
+        tel = getattr(self, "_mark_telemetry", None)
+        mark_source = tel.get("mark_source") if isinstance(tel, dict) else None
+        filters = _symbol_filters(info, symbol) or []
+        if price_error:
+            diag = {
+                "order_type": order_type,
+                "reference": None,
+                "reference_price": None,
+                "mark": self._entry_mark,
+                "mark_source": mark_source,
+                "aligned_stop": None,
+                "aligned_take_profit": None,
+                "aligned_limit": None,
+                "planned_limit": None,
+                "mark_inside_band": None,
+            }
+            self._oco_preflight = diag
+            return extras, plan, pairs, self._refuse_protected_buy(
+                error=price_error,
+                symbol=symbol,
+                gates=gates,
+                plan=plan,
+            )
+        if order_type in {"LIMIT", "LIMIT_MAKER"} and not self._resting_ceiling:
+            _bid, ask, book_err = self._maker_top_of_book(self.client, symbol)
+            if book_err or not ask:
+                self._oco_preflight = {
+                    "order_type": order_type,
+                    "reference": None,
+                    "mark": self._entry_mark,
+                    "mark_source": mark_source,
+                    "ceiling_source": None,
+                    "mark_inside_band": None,
+                }
+                return extras, plan, pairs, self._refuse_protected_buy(
+                    error=book_err or "ask_unavailable",
+                    symbol=symbol,
+                    gates=gates,
+                    plan=plan,
+                )
+            self._resting_ceiling = ask
+        diag, pre_err = buy_entry_oco_preflight(
+            order_type=order_type or "",
+            limit_price=raw_limit,
+            stop_price=plan.get("stop_price"),
+            take_profit_price=plan.get("take_profit_price"),
+            mark=self._entry_mark,
+            mark_source=mark_source,
+            filters=filters,
+            resting_ceiling=self._resting_ceiling,
+            ceiling_source=self._resting_ceiling_source,
+        )
+        if isinstance(diag, dict):
+            diag["ask_age_ms"] = self._resting_ask_age_ms
+        self._oco_preflight = diag
+        if pre_err is None and not self._auto_flatten_enabled():
+            # Every resting buy can fill after the mark has left the original
+            # band, or the OCO can be rejected. Deployed defaults do not
+            # flatten that fill, and blocking the next buy does not close it.
+            # Do not send LIMIT or LIMIT_MAKER unless the existing
+            # auto-flatten switch is already on. Reanchor is not that switch.
+            # This does not turn the switch on. Resting entries stay
+            # unavailable until an operator makes that risk decision.
+            # MARKET is not decided here.
+            return extras, plan, pairs, self._refuse_protected_buy(
+                error="resting_protection_unconfigured",
+                symbol=symbol,
+                gates=gates,
+                plan=plan,
+            )
+        if pre_err:
+            return extras, plan, pairs, self._refuse_protected_buy(
+                error=pre_err,
+                symbol=symbol,
+                gates=gates,
+                plan=plan,
+            )
+        aligned = diag.get("aligned_limit")
+        current = dict(pairs).get("price")
+        aligned_n = _to_decimal(aligned)
+        if aligned_n is not None and _to_decimal(current) != aligned_n:
+            stamped = dict(extras)
+            if stamped.get("price") not in (None, ""):
+                stamped["price"] = aligned
+            if stamped.get("limit_price") not in (None, "") or stamped.get("price") in (None, ""):
+                stamped["limit_price"] = aligned
+            floor_error = entry_notional_floor_error(stamped)
+            if floor_error:
+                return extras, plan, pairs, self._refuse_protected_buy(
+                    error=floor_error,
+                    symbol=symbol,
+                    gates=gates,
+                    plan=plan,
+                )
+            rebuilt, qty_error = self._preview_pairs(sig, stamped, symbol)
+            if qty_error or rebuilt is None:
+                return extras, plan, pairs, self._refuse_protected_buy(
+                    error=qty_error or "missing_order_qty",
+                    symbol=symbol,
+                    gates=gates,
+                    plan=plan,
+                )
+            extras = stamped
+            pairs = rebuilt
+        return extras, plan, pairs, None
+
     def _repost_band(self, row: dict[str, Any], mark: object) -> tuple[bool, str | None]:
         """True only when the original stop and take-profit still bracket ``mark``."""
         band = self._held_band_error(row, mark)
@@ -1736,6 +2021,13 @@ class BinanceSpotAdapter:
         if not decision.isdigit():
             return "invalid_oco_client_id"
         purpose = str(sig.get("purpose") or "")
+        if self.peer_book_error:
+            return self.peer_book_error
+        shared = list(self.buy_blocks) + list(self.peer_buy_blocks)
+        held_rows = shared + list(self.canonical_rows)
+        unresolved = hard_unresolved_halt(held_rows)
+        if unresolved:
+            return unresolved
         held = buy_exposure_block(
             self.buy_blocks,
             self.canonical_rows,
@@ -1744,7 +2036,6 @@ class BinanceSpotAdapter:
         )
         if held:
             return held
-        shared = list(self.buy_blocks) + list(self.peer_buy_blocks)
         other_arm = cross_arm_symbol_block(shared, purpose=purpose, symbol=symbol)
         if other_arm:
             return other_arm
@@ -1755,11 +2046,324 @@ class BinanceSpotAdapter:
             planned = sig.get("extras", {}).get("quote_order_qty") if isinstance(sig.get("extras"), dict) else None
             if planned in (None, "") and isinstance(sig.get("extras"), dict):
                 planned = sig["extras"].get("quoteOrderQty")
-        return funding_after_reservation(
+        funding = funding_after_reservation(
             snapshot_usdt_free(self.account_snapshot),
             ENTRY_MIN_NOTIONAL_USDT,
             planned,
             reserved_quote_usdt(shared),
+        )
+        if funding:
+            return funding
+        return self._exchange_evidence_halt(held_rows)
+
+    def _exchange_evidence_halt(self, rows: list[dict[str, Any]]) -> str | None:
+        """Clear a working list or a zeroed exit only from this call's reads.
+
+        The entry net is the fee-net on the entry order. A local quantity is
+        not that net. A local ``exit_filled_qty`` is not a sell. Each OCO leg
+        must still cover whatever the entry read shows is unsold.
+        """
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            purpose = str(row.get("purpose") or "").strip()
+            if purpose and purpose not in {
+                PURPOSE_LIVE_BNB_BOLL_FADE,
+                PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+            }:
+                continue
+            reason = row_unresolved_reason(row)
+            if reason not in {"oco_readback_unverified", "exit_readback_unverified"}:
+                continue
+            entry_net = self._live_order_net(
+                row,
+                order_id=str(row.get("entry_order_id") or ""),
+                side="BUY",
+            )
+            if entry_net is None:
+                return "entry_origin_unverified"
+            exit_ids = _exit_order_ids(row)
+            exit_net = Decimal("0")
+            for exit_id in exit_ids:
+                one = self._live_order_net(row, order_id=exit_id, side="SELL")
+                if one is None:
+                    return "exit_readback_unverified"
+                exit_net += one
+            still = entry_net - exit_net
+            if still <= 0:
+                continue
+            if not self._current_list_covers(row, still):
+                return reason
+        return None
+
+    def _live_order_net(self, row: dict[str, Any], *, order_id: str, side: str) -> Decimal | None:
+        symbol = str(row.get("symbol") or "").strip()
+        order_id = order_id.strip()
+        if not symbol or not order_id:
+            return None
+        client = self._trade_client()
+        query = getattr(client, "get_order", None) if client is not None else None
+        if not callable(query):
+            return None
+        key, secret = self._credentials()
+        if not key or not secret:
+            return None
+        pairs = [
+            ("symbol", symbol),
+            ("orderId", order_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            payload = query(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("symbol") or "").strip().upper() != symbol.upper():
+            return None
+        if str(payload.get("orderId") or "").strip() != order_id:
+            return None
+        if str(payload.get("side") or "").strip().upper() != side:
+            return None
+        text = self._verified_order_base(payload, symbol=symbol, side=side)
+        if text is None:
+            return None
+        number = Decimal(text)
+        if not number.is_finite() or number <= 0:
+            return None
+        return number
+
+    def _order_trades(self, *, symbol: str, order_id: str) -> list[dict[str, Any]] | None:
+        """Every trade for this order. A short page ends the read. A gap halts."""
+        client = self._trade_client()
+        query = getattr(client, "my_trades", None) if client is not None else None
+        if not callable(query):
+            return None
+        key, secret = self._credentials()
+        if not key or not secret:
+            return None
+        seen: dict[str, dict[str, Any]] = {}
+        from_id: int | None = None
+        for _page in range(20):
+            pairs = [
+                ("symbol", symbol),
+                ("orderId", order_id),
+                ("limit", "1000"),
+                ("recvWindow", RECV_WINDOW_MS),
+                ("timestamp", str(int(self.clock_ms()))),
+            ]
+            if from_id is not None:
+                pairs.append(("fromId", str(from_id)))
+            try:
+                page = query(sign_query(pairs, secret), api_key=key)
+            except Exception as exc:  # noqa: BLE001
+                if isinstance(exc, AssertionError):
+                    raise
+                return None
+            if not isinstance(page, list):
+                return None
+            if not page:
+                break
+            last_id: int | None = None
+            fresh = 0
+            for trade in page:
+                if not isinstance(trade, dict):
+                    return None
+                trade_id = str(trade.get("id") if trade.get("id") is not None else "").strip()
+                if not trade_id or not trade_id.isdigit():
+                    return None
+                if str(trade.get("symbol") or "").strip().upper() != symbol.upper():
+                    return None
+                if str(trade.get("orderId") or "").strip() != order_id:
+                    return None
+                if trade_id not in seen:
+                    seen[trade_id] = trade
+                    fresh += 1
+                last_id = int(trade_id)
+            if len(page) < 1000:
+                break
+            if fresh == 0 or last_id is None:
+                return None
+            from_id = last_id + 1
+        else:
+            return None
+        return list(seen.values())
+
+    def _verified_order_base(self, payload: dict[str, Any], *, symbol: str, side: str) -> str | None:
+        """Buy net or sell reduction from one order. Gross is not a substitute.
+
+        Fills on the payload are used only when every fill has a quantity and
+        a commission. A payload with no fills is read from ``myTrades``.
+        ``PARTIALLY_FILLED`` is not a final quantity.
+        """
+        self._proved_fills = None
+        if not isinstance(payload, dict):
+            return None
+        executed = final_executed_qty(payload)
+        order_id = str(payload.get("orderId") or "").strip()
+        if executed is None or not order_id:
+            return None
+        reported = str(payload.get("symbol") or "").strip().upper()
+        if reported and reported != symbol.upper():
+            return None
+        fills = payload.get("fills")
+        if isinstance(fills, list) and fills:
+            trades: list[dict[str, Any]] = []
+            for index, fill in enumerate(fills, start=1):
+                if not isinstance(fill, dict):
+                    return None
+                trades.append(
+                    {
+                        "id": fill.get("tradeId", index),
+                        "symbol": symbol,
+                        "orderId": order_id,
+                        "qty": fill.get("qty"),
+                        "commission": fill.get("commission"),
+                        "commissionAsset": fill.get("commissionAsset"),
+                    }
+                )
+            effect = account_order_base(
+                trades,
+                symbol=symbol,
+                order_id=order_id,
+                side=side,
+                executed_qty=executed,
+            )
+            if effect is None:
+                return None
+            self._remember_proved_fills(order_id, trades)
+            return _decimal_text(effect)
+        trades_page = self._order_trades(symbol=symbol, order_id=order_id)
+        if trades_page is None:
+            return None
+        effect = account_order_base(
+            trades_page,
+            symbol=symbol,
+            order_id=order_id,
+            side=side,
+            executed_qty=executed,
+        )
+        if effect is None:
+            return None
+        self._remember_proved_fills(order_id, trades_page)
+        return _decimal_text(effect)
+
+    def _remember_proved_fills(self, order_id: str, trades: list[dict[str, Any]]) -> None:
+        """Keep the rows that proved this order so the receipt uses those fees."""
+        fills: list[dict[str, Any]] = []
+        for trade in trades:
+            if not isinstance(trade, dict):
+                return
+            fills.append(
+                {
+                    "tradeId": trade.get("id"),
+                    "qty": trade.get("qty"),
+                    "commission": trade.get("commission"),
+                    "commissionAsset": trade.get("commissionAsset"),
+                }
+            )
+        self._proved_fills = (order_id, fills)
+
+    def _with_proved_fills(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Attach the proved trades when the ack itself has no fill list."""
+        proved = getattr(self, "_proved_fills", None)
+        order_id = str(payload.get("orderId") or "").strip()
+        if not isinstance(proved, tuple) or len(proved) != 2 or proved[0] != order_id:
+            return payload
+        existing = payload.get("fills")
+        if isinstance(existing, list) and existing:
+            return payload
+        evidenced = dict(payload)
+        evidenced["fills"] = [dict(item) for item in proved[1]]
+        return evidenced
+
+    def _read_order(self, *, symbol: str, order_id: str) -> dict[str, Any] | None:
+        if not symbol or not order_id:
+            return None
+        client = self._trade_client()
+        query = getattr(client, "get_order", None) if client is not None else None
+        if not callable(query):
+            return None
+        key, secret = self._credentials()
+        if not key or not secret:
+            return None
+        pairs = [
+            ("symbol", symbol),
+            ("orderId", order_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            payload = query(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _verified_order_base_for_exit(self, row: dict[str, Any]) -> str | None:
+        """Size a reduce sell from a final entry fill, capped by the stored remainder.
+
+        An entry order that is still open is not a new fill. The stored
+        remainder stays. A final entry whose fee cannot be read is not sold.
+        """
+        stored = _positive_decimal(row.get("quantity"))
+        order_id = str(row.get("entry_order_id") or "").strip()
+        symbol = str(row.get("symbol") or "").strip()
+        self._exit_fee_block = None
+        if not order_id:
+            return stored
+        payload = self._read_order(symbol=symbol, order_id=order_id)
+        if not isinstance(payload, dict) or final_executed_qty(payload) is None:
+            return stored
+        verified = self._verified_order_base(payload, symbol=symbol, side="BUY")
+        if verified is None:
+            self._exit_fee_block = "fee_unverified"
+            return None
+        if stored is None or Decimal(stored) > Decimal(verified):
+            return verified
+        return stored
+
+    def _verified_order_base_text(self, row: dict[str, Any], *, order_id: str, side: str) -> str | None:
+        net = self._live_order_net(row, order_id=order_id, side=side)
+        if net is None:
+            return None
+        return _decimal_text(net)
+
+    def _current_list_covers(self, row: dict[str, Any], held: Decimal) -> bool:
+        list_id = str(row.get("oco_order_list_id") or "").strip()
+        symbol = str(row.get("symbol") or "").strip()
+        if not list_id or not symbol or held <= 0:
+            return False
+        client = self._trade_client()
+        query = getattr(client, "get_order_list", None) if client is not None else None
+        if not callable(query):
+            return False
+        key, secret = self._credentials()
+        if not key or not secret:
+            return False
+        pairs = [
+            ("symbol", symbol),
+            ("orderListId", list_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            payload = query(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            return False
+        return oco_readback_covers(
+            payload,
+            symbol=symbol,
+            held_net=held,
+            list_id=list_id,
+            above_id=row.get("oco_above_order_id"),
+            below_id=row.get("oco_below_order_id"),
         )
 
     def _auto_flatten_naked_position(
@@ -1783,13 +2387,17 @@ class BinanceSpotAdapter:
                 exchange_error=exchange_error,
             )
         symbol = str(row.get("symbol") or "")
-        qty = _positive_decimal(row.get("quantity"))
+        if not isinstance(info, dict):
+            loaded, _load_error = self._load_symbol_info(row, gates)
+            if isinstance(loaded, dict):
+                info = loaded
+        qty = _positive_decimal(self._verified_order_base_for_exit(row))
         client_id = flatten_client_order_id(row.get("decision_log_id"))
         if not is_spot_usdt_symbol(symbol) or qty is None or client_id is None:
             return self._oco_failed(
                 row,
                 save,
-                f"{oco_error}|flatten_invalid_spec",
+                f"{oco_error}|fee_unverified" if qty is None else f"{oco_error}|flatten_invalid_spec",
                 exchange_error=exchange_error,
             )
         key, secret = self._credentials()
@@ -1872,6 +2480,8 @@ class BinanceSpotAdapter:
                 protection=PROTECTION_AUTO_FLATTEN,
                 error_prefix=f"oco_failed_auto_flattened:{oco_error}",
                 exchange_error=exchange_error,
+                mark=mark,
+                info=info if isinstance(info, dict) else None,
             )
         if str(row.get("last_error") or "").startswith("flatten_submit_unknown"):
             return self._oco_failed(
@@ -1930,6 +2540,8 @@ class BinanceSpotAdapter:
             protection=PROTECTION_AUTO_FLATTEN,
             error_prefix=f"oco_failed_auto_flattened:{oco_error}",
             exchange_error=exchange_error,
+            mark=mark,
+            info=info if isinstance(info, dict) else None,
         )
 
     def _buy_with_native_oco(
@@ -1951,7 +2563,7 @@ class BinanceSpotAdapter:
         info_obj = info if isinstance(info, dict) else None
         filters = _symbol_filters(info_obj, symbol) if info_obj is not None else None
         decision_id = int(str(sig.get("decision_log_id")).strip())
-        qty = sellable or filled
+        qty = sellable
         arm: dict[str, Any] = {
             "decision_log_id": decision_id,
             "symbol": symbol,
@@ -1981,7 +2593,7 @@ class BinanceSpotAdapter:
             filled_qty=filled,
             sellable_qty=sellable,
         )
-        if qty is None:
+        if qty is None and not filled:
             arm["status"] = "qty_unconfirmed"
             return _result(
                 ok=False,
@@ -1993,6 +2605,25 @@ class BinanceSpotAdapter:
                 arm_position=arm,
                 consumer_allowed=False,
                 **common,
+            )
+        if qty is None:
+            arm["status"] = "oco_failed"
+            arm["protection"] = PROTECTION_PENDING
+            arm["quantity"] = None
+            arm["last_error"] = "fee_unverified"
+            return self._label_fill_protection(
+                _result(
+                    ok=False,
+                    dry_run=False,
+                    executed=0,
+                    submitted=True,
+                    error="fee_unverified",
+                    exit_plan=plan,
+                    arm_position=arm,
+                    consumer_allowed=False,
+                    **common,
+                ),
+                qty=str(filled or ""),
             )
         row: dict[str, Any] = {
             "id": 1,
@@ -2009,26 +2640,58 @@ class BinanceSpotAdapter:
         def save(fields: dict[str, Any]) -> None:
             row.update(fields)
 
-        band_error: str | None = None
-        for candidate in (getattr(self, "_entry_mark", None), fill_price):
-            if not filters or _to_decimal(candidate) is None:
-                continue
-            band_error = protective_band_error(
-                stop_price=str(row.get("stop_price") or ""),
-                take_profit_price=str(row.get("take_profit_price") or ""),
-                mark=candidate,
-                filters=filters,
-            )
-            if band_error:
-                break
+        pre = getattr(self, "_oco_preflight", None)
+        strict_fill = (
+            isinstance(pre, dict)
+            and pre.get("reference") == "planned_entry"
+            and pre.get("mark_inside_band") is False
+        )
+        protect_mark = getattr(self, "_entry_mark", None)
+        anchors: tuple[object, ...] = (protect_mark, fill_price)
+        anchor_block: str | None = None
+        if strict_fill and isinstance(pre, dict):
+            # The pre-submit mark was allowed to sit outside the band. The
+            # fill is protected against the fill average and a fresh mark.
+            client_now = self.client if self.client is not None else self._trade_client()
+            if client_now is None:
+                fresh, fresh_err = None, "mark_unavailable"
+            else:
+                fresh, fresh_err = self._read_entry_mark(client_now, symbol)
+            noted = dict(pre)
+            noted["fill_mark"] = fresh
+            noted["fill_average"] = fill_price
+            if fresh_err:
+                noted["fill_mark_error"] = fresh_err
+            self._oco_preflight = noted
+            if fresh_err or _to_decimal(fresh) is None:
+                anchor_block = fresh_err or "mark_unavailable"
+            elif _to_decimal(fill_price) is None:
+                anchor_block = "fill_price_unavailable"
+            else:
+                anchors = (fresh, fill_price)
+                protect_mark = fresh
 
-        if band_error and self._reanchor_enabled() and filters:
+        band_error: str | None = anchor_block
+        if band_error is None:
+            for candidate in anchors:
+                if not filters or _to_decimal(candidate) is None:
+                    continue
+                band_error = protective_band_error(
+                    stop_price=str(row.get("stop_price") or ""),
+                    take_profit_price=str(row.get("take_profit_price") or ""),
+                    mark=candidate,
+                    filters=filters,
+                )
+                if band_error:
+                    break
+
+        if band_error and anchor_block is None and self._reanchor_enabled() and filters:
             reanchored, reanchor_err = reanchor_oco_prices_to_fill(
                 signal_entry_price=signal_entry,
                 stop_price=str(plan.get("stop_price") or ""),
                 take_profit_price=str(plan.get("take_profit_price") or ""),
                 fill_price=fill_price,
-                mark=getattr(self, "_entry_mark", None),
+                mark=protect_mark,
                 filters=filters,
             )
             if reanchored is not None and reanchor_err is None:
@@ -2047,42 +2710,49 @@ class BinanceSpotAdapter:
                 flat = self._auto_flatten_naked_position(
                     row,
                     info=info_obj,
-                    mark=fill_price or getattr(self, "_entry_mark", None),
+                    mark=fill_price or protect_mark,
                     oco_error=detail,
                     save=save,
                 )
-                for k in ("status", "protection", "exit_order_id", "exit_reason", "exit_client_order_id", "last_error"):
-                    if row.get(k) is not None:
-                        arm[k] = row[k]
-                return _result(
-                    ok=False,
-                    dry_run=False,
-                    executed=0,
-                    submitted=False,
-                    error=str(flat.get("error") or detail),
-                    exit_plan=plan,
-                    arm_position=arm,
-                    consumer_allowed=False,
-                    **common,
+                self._copy_exit_onto_arm(arm, row)
+                return self._label_fill_protection(
+                    _result(
+                        ok=False,
+                        dry_run=False,
+                        executed=0,
+                        submitted=False,
+                        error=str(flat.get("error") or detail),
+                        exit_plan=plan,
+                        arm_position=arm,
+                        consumer_allowed=False,
+                        **common,
+                    ),
+                    qty=str(arm.get("quantity") or ""),
                 )
             arm["status"] = "oco_failed"
             arm["protection"] = PROTECTION_PENDING
             row["status"] = "oco_failed"
             row["protection"] = PROTECTION_PENDING
             row["last_error"] = detail
-            return _result(
-                ok=False,
-                dry_run=False,
-                executed=0,
-                submitted=False,
-                error=detail,
-                exit_plan=plan,
-                arm_position=arm,
-                consumer_allowed=False,
-                **common,
+            return self._label_fill_protection(
+                _result(
+                    ok=False,
+                    dry_run=False,
+                    executed=0,
+                    submitted=False,
+                    error=detail,
+                    exit_plan=plan,
+                    arm_position=arm,
+                    consumer_allowed=False,
+                    **common,
+                ),
+                qty=str(arm.get("quantity") or ""),
             )
 
-        oco_mark = fill_price or getattr(self, "_entry_mark", None) or plan.get("entry_price")
+        if strict_fill:
+            oco_mark = protect_mark or fill_price
+        else:
+            oco_mark = fill_price or protect_mark or plan.get("entry_price")
         outcome = self._try_place_oco(row, oco_mark, save)
         oco_fields = {
             key: row.get(key)
@@ -2125,7 +2795,7 @@ class BinanceSpotAdapter:
             arm["status"] = "oco_working"
             arm["protection"] = PROTECTION_EXCHANGE
             arm["quantity"] = row.get("quantity") or qty
-            return _result(
+            covered_result = _result(
                 ok=True,
                 dry_run=False,
                 executed=1,
@@ -2137,6 +2807,8 @@ class BinanceSpotAdapter:
                 consumer_allowed=True,
                 **common,
             )
+            covered_result["protection_state"] = "oco_working"
+            return covered_result
         status = str(row.get("status") or "")
         if status in {"", "open"}:
             status = "oco_failed"
@@ -2159,36 +2831,38 @@ class BinanceSpotAdapter:
                 save=save,
                 exchange_error=exch_err,
             )
-            for k in ("status", "protection", "exit_order_id", "exit_reason", "exit_client_order_id", "last_error"):
-                if row.get(k) is not None:
-                    arm[k] = row[k]
-            if row.get("last_error"):
-                oco_fields["last_error"] = row["last_error"]
-            return _result(
+            self._copy_exit_onto_arm(arm, row, oco_fields)
+            return self._label_fill_protection(
+                _result(
+                    ok=False,
+                    dry_run=False,
+                    executed=0,
+                    submitted=False,
+                    error=str(flat.get("error") or error),
+                    exit_plan=plan,
+                    arm_position=arm,
+                    oco_fields=oco_fields or None,
+                    exchange_error=exch_err,
+                    consumer_allowed=False,
+                    **common,
+                ),
+                qty=str(arm.get("quantity") or ""),
+            )
+        return self._label_fill_protection(
+            _result(
                 ok=False,
                 dry_run=False,
                 executed=0,
                 submitted=False,
-                error=str(flat.get("error") or error),
+                error=str(error),
                 exit_plan=plan,
                 arm_position=arm,
                 oco_fields=oco_fields or None,
                 exchange_error=exch_err,
                 consumer_allowed=False,
                 **common,
-            )
-        return _result(
-            ok=False,
-            dry_run=False,
-            executed=0,
-            submitted=False,
-            error=str(error),
-            exit_plan=plan,
-            arm_position=arm,
-            oco_fields=oco_fields or None,
-            exchange_error=exch_err,
-            consumer_allowed=False,
-            **common,
+            ),
+            qty=str(arm.get("quantity") or ""),
         )
 
     def _resting_maker_ack(
@@ -2210,9 +2884,9 @@ class BinanceSpotAdapter:
         cancel is ``closed_canceled`` and does not keep the lock.
         """
         order = dict(pairs)
-        filled = sellable_base_qty(placed, symbol) or filled_base_qty(placed)
         ack = str(placed.get("status") or "").upper()
         terminal = ack in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"}
+        base_filled = filled_base_qty(placed)
         if plan is None:
             return _result(
                 ok=False,
@@ -2227,6 +2901,40 @@ class BinanceSpotAdapter:
                 intent=intent,
                 consumer_allowed=False,
             )
+        if terminal and base_filled:
+            filled = self._verified_order_base(placed, symbol=symbol, side="BUY")
+            if not filled:
+                arm = {
+                    "decision_log_id": int(str(sig.get("decision_log_id")).strip()),
+                    "symbol": symbol,
+                    "quantity": None,
+                    "entry_order_id": order_id,
+                    "stop_price": plan["stop_price"],
+                    "take_profit_price": plan["take_profit_price"],
+                    "status": "oco_failed",
+                    "protection": PROTECTION_PENDING,
+                    "last_error": "fee_unverified",
+                    "purpose": str(sig.get("purpose") or "").strip() or PURPOSE_LIVE_BNB_BOLL_FADE,
+                }
+                return _result(
+                    ok=False,
+                    dry_run=False,
+                    executed=0,
+                    submitted=True,
+                    error="fee_unverified",
+                    symbol=symbol,
+                    order=order,
+                    exchange_order_id=order_id,
+                    gates=gates,
+                    intent=intent,
+                    exit_plan=plan,
+                    filled_qty=base_filled,
+                    sellable_qty=None,
+                    arm_position=arm,
+                    consumer_allowed=False,
+                )
+        else:
+            filled = base_filled
         if terminal and not filled:
             return _result(
                 ok=False,
@@ -2271,7 +2979,7 @@ class BinanceSpotAdapter:
             intent=intent,
             exit_plan=plan,
             filled_qty=filled,
-            sellable_qty=filled,
+            sellable_qty=filled if terminal else None,
             arm_position=arm,
             consumer_allowed=False,
         )
@@ -2281,6 +2989,10 @@ class BinanceSpotAdapter:
         self._entry_mark = None
         self._orderbook_metrics = None
         self._mark_telemetry = None
+        self._oco_preflight = None
+        self._resting_ceiling = None
+        self._resting_ceiling_source = None
+        self._resting_ask_age_ms = None
         gates = self._gates()
         purpose = str(sig.get("purpose") or "").strip()
         if not is_live_bnb_spot_purpose(purpose):
@@ -2710,14 +3422,33 @@ class BinanceSpotAdapter:
 
         if side_now == "BUY" and isinstance(plan, dict):
             mark, mark_error = self._read_entry_mark(client, symbol)
-            if mark_error:
+            order_type_now = _parse_order_type(
+                extras.get("order_type", extras.get("binance_order_type"))
+            )
+            tel = getattr(self, "_mark_telemetry", None)
+            mark_source = tel.get("mark_source") if isinstance(tel, dict) else None
+            if mark_error or mark is None:
+                self._oco_preflight = {
+                    "order_type": order_type_now,
+                    "reference": None,
+                    "reference_price": None,
+                    "mark": None,
+                    "mark_source": mark_source,
+                    "ceiling_price": None,
+                    "ceiling_source": None,
+                    "aligned_stop": None,
+                    "aligned_take_profit": None,
+                    "aligned_limit": None,
+                    "planned_limit": None,
+                    "mark_inside_band": None,
+                }
                 return self._finish(
                     _result(
                         ok=False,
                         dry_run=False,
                         executed=0,
                         submitted=False,
-                        error=mark_error,
+                        error=mark_error or "mark_unavailable",
                         symbol=symbol,
                         order=None,
                         exchange_order_id=None,
@@ -2726,23 +3457,29 @@ class BinanceSpotAdapter:
                         consumer_allowed=False,
                     )
                 )
-            if mark is not None:
-                self._entry_mark = mark
+            self._entry_mark = mark
+            # MARKET keeps the live-mark band. A resting limit is checked
+            # after pegging, against its own planned entry.
+            if order_type_now == "MARKET":
                 filters = _symbol_filters(info, symbol) or []
-                band_error = protective_band_error(
-                    stop_price=str(plan.get("stop_price") or ""),
-                    take_profit_price=str(plan.get("take_profit_price") or ""),
+                diag, pre_err = buy_entry_oco_preflight(
+                    order_type="MARKET",
+                    limit_price=None,
+                    stop_price=plan.get("stop_price"),
+                    take_profit_price=plan.get("take_profit_price"),
                     mark=mark,
+                    mark_source=mark_source,
                     filters=filters,
                 )
-                if band_error:
+                self._oco_preflight = diag
+                if pre_err:
                     return self._finish(
                         _result(
                             ok=False,
                             dry_run=False,
                             executed=0,
                             submitted=False,
-                            error=band_error,
+                            error=pre_err,
                             symbol=symbol,
                             order=None,
                             exchange_order_id=None,
@@ -2751,9 +3488,27 @@ class BinanceSpotAdapter:
                             consumer_allowed=False,
                         )
                     )
-            order_type_now = _parse_order_type(
-                extras.get("order_type", extras.get("binance_order_type"))
-            )
+                if not self._auto_flatten_enabled():
+                    # A MARKET fill can still be left naked if the OCO is
+                    # rejected. Deployed defaults do not sell that fill.
+                    # Do not send the buy. This does not enable auto-flatten.
+                    diag["protection_disposition"] = "unconfigured"
+                    self._oco_preflight = diag
+                    return self._finish(
+                        _result(
+                            ok=False,
+                            dry_run=False,
+                            executed=0,
+                            submitted=False,
+                            error="buy_protection_unconfigured",
+                            symbol=symbol,
+                            order=None,
+                            exchange_order_id=None,
+                            gates=gates,
+                            exit_plan=plan,
+                            consumer_allowed=False,
+                        )
+                    )
             if order_type_now == "LIMIT" and (
                 self._post_only_limit_enabled() or extras.get("post_only") is True
             ):
@@ -2779,6 +3534,7 @@ class BinanceSpotAdapter:
                             consumer_allowed=False,
                         )
                     )
+                self._resting_ceiling = best_ask_px
                 raw_lim, _ = _chosen_limit_raw(extras)
                 filters = _symbol_filters(info, symbol) or []
                 pegged_px, was_clamped, peg_err = peg_maker_buy_price(
@@ -2889,6 +3645,8 @@ class BinanceSpotAdapter:
                                     plan = dict(plan)
                                     plan["entry_price"] = sor_spec["price"]
                                     plan["sor_routed"] = "limit_maker_at_best_bid"
+                                    self._resting_ceiling = str(ob_metrics.get("best_ask") or "")
+                                    self._resting_ceiling_source = "rest_book"
                                     ob_metrics["sor_routed"] = "limit_maker_at_best_bid"
                                     ob_metrics["sor_original_block"] = ob_error
                                     ob_metrics["sor_maker_price"] = sor_spec["price"]
@@ -2911,8 +3669,25 @@ class BinanceSpotAdapter:
                                 )
                             )
 
+        if side_now == "BUY" and isinstance(plan, dict):
+            final_type = _parse_order_type(
+                extras.get("order_type", extras.get("binance_order_type"))
+            )
+            if final_type in {"LIMIT", "LIMIT_MAKER"}:
+                extras, plan, pairs, refused = self._resting_limit_preflight(
+                    sig=sig,
+                    extras=extras,
+                    plan=plan,
+                    pairs=pairs,
+                    info=info,
+                    symbol=symbol,
+                    gates=gates,
+                )
+                if refused is not None:
+                    return refused
+
         posted = {key_name: value for key_name, value in pairs}
-        if posted.get("side") == "BUY" and posted.get("type") == "LIMIT_MAKER":
+        if posted.get("side") == "BUY" and posted.get("type") in {"LIMIT", "LIMIT_MAKER"}:
             if not _maker_entry_lifecycle_ready(client):
                 return self._finish(
                     _result(
@@ -2990,9 +3765,14 @@ class BinanceSpotAdapter:
                 extras, side=side, order_type=order_type, order=dict(pairs)
             )
         filled = filled_base_qty(placed)
-        sellable = sellable_base_qty(placed, symbol) or filled
+        sellable = (
+            self._verified_order_base(placed, symbol=symbol, side="BUY")
+            if isinstance(placed, dict)
+            else None
+        )
+        entry_evidence = self._with_proved_fills(placed) if isinstance(placed, dict) else None
         ack_status = str(placed.get("status") or "").upper()
-        if side_now == "BUY" and order_type == "LIMIT_MAKER" and ack_status != "FILLED":
+        if side_now == "BUY" and order_type in {"LIMIT", "LIMIT_MAKER"} and ack_status != "FILLED":
             return self._finish(
                 self._resting_maker_ack(
                     sig,
@@ -3006,21 +3786,22 @@ class BinanceSpotAdapter:
                 )
             )
         if side_now == "BUY":
-            return self._finish(
-                self._buy_with_native_oco(
-                    sig,
-                    plan=plan,
-                    gates=gates,
-                    intent=intent,
-                    pairs=pairs,
-                    order_id=str(order_id),
-                    filled=filled,
-                    sellable=sellable,
-                    info=info,
-                    symbol=symbol,
-                    placed=placed,
-                )
+            bought = self._buy_with_native_oco(
+                sig,
+                plan=plan,
+                gates=gates,
+                intent=intent,
+                pairs=pairs,
+                order_id=str(order_id),
+                filled=filled,
+                sellable=sellable,
+                info=info,
+                symbol=symbol,
+                placed=placed,
             )
+            if isinstance(entry_evidence, dict):
+                bought["entry_fill"] = entry_evidence
+            return self._finish(bought)
         return self._finish(
             _result(
                 ok=True,
@@ -3108,24 +3889,27 @@ class BinanceSpotAdapter:
             timestamp_ms=int(self.clock_ms()),
         )
 
-    def refresh_filled_qty(self, position: dict[str, Any]) -> str | None:
-        """Read the entry order's base fill. No request while the live gates are shut."""
+    def refresh_filled_qty(self, position: dict[str, Any]) -> tuple[str | None, str | None]:
+        """Verified entry net, plus ``fee_unverified`` when a final fill has no commission.
+
+        A still-open order is ``(None, None)``. Gross ``executedQty`` is not returned.
+        """
         gates = self._gates()
         if not gates["live_enabled"]:
-            return None
+            return None, None
         symbol = position.get("symbol")
         order_id = position.get("entry_order_id")
         if not isinstance(symbol, str) or not is_spot_usdt_symbol(symbol):
-            return None
+            return None, None
         if order_id is None or not str(order_id).strip():
-            return None
+            return None, None
         key, secret = self._credentials()
         if not key or not secret:
-            return None
+            return None, None
         client = self.client if self.client is not None else BinanceSpotHttpClient()
         lookup = getattr(client, "get_order", None)
         if not callable(lookup):
-            return None
+            return None, None
         pairs = [
             ("symbol", symbol),
             ("orderId", str(order_id).strip()),
@@ -3137,10 +3921,15 @@ class BinanceSpotAdapter:
         except Exception as exc:  # noqa: BLE001 — a missed read must not submit
             if isinstance(exc, AssertionError):
                 raise
-            return None
+            return None, None
         if not isinstance(placed, dict):
-            return None
-        return filled_base_qty(placed)
+            return None, None
+        if final_executed_qty(placed) is None:
+            return None, None
+        net = self._verified_order_base(placed, symbol=symbol, side="BUY")
+        if net is None:
+            return None, "fee_unverified"
+        return net, None
 
     def mark_price(self, symbol: str) -> object | None:
         """Public last price. No client is built while the live gates are shut."""
@@ -3234,9 +4023,10 @@ class BinanceSpotAdapter:
         if not isinstance(symbol, str) or not is_spot_usdt_symbol(symbol):
             outcome["error"] = "invalid_binance_symbol"
             return self._log_exit(outcome)
-        qty = _positive_decimal(position.get("quantity"))
+        qty = self._verified_order_base_for_exit(position)
         if qty is None:
-            outcome["error"] = "exit_qty_unconfirmed"
+            outcome["error"] = getattr(self, "_exit_fee_block", None) or "exit_qty_unconfirmed"
+            outcome["book"] = "error_only"
             return self._log_exit(outcome)
         if client_id is None:
             outcome["error"] = "invalid_exit_client_id"
@@ -3356,6 +4146,14 @@ class BinanceSpotAdapter:
                 book="unchanged",
                 error="exit_qty_unconfirmed",
                 submitted=False,
+            )
+        if str(row.get("last_error") or "") == "fee_unverified":
+            return self._coverage(
+                row,
+                book="oco_failed",
+                submitted=False,
+                error="fee_unverified",
+                protection=PROTECTION_PENDING,
             )
         if status in {"closed", "closed_dust", "exit_submitted", "oco_filled"}:
             return self._coverage(
@@ -3594,6 +4392,75 @@ class BinanceSpotAdapter:
             protection=PROTECTION_PENDING,
         )
 
+    def _fill_left_original_band(
+        self,
+        row: dict[str, Any],
+        mark: object,
+        fill: object,
+    ) -> str | None:
+        """Error when the current mark or the fill average is outside the original band."""
+        if _to_decimal(mark) is None:
+            return "mark_unavailable"
+        info, err = self._load_symbol_info(row, self._gates())
+        if err or not isinstance(info, dict):
+            return err or "oco_missing_lot_filter"
+        filters = _symbol_filters(info, str(row.get("symbol") or ""))
+        if not filters:
+            return "oco_missing_lot_filter"
+        band = protective_band_error(
+            stop_price=str(row.get("stop_price") or ""),
+            take_profit_price=str(row.get("take_profit_price") or ""),
+            mark=mark,
+            filters=filters,
+        )
+        if band:
+            return band
+        if _to_decimal(fill) is None:
+            return None
+        return protective_band_error(
+            stop_price=str(row.get("stop_price") or ""),
+            take_profit_price=str(row.get("take_profit_price") or ""),
+            mark=fill,
+            filters=filters,
+        )
+
+    def _reanchor_open_row(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        *,
+        mark: object,
+        fill_price: object,
+        signal_entry: object,
+    ) -> bool:
+        """Move stop and take-profit to the actual fill and mark. False leaves them unchanged."""
+        info, err = self._load_symbol_info(row, self._gates())
+        if err or not isinstance(info, dict):
+            return False
+        filters = _symbol_filters(info, str(row.get("symbol") or ""))
+        if not filters:
+            return False
+        reanchored, re_err = reanchor_oco_prices_to_fill(
+            signal_entry_price=signal_entry,
+            stop_price=str(row.get("stop_price") or ""),
+            take_profit_price=str(row.get("take_profit_price") or ""),
+            fill_price=fill_price,
+            mark=mark,
+            filters=filters,
+        )
+        if reanchored is None or re_err:
+            return False
+        save(
+            {
+                "stop_price": reanchored["stop_price"],
+                "take_profit_price": reanchored["take_profit_price"],
+            }
+        )
+        row["stop_price"] = reanchored["stop_price"]
+        row["take_profit_price"] = reanchored["take_profit_price"]
+        row["oco_reanchored"] = True
+        return True
+
     def _adopt_terminal_entry(
         self,
         row: dict[str, Any],
@@ -3606,11 +4473,29 @@ class BinanceSpotAdapter:
     ) -> dict[str, Any]:
         """OCO only the base the entry order actually filled. Zero is terminal."""
         status = str(payload.get("status") or "").upper()
-        if status == "FILLED" or (
+        final_qty = final_executed_qty(payload)
+        terminal_fill = status == "FILLED" or (
             status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"}
-            and filled_qty
-        ):
+            and final_qty is not None
+        )
+        if terminal_fill:
             if not filled_qty:
+                if final_executed_qty(payload) is not None:
+                    save(
+                        {
+                            "status": "oco_failed",
+                            "protection": PROTECTION_PENDING,
+                            "last_error": "fee_unverified",
+                            "quantity": None,
+                        }
+                    )
+                    return self._coverage(
+                        row,
+                        book="oco_failed",
+                        submitted=False,
+                        error="fee_unverified",
+                        protection=PROTECTION_PENDING,
+                    )
                 save(
                     {
                         "status": "maker_cancel_unknown",
@@ -3624,12 +4509,62 @@ class BinanceSpotAdapter:
                     error="maker_fill_unconfirmed",
                     protection="maker_resting",
                 )
+            signal_entry = row.get("entry_limit_price") or row.get("entry_price")
             upd: dict[str, Any] = {"status": "open", "quantity": filled_qty}
             if avg_px:
                 upd["entry_price"] = avg_px
             save(upd)
-            ref_mark = mark if _to_decimal(mark) is not None else (avg_px or row.get("entry_price"))
-            return self.maintain_held_position(row, ref_mark, persist=persist)
+            recorder = getattr(self, "record_entry_origin", None)
+            if callable(recorder) and row.get("id") is not None:
+                recorder(
+                    int(row["id"]),
+                    symbol=str(row.get("symbol") or ""),
+                    placed=self._with_proved_fills(payload if isinstance(payload, dict) else {}),
+                )
+            if _to_decimal(mark) is None:
+                detail = "oco_unprotectable:mark_unavailable"
+                if self._auto_flatten_enabled():
+                    flat = self._auto_flatten_naked_position(
+                        row,
+                        info=None,
+                        mark=avg_px or signal_entry,
+                        oco_error=detail,
+                        save=save,
+                    )
+                    return flat
+                save(
+                    {
+                        "status": "oco_failed",
+                        "protection": PROTECTION_PENDING,
+                        "last_error": detail,
+                    }
+                )
+                return self._coverage(
+                    row,
+                    book="oco_failed",
+                    submitted=False,
+                    error=detail,
+                    protection=PROTECTION_PENDING,
+                )
+            left = self._fill_left_original_band(row, mark, avg_px)
+            if left and self._reanchor_enabled():
+                if self._reanchor_open_row(
+                    row,
+                    save,
+                    mark=mark,
+                    fill_price=avg_px,
+                    signal_entry=signal_entry,
+                ):
+                    left = None
+            if left and self._auto_flatten_enabled() and not self._reanchor_enabled():
+                return self._auto_flatten_naked_position(
+                    row,
+                    info=None,
+                    mark=mark,
+                    oco_error=f"oco_unprotectable:{left}",
+                    save=save,
+                )
+            return self.maintain_held_position(row, mark, persist=persist)
         save(
             {
                 "status": "closed_canceled",
@@ -3728,7 +4663,7 @@ class BinanceSpotAdapter:
                 error="maker_cancel_unknown",
                 protection="maker_resting",
             )
-        filled_qty = sellable_base_qty(fresh, symbol) or filled_base_qty(fresh)
+        filled_qty = self._verified_order_base(fresh, symbol=symbol, side="BUY")
         return self._adopt_terminal_entry(
             row,
             save,
@@ -3800,7 +4735,7 @@ class BinanceSpotAdapter:
             return self._coverage(row, book="unchanged", submitted=False, error="entry_requery_failed")
 
         ord_status = str(order_payload.get("status") or "").upper()
-        filled_qty = sellable_base_qty(order_payload, symbol) or filled_base_qty(order_payload)
+        filled_qty = self._verified_order_base(order_payload, symbol=symbol, side="BUY")
         avg_px = fill_average_price(order_payload)
         created_ms = _row_epoch_ms(row)
         if created_ms is None:
@@ -4059,16 +4994,16 @@ class BinanceSpotAdapter:
     ) -> dict[str, Any]:
         gates = self._gates()
         symbol = str(row.get("symbol") or "")
-        qty = _positive_decimal(row.get("quantity"))
+        qty = _positive_decimal(self._verified_order_base_for_exit(row))
         key, secret = self._credentials()
         client = self._trade_client()
         if qty is None or client is None or not key or not secret:
-            save({"last_error": "time_stop_submit_unknown"})
+            save({"last_error": "fee_unverified" if qty is None else "time_stop_submit_unknown"})
             return self._coverage(
                 row,
                 book="time_stop_unknown",
                 submitted=False,
-                error="time_stop_submit_unknown",
+                error="fee_unverified" if qty is None else "time_stop_submit_unknown",
                 protection=PROTECTION_TIME_STOP,
                 reason="time_stop_max_hold",
             )
@@ -4193,6 +5128,8 @@ class BinanceSpotAdapter:
         error_prefix: str,
         order: dict[str, str] | None = None,
         exchange_error: dict[str, Any] | None = None,
+        mark: object = None,
+        info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Close only a sell that filled the whole remaining qty. A zero or partial fill stays open."""
         order_id = _exit_order_accepted(placed)
@@ -4211,21 +5148,49 @@ class BinanceSpotAdapter:
             )
         held = _to_decimal(row.get("quantity")) or Decimal("0")
         executed = _to_decimal(placed.get("executedQty")) or Decimal("0")
-        orig = _to_decimal(placed.get("origQty") or placed.get("origQuantity"))
         prior_id = str(row.get("exit_order_id") or "")
         accounted = (
             _to_decimal(row.get("exit_filled_qty")) or Decimal("0")
             if prior_id == str(order_id)
             else Decimal("0")
         )
-        if orig is not None:
-            remainder = orig - executed
-        else:
-            delta = executed - accounted
-            if delta < 0:
-                delta = Decimal("0")
-            remainder = held - delta
-        full = executed > 0 and remainder <= Decimal("0.00000001")
+        # The sell's origQty is the size of that order. Completing it does
+        # not close a larger hold. The remainder is held minus executedQty.
+        delta = executed - accounted
+        if delta < 0:
+            delta = Decimal("0")
+        remainder = held - delta
+        full = delta > 0 and remainder <= Decimal("0.00000001")
+        lot_residual = _to_decimal(row.get("residual_qty"))
+        if full and lot_residual is not None and lot_residual > Decimal("0.00000001"):
+            # The sell filled its own quantity. A lot remainder was stored
+            # aside and was not part of that order. That is not a flat close.
+            residual_text = _decimal_text(lot_residual)
+            fields = dust_archive_fields(
+                quantity=residual_text,
+                mark=mark if mark is not None else row.get("entry_price"),
+                stop=row.get("stop_price"),
+                detail="oco_lot_residual",
+            )
+            fields["quantity"] = residual_text
+            fields["exit_order_id"] = order_id
+            fields["exit_client_order_id"] = client_id
+            fields["exit_filled_qty"] = _decimal_text(delta)
+            save(fields)
+            out = self._coverage(
+                row,
+                book="closed_dust",
+                submitted=False,
+                error="dust_untradable",
+                protection=PROTECTION_DUST,
+                reason="dust_abandon",
+                order=order,
+                quantity=residual_text,
+                exchange_error=exchange_error,
+            )
+            out["exchange_order_id"] = order_id
+            out["exit_client_order_id"] = client_id
+            return out
         if full:
             sold = _decimal_text(executed)
             save(
@@ -4257,6 +5222,41 @@ class BinanceSpotAdapter:
             out["exit_client_order_id"] = client_id
             return out
         kept = _decimal_text(held if remainder < 0 else remainder)
+        if (
+            reason != "time_stop_max_hold"
+            and isinstance(info, dict)
+            and remainder > Decimal("0.00000001")
+            and kept is not None
+        ):
+            _sized, size_error = size_exit_quantity(
+                info, str(row.get("symbol") or ""), kept, mark
+            )
+            if dust_detail(size_error):
+                fields = dust_archive_fields(
+                    quantity=kept,
+                    mark=mark,
+                    stop=row.get("stop_price"),
+                    detail=size_error or "exit_qty_below_min",
+                )
+                fields["quantity"] = kept
+                fields["exit_order_id"] = order_id
+                fields["exit_client_order_id"] = client_id
+                fields["exit_filled_qty"] = _decimal_text(delta)
+                save(fields)
+                out = self._coverage(
+                    row,
+                    book="closed_dust",
+                    submitted=False,
+                    error="dust_untradable",
+                    protection=PROTECTION_DUST,
+                    reason="dust_abandon",
+                    order=order,
+                    quantity=kept,
+                    exchange_error=exchange_error,
+                )
+                out["exchange_order_id"] = order_id
+                out["exit_client_order_id"] = client_id
+                return out
         book = "time_stop_unknown" if reason == "time_stop_max_hold" else "oco_failed"
         open_protection = PROTECTION_TIME_STOP if reason == "time_stop_max_hold" else PROTECTION_PENDING
         save(
@@ -4432,6 +5432,8 @@ class BinanceSpotAdapter:
         filters = _symbol_filters(info, str(row.get("symbol") or ""))
         if not filters:
             return self._oco_failed(row, save, "oco_missing_lot_filter")
+        if _to_decimal(mark) is None:
+            return self._oco_failed(row, save, "mark_unavailable")
         seq = int(row.get("oco_ratchet_count") or 0) if ratchet_seq is None else int(ratchet_seq)
         spec, spec_error = build_spot_oco(
             symbol=str(row.get("symbol") or ""),
@@ -4811,13 +5813,23 @@ class BinanceSpotAdapter:
         mark_tel = getattr(self, "_mark_telemetry", None)
         if isinstance(mark_tel, dict):
             result["mark_telemetry"] = dict(mark_tel)
+        preflight = getattr(self, "_oco_preflight", None)
+        if isinstance(preflight, dict):
+            result["oco_preflight"] = dict(preflight)
+        logged = result.get("oco_preflight") if isinstance(result.get("oco_preflight"), dict) else {}
         log.info(
-            "binance_spot symbol=%s dry_run=%s ok=%s submitted=%s error=%s",
+            "binance_spot symbol=%s dry_run=%s ok=%s submitted=%s error=%s reference=%s mark=%s mark_source=%s aligned_stop=%s aligned_tp=%s aligned_limit=%s",
             result.get("symbol"),
             result.get("dry_run"),
             result.get("ok"),
             result.get("submitted"),
             result.get("error"),
+            logged.get("reference"),
+            logged.get("mark"),
+            logged.get("mark_source"),
+            logged.get("aligned_stop"),
+            logged.get("aligned_take_profit"),
+            logged.get("aligned_limit"),
         )
         return result
 

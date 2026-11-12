@@ -6,6 +6,7 @@ Read-only against the crawl/decision DB. Never writes main-library business tabl
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -32,6 +33,67 @@ _CLASSIC_LEDGER_NAME = "execution_ledger_live_bnb_boll_classic.db"
 _BUY_LOCK_NAME = "binance_spot_shared_buy.lock"
 
 
+def _stored_qty_zero(raw: object) -> bool:
+    if raw is None or isinstance(raw, bool):
+        return False
+    try:
+        number = Decimal(str(raw).strip())
+    except Exception:
+        return False
+    return bool(number.is_finite() and number == 0)
+
+
+def _stored_qty_positive(raw: object) -> bool:
+    if raw is None or isinstance(raw, bool):
+        return False
+    try:
+        number = Decimal(str(raw).strip())
+    except Exception:
+        return False
+    return bool(number.is_finite() and number > 0)
+
+
+def _fee_net_base(placed: dict[str, Any], symbol: str, gross: Decimal) -> Decimal | None:
+    """Ack fee-net. Missing fills or a missing commission is unknown, not zero.
+
+    Same base-versus-other-asset rule as ``sellable_base_qty``. The ledger
+    does not import the executor package. A later buy does not use this
+    number as the unlock; it reads ``myTrades``.
+    """
+    fills = placed.get("fills")
+    if not isinstance(fills, list) or not fills:
+        return None
+    base = symbol[: -len("USDT")] if str(symbol).endswith("USDT") else ""
+    fee = Decimal("0")
+    qty = Decimal("0")
+    for fill in fills:
+        if not isinstance(fill, dict):
+            return None
+        if "commission" not in fill or "commissionAsset" not in fill:
+            return None
+        try:
+            part_qty = Decimal(str(fill.get("qty")).strip())
+            part = Decimal(str(fill.get("commission")).strip())
+        except Exception:
+            return None
+        if not part_qty.is_finite() or part_qty <= 0:
+            return None
+        if not part.is_finite() or part < 0:
+            return None
+        asset = str(fill.get("commissionAsset") or "").strip().upper()
+        if not asset:
+            return None
+        qty += part_qty
+        if asset == base:
+            fee += part
+    if qty != gross:
+        return None
+    net = gross - fee
+    if not net.is_finite() or net <= 0:
+        return None
+    return net
+
+
 def _utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -49,6 +111,273 @@ def _bnb_purpose_clause(purpose: str | None) -> tuple[str, tuple[Any, ...]]:
     return " AND purpose = ?", (arm,)
 
 
+LEDGER_REGISTRY_ENV = "BINANCE_SPOT_LEDGER_REGISTRY"
+_BINDING_TABLE = "spot_ledger_binding"
+_REGISTRY_TABLE = "spot_ledger_registry"
+
+
+def load_ledger_registry(
+    environ: Any | None = None,
+) -> tuple[dict[str, Path] | None, str | None]:
+    """Purpose-to-ledger map. A bare path list is incomplete.
+
+    ``required_purposes`` is the deployment set. ``purpose_ledgers`` must
+    name every one of those purposes and no others. The process does not
+    scan the directory for the other book. The file does not contain a uid.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(LEDGER_REGISTRY_ENV) if hasattr(env, "get") else None
+    if raw is None or not str(raw).strip():
+        return None, "ledger_registry_unmapped"
+    path = Path(str(raw).strip()).expanduser()
+    if not path.is_file():
+        return None, "ledger_registry_unmapped"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "ledger_registry_unmapped"
+    if not isinstance(payload, dict) or "ledgers" in payload:
+        return None, "ledger_registry_incomplete"
+    required = payload.get("required_purposes")
+    mapped = payload.get("purpose_ledgers")
+    if not isinstance(required, list) or not required:
+        return None, "ledger_registry_incomplete"
+    if not isinstance(mapped, dict) or not mapped:
+        return None, "ledger_registry_incomplete"
+    purposes = [str(item).strip() for item in required]
+    if any(not item for item in purposes) or len(set(purposes)) != len(purposes):
+        return None, "ledger_registry_incomplete"
+    if set(mapped) != set(purposes):
+        return None, "ledger_registry_incomplete"
+    books: dict[str, Path] = {}
+    for purpose in purposes:
+        raw_path = mapped.get(purpose)
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return None, "ledger_registry_incomplete"
+        books[purpose] = Path(raw_path).expanduser().resolve()
+    if len(set(books.values())) != len(books):
+        return None, "ledger_registry_incomplete"
+    return books, None
+
+
+def canonical_registry_membership(
+    membership: dict[str, str],
+) -> tuple[dict[str, str], str] | None:
+    """Sorted purpose-to-path document and its sha256. Not a directory scan."""
+    if not isinstance(membership, dict) or not membership:
+        return None
+    books: dict[str, str] = {}
+    for purpose, raw in membership.items():
+        name = str(purpose).strip()
+        if not name or not isinstance(raw, str) or not raw.strip():
+            return None
+        books[name] = str(Path(raw).expanduser().resolve())
+    if len(books) != len(membership) or len(set(books.values())) != len(books):
+        return None
+    payload = json.dumps(books, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return books, digest
+
+
+def read_ledger_membership(
+    path: str | Path,
+) -> tuple[dict[str, str] | None, str | None, str | None]:
+    """Membership stored on one ledger. A missing row is not an empty set."""
+    file = Path(path)
+    if not file.is_file():
+        return None, None, "peer_ledger_absent"
+    uri = "file:" + file.resolve().as_posix() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    except sqlite3.Error:
+        return None, None, "peer_ledger_unreadable"
+    try:
+        positions = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'binance_spot_positions'"
+        ).fetchone()
+        if positions is None:
+            return None, None, "ledger_schema_uninitialized"
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (_REGISTRY_TABLE,),
+        ).fetchone()
+        if table is None:
+            return None, None, "ledger_registry_unbound"
+        row = conn.execute(
+            f"SELECT registry_digest, membership_json FROM {_REGISTRY_TABLE} LIMIT 1"
+        ).fetchone()
+        if row is None or not str(row[0] or "").strip() or not str(row[1] or "").strip():
+            return None, None, "ledger_registry_unbound"
+        try:
+            payload = json.loads(str(row[1]))
+        except json.JSONDecodeError:
+            return None, None, "ledger_registry_unbound"
+        if not isinstance(payload, dict):
+            return None, None, "ledger_registry_unbound"
+        parsed = canonical_registry_membership({str(k): str(v) for k, v in payload.items()})
+        if parsed is None:
+            return None, None, "ledger_registry_unbound"
+        books, digest = parsed
+        if digest != str(row[0]).strip():
+            return None, None, "ledger_registry_incomplete"
+        return books, digest, None
+    except sqlite3.Error:
+        return None, None, "peer_ledger_unreadable"
+    finally:
+        conn.close()
+
+
+def initialize_spot_registry_membership(
+    membership: dict[str, str],
+    account_uid: str,
+) -> str | None:
+    """Record one registry on every ledger it names.
+
+    The first write is the operator's checklist for the ledgers named in
+    that call. It is not an external authority for carriers that were
+    never written down. A later write with a different set is refused.
+    This does not discover a ledger that was left out of the checklist,
+    and a matching digest does not prove the deployment has no other book.
+    A JSON file that merely agrees with itself is not this record.
+    """
+    parsed = canonical_registry_membership(membership)
+    if parsed is None:
+        return "ledger_registry_incomplete"
+    books, digest = parsed
+    pending: list[Path] = []
+    for raw in books.values():
+        path = Path(raw)
+        found, found_digest, err = read_ledger_membership(path)
+        if err == "ledger_registry_unbound":
+            pending.append(path)
+            continue
+        if err:
+            return err
+        if found != books or found_digest != digest:
+            return "ledger_registry_incomplete"
+        pending.append(path)
+    payload = json.dumps(books, sort_keys=True, separators=(",", ":"))
+    for path in pending:
+        uid_error = initialize_spot_ledger_binding(path, account_uid)
+        if uid_error:
+            return uid_error
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_REGISTRY_TABLE} (
+                    registry_digest TEXT NOT NULL,
+                    membership_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(f"DELETE FROM {_REGISTRY_TABLE}")
+            conn.execute(
+                f"INSERT INTO {_REGISTRY_TABLE} (registry_digest, membership_json) VALUES (?, ?)",
+                (digest, payload),
+            )
+            conn.commit()
+        except sqlite3.Error:
+            return "ledger_schema_uninitialized"
+        finally:
+            conn.close()
+    return None
+
+
+def bind_registry_membership(
+    account_uid: str,
+    environ: Any | None = None,
+) -> str | None:
+    """Write the env registry onto every ledger it names. A shrink is refused."""
+    books, error = load_ledger_registry(environ)
+    if error or books is None:
+        return error or "ledger_registry_unmapped"
+    return initialize_spot_registry_membership(
+        {purpose: str(path) for purpose, path in books.items()},
+        account_uid,
+    )
+
+
+def initialize_spot_ledger_binding(path: str | Path, account_uid: str) -> str | None:
+    """Write the account uid onto one already initialized ledger.
+
+    Not called on process start and not a migration of existing rows.
+    ``account_uid`` must be the uid from ``GET /api/v3/account``. If that
+    payload has no uid, do not call this and do not invent one: live buys
+    stay ``ledger_account_unbound``.
+    """
+    uid = str(account_uid or "").strip()
+    if not uid or not uid.isdigit():
+        return "ledger_account_unbound"
+    file = Path(path)
+    if not file.is_file():
+        return "ledger_schema_uninitialized"
+    conn = sqlite3.connect(str(file))
+    try:
+        have = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'binance_spot_positions'"
+        ).fetchone()
+        if have is None:
+            return "ledger_schema_uninitialized"
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_BINDING_TABLE} (
+                account_uid TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(f"DELETE FROM {_BINDING_TABLE}")
+        conn.execute(
+            f"INSERT INTO {_BINDING_TABLE} (account_uid) VALUES (?)",
+            (uid,),
+        )
+        conn.commit()
+        return None
+    except sqlite3.Error:
+        return "ledger_schema_uninitialized"
+    finally:
+        conn.close()
+
+
+def read_ledger_account_uid(path: str | Path) -> tuple[str | None, str | None]:
+    """Uid stored on one ledger, or why the book cannot be used.
+
+    A missing file is ``peer_ledger_absent``, not an empty book. Zero
+    position rows are empty only after the positions table and the binding
+    row are both present.
+    """
+    file = Path(path)
+    if not file.is_file():
+        return None, "peer_ledger_absent"
+    uri = "file:" + file.resolve().as_posix() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    except sqlite3.Error:
+        return None, "peer_ledger_unreadable"
+    try:
+        positions = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'binance_spot_positions'"
+        ).fetchone()
+        if positions is None:
+            return None, "ledger_schema_uninitialized"
+        binding = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (_BINDING_TABLE,),
+        ).fetchone()
+        if binding is None:
+            return None, "ledger_account_unbound"
+        row = conn.execute(
+            f"SELECT account_uid FROM {_BINDING_TABLE} LIMIT 1"
+        ).fetchone()
+        if row is None or not str(row[0] or "").strip():
+            return None, "ledger_account_unbound"
+        return str(row[0]).strip(), None
+    except sqlite3.Error:
+        return None, "peer_ledger_unreadable"
+    finally:
+        conn.close()
+
+
 def peer_live_bnb_ledger_path(path: str | Path) -> Path | None:
     """The other arm's ledger file when ``path`` is one of the two named books."""
     current = Path(path)
@@ -58,6 +387,37 @@ def peer_live_bnb_ledger_path(path: str | Path) -> Path | None:
     if name == _CLASSIC_LEDGER_NAME:
         return current.with_name(_FADE_LEDGER_NAME)
     return None
+
+
+def read_peer_spot_blocks(path: str | Path) -> tuple[list[dict[str, Any]], str | None]:
+    """Rows from one registry path that has already passed the binding check.
+
+    The caller treats a missing file as ``peer_ledger_absent`` before this
+    read. This function does not decide that an absent file is empty.
+    """
+    file = Path(path)
+    if not file.is_file():
+        return [], None
+    uri = "file:" + file.resolve().as_posix() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    except sqlite3.Error:
+        return [], "peer_ledger_unreadable"
+    try:
+        conn.row_factory = sqlite3.Row
+        have = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'binance_spot_positions'"
+        ).fetchone()
+        if have is None:
+            return [], "peer_ledger_unreadable"
+        rows = conn.execute(
+            "SELECT * FROM binance_spot_positions ORDER BY id ASC"
+        ).fetchall()
+        return [dict(row) for row in rows], None
+    except sqlite3.Error:
+        return [], "peer_ledger_unreadable"
+    finally:
+        conn.close()
 
 
 def read_spot_buy_blocks_readonly(path: str | Path) -> list[dict[str, Any]]:
@@ -334,9 +694,13 @@ class ExecutionLedger:
             "oco_ratchet_count",
             "initial_stop_price",
             "entry_order_qty",
+            "gross_entry_qty",
+            "fee_net_qty",
+            "entry_origin",
             "entry_limit_price",
             "created_at_ms",
             "exit_filled_qty",
+            "exit_order_ids",
         ):
             if name not in have:
                 self.conn.execute(
@@ -884,14 +1248,28 @@ class ExecutionLedger:
         row = self.binance_spot_position_by_decision(decision_id)
         if row is None:
             raise RuntimeError(f"binance spot position missing for {decision_id}")
+        caller_origin = spec.get("entry_order_qty")
+        if caller_origin not in (None, "") and not str(row.get("entry_order_qty") or "").strip():
+            self.conn.execute(
+                """
+                UPDATE binance_spot_positions
+                SET entry_order_qty = ?, updated_at = ?
+                WHERE id = ? AND (entry_order_qty IS NULL OR entry_order_qty = '')
+                """,
+                (str(caller_origin), _utc(), int(row["id"])),
+            )
+            self.conn.commit()
+            refreshed = self.binance_spot_position_by_id(int(row["id"]))
+            if isinstance(refreshed, dict):
+                row = refreshed
         extra = {
             key: spec[key]
             for key in (
                 "oco_ratchet_count",
                 "initial_stop_price",
-                "entry_order_qty",
                 "entry_limit_price",
                 "created_at_ms",
+                "last_error",
             )
             if key in spec and spec.get(key) not in (None, "")
         }
@@ -924,7 +1302,6 @@ class ExecutionLedger:
         "take_profit_price",
         "oco_ratchet_count",
         "initial_stop_price",
-        "entry_order_qty",
         "entry_limit_price",
         "created_at_ms",
         "exit_filled_qty",
@@ -943,6 +1320,34 @@ class ExecutionLedger:
         "residual_qty",
         "residual_quote",
     )
+
+    def _remember_exit_order_id(self, position_id: int, order_id: object) -> None:
+        text = str(order_id or "").strip()
+        if not text:
+            return
+        row = self.binance_spot_position_by_id(position_id)
+        if row is None:
+            return
+        found: list[str] = []
+        raw = row.get("exit_order_ids")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                found = [str(item).strip() for item in parsed if str(item or "").strip()]
+        if text not in found:
+            found.append(text)
+        self.conn.execute(
+            """
+            UPDATE binance_spot_positions
+            SET exit_order_ids = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (json.dumps(found), _utc(), int(position_id)),
+        )
+        self.conn.commit()
 
     def update_binance_spot_position(
         self, position_id: int, fields: dict[str, Any]
@@ -964,7 +1369,59 @@ class ExecutionLedger:
             values,
         )
         self.conn.commit()
+        if "exit_order_id" in allowed:
+            self._remember_exit_order_id(int(position_id), allowed.get("exit_order_id"))
         return self.binance_spot_position_by_id(position_id)
+
+    def record_exchange_entry_origin(
+        self,
+        position_id: int,
+        *,
+        symbol: str,
+        placed: dict[str, Any],
+    ) -> str | None:
+        """Store gross executedQty and fee-net from this fill payload.
+
+        A generic field update cannot write these columns. A second payload
+        does not replace a recorded origin. The numbers are computed here
+        from ``placed``, not taken from the caller as a quantity.
+        """
+        if not isinstance(placed, dict):
+            return "entry_origin_unverified"
+        try:
+            gross = Decimal(str(placed.get("executedQty")).strip())
+        except Exception:
+            return "entry_origin_unverified"
+        if not gross.is_finite() or gross <= 0:
+            return "entry_origin_unverified"
+        net = _fee_net_base(placed, symbol, gross)
+        if net is None or net > gross:
+            return "entry_origin_unverified"
+        row = self.binance_spot_position_by_id(position_id)
+        if row is None:
+            return "entry_origin_unverified"
+        if str(row.get("symbol") or "").strip() != str(symbol or "").strip():
+            return "entry_origin_unverified"
+        if str(row.get("entry_order_id") or "").strip() != str(placed.get("orderId") or "").strip():
+            return "entry_origin_unverified"
+        if str(row.get("entry_origin") or "").strip() == "exchange_fill":
+            return None
+        self.conn.execute(
+            """
+            UPDATE binance_spot_positions
+            SET gross_entry_qty = ?, fee_net_qty = ?, entry_origin = ?, updated_at = ?
+            WHERE id = ? AND (entry_origin IS NULL OR entry_origin = '')
+            """,
+            (
+                format(gross, "f"),
+                format(net, "f"),
+                "exchange_fill",
+                _utc(),
+                int(position_id),
+            ),
+        )
+        self.conn.commit()
+        return None
 
     def list_binance_spot_positions_for_exit(
         self, purpose: str | None = None
@@ -991,20 +1448,43 @@ class ExecutionLedger:
 
         A protected open blocks a new BUY of that same symbol. Another symbol
         on the arm is not stacked onto that row. Unsafe rows still block the
-        arm. ``purpose`` omitted returns every arm. Callers that pass a
+        arm. A ``closed_dust`` row is included so a partial-exit remainder
+        can still block; a whole-qty dust abandon does not.
+        ``purpose`` omitted returns every arm. Callers that pass a
         purpose leave the other arm's open position out of this list.
         """
         clause, params = _bnb_purpose_clause(purpose)
         rows = self.conn.execute(
             f"""
             SELECT * FROM binance_spot_positions
-            WHERE status NOT IN ('closed', 'closed_dust', 'oco_filled', 'closed_canceled')
+            WHERE (
+                status NOT IN ('closed', 'oco_filled', 'closed_canceled')
+                OR (
+                    status IN ('closed', 'oco_filled', 'closed_canceled', 'closed_dust')
+                    AND quantity IS NOT NULL
+                    AND quantity != ''
+                )
+                OR (
+                    residual_qty IS NOT NULL
+                    AND residual_qty != ''
+                    AND residual_qty != '0'
+                )
+            )
             {clause}
             ORDER BY id ASC
             """,
             params,
         ).fetchall()
-        return [dict(row) for row in rows]
+        kept: list[dict[str, Any]] = []
+        for raw in rows:
+            row = dict(raw)
+            status = str(row.get("status") or "")
+            if status not in {"closed", "oco_filled", "closed_canceled", "closed_dust"}:
+                kept.append(row)
+                continue
+            if _stored_qty_zero(row.get("quantity")) or _stored_qty_positive(row.get("residual_qty")):
+                kept.append(row)
+        return kept
 
     def confirm_binance_spot_qty(
         self, position_id: int, quantity: str
@@ -1063,6 +1543,7 @@ class ExecutionLedger:
                     int(position_id),
                 ),
             )
+            self._remember_exit_order_id(int(position_id), outcome.get("exchange_order_id"))
         elif outcome.get("error") and row["status"] in {"open", "qty_unconfirmed"}:
             self.conn.execute(
                 """

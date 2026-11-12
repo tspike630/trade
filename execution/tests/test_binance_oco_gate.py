@@ -120,8 +120,23 @@ class _Client:
     def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_order", signed_query, api_key))
         if "side=SELL" in signed_query:
-            return {"orderId": "77", "status": "FILLED", "executedQty": "1.23"}
-        return {"orderId": "99", "status": "FILLED", "executedQty": "1.239", "symbol": "BNBUSDT"}
+            qty = parse_qs(signed_query).get("quantity", ["1.23"])[0]
+            return {"orderId": "77", "status": "FILLED", "executedQty": qty, "origQty": qty}
+        return {"orderId": "99", "status": "FILLED", "executedQty": "1.239", "symbol": "BNBUSDT", "fills": [{"tradeId": 1, "qty": "1.239", "commission": "0", "commissionAsset": "BNB"}]}
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        return [{"symbol": symbol, "id": 1, "orderId": int(order_id) if str(order_id).isdigit() else order_id, "qty": "1.239", "commission": "0", "commissionAsset": "BNB"}]
+
+    def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        form = parse_qs(signed_query)
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        return {"symbol": symbol, "orderId": int(order_id) if str(order_id).isdigit() else order_id, "side": "BUY", "status": "FILLED", "executedQty": "1.239", "origQty": "1.239"}
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_oco", signed_query, api_key))
@@ -271,6 +286,7 @@ class ConsumerGateTests(unittest.TestCase):
             account_snapshot=_BOUND,
             production_book=REST_BOOK,
             rest_expected=_EXPECTED,
+            auto_flatten_on_oco_fail=True,
             **extra,
         )
 
@@ -302,16 +318,10 @@ class ConsumerGateTests(unittest.TestCase):
             naked = failed.execute(_buy(147842))
         self.assertFalse(naked["consumer_allowed"])
         self.assertEqual(naked["executed"], 0)
-        self.assertEqual(naked["arm_position"]["status"], "oco_failed")
-        self.assertTrue(str(naked["error"]).startswith("oco_rejected:"))
-        failed.buy_blocks = [naked["arm_position"]]
-        with mock.patch.dict(os.environ, _env(self.root)):
-            again = failed.execute(_buy(147843))
-        self.assertEqual(again["error"], "oco_failed_blocks_buy")
-        self.assertEqual(
-            [call[0] for call in failed_client.calls if call[0] == "new_order"],
-            ["new_order"],
-        )
+        self.assertEqual(naked["protection_state"], "dust_residual", naked)
+        self.assertEqual(naked["arm_position"]["status"], "closed_dust")
+        self.assertEqual(naked["arm_position"]["protection"], "dust_abandon")
+        self.assertEqual(naked["error"], "dust_untradable")
 
     def test_fill_average_is_the_ledger_entry_and_signal_stays_on_the_plan(self) -> None:
         """Signal 48.08, exchange average 48.02. The new row stores 48.02.
@@ -331,6 +341,7 @@ class ConsumerGateTests(unittest.TestCase):
                     "executedQty": "1",
                     "cummulativeQuoteQty": "48.02",
                     "symbol": "BNBUSDT",
+                    "fills": [{"tradeId": 1, "qty": "1", "commission": "0", "commissionAsset": "BNB"}],
                 }
 
         client = _AverageFill()
@@ -491,6 +502,7 @@ class ConsumerGateTests(unittest.TestCase):
             account_snapshot=_BOUND,
             production_book=REST_BOOK,
             rest_expected=_EXPECTED,
+            auto_flatten_on_oco_fail=True,
         )
         with mock.patch.dict(os.environ, env):
             opened = ready.execute(_buy(147850))

@@ -167,6 +167,7 @@ class PortfolioClustersAndVolSizingTests(unittest.TestCase):
                     "oco_order_list_id": 1001,
                     "oco_above_order_id": 2001,
                     "oco_below_order_id": 2002,
+                    "quantity": "1",
                 },
             ),
             canonical=(),
@@ -201,10 +202,9 @@ class PortfolioClustersAndVolSizingTests(unittest.TestCase):
             else:
                 os.environ[ENV_CLUSTER_CAP_ENABLED] = prev
 
-        # TAOUSDT (ai_compute) is blocked because FETUSDT (ai_compute) is already open;
-        # UNIUSDT (defi_infra) is allowed through!
-        self.assertEqual([s["binance_symbol"] for s in kept], ["UNIUSDT"])
-        self.assertEqual(report.get("cluster_dropped"), 1)
+        # The open row is stored ids only. Decision halts before the cluster cap.
+        self.assertEqual(kept, [])
+        self.assertEqual(report.get("protection_halt"), "oco_readback_unverified")
 
 
 if __name__ == "__main__":

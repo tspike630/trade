@@ -125,6 +125,10 @@ class PerpMicrostructureAndBetaHedgeTests(unittest.TestCase):
                         "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
                         "status": "oco_working",
                         "quantity": "1.0",
+                        "protection": "exchange_oco",
+                        "oco_order_list_id": "1",
+                        "oco_above_order_id": "2",
+                        "oco_below_order_id": "3",
                         "entry_price": "120.0",  # 12% of book * 1.45 beta = 0.174 beta_pct
                     }
                 ],
@@ -157,15 +161,10 @@ class PerpMicrostructureAndBetaHedgeTests(unittest.TestCase):
                 purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
                 book=book,
             )
-            # High-beta PEPEUSDT is blocked, while lower-beta BTCUSDT is admitted!
-            self.assertEqual([s["binance_symbol"] for s in kept], ["BTCUSDT"])
-            self.assertEqual(report.get("beta_dropped"), 1)
-            self.assertIn("beta_hedge_plan", report)
-            self.assertAlmostEqual(
-                report["beta_hedge_plan"]["portfolio_beta_pct"],
-                0.224,
-                places=3,
-            )
+            # The open list is three stored ids. Decision does not call the
+            # exchange, so the purpose halts before the beta cap runs.
+            self.assertEqual(kept, [])
+            self.assertEqual(report.get("protection_halt"), "oco_readback_unverified")
         finally:
             if old_gate is None:
                 os.environ.pop("LIVE_BNB_PORTFOLIO_BETA_GATE", None)

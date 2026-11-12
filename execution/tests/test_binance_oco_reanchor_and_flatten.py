@@ -107,6 +107,7 @@ class _SlippageAndFlattenClient:
             "executedQty": "1.082",
             "cummulativeQuoteQty": "51.957640",
             "symbol": "DASHUSDT",
+            "fills": [{"tradeId": 1, "qty": "1.082", "commission": "0", "commissionAsset": "DASH"}],
         }
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
@@ -203,7 +204,7 @@ class OcoReanchorAndAutoFlattenTests(unittest.TestCase):
             os.environ,
             self._env(BINANCE_SPOT_REANCHOR_OCO_ON_FILL="1"),
         ):
-            res = adapter.execute(_dash_buy())
+            res = self._adapter(client, auto_flatten_on_oco_fail=True).execute(_dash_buy())
         self.assertTrue(res["ok"], res)
         self.assertEqual(res["executed"], 1)
         self.assertTrue(res["consumer_allowed"])

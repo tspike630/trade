@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -33,6 +34,11 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     classify_oco,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 from execution.run import tick_live_bnb_exits  # noqa: E402
 
 _FILTERS = [
@@ -109,7 +115,7 @@ class _Client:
     def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_order", signed_query, api_key))
         if "side=BUY" in signed_query:
-            return {"orderId": "99", "status": "FILLED", "executedQty": "1.239"}
+            return {"orderId": "99", "status": "FILLED", "executedQty": "1.239", "fills": [{"tradeId": 1, "qty": "1.239", "commission": "0", "commissionAsset": "BNB"}]}
         return {"orderId": "77", "status": "FILLED", "executedQty": "1.23"}
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
@@ -134,6 +140,24 @@ class _Client:
         if order_id in self.legs:
             return self.legs[order_id]
         raise BinanceRequestError(400)
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        self.calls.append(("my_trades", signed_query, api_key))
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        return [
+            {
+                "symbol": symbol,
+                "id": 1,
+                "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+                "qty": "1.239",
+                "commission": "0",
+                "commissionAsset": "BNB",
+            }
+        ]
 
     def ticker_price(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("ticker_price", symbol))
@@ -215,6 +239,7 @@ class ResidualS6Tests(unittest.TestCase):
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
+            auto_flatten_on_oco_fail=True,
             account_snapshot={
                 "accountType": "SPOT",
                 "canTrade": True,
@@ -225,6 +250,7 @@ class ResidualS6Tests(unittest.TestCase):
                     "ipRestrict": True,
                 },
                 "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+                "uid": 424242,
             },
             production_book="rest_api_key",
             rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
@@ -234,15 +260,45 @@ class ResidualS6Tests(unittest.TestCase):
         self._net.stop()
         self._tmp.cleanup()
 
-    def _gateway(self) -> ExecutionGateway:
-        return ExecutionGateway(
+    @contextmanager
+    def _gateway(self) -> Any:
+        ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        if not classic.is_file():
+            ExecutionLedger(classic).close()
+        initialize_spot_ledger_binding(classic, "424242")
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(ledger_path.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
+        with ExecutionGateway(
             decision_db=self.root / "decision.db",
-            ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+            ledger_path=ledger_path,
             paper_enabled=False,
             pm_enabled=False,
             accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
             binance_spot=self.adapter,
-        )
+        ) as gw:
+            bound = initialize_spot_ledger_binding(ledger_path, "424242")
+            if bound:
+                raise RuntimeError(bound)
+            membership = bind_registry_membership("424242")
+            if membership:
+                raise RuntimeError(membership)
+            yield gw
 
     def test_dry_run_submits_nothing(self) -> None:
         env = _env(self.root, enabled="1")
@@ -428,19 +484,13 @@ class ResidualS6Tests(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             with self._gateway() as gw:
                 opened = gw.process_one(_row())
-                # Inside the band: rejection is recorded and no market sell is forced.
-                quiet = tick_live_bnb_exits(
-                    gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "100"}
-                )
                 row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertFalse(quiet[0]["submitted"], quiet[0])
-        self.assertNotEqual(quiet[0]["protection"], "exchange_oco")
-        self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
-        assert row is not None
-        self.assertEqual(row["status"], "oco_failed")
-        self.assertNotEqual(row["protection"], "exchange_oco")
-        self.assertTrue(str(opened["error"]).startswith("oco_rejected:"), opened["error"])
         self.assertEqual(opened["executed"], 0)
+        assert row is not None
+        self.assertEqual(row["status"], "closed_dust")
+        self.assertEqual(row["protection"], "dust_abandon")
+        self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
+        self.assertEqual(opened["exec_result"]["protection_state"], "dust_residual")
 
     def test_exchange_fill_and_expiry_are_reconciled(self) -> None:
         env = _env(self.root, enabled="1")
@@ -549,12 +599,10 @@ class ResidualS6Tests(unittest.TestCase):
                     gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "100"}
                 )
                 woke_row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertEqual(woke[0]["book"], "oco_failed", woke[0])
         assert woke_row is not None
-        self.assertEqual(woke_row["status"], "oco_failed")
-        self.assertEqual(woke_row["last_error"], "oco_terminal_unfilled")
-        self.assertNotEqual(woke_row["protection"], "exchange_oco")
-        self.assertFalse(any(call[0] == "new_order" for call in self.client.calls))
+        self.assertEqual(woke_row["status"], "closed_dust", woke)
+        self.assertEqual(woke_row["protection"], "dust_abandon")
+        self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
 
     def test_entry_floor_fee_and_dust_archive(self) -> None:
         self.assertEqual(ENTRY_MIN_NOTIONAL_USDT, 20)

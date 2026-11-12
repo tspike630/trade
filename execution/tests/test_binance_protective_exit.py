@@ -13,6 +13,7 @@ import sys
 import time
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -32,7 +33,11 @@ from execution.executors.binance_spot import (  # noqa: E402
     size_exit_quantity,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
-from execution.ledger import ExecutionLedger  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 from execution.run import tick_live_bnb_exits  # noqa: E402
 
 _INFO = {
@@ -101,6 +106,7 @@ class _Client:
                 "orderId": "99",
                 "status": "FILLED",
                 "executedQty": "1.239",
+                "fills": [{"tradeId": 1, "qty": "1.239", "commission": "0", "commissionAsset": "BNB"}],
             }
         return {"orderId": "77", "status": "FILLED"}
 
@@ -203,6 +209,7 @@ class ProtectiveExitTests(unittest.TestCase):
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
+            auto_flatten_on_oco_fail=True,
             account_snapshot={
                 "accountType": "SPOT",
                 "canTrade": True,
@@ -213,6 +220,7 @@ class ProtectiveExitTests(unittest.TestCase):
                     "ipRestrict": True,
                 },
                 "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+                "uid": 424242,
             },
             production_book="rest_api_key",
             rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
@@ -222,15 +230,45 @@ class ProtectiveExitTests(unittest.TestCase):
         self._net.stop()
         self._tmp.cleanup()
 
-    def _gateway(self) -> ExecutionGateway:
-        return ExecutionGateway(
+    @contextmanager
+    def _gateway(self) -> Any:
+        ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        if not classic.is_file():
+            ExecutionLedger(classic).close()
+        initialize_spot_ledger_binding(classic, "424242")
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(ledger_path.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
+        with ExecutionGateway(
             decision_db=self.root / "decision.db",
-            ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+            ledger_path=ledger_path,
             paper_enabled=False,
             pm_enabled=False,
             accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
             binance_spot=self.adapter,
-        )
+        ) as gw:
+            bound = initialize_spot_ledger_binding(ledger_path, "424242")
+            if bound:
+                raise RuntimeError(bound)
+            membership = bind_registry_membership("424242")
+            if membership:
+                raise RuntimeError(membership)
+            yield gw
 
     def test_dry_run_submits_nothing_and_does_not_arm(self) -> None:
         env = _env(self.root, enabled="1")
@@ -442,16 +480,36 @@ class ProtectiveExitTests(unittest.TestCase):
         def new_order(signed_query: str, *, api_key: str) -> dict[str, Any]:
             self.client.calls.append(("new_order", signed_query, api_key))
             if "side=SELL" in signed_query:
-                return {"orderId": "77", "status": "FILLED"}
+                qty = parse_qs(signed_query).get("quantity", ["1.23"])[0]
+                return {"orderId": "77", "status": "FILLED", "executedQty": qty, "origQty": qty}
             return {"orderId": "99", "status": "NEW"}
 
         def get_order(signed_query: str, *, api_key: str) -> dict[str, Any]:
             self.client.calls.append(("get_order", signed_query, api_key))
             self.assertNotIn("test-secret", signed_query)
-            return {"orderId": "99", "status": "FILLED", "executedQty": "1.239"}
+            if "origClientOrderId" in signed_query:
+                raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+            return {"orderId": "99", "symbol": "BNBUSDT", "side": "BUY", "status": "FILLED", "executedQty": "1.239", "origQty": "1.239"}
 
         self.client.new_order = new_order  # type: ignore[method-assign]
         self.client.get_order = get_order  # type: ignore[method-assign]
+
+        def my_trades(signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+            form = parse_qs(signed_query)
+            if form.get("fromId"):
+                return []
+            return [
+                {
+                    "symbol": "BNBUSDT",
+                    "id": 1,
+                    "orderId": 99,
+                    "qty": "1.239",
+                    "commission": "0",
+                    "commissionAsset": "BNB",
+                }
+            ]
+
+        self.client.my_trades = my_trades  # type: ignore[method-assign]
         self.adapter.client = self.client
         env = _env(self.root, enabled="1")
         with mock.patch.dict(os.environ, env):
@@ -465,14 +523,13 @@ class ProtectiveExitTests(unittest.TestCase):
                     {"BNBUSDT": "98"},
                 )
                 row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertEqual(exits[0]["position_status"], "oco_failed")
-        self.assertEqual(exits[0]["error"], "oco_price_restriction")
-        self.assertFalse(exits[0]["submitted"])
-        self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
+        self.assertEqual(exits[0]["position_status"], "closed_dust", exits[0])
+        self.assertEqual(row["protection"], "dust_abandon")
+        self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
         assert row is not None
-        self.assertEqual(row["status"], "oco_failed")
+        self.assertEqual(row["status"], "closed_dust")
         self.assertIn("orderId=99", next(call[1] for call in self.client.calls if call[0] == "get_order"))
-        self.assertEqual(_sell_forms(self.client), [])
+        self.assertEqual(_sell_forms(self.client)[0]["side"], ["SELL"])
 
     def test_http_failure_keeps_the_position_open_and_retries_one_client_id(self) -> None:
         self.client = _Client(fail_sells=1)
@@ -764,30 +821,10 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, env):
             filled = adapter.execute(self._dash_buy())
-        self.assertEqual(filled["error"], "oco_unprotectable:oco_price_restriction")
-        self.assertEqual(filled["arm_position"]["status"], "oco_failed")
-        self.assertEqual(filled["arm_position"]["stop_price"], "48.02605")
-        self.assertEqual(filled["arm_position"]["take_profit_price"], "48.2895")
-        self.assertEqual(filled["executed"], 0)
-        self.assertEqual(sum(1 for call in client.calls if call[0] == "new_order"), 1)
+        self.assertEqual(filled["error"], "buy_protection_unconfigured")
+        self.assertIsNone(filled.get("arm_position"))
+        self.assertFalse(any(call[0] == "new_order" for call in client.calls))
         self.assertFalse(any(call[0] == "new_oco" for call in client.calls))
-        adapter.buy_blocks = [filled["arm_position"]]
-        with mock.patch.dict(os.environ, env):
-            blocked = adapter.execute(
-                {
-                    **self._dash_buy(),
-                    "decision_log_id": 148593,
-                    "token_address": "ETHUSDT",
-                    "extras": {
-                        **self._dash_buy()["extras"],
-                        "binance_symbol": "ETHUSDT",
-                        "price_usd": "100",
-                        "stop_price": "90",
-                        "take_profit_price": "120",
-                    },
-                }
-            )
-        self.assertEqual(blocked["error"], "oco_failed_blocks_buy")
 
     def test_absent_list_code_is_not_a_working_oco_and_does_not_repost(self) -> None:
         class _Query:

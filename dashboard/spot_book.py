@@ -188,6 +188,7 @@ def _from_row(
         relation=relation,
         oco=oco,
         matched=relation == "match",
+        residual_qty=row.get("residual_qty"),
     )
     if snapshot_only:
         protection = f"{protection} · 无仓表，后续状态不可用"
@@ -214,11 +215,14 @@ def _protection_text(
     relation: str,
     oco: bool,
     matched: bool,
+    residual_qty: object = None,
 ) -> str:
     if status_key == "closed_canceled":
         return "无交易所OCO"
-    if status_key == "oco_failed" or protection == "oco_pending":
-        return "OCO未证实，不声称已保护"
+    if status_key == "closed_dust" and str(residual_qty or "").strip() not in {"", "0"}:
+        return "尘埃残余待人工复核，未自动清除，未外发通知"
+    if status_key in {"oco_failed", "oco_unknown"} or protection == "oco_pending":
+        return "OCO未证实，不声称已保护；本账户新买入已拦住，未外发通知"
     if oco:
         if relation in {"unknown", "zero"}:
             return "OCO状态已写入，已成交数量为空，不声称已保护"

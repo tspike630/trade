@@ -35,6 +35,11 @@ from execution.executors.binance_spot import (  # noqa: E402
 )
 from execution.executors.binance_spot_gate import REST_BOOK  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 
 _API_KEY = "test-key"
 _API_SECRET = "test-secret"
@@ -378,13 +383,39 @@ class ReceiptPersistenceTests(unittest.TestCase):
             account_snapshot=_BOUND,
             production_book=REST_BOOK,
             rest_expected=_EXPECTED,
+            auto_flatten_on_oco_fail=True,
         )
 
     def test_http_400_is_one_post_and_lands_in_the_ledger(self) -> None:
         exc = _reject(400, _body(-1013, "Filter failure: LOT_SIZE"))
         client = _RejectingClient(exc)
         adapter = self._adapter(client)
+        snap = dict(adapter.account_snapshot)
+        snap["uid"] = 424242
+        adapter.account_snapshot = snap
         env = _env(self.root)
+        ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        registry = self.root / "registry.json"
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        if not classic.is_file():
+            ExecutionLedger(classic).close()
+        initialize_spot_ledger_binding(classic, "424242")
+        registry.write_text(
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(ledger_path.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        env["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
         with mock.patch.dict(os.environ, env):
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
@@ -394,6 +425,8 @@ class ReceiptPersistenceTests(unittest.TestCase):
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
                 binance_spot=adapter,
             ) as gw:
+                initialize_spot_ledger_binding(ledger_path, "424242")
+                bind_registry_membership("424242")
                 result = gw.process_one(_decision_row())
                 stored = gw.ledger.conn.execute(
                     "SELECT receipt_json, executed, status FROM execution_log WHERE decision_log_id = ?",
