@@ -88,10 +88,13 @@ class BinancePerpShortAdapter:
         )
         live_env = os.environ.get(PERP_SHORT_LIVE_ENV, "").strip() == "1"
         kill_on = os.environ.get(LIVE_DISABLED_ENV, "1").strip() != "0"
-        if dry_run is None:
-            self.dry_run = not (live_env and not kill_on)
+        live_allowed = live_env and not kill_on
+        # Explicit dry_run=False still needs both switches. This adapter does
+        # not read API keys and does not submit to the exchange either way.
+        if dry_run is True:
+            self.dry_run = True
         else:
-            self.dry_run = bool(dry_run) or kill_on
+            self.dry_run = not live_allowed
         self._init_ledger()
 
     def _init_ledger(self) -> None:

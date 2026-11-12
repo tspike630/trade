@@ -6,6 +6,9 @@ import os
 import unittest
 
 from decision_engine.core.conviction_whitelist import WHITELIST_ENV
+from decision_engine.core.live_buy_guards import recheck_portfolio_beta_after_sizing
+from decision_engine.core.perp_microstructure_and_beta_hedge import portfolio_beta_exposure_block
+from decision_engine.core.protection_halt import ProtectionBook
 from decision_engine.core.regime_strategy_router import (
     EXPAND_OCO_TP_ENV,
     OPTIMAL_KELLY_ENV,
@@ -15,7 +18,7 @@ from decision_engine.core.regime_strategy_router import (
     REGIME_4_CROWDED_LONG_DEFENSIVE,
     apply_five_state_regime_router,
 )
-from decision_engine.core.signal_bus import normalize_signal
+from decision_engine.core.signal_bus import PURPOSE_LIVE_BNB_BOLL_FADE, normalize_signal
 
 
 class Tier1KellyAndOcoTpTests(unittest.TestCase):
@@ -171,6 +174,49 @@ class Tier1KellyAndOcoTpTests(unittest.TestCase):
         self.assertAlmostEqual(out[0]["size_pct"], 0.06, places=6)  # 0.05 * 1.20
         self.assertEqual(out[0]["take_profit_price"], 203.0)
         self.assertNotIn("regime_tp_expanded", out[0])
+
+    def test_beta_gate_sees_the_one_shot_size_not_the_pre_router_size(self) -> None:
+        saved_gate = os.environ.get("LIVE_BNB_PORTFOLIO_BETA_GATE")
+        saved_cap = os.environ.get("LIVE_BNB_MAX_PORTFOLIO_BETA")
+        try:
+            os.environ[OPTIMAL_KELLY_ENV] = "1"
+            os.environ["LIVE_BNB_PORTFOLIO_BETA_GATE"] = "1"
+            os.environ["LIVE_BNB_MAX_PORTFOLIO_BETA"] = "0.45"
+            pre = portfolio_beta_exposure_block(
+                [],
+                purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                symbol="SOLUSDT",
+                candidate_size_pct=0.05,
+            )
+            self.assertIsNone(pre)
+            out, _ = apply_five_state_regime_router(
+                [{
+                    "action": "buy",
+                    "binance_symbol": "SOLUSDT",
+                    "size_pct": 0.05,
+                    "price_usd": 200.0,
+                    "stop_price": 197.5,
+                    "take_profit_price": 203.0,
+                }],
+                [{"binance_symbol": "SOLUSDT", "funding_z": -2.1}],
+            )
+            self.assertAlmostEqual(out[0]["size_pct"], 0.45, places=6)
+            kept, dropped = recheck_portfolio_beta_after_sizing(
+                out,
+                purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                book=ProtectionBook.ready(positions=[], canonical=[]),
+            )
+            self.assertEqual(dropped, 1)
+            self.assertEqual(kept, [])
+        finally:
+            if saved_gate is None:
+                os.environ.pop("LIVE_BNB_PORTFOLIO_BETA_GATE", None)
+            else:
+                os.environ["LIVE_BNB_PORTFOLIO_BETA_GATE"] = saved_gate
+            if saved_cap is None:
+                os.environ.pop("LIVE_BNB_MAX_PORTFOLIO_BETA", None)
+            else:
+                os.environ["LIVE_BNB_MAX_PORTFOLIO_BETA"] = saved_cap
 
 
 if __name__ == "__main__":

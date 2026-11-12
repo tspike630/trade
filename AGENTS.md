@@ -9,9 +9,9 @@
 
 1. **五态市场状态路由器 (`decision_engine/core/regime_strategy_router.py`)**
    - 已挂载至主引擎 `decision_engine/core/engine.py` (`apply_five_state_regime_router`)。
-   - **状态 1 (`regime_1_positive_gamma_pinned`)**：常态正 Gamma 震荡（约占 55% 时间），运行 1h 布林下轨均值回归 (`tech_boll_fade_standard`)，全凯利最优固定底仓 **`18.5%`**（不追高加仓）。
+   - **状态 1 (`regime_1_positive_gamma_pinned`)**：常态正 Gamma 震荡（约占 55% 时间）。标准剧本仍是 `tech_boll_fade_standard`（乘数 `1.00`）。杨于 **2026-11-12 13:08 HKT** 裁定：四个新开关全关时也**默认启用**鲸鱼倾斜，不另设开关。`whale_retail_divergence >= 1.35` 且（`funding_z` 缺失或 `<= 0.80`）时，`size_multiplier = 1.08`、`tp_multiplier = 1.22`（传入 `size_pct = 0.05` 得到 **0.054**）。熊向进入条件是 **`0.45 < whale_div <= 0.72`**（`0.45` 本身不进入；刚大于 `0.72` 且未到 `1.35` 回到标准 `1.00`）。进入后，`boll_z` 有值且 **`> -2.25`** 阻断浅跌、不发单；`boll_z` 缺失或 `<= -2.25` 用 `size_multiplier = 0.85`、`tp_multiplier = 0.72`（`0.05` 得到 **0.0425**）。`USE_OPTIMAL_KELLY_MATRIX` 打开后的状态 1 底仓仍是 **`18.5%`**，本次不改。
    - **状态 2 (`regime_2_short_squeeze_breakout`)**：CFTC 杠杆基金净空头拥挤 / 高空头矿企 / 币安极端负资金费率逼空，运行**三阶零本金风险 OCO 棘轮推仓 (`35.0% -> 70.0% -> 95.0%`)**。
-   - **状态 3 (`regime_3_cross_asset_bull_pullback`)**：`NVDA.O` / `SMH.O` 1h 领涨 (`>= +1.2%`) 或截面广度 `>= 68%` 的跨资产牛市，剔除截面后 35% 弱势币，并内置**防闷杀五看盘口过滤**（拒绝 `obi_top5 <= -0.25` 薄托单假突破与 `volume_z >= 3.8` 巨量派发陷阱），对前排龙头运行**三阶 OCO 棘轮推仓 (`30.0% -> 60.0% -> 85.0%`)**。
+   - **状态 3 (`regime_3_cross_asset_bull_pullback`)**：`NVDA.O` / `SMH.O` 1h 领涨 (`>= +1.2%`) 或截面广度 `>= 68%` 的跨资产牛市，剔除截面后 35% 弱势币。杨于 **2026-11-12 13:08 HKT** 裁定保留**联合条件**，覆盖本行原先「无条件拒绝」的歧义。薄盘口：`obi_top5` 有值且 `<= -0.25`，并且主动吃单**缺失或 `<= 0.45`**，才拒绝；吃单 `> 0.45` 不因薄盘口拒绝；**`obi` 缺失不因该项拒绝**。巨量：没有历史样本时阈值是 **`3.8`**；`volume_z >= 3.8` 并且 `whale_retail_divergence` **有值且 `<= 0.65`** 才拒绝；**巨量但鲸鱼指标缺失仍允许放行**；**`volume_z` 缺失不因该项拒绝**。对前排龙头运行**三阶 OCO 棘轮推仓 (`30.0% -> 60.0% -> 85.0%`)**，这些比例本次不改。
    - **状态 4 (`regime_4_crowded_long_defensive`)**：散户多头拥挤或宏观高波冲击，现货缩至 **`5.0%`** 极深接针仓 + 强制开启 **`50%` 永续合约 Beta 空单对冲**。
    - **状态 5 (`regime_5_crisis_liquidation_halt`)**：宏观黑天鹅 / `.VIX` / `.MOVE` / 日元风险逆转 (`JPY1MRR=`) 崩盘 / CME 期货贴水 (`BTCc2 < BTCc1`) / 连环清算瀑布，**100% 熔断拦截现货开多**（保留卖出通道）+ **`100%` 永续空单锁仓**。
 

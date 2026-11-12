@@ -22,7 +22,10 @@ from decision_engine.core.live_bnb_turnover import (
     filter_live_bnb_hot,
     stamp_turnover,
 )
-from decision_engine.core.live_buy_guards import apply_live_buy_guards
+from decision_engine.core.live_buy_guards import (
+    apply_live_buy_guards,
+    recheck_portfolio_beta_after_sizing,
+)
 from decision_engine.core.volume_z_1h import (
     attach_stored_volume_z,
     persist_volume_z_for_decision_tick,
@@ -293,6 +296,11 @@ class DecisionEngine:
                 macro_halt=macro_halt,
                 news_snapshot=news_snapshot,
             )
+            passed, _beta_after = recheck_portfolio_beta_after_sizing(
+                passed,
+                purpose=self.bus.purpose,
+                book=protection_book,
+            )
             passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
         emitted = self.bus.publish_many(passed)
         eff_macro_halt = guard_report.get("macro_halt") or macro_halt
@@ -336,14 +344,19 @@ class DecisionEngine:
         accepted_buys: list[dict[str, Any]],
         macro_halt: str | None,
     ) -> dict[str, Any] | None:
-        from decision_engine.core.perp_short_alpha_engine import (
-            is_perp_short_engine_enabled,
-            run_perp_short_tick,
-        )
-
-        if not is_perp_short_engine_enabled():
+        # Env gate stays here so a fault in the perp module cannot abort a
+        # spot tick while ENABLE_PERP_SHORT_ENGINE is left off. The import is
+        # inline for that isolation, not because of a cycle.
+        if os.environ.get("ENABLE_PERP_SHORT_ENGINE", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
             return None
         try:
+            from decision_engine.core.perp_short_alpha_engine import run_perp_short_tick
+
             sink_db = getattr(self.bus, "db_path", getattr(self.adapter, "db_path", None))
             return run_perp_short_tick(
                 hot_rows=hot,
