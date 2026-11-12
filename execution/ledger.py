@@ -54,27 +54,40 @@ def _stored_qty_positive(raw: object) -> bool:
 
 
 def _fee_net_base(placed: dict[str, Any], symbol: str, gross: Decimal) -> Decimal | None:
-    """executedQty minus commission only when the fee asset is the base.
+    """Ack fee-net. Missing fills or a missing commission is unknown, not zero.
 
-    Same rule as ``sellable_base_qty``. Kept here so the ledger does not
-    import the executor package.
+    Same base-versus-other-asset rule as ``sellable_base_qty``. The ledger
+    does not import the executor package. A later buy does not use this
+    number as the unlock; it reads ``myTrades``.
     """
+    fills = placed.get("fills")
+    if not isinstance(fills, list) or not fills:
+        return None
     base = symbol[: -len("USDT")] if str(symbol).endswith("USDT") else ""
     fee = Decimal("0")
-    fills = placed.get("fills")
-    if isinstance(fills, list) and base:
-        for fill in fills:
-            if not isinstance(fill, dict):
-                continue
-            if str(fill.get("commissionAsset") or "").upper() != base:
-                continue
-            try:
-                part = Decimal(str(fill.get("commission")).strip())
-            except Exception:
-                return None
-            if not part.is_finite() or part < 0:
-                return None
+    qty = Decimal("0")
+    for fill in fills:
+        if not isinstance(fill, dict):
+            return None
+        if "commission" not in fill or "commissionAsset" not in fill:
+            return None
+        try:
+            part_qty = Decimal(str(fill.get("qty")).strip())
+            part = Decimal(str(fill.get("commission")).strip())
+        except Exception:
+            return None
+        if not part_qty.is_finite() or part_qty <= 0:
+            return None
+        if not part.is_finite() or part < 0:
+            return None
+        asset = str(fill.get("commissionAsset") or "").strip().upper()
+        if not asset:
+            return None
+        qty += part_qty
+        if asset == base:
             fee += part
+    if qty != gross:
+        return None
     net = gross - fee
     if not net.is_finite() or net <= 0:
         return None
@@ -220,9 +233,11 @@ def initialize_spot_registry_membership(
 ) -> str | None:
     """Record one registry on every ledger it names.
 
-    The first write is the operator preflight. A later write with a different
-    set is refused, so a shrunk file cannot replace a larger membership.
-    This does not discover ledgers that were never in an initialization.
+    The first write is the operator's checklist for the ledgers named in
+    that call. It is not an external authority for carriers that were
+    never written down. A later write with a different set is refused.
+    This does not discover a ledger that was left out of the checklist,
+    and a matching digest does not prove the deployment has no other book.
     A JSON file that merely agrees with itself is not this record.
     """
     parsed = canonical_registry_membership(membership)
@@ -685,6 +700,7 @@ class ExecutionLedger:
             "entry_limit_price",
             "created_at_ms",
             "exit_filled_qty",
+            "exit_order_ids",
         ):
             if name not in have:
                 self.conn.execute(
@@ -1304,6 +1320,34 @@ class ExecutionLedger:
         "residual_quote",
     )
 
+    def _remember_exit_order_id(self, position_id: int, order_id: object) -> None:
+        text = str(order_id or "").strip()
+        if not text:
+            return
+        row = self.binance_spot_position_by_id(position_id)
+        if row is None:
+            return
+        found: list[str] = []
+        raw = row.get("exit_order_ids")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                found = [str(item).strip() for item in parsed if str(item or "").strip()]
+        if text not in found:
+            found.append(text)
+        self.conn.execute(
+            """
+            UPDATE binance_spot_positions
+            SET exit_order_ids = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (json.dumps(found), _utc(), int(position_id)),
+        )
+        self.conn.commit()
+
     def update_binance_spot_position(
         self, position_id: int, fields: dict[str, Any]
     ) -> dict[str, Any] | None:
@@ -1324,6 +1368,8 @@ class ExecutionLedger:
             values,
         )
         self.conn.commit()
+        if "exit_order_id" in allowed:
+            self._remember_exit_order_id(int(position_id), allowed.get("exit_order_id"))
         return self.binance_spot_position_by_id(position_id)
 
     def record_exchange_entry_origin(
@@ -1496,6 +1542,7 @@ class ExecutionLedger:
                     int(position_id),
                 ),
             )
+            self._remember_exit_order_id(int(position_id), outcome.get("exchange_order_id"))
         elif outcome.get("error") and row["status"] in {"open", "qty_unconfirmed"}:
             self.conn.execute(
                 """

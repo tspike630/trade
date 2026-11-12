@@ -24,8 +24,10 @@ unsafe row blocks every new BUY on that purpose:
 
 Stored list ids are not a working OCO. Decision does not call the
 exchange, so a row that still needs an entry, list, or exit read halts
-the purpose. Execution is the only place that can clear those two
-read reasons, and only from a read on that call.
+the purpose. That blocks every new buy on the purpose, including a
+second symbol. This is not a restored multi-coin book. Execution is
+the only place that can clear those two read reasons, and only from a
+read on that call. A stored fee or a stored exit id is not that read.
 
 Handoff path, first hit wins:
 

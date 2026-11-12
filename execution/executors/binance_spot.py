@@ -67,6 +67,7 @@ DEFAULT_BASE_URL = "https://api.binance.com"
 ACCOUNT_PATH = "/api/v3/account"
 API_RESTRICTIONS_PATH = "/sapi/v1/account/apiRestrictions"
 SPOT_PATH = "/api/v3/order"
+TRADES_PATH = "/api/v3/myTrades"
 EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
 TICKER_PATH = "/api/v3/ticker/price"
 OCO_PATH = "/api/v3/orderList/oco"
@@ -1065,6 +1066,19 @@ class BinanceSpotHttpClient:
         status, body = self._opener(request, self.timeout)
         return _decode_ok(status, body, secrets=(api_key,))
 
+    def my_trades(self, signed_query: str, *, api_key: str) -> Any:
+        """One page of ``GET /api/v3/myTrades``. The caller paginates."""
+        request = urllib.request.Request(
+            f"{self.base_url}{TRADES_PATH}?{signed_query}",
+            method="GET",
+            headers={
+                "User-Agent": "trade-binance-spot",
+                "X-MBX-APIKEY": api_key,
+            },
+        )
+        status, body = self._opener(request, self.timeout)
+        return _decode_ok(status, body, secrets=(api_key,))
+
     def cancel_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{self.base_url}{SPOT_PATH}?{signed_query}",
@@ -1320,7 +1334,9 @@ from execution.binance_ws_stream import default_max_age_ms  # noqa: E402
 from execution.executors.binance_spot_gate import (  # noqa: E402
     REST_BOOK,
     account_book_block,
+    account_order_base,
     buy_exposure_block,
+    final_executed_qty,
     hard_unresolved_halt,
     oco_readback_covers,
     row_unresolved_reason,
@@ -1431,6 +1447,29 @@ def _floor_limit_quantity(
         if min_notional is not None and notion < min_notional:
             return None, "entry_not_viable:below_min_notional"
     return floored, None
+
+
+def _exit_order_ids(row: dict[str, Any]) -> list[str]:
+    """Every exit order id recorded on the row. The latest id is not the only one."""
+    found: list[str] = []
+    raw = row.get("exit_order_ids")
+    parsed: object = None
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+    elif isinstance(raw, list):
+        parsed = raw
+    if isinstance(parsed, list):
+        for item in parsed:
+            text = str(item or "").strip()
+            if text and text not in found:
+                found.append(text)
+    one = str(row.get("exit_order_id") or "").strip()
+    if one and one not in found:
+        found.append(one)
+    return found
 
 
 class BinanceSpotAdapter:
@@ -2037,13 +2076,13 @@ class BinanceSpotAdapter:
             )
             if entry_net is None:
                 return "entry_origin_unverified"
-            exit_id = str(row.get("exit_order_id") or "").strip()
-            if exit_id:
-                exit_net = self._live_order_net(row, order_id=exit_id, side="SELL")
-                if exit_net is None:
+            exit_ids = _exit_order_ids(row)
+            exit_net = Decimal("0")
+            for exit_id in exit_ids:
+                one = self._live_order_net(row, order_id=exit_id, side="SELL")
+                if one is None:
                     return "exit_readback_unverified"
-            else:
-                exit_net = Decimal("0")
+                exit_net += one
             still = entry_net - exit_net
             if still <= 0:
                 continue
@@ -2083,15 +2122,78 @@ class BinanceSpotAdapter:
             return None
         if str(payload.get("side") or "").strip().upper() != side:
             return None
-        if str(payload.get("status") or "").strip().upper() not in {"FILLED", "PARTIALLY_FILLED"}:
+        executed = final_executed_qty(payload)
+        if executed is None:
             return None
-        net_text = sellable_base_qty(payload, symbol)
-        if net_text is None:
+        trades = self._order_trades(symbol=symbol, order_id=order_id)
+        if trades is None:
             return None
-        net = Decimal(net_text)
-        if not net.is_finite() or net <= 0:
+        effect = account_order_base(
+            trades,
+            symbol=symbol,
+            order_id=order_id,
+            side=side,
+            executed_qty=executed,
+        )
+        if effect is None or effect <= 0:
             return None
-        return net
+        return effect
+
+    def _order_trades(self, *, symbol: str, order_id: str) -> list[dict[str, Any]] | None:
+        """Every trade for this order. A short page ends the read. A gap halts."""
+        client = self._trade_client()
+        query = getattr(client, "my_trades", None) if client is not None else None
+        if not callable(query):
+            return None
+        key, secret = self._credentials()
+        if not key or not secret:
+            return None
+        seen: dict[str, dict[str, Any]] = {}
+        from_id: int | None = None
+        for _page in range(20):
+            pairs = [
+                ("symbol", symbol),
+                ("orderId", order_id),
+                ("limit", "1000"),
+                ("recvWindow", RECV_WINDOW_MS),
+                ("timestamp", str(int(self.clock_ms()))),
+            ]
+            if from_id is not None:
+                pairs.append(("fromId", str(from_id)))
+            try:
+                page = query(sign_query(pairs, secret), api_key=key)
+            except Exception as exc:  # noqa: BLE001
+                if isinstance(exc, AssertionError):
+                    raise
+                return None
+            if not isinstance(page, list):
+                return None
+            if not page:
+                break
+            last_id: int | None = None
+            fresh = 0
+            for trade in page:
+                if not isinstance(trade, dict):
+                    return None
+                trade_id = str(trade.get("id") if trade.get("id") is not None else "").strip()
+                if not trade_id or not trade_id.isdigit():
+                    return None
+                if str(trade.get("symbol") or "").strip().upper() != symbol.upper():
+                    return None
+                if str(trade.get("orderId") or "").strip() != order_id:
+                    return None
+                if trade_id not in seen:
+                    seen[trade_id] = trade
+                    fresh += 1
+                last_id = int(trade_id)
+            if len(page) < 1000:
+                break
+            if fresh == 0 or last_id is None:
+                return None
+            from_id = last_id + 1
+        else:
+            return None
+        return list(seen.values())
 
     def _current_list_covers(self, row: dict[str, Any], held: Decimal) -> bool:
         list_id = str(row.get("oco_order_list_id") or "").strip()

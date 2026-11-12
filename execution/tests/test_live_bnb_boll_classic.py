@@ -32,7 +32,9 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
     REST_BOOK,
+    account_order_base,
     buy_exposure_block,
+    final_executed_qty,
     oco_readback_covers,
 )
 from execution.executors.binance_spot_protect import (  # noqa: E402
@@ -140,6 +142,25 @@ class _Client:
             "status": "FILLED",
             "executedQty": "100",
         }
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        self.calls.append(("my_trades", signed_query, api_key))
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["1"])[0]
+        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        return [
+            {
+                "symbol": symbol,
+                "id": int(order_id) * 10 + 1,
+                "orderId": int(order_id),
+                "qty": "100",
+                "commission": "0",
+                "commissionAsset": base,
+            }
+        ]
 
     def ticker_price(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("ticker_price", symbol))
@@ -722,8 +743,27 @@ def _trading_info(symbol: str) -> dict[str, Any]:
     }
 
 
+def _zero_fee_trades(signed_query: str, qty: str) -> list[dict[str, Any]]:
+    form = parse_qs(signed_query)
+    if form.get("fromId"):
+        return []
+    symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+    order_id = (form.get("orderId") or ["1"])[0]
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    return [
+        {
+            "symbol": symbol,
+            "id": int(order_id) * 10 + 1,
+            "orderId": int(order_id),
+            "qty": qty,
+            "commission": "0",
+            "commissionAsset": base,
+        }
+    ]
+
+
 class FillNetTests(unittest.TestCase):
-    """Commission is subtracted only when it is the traded base. Do not change that."""
+    """Base commission changes the base quantity only when the fill states it."""
 
     def test_third_asset_quote_and_two_base_fills(self) -> None:
         eth = {
@@ -749,7 +789,81 @@ class FillNetTests(unittest.TestCase):
         }
         self.assertEqual(sellable_base_qty(two, "BNBUSDT"), "0.249")
         missing = {"executedQty": "0.25"}
-        self.assertEqual(sellable_base_qty(missing, "BNBUSDT"), "0.25")
+        self.assertIsNone(sellable_base_qty(missing, "BNBUSDT"))
+        empty = {"executedQty": "0.25", "fills": []}
+        self.assertIsNone(sellable_base_qty(empty, "BNBUSDT"))
+        no_fee = {
+            "executedQty": "0.25",
+            "fills": [{"qty": "0.25", "commissionAsset": "BNB"}],
+        }
+        self.assertIsNone(sellable_base_qty(no_fee, "BNBUSDT"))
+
+
+class TradeEvidenceTests(unittest.TestCase):
+    """A get_order body without fills is not a fee. myTrades is the fee read."""
+
+    def test_pages_duplicates_fees_and_partial_orders(self) -> None:
+        pages = [
+            [
+                {"symbol": "BNBUSDT", "id": 2, "orderId": 99, "qty": "0.10", "commission": "0.0004", "commissionAsset": "BNB"},
+                {"symbol": "BNBUSDT", "id": 1, "orderId": 99, "qty": "0.10", "commission": "0.0004", "commissionAsset": "BNB"},
+            ],
+            [
+                {"symbol": "BNBUSDT", "id": 2, "orderId": 99, "qty": "0.10", "commission": "0.0004", "commissionAsset": "BNB"},
+                {"symbol": "BNBUSDT", "id": 3, "orderId": 99, "qty": "0.05", "commission": "0.0002", "commissionAsset": "BNB"},
+            ],
+        ]
+        seen: dict[str, dict[str, Any]] = {}
+        for page in pages:
+            for trade in page:
+                seen.setdefault(str(trade["id"]), trade)
+        self.assertEqual(
+            account_order_base(list(seen.values()), symbol="BNBUSDT", order_id="99", side="BUY", executed_qty=Decimal("0.25")),
+            Decimal("0.249"),
+        )
+        self.assertIsNone(
+            account_order_base(
+                [{"symbol": "BNBUSDT", "id": 1, "orderId": 99, "qty": "0.25", "commissionAsset": "BNB"}],
+                symbol="BNBUSDT",
+                order_id="99",
+                side="BUY",
+                executed_qty=Decimal("0.25"),
+            )
+        )
+        self.assertIsNone(
+            account_order_base(
+                [{"symbol": "BNBUSDT", "id": 1, "orderId": 99, "qty": "0.10", "commission": "0.001", "commissionAsset": "BNB"}],
+                symbol="BNBUSDT",
+                order_id="99",
+                side="BUY",
+                executed_qty=Decimal("0.25"),
+            )
+        )
+        self.assertEqual(
+            account_order_base(
+                [{"symbol": "ETHUSDT", "id": 1, "orderId": 7, "qty": "1.5", "commission": "0.01", "commissionAsset": "BNB"}],
+                symbol="ETHUSDT",
+                order_id="7",
+                side="BUY",
+                executed_qty=Decimal("1.5"),
+            ),
+            Decimal("1.5"),
+        )
+        self.assertEqual(
+            account_order_base(
+                [{"symbol": "BNBUSDT", "id": 9, "orderId": 50, "qty": "0.248", "commission": "0.001", "commissionAsset": "BNB"}],
+                symbol="BNBUSDT",
+                order_id="50",
+                side="SELL",
+                executed_qty=Decimal("0.248"),
+            ),
+            Decimal("0.249"),
+        )
+        self.assertIsNone(final_executed_qty({"status": "PARTIALLY_FILLED", "executedQty": "0.10", "origQty": "0.25"}))
+        self.assertEqual(
+            final_executed_qty({"status": "CANCELED", "executedQty": "0.10", "origQty": "0.25"}),
+            Decimal("0.10"),
+        )
 
 
 class ClassicGatewayProtectionTests(unittest.TestCase):
@@ -1205,6 +1319,10 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                     "executedQty": "0.25",
                 }
 
+            def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+                self.calls.append(("my_trades", signed_query))
+                return _zero_fee_trades(signed_query, "0.25")
+
         client = _Timeout()
         purposes = frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSE_LIVE_BNB_BOLL_FADE})
         with mock.patch.dict(os.environ, _env(self.root)):
@@ -1309,6 +1427,222 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         self.assertEqual(eth_buys[0]["side"], ["BUY"])
 
 
+        self._tmp.cleanup()
+
+    def test_mytrades_pages_fees_and_partials_do_not_invent_a_net(self) -> None:
+        def _trade(symbol: str, order_id: str, trade_id: int, qty: str, fee: str, asset: str = "BNB") -> dict[str, Any]:
+            return {
+                "symbol": symbol,
+                "id": trade_id,
+                "orderId": int(order_id),
+                "qty": qty,
+                "commission": fee,
+                "commissionAsset": asset,
+            }
+
+        class _Trades:
+            def __init__(self, mode: str) -> None:
+                self.mode = mode
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _trading_info(symbol)
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                if self.mode not in {"duplicate", "pages", "sells"}:
+                    raise AssertionError(self.mode)
+                form = parse_qs(signed_query)
+                symbol = (form.get("symbol") or ["ETHUSDT"])[0]
+                base = symbol[:-4] if symbol.endswith("USDT") else symbol
+                return {
+                    "orderId": "77",
+                    "status": "FILLED",
+                    "executedQty": "1",
+                    "symbol": symbol,
+                    "fills": [{"qty": "1", "commission": "0", "commissionAsset": base}],
+                }
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                return _working()
+
+            def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                form = parse_qs(signed_query)
+                order_id = (form.get("orderId") or ["99"])[0]
+                status = "PARTIALLY_FILLED" if self.mode == "partial" else "FILLED"
+                side = "SELL" if order_id in {"50", "51"} else "BUY"
+                executed = "0.124" if order_id in {"50", "51"} else "0.25"
+                return {
+                    "symbol": (form.get("symbol") or ["BNBUSDT"])[0],
+                    "orderId": int(order_id),
+                    "side": side,
+                    "status": status,
+                    "executedQty": executed,
+                    "origQty": "0.25",
+                }
+
+            def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+                form = parse_qs(signed_query)
+                symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+                order_id = (form.get("orderId") or ["99"])[0]
+                if self.mode == "pages":
+                    if form.get("fromId"):
+                        return [_trade(symbol, order_id, 1001, "0.05", "0.0002")]
+                    return [_trade(symbol, order_id, i, "0.0002", "0.0000008") for i in range(1, 1001)]
+                if self.mode == "missing_page":
+                    if form.get("fromId"):
+                        return []
+                    return [_trade(symbol, order_id, i, "0.0002", "0") for i in range(1, 1001)]
+                if self.mode == "missing_fee":
+                    return [{"symbol": symbol, "id": 1, "orderId": int(order_id), "qty": "0.25", "commissionAsset": "BNB"}]
+                if self.mode == "duplicate":
+                    row = _trade(symbol, order_id, 1, "0.25", "0.001")
+                    return [row, dict(row)]
+                if self.mode == "third":
+                    return [_trade(symbol, order_id, 1, "0.25", "0.01", asset="USDT")]
+                if self.mode == "sells":
+                    if order_id in {"50", "51"}:
+                        return [_trade(symbol, order_id, int(order_id), "0.124", "0.0005")]
+                    return [_trade(symbol, order_id, 1, "0.25", "0.001")]
+                return [_trade(symbol, order_id, 1, "0.25", "0.001")]
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                form = parse_qs(signed_query)
+                symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+                qty = "0.0001" if self.mode == "sells" else "0.249"
+                return {
+                    "symbol": symbol,
+                    "orderListId": int((form.get("orderListId") or ["3"])[0]),
+                    "listOrderStatus": "EXECUTING",
+                    "listStatusType": "EXEC_STARTED",
+                    "orderReports": [
+                        {"symbol": symbol, "orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "origQty": qty, "executedQty": "0"},
+                        {"symbol": symbol, "orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "origQty": qty, "executedQty": "0"},
+                    ],
+                }
+
+        ids = {
+            "missing_page": 5101,
+            "missing_fee": 5102,
+            "partial": 5103,
+            "third": 5104,
+            "duplicate": 5105,
+            "pages": 5106,
+            "sells": 5107,
+        }
+
+        def _once(mode: str, *, exits: tuple[str, ...] = ()) -> dict[str, Any]:
+            for name in ("ledger.db", "other-carrier.db", "registry.json"):
+                path = self.root / name
+                if path.exists():
+                    path.unlink()
+            purposes = frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSE_LIVE_BNB_BOLL_FADE})
+            with mock.patch.dict(os.environ, _env(self.root)):
+                with self._gateway(_Trades(mode), purposes) as gw:
+                    armed = gw.ledger.arm_binance_spot_position(
+                        {
+                            "decision_log_id": ids[mode],
+                            "symbol": "BNBUSDT",
+                            "purpose": PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+                            "status": "oco_working",
+                            "quantity": "0.25",
+                            "stop_price": "95",
+                            "take_profit_price": "110",
+                            "entry_order_id": "99",
+                            "protection": "exchange_oco",
+                        }
+                    )
+                    fields: dict[str, Any] = {
+                        "oco_order_list_id": "3",
+                        "oco_above_order_id": "11",
+                        "oco_below_order_id": "10",
+                    }
+                    gw.ledger.update_binance_spot_position(int(armed["id"]), fields)
+                    for exit_id in exits:
+                        gw.ledger.update_binance_spot_position(int(armed["id"]), {"exit_order_id": exit_id})
+                    return gw.process_one(
+                        _decision_row(
+                            mode="live_stub",
+                            decision_log_id=ids[mode] + 100,
+                            purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                            token_address="ETHUSDT",
+                            pair_address="ETH/USDT",
+                            extras=_classic_extras(binance_symbol="ETHUSDT"),
+                        )
+                    )
+
+        class _NoTrades:
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _trading_info(symbol)
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise AssertionError("no trade history")
+
+            def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                form = parse_qs(signed_query)
+                return {
+                    "symbol": (form.get("symbol") or ["BNBUSDT"])[0],
+                    "orderId": int((form.get("orderId") or ["99"])[0]),
+                    "side": "BUY",
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                    "origQty": "0.25",
+                }
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise AssertionError("list is not the fee")
+
+        blocked = _once("missing_page")
+        self.assertEqual(blocked["error"], "entry_origin_unverified", blocked)
+        self.assertEqual(_once("missing_fee")["error"], "entry_origin_unverified")
+        self.assertEqual(_once("partial")["error"], "entry_origin_unverified")
+        self.assertEqual(_once("third")["error"], "oco_readback_unverified")
+        covered = _once("duplicate")
+        self.assertEqual(covered["executed"], 1, covered)
+        paged = _once("pages")
+        self.assertEqual(paged["executed"], 1, paged)
+        sold = _once("sells", exits=("50", "51"))
+        self.assertEqual(sold["executed"], 1, sold)
+        for name in ("ledger.db", "other-carrier.db", "registry.json"):
+            path = self.root / name
+            if path.exists():
+                path.unlink()
+        purposes = frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSE_LIVE_BNB_BOLL_FADE})
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(_NoTrades(), purposes) as gw:
+                armed = gw.ledger.arm_binance_spot_position(
+                    {
+                        "decision_log_id": 5099,
+                        "symbol": "BNBUSDT",
+                        "purpose": PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+                        "status": "oco_working",
+                        "quantity": "0.25",
+                        "stop_price": "95",
+                        "take_profit_price": "110",
+                        "entry_order_id": "99",
+                        "protection": "exchange_oco",
+                    }
+                )
+                gw.ledger.update_binance_spot_position(
+                    int(armed["id"]),
+                    {"oco_order_list_id": "3", "oco_above_order_id": "11", "oco_below_order_id": "10"},
+                )
+                unsupported = gw.process_one(
+                    _decision_row(
+                        mode="live_stub",
+                        decision_log_id=6099,
+                        purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                        token_address="ETHUSDT",
+                        pair_address="ETH/USDT",
+                        extras=_classic_extras(binance_symbol="ETHUSDT"),
+                    )
+                )
+        self.assertEqual(unsupported["error"], "entry_origin_unverified", unsupported)
+
     def test_forged_working_list_and_zeroed_qty_do_not_unlock(self) -> None:
         class _Echo:
             def __init__(self) -> None:
@@ -1334,6 +1668,10 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                     "status": "FILLED",
                     "executedQty": "0.25",
                 }
+
+            def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+                self.calls.append(("my_trades", signed_query))
+                return _zero_fee_trades(signed_query, "0.25")
 
             def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
                 self.calls.append(("get_order_list", signed_query))
@@ -1506,7 +1844,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
             "status": "FILLED",
             "executedQty": "0.25",
             "symbol": "BNBUSDT",
-            "fills": [{"commission": "0.001", "commissionAsset": "BNB"}],
+            "fills": [{"qty": "0.25", "commission": "0.001", "commissionAsset": "BNB"}],
         }
         self.assertIsNone(
             ledger.record_exchange_entry_origin(int(overridden["id"]), symbol="BNBUSDT", placed=placed)
@@ -1587,6 +1925,9 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                     "status": "NEW" if order_id == "50" else "FILLED",
                     "executedQty": "0.25",
                 }
+
+            def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+                return _zero_fee_trades(signed_query, "0.25")
 
             def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
                 form = parse_qs(signed_query)

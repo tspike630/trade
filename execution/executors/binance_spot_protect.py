@@ -272,29 +272,45 @@ def entry_viability_error(
 
 
 def sellable_base_qty(placed: dict[str, Any] | None, symbol: str) -> str | None:
-    """``executedQty`` minus base-asset commission shown on this fill.
+    """Base left from an order ack that lists every fill's commission.
 
-    Commission in any other asset is ignored. A missing ``fills`` array does
-    not invent a fee.
+    A missing ``fills`` list, an empty list, or a fill with no commission
+    is unknown, not a zero fee. Commission in another asset does not change
+    the base quantity. This is the ack helper. A later buy uses ``myTrades``.
     """
     if not isinstance(placed, dict):
         return None
     executed = _to_decimal(placed.get("executedQty"))
-    if executed is None:
+    if executed is None or executed <= 0:
+        return None
+    fills = placed.get("fills")
+    if not isinstance(fills, list) or not fills:
         return None
     base = symbol[: -len("USDT")] if symbol.endswith("USDT") else ""
     fee = Decimal("0")
-    fills = placed.get("fills")
-    if isinstance(fills, list) and base:
-        for fill in fills:
-            if not isinstance(fill, dict):
-                continue
-            asset = str(fill.get("commissionAsset") or "").upper()
-            if asset != base:
-                continue
-            part = _to_decimal(fill.get("commission"))
-            if part is not None:
-                fee += part
+    qty = Decimal("0")
+    for fill in fills:
+        if not isinstance(fill, dict):
+            return None
+        part_qty = _to_decimal(fill.get("qty"))
+        if part_qty is None or part_qty <= 0:
+            return None
+        qty += part_qty
+        if "commission" not in fill or "commissionAsset" not in fill:
+            return None
+        asset = str(fill.get("commissionAsset") or "").strip().upper()
+        if not asset:
+            return None
+        try:
+            part = Decimal(str(fill.get("commission")).strip())
+        except Exception:
+            return None
+        if not part.is_finite() or part < 0:
+            return None
+        if asset == base:
+            fee += part
+    if qty != executed:
+        return None
     net = executed - fee
     if net <= 0:
         return None

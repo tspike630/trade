@@ -891,6 +891,100 @@ def oco_readback_covers(
     return True
 
 
+_FINAL_ORDER_STATUS = frozenset(
+    {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"}
+)
+
+
+def final_executed_qty(payload: object) -> Decimal | None:
+    """Executed quantity once the remainder cannot fill.
+
+    ``PARTIALLY_FILLED`` and ``NEW`` are not final: the rest of the order
+    can still trade. A canceled or expired order's executed quantity is final.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("status") or "").strip().upper() not in _FINAL_ORDER_STATUS:
+        return None
+    text = _decimal_text(payload.get("executedQty"))
+    if text is None:
+        return None
+    number = Decimal(text)
+    if number <= 0:
+        return None
+    return number
+
+
+def account_order_base(
+    trades: object,
+    *,
+    symbol: str,
+    order_id: object,
+    side: str,
+    executed_qty: Decimal,
+) -> Decimal | None:
+    """Base effect of one final order from its own trades.
+
+    BUY returns executed quantity minus base-asset commission. SELL returns
+    executed quantity plus base-asset commission. A quote or third-asset
+    commission does not change the base. Duplicate trade ids count once.
+    A missing commission, a trade for another order, or a quantity sum that
+    is not ``executed_qty`` is unknown.
+    """
+    if not isinstance(trades, list) or executed_qty <= 0:
+        return None
+    wanted_side = str(side or "").strip().upper()
+    if wanted_side not in {"BUY", "SELL"}:
+        return None
+    wanted_symbol = str(symbol or "").strip().upper()
+    wanted_order = str(order_id or "").strip()
+    base = wanted_symbol[: -len("USDT")] if wanted_symbol.endswith("USDT") else ""
+    if not wanted_symbol or not wanted_order or not base:
+        return None
+    seen: dict[str, dict[str, Any]] = {}
+    for trade in trades:
+        if not isinstance(trade, dict):
+            return None
+        trade_id = str(trade.get("id") if trade.get("id") is not None else "").strip()
+        if not trade_id or trade_id in seen:
+            if not trade_id:
+                return None
+            continue
+        if str(trade.get("symbol") or "").strip().upper() != wanted_symbol:
+            return None
+        if str(trade.get("orderId") or "").strip() != wanted_order:
+            return None
+        seen[trade_id] = trade
+    if not seen:
+        return None
+    qty = Decimal("0")
+    base_fee = Decimal("0")
+    for trade in seen.values():
+        try:
+            part_qty = Decimal(str(trade.get("qty")).strip())
+            part_fee = Decimal(str(trade.get("commission")).strip())
+        except Exception:
+            return None
+        if not part_qty.is_finite() or part_qty <= 0:
+            return None
+        if "commission" not in trade or "commissionAsset" not in trade:
+            return None
+        if not part_fee.is_finite() or part_fee < 0:
+            return None
+        asset = str(trade.get("commissionAsset") or "").strip().upper()
+        if not asset:
+            return None
+        qty += part_qty
+        if asset == base:
+            base_fee += part_fee
+    if qty != executed_qty:
+        return None
+    effect = executed_qty - base_fee if wanted_side == "BUY" else executed_qty + base_fee
+    if not effect.is_finite() or effect <= 0:
+        return None
+    return effect
+
+
 def row_unresolved_reason(row: dict[str, Any]) -> str | None:
     """Why this row still blocks a buy. Local ids and local fills do not clear it."""
     if any(
