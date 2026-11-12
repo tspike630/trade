@@ -860,6 +860,54 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         self.assertEqual(still["status"], "closed_canceled")
         self.assertEqual(still["residual_qty"], "0.009")
 
+    def test_peer_file_unresolved_row_blocks_a_trading_symbol(self) -> None:
+        fade = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with ExecutionGateway(
+                decision_db=self.root / "decision.db",
+                ledger_path=fade,
+                paper_enabled=False,
+                pm_enabled=False,
+                accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
+                binance_spot=_adapter(self.root, _Client(), auto_flatten_on_oco_fail=True),
+            ) as gw:
+                gw.ledger.arm_binance_spot_position(
+                    {
+                        "decision_log_id": 147880,
+                        "symbol": "BNBUSDT",
+                        "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                        "status": "oco_unknown",
+                        "quantity": "0.25",
+                        "stop_price": "95",
+                        "take_profit_price": "110",
+                        "entry_price": "102",
+                        "entry_order_id": "99",
+                        "protection": "oco_pending",
+                    }
+                )
+        client = _Client()
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with ExecutionGateway(
+                decision_db=self.root / "decision-classic.db",
+                ledger_path=classic,
+                paper_enabled=False,
+                pm_enabled=False,
+                accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
+                binance_spot=_adapter(self.root, client, auto_flatten_on_oco_fail=True),
+            ) as gw:
+                refused = gw.process_one(
+                    _decision_row(
+                        mode="live_stub",
+                        decision_log_id=147881,
+                        token_address="ETHUSDT",
+                        pair_address="ETH/USDT",
+                        extras=_classic_extras(binance_symbol="ETHUSDT"),
+                    )
+                )
+        self.assertEqual(refused["error"], "oco_failed_blocks_buy", refused)
+        self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
+
     def test_unreadable_peer_ledger_blocks_the_buy(self) -> None:
         classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
         (self.root / "execution_ledger_live_bnb_boll_fade.db").write_bytes(b"not a sqlite ledger")
