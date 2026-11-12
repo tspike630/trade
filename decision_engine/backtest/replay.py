@@ -14,6 +14,7 @@ from typing import Any, Iterator, Optional
 from logging_setup import get_logger
 
 from decision_engine.backtest.filters import safe_float
+from decision_engine.core.data_adapter import local_hot_rank_key
 
 log = get_logger("decision_engine.backtest.replay")
 
@@ -113,6 +114,7 @@ class HistoryReplay:
         "volume_7d_avg",
         "volatility_24h",
         "volume_strength",
+        "local_score",
         "jev_score",
         "jev_strength",
         "sentiment_score",
@@ -454,14 +456,13 @@ class HistoryReplay:
             bar_dt = parse_ts(bar_ts)
             assert bar_dt is not None
             token_map = bars[bar_ts]
-            # Rank hot: prefer tier=hot, then jev_strength, then volume_strength
+            # Rank hot: tier=hot first, then local_score, volume_strength, change_5m.
+            # jev_strength does not decide the order.
             ranked = list(token_map.values())
 
             def sort_key(row: dict[str, Any]) -> tuple:
                 tier_rank = 0 if (row.get("tier") or "") == "hot" else 1
-                js = safe_float(row.get("jev_strength"))
-                vs = safe_float(row.get("volume_strength"))
-                return (tier_rank, -(js if js is not None else -1.0), -(vs if vs is not None else -1.0))
+                return (tier_rank, *local_hot_rank_key(row))
 
             ranked.sort(key=sort_key)
             hot = ranked[: self.hot_limit]

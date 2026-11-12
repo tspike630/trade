@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS token_indicators (
     -- social 突热 (observe-only; weight 0)
     spike_ratio REAL,
     spike INTEGER,
+    -- Local旁路 rank score (replaces jevs.fun for ordering). Legacy jev_* stay.
+    local_score REAL,
+    local_score_updated_at TEXT,
     -- composite (future)
     composite_score REAL,
     composite_updated_at TEXT,
@@ -96,6 +99,7 @@ CREATE TABLE IF NOT EXISTS indicator_history (
     sentiment_polarity REAL,
     spike_ratio REAL,
     spike INTEGER,
+    local_score REAL,
     composite_score REAL,
     tier TEXT,
     primary_pair_address TEXT

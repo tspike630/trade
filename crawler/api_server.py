@@ -305,6 +305,8 @@ def _format_indicator_row(row: dict[str, Any]) -> dict[str, Any]:
             "change_24h": row.get("change_24h"),
             "volatility_24h": row.get("volatility_24h"),
             "volume_strength": row.get("volume_strength"),
+            "local_score": row.get("local_score"),
+            "local_score_updated_at": row.get("local_score_updated_at"),
         },
         "funding": {
             "jev_raw_score": row.get("jev_raw_score"),
@@ -342,8 +344,8 @@ def _format_indicator_row(row: dict[str, Any]) -> dict[str, Any]:
 def indicators_top(
     chain: str | None = Query(default=None),
     sort: str = Query(
-        default="change_5m",
-        description="change_5m | jev_strength | volume_strength",
+        default="local_score",
+        description="local_score | volume_strength | change_5m",
     ),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:

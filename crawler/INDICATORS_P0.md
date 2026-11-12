@@ -50,7 +50,7 @@
 | 参数 | 默认 | 约束 |
 |------|------|------|
 | `chain` | 无（全链） | 可选，如 `solana` |
-| `sort` | `change_5m` | **仅** `change_5m` \| `jev_strength` \| `volume_strength` |
+| `sort` | `local_score` | **仅** `local_score` \| `volume_strength` \| `change_5m` |
 | `limit` | `20` | 1–100；非法 sort → 400 |
 
 排序：`NULL` 置后，再按列 **DESC**，同分按 `updated_at DESC`。
@@ -66,9 +66,9 @@ curl -sS -H "X-API-Key: $API_SECRET" \
 curl -sS -H "X-API-Key: $API_SECRET" \
   "http://127.0.0.1:8080/indicators/top?chain=solana&sort=volume_strength&limit=20"
 
-# Top by JEV strength
+# Top by local_score
 curl -sS -H "X-API-Key: $API_SECRET" \
-  "http://127.0.0.1:8080/indicators/top?chain=solana&sort=jev_strength&limit=10"
+  "http://127.0.0.1:8080/indicators/top?chain=solana&sort=local_score&limit=10"
 ```
 
 缺密钥且未 `ALLOW_INSECURE_API=1` → 与其它数据路由相同（401 / 503）。

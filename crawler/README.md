@@ -359,7 +359,7 @@ python -m indicators.run --loop --interval 300
 python -m sources.jev --loop --interval 900
 
 # 一键 Top（需 api_server）
-./top.sh jev
+./top.sh local
 ./top.sh change5m solana 10
 
 # DD（含技术/资金/舆情；可选 --telegram）
@@ -424,7 +424,7 @@ deploy/*.service  deploy/*.timer  deploy/crontab.example
 | Grok DD | `python scripts/grok_dd_report.py --chain solana --token TOKEN` (`[--telegram]`) |
 | Indicators | `python -m indicators.run --loop --interval 300` / `--once` / `--full` |
 | JEV enricher | `python -m sources.jev --loop --interval 900` — **AUTH_JEV.md** |
-| Indicators Top | `./top.sh jev\|change5m\|volume` → `/indicators/top` |
+| Indicators Top | `./top.sh local\|change5m\|volume` → `/indicators/top` |
 | Indicators audit | **INDICATORS_AUDIT.md** |
 | Indicators demo | `python demo_indicators_p0.py` |
 | Worker | `python -m worker.scheduler --once` / `python -m worker.run_worker --once` |

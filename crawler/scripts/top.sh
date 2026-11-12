@@ -2,11 +2,11 @@
 # One-shot Top query via GET /indicators/top (api_server).
 #
 # Usage:
-#   ./top.sh jev              # sort=jev_strength
+#   ./top.sh local            # sort=local_score
 #   ./top.sh change5m         # sort=change_5m
 #   ./top.sh volume           # sort=volume_strength
-#   ./top.sh jev solana 10    # optional: chain limit
-#   ./scripts/top.sh jev
+#   ./top.sh local solana 10  # optional: chain limit
+#   ./scripts/top.sh local
 #
 # Env (read from process env, else project .env — never printed):
 #   API_SECRET   → X-API-Key header (required when api_server auth is on)
@@ -21,18 +21,18 @@ cd "$ROOT"
 
 _usage() {
   cat <<'USAGE'
-Usage: ./top.sh <jev|change5m|volume> [chain] [limit]
+Usage: ./top.sh <local|change5m|volume> [chain] [limit]
 
-  jev       → GET /indicators/top?sort=jev_strength
+  local     → GET /indicators/top?sort=local_score
   change5m  → GET /indicators/top?sort=change_5m
   volume    → GET /indicators/top?sort=volume_strength
 
-Defaults: chain=solana, limit=20
+jev_strength is not a sort key. Defaults: chain=solana, limit=20
 Auth: X-API-Key from API_SECRET (env or .env). Key is never printed.
 Host: http://${API_HOST:-127.0.0.1}:${API_PORT:-8080}
 
 Examples:
-  ./top.sh jev
+  ./top.sh local
   ./top.sh change5m solana 20
   ./top.sh volume bsc 10
 USAGE
@@ -86,11 +86,15 @@ if [[ -z "$MODE" || "$MODE" == "-h" || "$MODE" == "--help" ]]; then
 fi
 
 case "$MODE" in
-  jev)       SORT="jev_strength" ;;
+  local)     SORT="local_score" ;;
   change5m)  SORT="change_5m" ;;
   volume)    SORT="volume_strength" ;;
+  jev)
+    echo "error: jev_strength sort is retired; use local, change5m, or volume" >&2
+    exit 2
+    ;;
   *)
-    echo "error: unknown mode '$MODE' (expected jev|change5m|volume)" >&2
+    echo "error: unknown mode '$MODE' (expected local|change5m|volume)" >&2
     _usage >&2
     exit 2
     ;;

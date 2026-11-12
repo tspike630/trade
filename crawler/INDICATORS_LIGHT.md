@@ -17,7 +17,7 @@
 
 | 子命令 | 对应 `sort` |
 |--------|-------------|
-| `jev` | `jev_strength` |
+| `local` | `local_score` |
 | `change5m` | `change_5m` |
 | `volume` | `volume_strength` |
 
@@ -25,12 +25,12 @@
 
 ```bash
 # 项目根目录
-./top.sh jev
+./top.sh local
 ./top.sh change5m
 ./top.sh volume
 
 # 可选：chain、limit
-./top.sh jev solana 10
+./top.sh local solana 10
 ./scripts/top.sh volume solana 20
 
 # 帮助
@@ -47,7 +47,7 @@
 
 ```bash
 curl -sS -H "X-API-Key: $API_SECRET" \
-  "http://127.0.0.1:8080/indicators/top?chain=solana&sort=jev_strength&limit=20"
+  "http://127.0.0.1:8080/indicators/top?chain=solana&sort=local_score&limit=20"
 ```
 
 ## 2) DD 报告推 Telegram（可选）
