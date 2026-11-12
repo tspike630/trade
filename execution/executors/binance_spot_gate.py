@@ -759,18 +759,94 @@ def account_unresolved_halt(rows: object) -> str | None:
     return None
 
 
+def _zeroed_entry(row: dict[str, Any]) -> bool:
+    """A local write of quantity 0 and no residual does not close an entry.
+
+    A real full exit has ``exit_filled_qty`` covering ``entry_order_qty``.
+    There is no separate human-clear record.
+    """
+    if not str(row.get("entry_order_id") or "").strip():
+        return False
+    if str(row.get("quantity") or "").strip() not in {"0", "0.0"}:
+        return False
+    if _positive_qty(row.get("residual_qty")):
+        return False
+    original = _decimal_text(row.get("entry_order_qty"))
+    sold = _decimal_text(row.get("exit_filled_qty"))
+    if original is not None and sold is not None and Decimal(sold) >= Decimal(original):
+        return False
+    return True
+
+
 def _positive_qty(raw: object) -> bool:
     text = _decimal_text(raw)
     return text is not None and Decimal(text) > 0
 
 
-def _verified_working_oco(row: dict[str, Any]) -> bool:
-    """List id, both legs, and a positive protected quantity. Status text is not enough."""
-    if not _position_ids_verified(row):
+_LIVE_LEG_STATUS = frozenset({"NEW", "PARTIALLY_FILLED", "PENDING_NEW"})
+
+
+def oco_readback_covers(
+    payload: object,
+    *,
+    symbol: str,
+    held_net: Decimal,
+    list_id: object,
+) -> bool:
+    """True only for this call's exchange list, not for fields stored on the row.
+
+    The list must be working, name the same symbol, have two live legs, and
+    the leg quantity must cover ``held_net``. A smaller local quantity does
+    not lower that bar.
+    """
+    if not isinstance(payload, dict) or held_net <= 0:
         return False
-    if str(row.get("protection") or "") != "exchange_oco":
+    if str(payload.get("listOrderStatus") or "").upper() != "EXECUTING":
         return False
-    return _positive_qty(row.get("quantity"))
+    if str(payload.get("listStatusType") or "").upper() not in {"EXEC_STARTED", "EXECUTING"}:
+        return False
+    if str(payload.get("orderListId") or "") != str(list_id or "").strip():
+        return False
+    reported = str(payload.get("symbol") or "").strip().upper()
+    if not reported or reported != str(symbol or "").strip().upper():
+        return False
+    reports = payload.get("orderReports")
+    if not isinstance(reports, list):
+        return False
+    above = None
+    below = None
+    for row in reports:
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("type") or "").upper()
+        if above is None and kind == "LIMIT_MAKER":
+            above = row
+        if below is None and kind == "STOP_LOSS_LIMIT":
+            below = row
+    if above is None or below is None:
+        return False
+    covered = Decimal("0")
+    for leg in (above, below):
+        if str(leg.get("symbol") or reported).strip().upper() != reported:
+            return False
+        if str(leg.get("status") or "").upper() not in _LIVE_LEG_STATUS:
+            return False
+        if _nonneg_id(leg.get("orderId")) is None:
+            return False
+        qty = _decimal_text(leg.get("origQty"))
+        if qty is None:
+            return False
+        covered = max(covered, Decimal(qty))
+    return covered >= held_net
+
+
+def held_net_qty(row: dict[str, Any]) -> Decimal:
+    """Original net when it was recorded. A later local quantity is not the target."""
+    for key in ("entry_order_qty", "quantity"):
+        text = _decimal_text(row.get(key))
+        if text is not None and Decimal(text) > 0:
+            return Decimal(text)
+    return Decimal("0")
 
 
 def _unresolved_row_reason(row: dict[str, Any]) -> str | None:
@@ -779,11 +855,13 @@ def _unresolved_row_reason(row: dict[str, Any]) -> str | None:
     if partial_dust_residual(row):
         return "unprotected_position_blocks_buy"
     status = str(row.get("status") or "")
+    if _zeroed_entry(row):
+        return "unprotected_position_blocks_buy"
     if status == "oco_working":
-        if _verified_working_oco(row):
+        if _position_ids_verified(row) and str(row.get("protection") or "") == "exchange_oco" and _positive_qty(row.get("quantity")):
             return None
         return "oco_failed_blocks_buy"
-    if status == "open" and _verified_working_oco(row):
+    if status == "open" and _position_ids_verified(row) and str(row.get("protection") or "") == "exchange_oco" and _positive_qty(row.get("quantity")):
         return None
     if status == "closed_canceled" and _positive_qty(row.get("quantity")):
         return "unprotected_position_blocks_buy"

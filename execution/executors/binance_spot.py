@@ -1322,6 +1322,8 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     account_book_block,
     account_unresolved_halt,
     buy_exposure_block,
+    held_net_qty,
+    oco_readback_covers,
     cross_arm_symbol_block,
     funding_after_reservation,
     reserved_quote_usdt,
@@ -1991,6 +1993,9 @@ class BinanceSpotAdapter:
         other_arm = cross_arm_symbol_block(shared, purpose=purpose, symbol=symbol)
         if other_arm:
             return other_arm
+        readback = self._working_list_readback_block(shared)
+        if readback:
+            return readback
         planned = None
         if isinstance(self._size_plan, dict):
             planned = self._size_plan.get("quote_usdt")
@@ -2004,6 +2009,47 @@ class BinanceSpotAdapter:
             planned,
             reserved_quote_usdt(shared),
         )
+
+    def _working_list_readback_block(self, rows: list[dict[str, Any]]) -> str | None:
+        """Re-read each claimed working list in this process. Stored ids are not proof."""
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "")
+            if status not in {"oco_working", "open"}:
+                continue
+            if str(row.get("protection") or "") != "exchange_oco":
+                continue
+            if not self._current_list_covers(row):
+                return "oco_readback_unverified"
+        return None
+
+    def _current_list_covers(self, row: dict[str, Any]) -> bool:
+        list_id = str(row.get("oco_order_list_id") or "").strip()
+        symbol = str(row.get("symbol") or "").strip()
+        held = held_net_qty(row)
+        if not list_id or not symbol or held <= 0:
+            return False
+        client = self._trade_client()
+        query = getattr(client, "get_order_list", None) if client is not None else None
+        if not callable(query):
+            return False
+        key, secret = self._credentials()
+        if not key or not secret:
+            return False
+        pairs = [
+            ("symbol", symbol),
+            ("orderListId", list_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            payload = query(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            return False
+        return oco_readback_covers(payload, symbol=symbol, held_net=held, list_id=list_id)
 
     def _auto_flatten_naked_position(
         self,

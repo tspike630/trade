@@ -35,7 +35,7 @@ from execution.executors.binance_spot import (  # noqa: E402
 )
 from execution.executors.binance_spot_gate import REST_BOOK  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
-from execution.ledger import initialize_spot_ledger_binding  # noqa: E402
+from execution.ledger import ExecutionLedger, initialize_spot_ledger_binding  # noqa: E402
 
 _API_KEY = "test-key"
 _API_SECRET = "test-secret"
@@ -392,7 +392,25 @@ class ReceiptPersistenceTests(unittest.TestCase):
         env = _env(self.root)
         ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
         registry = self.root / "registry.json"
-        registry.write_text(json.dumps({"ledgers": [str(ledger_path.resolve())]}), encoding="utf-8")
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        if not classic.is_file():
+            ExecutionLedger(classic).close()
+        initialize_spot_ledger_binding(classic, "424242")
+        registry.write_text(
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(ledger_path.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         env["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
         with mock.patch.dict(os.environ, env):
             with ExecutionGateway(

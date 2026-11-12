@@ -32,6 +32,7 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     PURPOSE_LIVE_BNB_BOLL_FADE,
     REST_BOOK,
     buy_exposure_block,
+    oco_readback_covers,
 )
 from execution.executors.binance_spot_protect import (  # noqa: E402
     ENTRY_MIN_NOTIONAL_USDT,
@@ -112,7 +113,17 @@ class _Client:
 
     def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("get_order_list", signed_query, api_key))
-        return _working()
+        form = parse_qs(signed_query)
+        body = _working()
+        if form.get("orderListId"):
+            body["orderListId"] = int(form["orderListId"][0])
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        body["symbol"] = symbol
+        for report in body["orderReports"]:
+            report["symbol"] = symbol
+            report["origQty"] = "100"
+            report["status"] = "NEW"
+        return body
 
     def ticker_price(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("ticker_price", symbol))
@@ -744,9 +755,24 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
     @contextmanager
     def _gateway(self, client: Any, purposes: frozenset[str]) -> Any:
         ledger_path = self.root / "ledger.db"
+        other = self.root / "other-carrier.db"
+        if not other.is_file():
+            ExecutionLedger(other).close()
+        initialize_spot_ledger_binding(other, "424242")
         registry = self.root / "registry.json"
         registry.write_text(
-            json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(ledger_path.resolve()),
+                        "live_bnb_boll_classic": str(other.resolve()),
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         os.environ[LEDGER_REGISTRY_ENV] = str(registry)
@@ -909,7 +935,18 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         snapshot["uid"] = 424242
         registry = self.root / "registry-peer.json"
         registry.write_text(
-            json.dumps({"ledgers": [str(fade.resolve()), str(classic.resolve())]}),
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(fade.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         with mock.patch.dict(os.environ, _env(self.root)):
@@ -1028,7 +1065,16 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 pass
             absent = _run(
                 classic,
-                {"ledgers": [str(classic.resolve()), str(fade.resolve())]},
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(fade.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                },
             )
         self.assertEqual(absent["error"], "peer_ledger_absent", absent)
         self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
@@ -1041,7 +1087,18 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         snapshot["uid"] = 424242
         registry = self.root / "registry-bad.json"
         registry.write_text(
-            json.dumps({"ledgers": [str(classic.resolve()), str(fade.resolve())]}),
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(fade.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         client = _Client()
@@ -1156,12 +1213,27 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
             [],
         )
         client.list_payload = {
+            "symbol": "BNBUSDT",
             "orderListId": 42,
             "listOrderStatus": "EXECUTING",
             "listStatusType": "EXEC_STARTED",
             "orderReports": [
-                {"orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "executedQty": "0"},
-                {"orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "executedQty": "0"},
+                {
+                    "symbol": "BNBUSDT",
+                    "orderId": 11,
+                    "type": "LIMIT_MAKER",
+                    "status": "NEW",
+                    "origQty": "0.25",
+                    "executedQty": "0",
+                },
+                {
+                    "symbol": "BNBUSDT",
+                    "orderId": 10,
+                    "type": "STOP_LOSS_LIMIT",
+                    "status": "NEW",
+                    "origQty": "0.25",
+                    "executedQty": "0",
+                },
             ],
         }
         with mock.patch.dict(os.environ, _env(self.root)):
@@ -1182,6 +1254,177 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         ]
         self.assertEqual(len(eth_buys), 1)
         self.assertEqual(eth_buys[0]["side"], ["BUY"])
+
+
+    def test_forged_working_list_and_zeroed_qty_do_not_unlock(self) -> None:
+        class _Echo:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _trading_info(symbol)
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_order", signed_query))
+                raise AssertionError("forged state must not buy")
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("get_order_list", signed_query))
+                form = parse_qs(signed_query)
+                symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+                list_id = (form.get("orderListId") or ["0"])[0]
+                return {
+                    "symbol": "DOGEUSDT" if list_id == "999" else symbol,
+                    "orderListId": int(list_id),
+                    "listOrderStatus": "EXECUTING",
+                    "listStatusType": "EXEC_STARTED",
+                    "orderReports": [
+                        {
+                            "symbol": "DOGEUSDT" if list_id == "999" else symbol,
+                            "orderId": 11,
+                            "type": "LIMIT_MAKER",
+                            "status": "NEW",
+                            "origQty": "0.001",
+                        },
+                        {
+                            "symbol": "DOGEUSDT" if list_id == "999" else symbol,
+                            "orderId": 10,
+                            "type": "STOP_LOSS_LIMIT",
+                            "status": "NEW",
+                            "origQty": "0.001",
+                        },
+                    ],
+                }
+
+        client = _Echo()
+        purposes = frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSE_LIVE_BNB_BOLL_FADE})
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(client, purposes) as gw:
+                armed = gw.ledger.arm_binance_spot_position(
+                    {
+                        "decision_log_id": 147960,
+                        "symbol": "BNBUSDT",
+                        "purpose": PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+                        "status": "oco_unknown",
+                        "quantity": "0.25",
+                        "stop_price": "95",
+                        "take_profit_price": "110",
+                        "entry_price": "102",
+                        "entry_order_id": "99",
+                        "protection": "oco_pending",
+                    }
+                )
+                kept_id = int(armed["id"])
+                before = gw.ledger.conn.execute(
+                    "SELECT COUNT(*) AS n FROM order_events"
+                ).fetchone()["n"]
+                gw.ledger.update_binance_spot_position(
+                    kept_id,
+                    {
+                        "status": "oco_working",
+                        "protection": "exchange_oco",
+                        "oco_order_list_id": "999",
+                        "oco_above_order_id": "998",
+                        "oco_below_order_id": "997",
+                        "quantity": "0.001",
+                    },
+                )
+                after = gw.ledger.conn.execute(
+                    "SELECT COUNT(*) AS n FROM order_events"
+                ).fetchone()["n"]
+                forged = gw.process_one(
+                    _decision_row(
+                        mode="live_stub",
+                        decision_log_id=147961,
+                        purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                        token_address="ETHUSDT",
+                        pair_address="ETH/USDT",
+                        extras=_classic_extras(binance_symbol="ETHUSDT"),
+                    )
+                )
+                gw.ledger.update_binance_spot_position(
+                    kept_id,
+                    {"status": "closed", "quantity": "0", "residual_qty": "0"},
+                )
+                zeroed = gw.process_one(
+                    _decision_row(
+                        mode="live_stub",
+                        decision_log_id=147962,
+                        purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                        token_address="ETHUSDT",
+                        pair_address="ETH/USDT",
+                        extras=_classic_extras(binance_symbol="ETHUSDT"),
+                    )
+                )
+                kept = gw.ledger.binance_spot_position_by_id(kept_id)
+        self.assertEqual(after, before)
+        self.assertEqual(forged["error"], "oco_readback_unverified", forged)
+        self.assertEqual(zeroed["error"], "unprotected_position_blocks_buy", zeroed)
+        self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
+        self.assertFalse(
+            oco_readback_covers(
+                {
+                    "symbol": "DOGEUSDT",
+                    "orderListId": 999,
+                    "listOrderStatus": "EXECUTING",
+                    "listStatusType": "EXEC_STARTED",
+                    "orderReports": [
+                        {"symbol": "DOGEUSDT", "orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "origQty": "0.001"},
+                        {"symbol": "DOGEUSDT", "orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "origQty": "0.001"},
+                    ],
+                },
+                symbol="BNBUSDT",
+                held_net=Decimal("0.25"),
+                list_id="999",
+            )
+        )
+        assert kept is not None
+        self.assertEqual(kept["symbol"], "BNBUSDT")
+        self.assertEqual(kept["entry_order_qty"], "0.25")
+        self.assertEqual(kept["entry_order_id"], "99")
+
+    def test_one_ledger_registry_is_incomplete(self) -> None:
+        ledger_path = self.root / "only-current.db"
+        snapshot = dict(_BOUND)
+        snapshot["uid"] = 424242
+        registry = self.root / "registry-one.json"
+        registry.write_text(
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_classic": str(ledger_path.resolve()),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        client = _Client()
+        with mock.patch.dict(os.environ, _env(self.root)):
+            os.environ[LEDGER_REGISTRY_ENV] = str(registry)
+            with ExecutionGateway(
+                decision_db=self.root / "decision-one.db",
+                ledger_path=ledger_path,
+                paper_enabled=False,
+                pm_enabled=False,
+                accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
+                binance_spot=_adapter(
+                    self.root,
+                    client,
+                    auto_flatten_on_oco_fail=True,
+                    account_snapshot=snapshot,
+                ),
+            ) as gw:
+                initialize_spot_ledger_binding(ledger_path, "424242")
+                refused = gw.process_one(_decision_row(mode="live_stub"))
+        self.assertEqual(refused["error"], "ledger_registry_incomplete", refused)
+        self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
 
 
 class ClassicGatewayTests(unittest.TestCase):
@@ -1264,8 +1507,23 @@ class ClassicGatewayTests(unittest.TestCase):
         )
         ledger.close()
         registry = self.root / "registry.json"
+        other = self.root / "fade-carrier.db"
+        if not other.is_file():
+            ExecutionLedger(other).close()
+        initialize_spot_ledger_binding(other, "424242")
         registry.write_text(
-            json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(other.resolve()),
+                        "live_bnb_boll_classic": str(ledger_path.resolve()),
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         env = _env(self.root)

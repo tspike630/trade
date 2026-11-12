@@ -38,7 +38,7 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     PROTECTION_AUTO_FLATTEN,
     buy_entry_oco_preflight,
 )
-from execution.ledger import initialize_spot_ledger_binding  # noqa: E402
+from execution.ledger import ExecutionLedger, initialize_spot_ledger_binding  # noqa: E402
 from execution.gateway import (  # noqa: E402
     _binance_public_result,
     ExecutionGateway,
@@ -903,8 +903,23 @@ class RestingLimitExecutionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
             registry = self.root / "registry.json"
+            classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+            if not classic.is_file():
+                ExecutionLedger(classic).close()
+            initialize_spot_ledger_binding(classic, "424242")
             registry.write_text(
-                json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+                json.dumps(
+                    {
+                        "required_purposes": [
+                            "live_bnb_boll_fade",
+                            "live_bnb_boll_classic",
+                        ],
+                        "purpose_ledgers": {
+                            "live_bnb_boll_fade": str(ledger_path.resolve()),
+                            "live_bnb_boll_classic": str(classic.resolve()),
+                        },
+                    }
+                ),
                 encoding="utf-8",
             )
             os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)

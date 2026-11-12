@@ -228,9 +228,24 @@ class ProtectiveExitTests(unittest.TestCase):
     @contextmanager
     def _gateway(self) -> Any:
         ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        if not classic.is_file():
+            ExecutionLedger(classic).close()
+        initialize_spot_ledger_binding(classic, "424242")
         registry = self.root / "registry.json"
         registry.write_text(
-            json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(ledger_path.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)

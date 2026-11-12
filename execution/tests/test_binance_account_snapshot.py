@@ -35,7 +35,7 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
 )
 from execution.executors.binance_spot_protect import ENTRY_MIN_NOTIONAL_USDT  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
-from execution.ledger import initialize_spot_ledger_binding  # noqa: E402
+from execution.ledger import ExecutionLedger, initialize_spot_ledger_binding  # noqa: E402
 from execution.live_bnb_watchdog import preflight  # noqa: E402
 
 SECRET = "snapshot-secret-not-a-key"
@@ -426,8 +426,23 @@ class ProductionAssemblyTests(unittest.TestCase):
             ):
                 ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
                 registry = self.root / "registry.json"
+                classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+                if not classic.is_file():
+                    ExecutionLedger(classic).close()
+                initialize_spot_ledger_binding(classic, "1275399777")
                 registry.write_text(
-                    json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+                    json.dumps(
+                        {
+                            "required_purposes": [
+                                "live_bnb_boll_fade",
+                                "live_bnb_boll_classic",
+                            ],
+                            "purpose_ledgers": {
+                                "live_bnb_boll_fade": str(ledger_path.resolve()),
+                                "live_bnb_boll_classic": str(classic.resolve()),
+                            },
+                        }
+                    ),
                     encoding="utf-8",
                 )
                 self.env["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)

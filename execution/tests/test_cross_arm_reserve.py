@@ -184,7 +184,18 @@ class SharedLedgerReservationTests(unittest.TestCase):
     def _account(self, *paths: Path) -> dict[str, Any]:
         registry = self.root / "registry.json"
         registry.write_text(
-            json.dumps({"ledgers": [str(path.resolve()) for path in paths]}),
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(paths[0].resolve()),
+                        "live_bnb_boll_classic": str(paths[-1].resolve()),
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         os.environ[LEDGER_REGISTRY_ENV] = str(registry)

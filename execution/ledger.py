@@ -55,11 +55,12 @@ _BINDING_TABLE = "spot_ledger_binding"
 
 def load_ledger_registry(
     environ: Any | None = None,
-) -> tuple[list[Path] | None, str | None]:
-    """Explicit ledger paths for this account. A missing registry is unmapped.
+) -> tuple[dict[str, Path] | None, str | None]:
+    """Purpose-to-ledger map. A bare path list is incomplete.
 
-    The file is operator configuration, not a filename guess. It does not
-    contain an account uid. The uid is read from each ledger's binding row.
+    ``required_purposes`` is the deployment set. ``purpose_ledgers`` must
+    name every one of those purposes and no others. The process does not
+    scan the directory for the other book. The file does not contain a uid.
     """
     env = os.environ if environ is None else environ
     raw = env.get(LEDGER_REGISTRY_ENV) if hasattr(env, "get") else None
@@ -72,15 +73,28 @@ def load_ledger_registry(
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None, "ledger_registry_unmapped"
-    listed = payload.get("ledgers") if isinstance(payload, dict) else None
-    if not isinstance(listed, list) or not listed:
-        return None, "ledger_registry_unmapped"
-    paths: list[Path] = []
-    for item in listed:
-        if not isinstance(item, str) or not item.strip():
-            return None, "ledger_registry_unmapped"
-        paths.append(Path(item).expanduser().resolve())
-    return paths, None
+    if not isinstance(payload, dict) or "ledgers" in payload:
+        return None, "ledger_registry_incomplete"
+    required = payload.get("required_purposes")
+    mapped = payload.get("purpose_ledgers")
+    if not isinstance(required, list) or not required:
+        return None, "ledger_registry_incomplete"
+    if not isinstance(mapped, dict) or not mapped:
+        return None, "ledger_registry_incomplete"
+    purposes = [str(item).strip() for item in required]
+    if any(not item for item in purposes) or len(set(purposes)) != len(purposes):
+        return None, "ledger_registry_incomplete"
+    if set(mapped) != set(purposes):
+        return None, "ledger_registry_incomplete"
+    books: dict[str, Path] = {}
+    for purpose in purposes:
+        raw_path = mapped.get(purpose)
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return None, "ledger_registry_incomplete"
+        books[purpose] = Path(raw_path).expanduser().resolve()
+    if len(set(books.values())) != len(books):
+        return None, "ledger_registry_incomplete"
+    return books, None
 
 
 def initialize_spot_ledger_binding(path: str | Path, account_uid: str) -> str | None:
@@ -175,11 +189,10 @@ def peer_live_bnb_ledger_path(path: str | Path) -> Path | None:
 
 
 def read_peer_spot_blocks(path: str | Path) -> tuple[list[dict[str, Any]], str | None]:
-    """Rows from the named peer book, or an error when that file cannot be read.
+    """Rows from one registry path that has already passed the binding check.
 
-    A missing file is an empty book: the other arm has not created one.
-    A file that is not a readable spot ledger is ``peer_ledger_unreadable``.
-    The caller fails closed on that error. This does not open any other account.
+    The caller treats a missing file as ``peer_ledger_absent`` before this
+    read. This function does not decide that an absent file is empty.
     """
     file = Path(path)
     if not file.is_file():
@@ -1030,6 +1043,9 @@ class ExecutionLedger:
         row = self.binance_spot_position_by_decision(decision_id)
         if row is None:
             raise RuntimeError(f"binance spot position missing for {decision_id}")
+        if not str(row.get("entry_order_qty") or "").strip() and spec.get("quantity") not in (None, ""):
+            spec = dict(spec)
+            spec["entry_order_qty"] = spec.get("quantity")
         extra = {
             key: spec[key]
             for key in (
@@ -1094,11 +1110,16 @@ class ExecutionLedger:
         self, position_id: int, fields: dict[str, Any]
     ) -> dict[str, Any] | None:
         """Write a whitelisted subset of the held-position row."""
+        current = self.binance_spot_position_by_id(position_id)
         allowed = {
             key: fields[key]
             for key in self._BINANCE_SPOT_MUTABLE
             if key in fields
         }
+        if current is not None:
+            for key in ("entry_order_qty",):
+                if str(current.get(key) or "").strip():
+                    allowed.pop(key, None)
         if not allowed:
             return self.binance_spot_position_by_id(position_id)
         assignments = ", ".join(f"{key} = ?" for key in allowed)
@@ -1148,6 +1169,7 @@ class ExecutionLedger:
             SELECT * FROM binance_spot_positions
             WHERE (
                 status NOT IN ('closed', 'oco_filled', 'closed_canceled')
+                OR quantity IN ('0', '0.0')
                 OR (
                     residual_qty IS NOT NULL
                     AND residual_qty != ''

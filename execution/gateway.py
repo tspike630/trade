@@ -81,13 +81,14 @@ log = get_logger("execution.gateway")
 def _required_peer_books(
     current: str | Path,
     snapshot_uid: str | None,
+    accept_purposes: frozenset[str] | set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Required books from the operator registry, not from a filename guess.
+    """Required books from the purpose map. A one-ledger list is incomplete.
 
-    A missing registry, a missing file, or a ledger with no binding row fails
-    closed. Zero position rows count as empty only when the schema and the
-    binding uid are present and match the snapshot uid. A snapshot with no
-    uid cannot prove the binding.
+    Every purpose in ``required_purposes`` is checked, including carriers
+    this process does not accept. Zero rows are empty only after the schema
+    and the binding uid match the snapshot. A snapshot with no uid cannot
+    prove the binding.
     """
     if not snapshot_uid:
         return [], "ledger_account_unbound"
@@ -95,10 +96,13 @@ def _required_peer_books(
     if error or registry is None:
         return [], error or "ledger_registry_unmapped"
     current_path = Path(current).expanduser().resolve()
-    if current_path not in registry:
+    if current_path not in set(registry.values()):
         return [], "ledger_registry_unmapped"
+    accepted = {str(item).strip() for item in (accept_purposes or set()) if str(item).strip()}
+    if any(item not in registry for item in accepted):
+        return [], "ledger_registry_incomplete"
     peer_rows: list[dict[str, Any]] = []
-    for path in registry:
+    for path in registry.values():
         uid, uid_error = read_ledger_account_uid(path)
         if uid_error:
             return [], uid_error
@@ -1376,6 +1380,7 @@ class ExecutionGateway:
                     other_book, peer_error = _required_peer_books(
                         self.ledger.path,
                         spot_account_uid(adapter.account_snapshot),
+                        self.accept_purposes,
                     )
                     adapter.peer_book_error = peer_error
                     adapter.buy_blocks = own
