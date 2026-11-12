@@ -48,6 +48,7 @@ from execution.executors.binance_spot_gate import (
     consumer_read_cursor,
     is_live_bnb_spot_purpose,
     sole_live_bnb_purpose,
+    spot_account_uid,
 )
 from execution.executors.binance_spot import (
     EXECUTOR_NAME as BINANCE_SPOT_EXECUTOR,
@@ -65,7 +66,8 @@ from execution.ledger import (
     ExecutionLedger,
     _utc,
     buy_reservation_lock,
-    peer_live_bnb_ledger_path,
+    load_ledger_registry,
+    read_ledger_account_uid,
     read_peer_spot_blocks,
     read_spot_buy_blocks_readonly,
 )
@@ -74,6 +76,41 @@ from execution.risk import run_all
 import execution.risk.limits  # noqa: F401 — register checkers on import
 
 log = get_logger("execution.gateway")
+
+
+def _required_peer_books(
+    current: str | Path,
+    snapshot_uid: str | None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Required books from the operator registry, not from a filename guess.
+
+    A missing registry, a missing file, or a ledger with no binding row fails
+    closed. Zero position rows count as empty only when the schema and the
+    binding uid are present and match the snapshot uid. A snapshot with no
+    uid cannot prove the binding.
+    """
+    if not snapshot_uid:
+        return [], "ledger_account_unbound"
+    registry, error = load_ledger_registry()
+    if error or registry is None:
+        return [], error or "ledger_registry_unmapped"
+    current_path = Path(current).expanduser().resolve()
+    if current_path not in registry:
+        return [], "ledger_registry_unmapped"
+    peer_rows: list[dict[str, Any]] = []
+    for path in registry:
+        uid, uid_error = read_ledger_account_uid(path)
+        if uid_error:
+            return [], uid_error
+        if uid != snapshot_uid:
+            return [], "ledger_account_mismatch"
+        if path == current_path:
+            continue
+        rows, read_error = read_peer_spot_blocks(path)
+        if read_error:
+            return [], read_error
+        peer_rows.extend(rows)
+    return peer_rows, None
 
 REQUIRED_FIELDS = (
     "strategy_id",
@@ -1336,11 +1373,10 @@ class ExecutionGateway:
                         for row in self.ledger.list_binance_spot_buy_blocks(purpose=None)
                         if row.get("id") not in own_ids
                     ]
-                    peer_path = peer_live_bnb_ledger_path(self.ledger.path)
-                    if peer_path is None:
-                        other_book, peer_error = [], None
-                    else:
-                        other_book, peer_error = read_peer_spot_blocks(peer_path)
+                    other_book, peer_error = _required_peer_books(
+                        self.ledger.path,
+                        spot_account_uid(adapter.account_snapshot),
+                    )
                     adapter.peer_book_error = peer_error
                     adapter.buy_blocks = own
                     adapter.peer_buy_blocks = same_book + other_book

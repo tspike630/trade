@@ -35,6 +35,7 @@ from execution.executors.binance_spot import (  # noqa: E402
 )
 from execution.executors.binance_spot_gate import REST_BOOK  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.ledger import initialize_spot_ledger_binding  # noqa: E402
 
 _API_KEY = "test-key"
 _API_SECRET = "test-secret"
@@ -385,7 +386,14 @@ class ReceiptPersistenceTests(unittest.TestCase):
         exc = _reject(400, _body(-1013, "Filter failure: LOT_SIZE"))
         client = _RejectingClient(exc)
         adapter = self._adapter(client)
+        snap = dict(adapter.account_snapshot)
+        snap["uid"] = 424242
+        adapter.account_snapshot = snap
         env = _env(self.root)
+        ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        registry = self.root / "registry.json"
+        registry.write_text(json.dumps({"ledgers": [str(ledger_path.resolve())]}), encoding="utf-8")
+        env["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
         with mock.patch.dict(os.environ, env):
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
@@ -395,6 +403,7 @@ class ReceiptPersistenceTests(unittest.TestCase):
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
                 binance_spot=adapter,
             ) as gw:
+                initialize_spot_ledger_binding(ledger_path, "424242")
                 result = gw.process_one(_decision_row())
                 stored = gw.ledger.conn.execute(
                     "SELECT receipt_json, executed, status FROM execution_log WHERE decision_log_id = ?",

@@ -741,10 +741,10 @@ def buy_exposure_block(
 def account_unresolved_halt(rows: object) -> str | None:
     """Block every new BUY while this account has an unresolved spot row.
 
-    The rows are this process's book plus its named peer book. A verified
-    working OCO and a full close are resolved. ``closed_canceled`` is the
-    existing operator clear. A dust remainder is not cleared here.
-    Another account's ledger is not in ``rows``.
+    A verified working OCO needs the list id, both leg ids, and a positive
+    quantity. A status write is not that evidence. A positive ``residual_qty``
+    stays unresolved under every status. There is no authenticated human-clear
+    record on this book, so a status change alone does not clear the halt.
     """
     held = rows if isinstance(rows, list) else []
     for row in held:
@@ -759,15 +759,35 @@ def account_unresolved_halt(rows: object) -> str | None:
     return None
 
 
+def _positive_qty(raw: object) -> bool:
+    text = _decimal_text(raw)
+    return text is not None and Decimal(text) > 0
+
+
+def _verified_working_oco(row: dict[str, Any]) -> bool:
+    """List id, both legs, and a positive protected quantity. Status text is not enough."""
+    if not _position_ids_verified(row):
+        return False
+    if str(row.get("protection") or "") != "exchange_oco":
+        return False
+    return _positive_qty(row.get("quantity"))
+
+
 def _unresolved_row_reason(row: dict[str, Any]) -> str | None:
+    if _positive_qty(row.get("residual_qty")):
+        return "unprotected_position_blocks_buy"
     if partial_dust_residual(row):
         return "unprotected_position_blocks_buy"
     status = str(row.get("status") or "")
-    if not status or status in _TERMINAL_POSITION or status == "flat":
-        return None
     if status == "oco_working":
+        if _verified_working_oco(row):
+            return None
+        return "oco_failed_blocks_buy"
+    if status == "open" and _verified_working_oco(row):
         return None
-    if status == "open" and str(row.get("protection") or "") == "exchange_oco" and _position_ids_verified(row):
+    if status == "closed_canceled" and _positive_qty(row.get("quantity")):
+        return "unprotected_position_blocks_buy"
+    if not status or status in _TERMINAL_POSITION or status == "flat":
         return None
     if status == "held_naked":
         return "naked_holds_new_buys"

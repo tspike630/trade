@@ -40,6 +40,7 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     resolve_entry_size,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.ledger import initialize_spot_ledger_binding  # noqa: E402
 from execution.run import tick_live_bnb_exits  # noqa: E402
 
 _INFO = {
@@ -161,6 +162,7 @@ class SizeChainTests(unittest.TestCase):
                     "ipRestrict": True,
                 },
                 "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+                "uid": 424242,
             },
             production_book="rest_api_key",
             rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
@@ -184,15 +186,25 @@ class SizeChainTests(unittest.TestCase):
         wrote.execute("UPDATE decision_log SET id = 147841")
         wrote.commit()
         wrote.close()
+        ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+            encoding="utf-8",
+        )
+        os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
         gw = ExecutionGateway(
             decision_db=db,
-            ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+            ledger_path=ledger_path,
             paper_enabled=False,
             pm_enabled=False,
             accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
             binance_spot=self.adapter,
         )
         gw.__enter__()
+        bound = initialize_spot_ledger_binding(ledger_path, "424242")
+        if bound:
+            raise RuntimeError(bound)
         self.assertFalse(gw.paper_enabled)
         stats = gw.process_pending()
         self.assertEqual(stats.processed, 1)

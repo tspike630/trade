@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,11 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     sellable_base_qty,
 )
 from execution.gateway import BINANCE_SPOT_EXECUTOR, ExecutionGateway  # noqa: E402
-from execution.ledger import ExecutionLedger  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    LEDGER_REGISTRY_ENV,
+    initialize_spot_ledger_binding,
+)
 from execution.run import _peer_isolation_guard, tick_live_bnb_exits  # noqa: E402
 
 _FILTERS = [
@@ -194,14 +199,19 @@ def _decision_row(**overrides: Any) -> dict[str, Any]:
     }
 
 
-def _adapter(root: Path, client: _Client | None = None, **kwargs: Any) -> BinanceSpotAdapter:
+def _adapter(
+    root: Path,
+    client: _Client | None = None,
+    account_snapshot: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> BinanceSpotAdapter:
     return BinanceSpotAdapter(
         client=client if client is not None else _Client(),
         kill_switch_path=root / "absent-kill",
         api_key="test-key",
         api_secret="test-secret",
         clock_ms=lambda: 1_700_000_000_000,
-        account_snapshot=_BOUND,
+        account_snapshot=_BOUND if account_snapshot is None else account_snapshot,
         production_book=REST_BOOK,
         rest_expected=_EXPECTED,
         **kwargs,
@@ -328,6 +338,7 @@ class ClassicPurposeTests(unittest.TestCase):
             "oco_order_list_id": "3",
             "oco_above_order_id": "4",
             "oco_below_order_id": "5",
+            "quantity": "1",
         }
         # No buy symbol: fail closed, same as the old one-open arm block.
         self.assertEqual(
@@ -406,10 +417,12 @@ class ClassicPurposeTests(unittest.TestCase):
         self.assertEqual(_oco_form(client)["belowType"], ["STOP_LOSS_LIMIT"])
 
         # Classic already holds BNBUSDT. A second BNB buy is still one-symbol-one-position.
-        adapter.buy_blocks = [fade_open, opened["arm_position"]]
+        held = dict(opened["arm_position"])
+        held.update(opened.get("oco_fields") or {})
+        adapter.buy_blocks = [fade_open, held]
         with mock.patch.dict(os.environ, _env(self.root)):
             again = adapter.execute(_sig(mode="live_stub", decision_log_id=147903))
-        self.assertEqual(again["error"], "position_open_blocks_buy")
+        self.assertEqual(again["error"], "unprotected_position_blocks_buy")
         self.assertEqual([call[0] for call in client.calls].count("new_order"), 1)
 
         # Fade holds CFGUSDT. A fade buy of BNBUSDT is another symbol on that arm.
@@ -728,15 +741,34 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         self._net.stop()
         self._tmp.cleanup()
 
-    def _gateway(self, client: Any, purposes: frozenset[str]) -> ExecutionGateway:
-        return ExecutionGateway(
+    @contextmanager
+    def _gateway(self, client: Any, purposes: frozenset[str]) -> Any:
+        ledger_path = self.root / "ledger.db"
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+            encoding="utf-8",
+        )
+        os.environ[LEDGER_REGISTRY_ENV] = str(registry)
+        snapshot = dict(_BOUND)
+        snapshot["uid"] = 424242
+        with ExecutionGateway(
             decision_db=self.root / "decision.db",
-            ledger_path=self.root / "ledger.db",
+            ledger_path=ledger_path,
             paper_enabled=False,
             pm_enabled=False,
             accept_purposes=purposes,
-            binance_spot=_adapter(self.root, client, auto_flatten_on_oco_fail=True),
-        )
+            binance_spot=_adapter(
+                self.root,
+                client,
+                auto_flatten_on_oco_fail=True,
+                account_snapshot=snapshot,
+            ),
+        ) as gateway:
+            bound = initialize_spot_ledger_binding(ledger_path, "424242")
+            if bound:
+                raise RuntimeError(bound)
+            yield gateway
 
     def test_dust_remainder_is_persisted_and_blocks_the_next_same_purpose_buy(self) -> None:
         class _Book:
@@ -842,7 +874,14 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         kept_id = int(kept["id"])
         with mock.patch.dict(os.environ, _env(self.root)):
             with self._gateway(client, purposes) as gw:
+                before = gw.ledger.conn.execute(
+                    "SELECT COUNT(*) AS n FROM order_events"
+                ).fetchone()["n"]
                 gw.ledger.update_binance_spot_position(kept_id, {"status": "closed_canceled"})
+                after_update = gw.ledger.conn.execute(
+                    "SELECT COUNT(*) AS n FROM order_events"
+                ).fetchone()["n"]
+                self.assertEqual(after_update, before)
                 cleared = gw.process_one(
                     _decision_row(
                         mode="live_stub",
@@ -854,24 +893,38 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                     )
                 )
                 still = gw.ledger.binance_spot_position_by_id(kept_id)
-        self.assertNotEqual(cleared["error"], "unprotected_position_blocks_buy", cleared)
+        self.assertEqual(cleared["error"], "unprotected_position_blocks_buy", cleared)
+        self.assertEqual(
+            [call for call in client.calls if call[0] == "new_order" and parse_qs(call[1]).get("symbol") == ["ETHUSDT"]],
+            [],
+        )
         assert still is not None
         self.assertEqual(still["id"], kept_id)
-        self.assertEqual(still["status"], "closed_canceled")
         self.assertEqual(still["residual_qty"], "0.009")
 
     def test_peer_file_unresolved_row_blocks_a_trading_symbol(self) -> None:
         fade = self.root / "execution_ledger_live_bnb_boll_fade.db"
         classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        snapshot = dict(_BOUND)
+        snapshot["uid"] = 424242
+        registry = self.root / "registry-peer.json"
+        registry.write_text(
+            json.dumps({"ledgers": [str(fade.resolve()), str(classic.resolve())]}),
+            encoding="utf-8",
+        )
         with mock.patch.dict(os.environ, _env(self.root)):
+            os.environ[LEDGER_REGISTRY_ENV] = str(registry)
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
                 ledger_path=fade,
                 paper_enabled=False,
                 pm_enabled=False,
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
-                binance_spot=_adapter(self.root, _Client(), auto_flatten_on_oco_fail=True),
+                binance_spot=_adapter(
+                    self.root, _Client(), auto_flatten_on_oco_fail=True, account_snapshot=snapshot
+                ),
             ) as gw:
+                initialize_spot_ledger_binding(fade, "424242")
                 gw.ledger.arm_binance_spot_position(
                     {
                         "decision_log_id": 147880,
@@ -886,15 +939,27 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                         "protection": "oco_pending",
                     }
                 )
-        client = _Client()
-        with mock.patch.dict(os.environ, _env(self.root)):
             with ExecutionGateway(
                 decision_db=self.root / "decision-classic.db",
                 ledger_path=classic,
                 paper_enabled=False,
                 pm_enabled=False,
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
-                binance_spot=_adapter(self.root, client, auto_flatten_on_oco_fail=True),
+                binance_spot=_adapter(
+                    self.root, _Client(), auto_flatten_on_oco_fail=True, account_snapshot=snapshot
+                ),
+            ) as gw:
+                initialize_spot_ledger_binding(classic, "424242")
+            client = _Client()
+            with ExecutionGateway(
+                decision_db=self.root / "decision-classic.db",
+                ledger_path=classic,
+                paper_enabled=False,
+                pm_enabled=False,
+                accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
+                binance_spot=_adapter(
+                    self.root, client, auto_flatten_on_oco_fail=True, account_snapshot=snapshot
+                ),
             ) as gw:
                 refused = gw.process_one(
                     _decision_row(
@@ -908,30 +973,100 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         self.assertEqual(refused["error"], "oco_failed_blocks_buy", refused)
         self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
 
+    def test_missing_required_peer_and_unmapped_ledger_do_not_buy(self) -> None:
+        snapshot = dict(_BOUND)
+        snapshot["uid"] = 424242
+        client = _Client()
+
+        def _run(ledger: Path, registry: dict[str, Any] | None) -> dict[str, Any]:
+            if registry is None:
+                os.environ.pop(LEDGER_REGISTRY_ENV, None)
+            else:
+                path = self.root / "registry-missing.json"
+                path.write_text(json.dumps(registry), encoding="utf-8")
+                os.environ[LEDGER_REGISTRY_ENV] = str(path)
+            with ExecutionGateway(
+                decision_db=self.root / "decision-missing.db",
+                ledger_path=ledger,
+                paper_enabled=False,
+                pm_enabled=False,
+                accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
+                binance_spot=_adapter(
+                    self.root,
+                    client,
+                    auto_flatten_on_oco_fail=True,
+                    account_snapshot=snapshot,
+                ),
+            ) as gw:
+                if registry is not None and ledger.is_file():
+                    initialize_spot_ledger_binding(ledger, "424242")
+                return gw.process_one(
+                    _decision_row(
+                        mode="live_stub",
+                        token_address="ETHUSDT",
+                        pair_address="ETH/USDT",
+                        extras=_classic_extras(binance_symbol="ETHUSDT"),
+                    )
+                )
+
+        with mock.patch.dict(os.environ, _env(self.root)):
+            unmapped = _run(self.root / "custom.db", None)
+        self.assertEqual(unmapped["error"], "ledger_registry_unmapped", unmapped)
+        self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
+
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        fade = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with ExecutionGateway(
+                decision_db=self.root / "decision-init.db",
+                ledger_path=classic,
+                paper_enabled=False,
+                pm_enabled=False,
+                accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
+                binance_spot=_adapter(self.root, _Client(), auto_flatten_on_oco_fail=True),
+            ):
+                pass
+            absent = _run(
+                classic,
+                {"ledgers": [str(classic.resolve()), str(fade.resolve())]},
+            )
+        self.assertEqual(absent["error"], "peer_ledger_absent", absent)
+        self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
+
     def test_unreadable_peer_ledger_blocks_the_buy(self) -> None:
         classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
-        (self.root / "execution_ledger_live_bnb_boll_fade.db").write_bytes(b"not a sqlite ledger")
+        fade = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        fade.write_bytes(b"not a sqlite ledger")
+        snapshot = dict(_BOUND)
+        snapshot["uid"] = 424242
+        registry = self.root / "registry-bad.json"
+        registry.write_text(
+            json.dumps({"ledgers": [str(classic.resolve()), str(fade.resolve())]}),
+            encoding="utf-8",
+        )
         client = _Client()
         with mock.patch.dict(os.environ, _env(self.root)):
+            os.environ[LEDGER_REGISTRY_ENV] = str(registry)
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
                 ledger_path=classic,
                 paper_enabled=False,
                 pm_enabled=False,
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
-                binance_spot=_adapter(self.root, client, auto_flatten_on_oco_fail=True),
+                binance_spot=_adapter(
+                    self.root, client, auto_flatten_on_oco_fail=True, account_snapshot=snapshot
+                ),
             ) as gw:
+                initialize_spot_ledger_binding(classic, "424242")
                 refused = gw.process_one(_decision_row(mode="live_stub"))
-        self.assertEqual(refused["error"], "protection_status_unknown", refused)
-        self.assertEqual(
-            [call for call in client.calls if call[0] == "new_order"],
-            [],
-        )
+        self.assertEqual(refused["error"], "peer_ledger_unreadable", refused)
+        self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
 
     def test_unknown_oco_blocks_known_predicates_and_a_valid_other_symbol_is_not_those(self) -> None:
         class _Timeout:
             def __init__(self) -> None:
                 self.calls: list[tuple[str, str]] = []
+                self.list_payload: dict[str, Any] | None = None
 
             def exchange_info(self, symbol: str) -> dict[str, Any]:
                 return _trading_info(symbol)
@@ -956,6 +1091,8 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
 
             def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
                 self.calls.append(("get_order_list", signed_query))
+                if self.list_payload is not None:
+                    return self.list_payload
                 raise TimeoutError("list timed out")
 
         client = _Timeout()
@@ -1008,18 +1145,35 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
             with self._gateway(client, purposes) as gw:
                 current = gw.ledger.binance_spot_position_by_id(kept_id)
                 assert current is not None
-                gw.ledger.update_binance_spot_position(
-                    kept_id,
-                    {
-                        "status": "oco_working",
-                        "protection": "exchange_oco",
-                        "oco_order_list_id": "42",
-                        "oco_above_order_id": "11",
-                        "oco_below_order_id": "10",
-                    },
-                )
-                resolved = gw.process_one(_eth(PURPOSE_LIVE_BNB_BOLL_FADE, 147914))
-                still = gw.ledger.binance_spot_position_by_id(kept_id)
+                gw.ledger.update_binance_spot_position(kept_id, {"status": "oco_working"})
+                forged = gw.process_one(_eth(PURPOSE_LIVE_BNB_BOLL_FADE, 147914))
+                bare = gw.ledger.binance_spot_position_by_id(kept_id)
+        self.assertEqual(forged["error"], "oco_failed_blocks_buy", forged)
+        assert bare is not None
+        self.assertEqual(bare["id"], kept_id)
+        self.assertEqual(
+            [call for call in client.calls if call[0] == "new_order" and parse_qs(call[1]).get("symbol") == ["ETHUSDT"]],
+            [],
+        )
+        client.list_payload = {
+            "orderListId": 42,
+            "listOrderStatus": "EXECUTING",
+            "listStatusType": "EXEC_STARTED",
+            "orderReports": [
+                {"orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "executedQty": "0"},
+                {"orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "executedQty": "0"},
+            ],
+        }
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(client, frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC})) as gw:
+                list(gw.tick_binance_protective_exits({"BNBUSDT": "102"}))
+                read_back = gw.ledger.binance_spot_position_by_id(kept_id)
+            with self._gateway(client, purposes) as gw:
+                resolved = gw.process_one(_eth(PURPOSE_LIVE_BNB_BOLL_FADE, 147915))
+        assert read_back is not None
+        self.assertEqual(read_back["id"], kept_id)
+        self.assertEqual(read_back["status"], "oco_working", read_back)
+        self.assertEqual(str(read_back.get("oco_order_list_id")), "42", read_back)
         self.assertNotEqual(resolved["error"], "oco_failed_blocks_buy", resolved)
         eth_buys = [
             parse_qs(call[1])
@@ -1028,10 +1182,6 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         ]
         self.assertEqual(len(eth_buys), 1)
         self.assertEqual(eth_buys[0]["side"], ["BUY"])
-        assert still is not None
-        self.assertEqual(still["id"], kept_id)
-        self.assertEqual(still["status"], "oco_working")
-        self.assertEqual(still["symbol"], "BNBUSDT")
 
 
 class ClassicGatewayTests(unittest.TestCase):
@@ -1113,15 +1263,30 @@ class ClassicGatewayTests(unittest.TestCase):
             1,
         )
         ledger.close()
-        with mock.patch.dict(os.environ, _env(self.root)):
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+            encoding="utf-8",
+        )
+        env = _env(self.root)
+        env[LEDGER_REGISTRY_ENV] = str(registry)
+        snapshot = dict(_BOUND)
+        snapshot["uid"] = 424242
+        with mock.patch.dict(os.environ, env):
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
                 ledger_path=ledger_path,
                 paper_enabled=False,
                 pm_enabled=False,
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
-                binance_spot=_adapter(self.root, client, auto_flatten_on_oco_fail=True),
+                binance_spot=_adapter(
+                    self.root,
+                    client,
+                    auto_flatten_on_oco_fail=True,
+                    account_snapshot=snapshot,
+                ),
             ) as gw:
+                initialize_spot_ledger_binding(ledger_path, "424242")
                 opened = gw.process_one(_decision_row(mode="live_stub"))
                 self.assertEqual(opened["executed"], 1, opened)
                 self.assertEqual(opened["receipt"]["held_position"]["purpose"], PURPOSE_LIVE_BNB_BOLL_CLASSIC)

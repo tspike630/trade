@@ -5,6 +5,7 @@ No live HTTP. Does not sell a position or read a production secret.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -33,7 +34,9 @@ from execution.executors.binance_spot_protect import ENTRY_MIN_NOTIONAL_USDT  # 
 from execution.gateway import ExecutionGateway  # noqa: E402
 from execution.ledger import (  # noqa: E402
     ExecutionLedger,
+    LEDGER_REGISTRY_ENV,
     buy_reservation_lock,
+    initialize_spot_ledger_binding,
     peer_live_bnb_ledger_path,
     read_spot_buy_blocks_readonly,
 )
@@ -178,6 +181,30 @@ class SharedLedgerReservationTests(unittest.TestCase):
         )
         ledger.close()
 
+    def _account(self, *paths: Path) -> dict[str, Any]:
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps({"ledgers": [str(path.resolve()) for path in paths]}),
+            encoding="utf-8",
+        )
+        os.environ[LEDGER_REGISTRY_ENV] = str(registry)
+        for path in paths:
+            if path.is_file():
+                initialize_spot_ledger_binding(path, "424242")
+        snapshot = {
+            "accountType": "SPOT",
+            "canTrade": True,
+            "permissions": ["SPOT"],
+            "restrictions": {
+                "enableSpotAndMarginTrading": True,
+                "enableReading": True,
+                "ipRestrict": True,
+            },
+            "balances": [{"asset": "USDT", "free": "1000.00", "locked": "0"}],
+            "uid": 424242,
+        }
+        return snapshot
+
     def test_sibling_file_blocks_the_same_symbol_and_reserves_quote(self) -> None:
         self._arm_fade(symbol="BNBUSDT", qty="6", entry="50", status="oco_working")
         peer = peer_live_bnb_ledger_path(self.root / _CLASSIC)
@@ -198,15 +225,19 @@ class SharedLedgerReservationTests(unittest.TestCase):
             def ticker_price(self, symbol: str) -> dict[str, Any]:
                 return {"symbol": symbol, "price": "100"}
 
+        fade = self.root / _FADE
+        classic = self.root / _CLASSIC
         with mock.patch.dict(os.environ, _env(self.root)):
+            snapshot = self._account(fade, classic)
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
-                ledger_path=self.root / _CLASSIC,
+                ledger_path=classic,
                 paper_enabled=False,
                 pm_enabled=False,
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
-                binance_spot=_adapter(self.root, _NoOrder()),
+                binance_spot=_adapter(self.root, _NoOrder(), account_snapshot=snapshot),
             ) as gw:
+                initialize_spot_ledger_binding(classic, "424242")
                 refused = gw.process_one(
                     _decision_row(
                         mode="live_stub",
@@ -223,15 +254,21 @@ class SharedLedgerReservationTests(unittest.TestCase):
     def test_other_symbol_buys_when_the_reserved_balance_still_covers_it(self) -> None:
         self._arm_fade(symbol="ETHUSDT", qty="1", entry="10", status="oco_working")
         client = _adapter(self.root).client
+        fade = self.root / _FADE
+        classic = self.root / _CLASSIC
         with mock.patch.dict(os.environ, _env(self.root)):
+            snapshot = self._account(fade, classic)
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
-                ledger_path=self.root / _CLASSIC,
+                ledger_path=classic,
                 paper_enabled=False,
                 pm_enabled=False,
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
-                binance_spot=_adapter(self.root, client, auto_flatten_on_oco_fail=True),
+                binance_spot=_adapter(
+                    self.root, client, auto_flatten_on_oco_fail=True, account_snapshot=snapshot
+                ),
             ) as gw:
+                initialize_spot_ledger_binding(classic, "424242")
                 opened = gw.process_one(_decision_row(mode="live_stub"))
         self.assertEqual(opened["executed"], 1, opened)
         self.assertEqual(opened["receipt"]["held_position"]["symbol"], "BNBUSDT")

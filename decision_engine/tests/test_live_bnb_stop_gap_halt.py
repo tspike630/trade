@@ -92,6 +92,7 @@ def _held(
         "oco_order_list_id": "1" if verified else None,
         "oco_above_order_id": "2" if verified else None,
         "oco_below_order_id": "3" if verified else None,
+        "quantity": "1" if verified else None,
     }
 
 

@@ -35,6 +35,7 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
 )
 from execution.executors.binance_spot_protect import ENTRY_MIN_NOTIONAL_USDT  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.ledger import initialize_spot_ledger_binding  # noqa: E402
 from execution.live_bnb_watchdog import preflight  # noqa: E402
 
 SECRET = "snapshot-secret-not-a-key"
@@ -423,13 +424,22 @@ class ProductionAssemblyTests(unittest.TestCase):
             ), mock.patch(
                 "execution.executors.binance_spot.urllib.request.urlopen", urlopen
             ):
+                ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+                registry = self.root / "registry.json"
+                registry.write_text(
+                    json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+                    encoding="utf-8",
+                )
+                self.env["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
+                os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
                 with ExecutionGateway(
                     decision_db=self.root / "decision.db",
-                    ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+                    ledger_path=ledger_path,
                     paper_enabled=False,
                     pm_enabled=False,
                     accept_purposes=frozenset({"live_bnb_boll_fade"}),
                 ) as gw:
+                    initialize_spot_ledger_binding(ledger_path, "1275399777")
                     refused = gw.process_one(self._row())
         finally:
             self._net.start()

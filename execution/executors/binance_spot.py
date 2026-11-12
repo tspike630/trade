@@ -1975,7 +1975,7 @@ class BinanceSpotAdapter:
             return "invalid_oco_client_id"
         purpose = str(sig.get("purpose") or "")
         if self.peer_book_error:
-            return "protection_status_unknown"
+            return self.peer_book_error
         shared = list(self.buy_blocks) + list(self.peer_buy_blocks)
         unresolved = account_unresolved_halt(shared + list(self.canonical_rows))
         if unresolved:

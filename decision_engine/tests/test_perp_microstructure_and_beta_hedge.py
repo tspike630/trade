@@ -125,6 +125,10 @@ class PerpMicrostructureAndBetaHedgeTests(unittest.TestCase):
                         "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
                         "status": "oco_working",
                         "quantity": "1.0",
+                        "protection": "exchange_oco",
+                        "oco_order_list_id": "1",
+                        "oco_above_order_id": "2",
+                        "oco_below_order_id": "3",
                         "entry_price": "120.0",  # 12% of book * 1.45 beta = 0.174 beta_pct
                     }
                 ],

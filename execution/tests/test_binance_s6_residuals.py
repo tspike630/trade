@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -33,6 +34,7 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     classify_oco,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.ledger import initialize_spot_ledger_binding  # noqa: E402
 from execution.run import tick_live_bnb_exits  # noqa: E402
 
 _FILTERS = [
@@ -226,6 +228,7 @@ class ResidualS6Tests(unittest.TestCase):
                     "ipRestrict": True,
                 },
                 "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+                "uid": 424242,
             },
             production_book="rest_api_key",
             rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
@@ -235,15 +238,27 @@ class ResidualS6Tests(unittest.TestCase):
         self._net.stop()
         self._tmp.cleanup()
 
-    def _gateway(self) -> ExecutionGateway:
-        return ExecutionGateway(
+    @contextmanager
+    def _gateway(self) -> Any:
+        ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+            encoding="utf-8",
+        )
+        os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
+        with ExecutionGateway(
             decision_db=self.root / "decision.db",
-            ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+            ledger_path=ledger_path,
             paper_enabled=False,
             pm_enabled=False,
             accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
             binance_spot=self.adapter,
-        )
+        ) as gw:
+            bound = initialize_spot_ledger_binding(ledger_path, "424242")
+            if bound:
+                raise RuntimeError(bound)
+            yield gw
 
     def test_dry_run_submits_nothing(self) -> None:
         env = _env(self.root, enabled="1")

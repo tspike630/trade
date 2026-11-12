@@ -167,6 +167,7 @@ class PortfolioClustersAndVolSizingTests(unittest.TestCase):
                     "oco_order_list_id": 1001,
                     "oco_above_order_id": 2001,
                     "oco_below_order_id": 2002,
+                    "quantity": "1",
                 },
             ),
             canonical=(),

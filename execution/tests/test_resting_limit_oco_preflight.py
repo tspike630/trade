@@ -38,6 +38,7 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     PROTECTION_AUTO_FLATTEN,
     buy_entry_oco_preflight,
 )
+from execution.ledger import initialize_spot_ledger_binding  # noqa: E402
 from execution.gateway import (  # noqa: E402
     _binance_public_result,
     ExecutionGateway,
@@ -875,6 +876,9 @@ class RestingLimitExecutionTests(unittest.TestCase):
     def test_receipt_persists_the_preflight_without_credentials(self) -> None:
         client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=[_MARK_ABOVE_TP])
         adapter = self._adapter(client)
+        snap = dict(adapter.account_snapshot)
+        snap["uid"] = 424242
+        adapter.account_snapshot = snap
         row = {
             "id": 148630,
             "ts": "2026-11-12T05:40:22Z",
@@ -897,14 +901,22 @@ class RestingLimitExecutionTests(unittest.TestCase):
         }
         env = self._env()
         with mock.patch.dict(os.environ, env):
+            ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+            registry = self.root / "registry.json"
+            registry.write_text(
+                json.dumps({"ledgers": [str(ledger_path.resolve())]}),
+                encoding="utf-8",
+            )
+            os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
             with ExecutionGateway(
                 decision_db=self.root / "decision.db",
-                ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+                ledger_path=ledger_path,
                 paper_enabled=False,
                 pm_enabled=False,
                 accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
                 binance_spot=adapter,
             ) as gw:
+                initialize_spot_ledger_binding(ledger_path, "424242")
                 processed = gw.process_one(row)
                 stored = gw.ledger.conn.execute(
                     "SELECT receipt_json, executed FROM execution_log WHERE decision_log_id = ?",

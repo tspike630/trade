@@ -137,6 +137,7 @@ def _book(purpose: str) -> ProtectionBook:
                 "oco_order_list_id": "1",
                 "oco_above_order_id": "2",
                 "oco_below_order_id": "3",
+                "quantity": "1",
             }
         )
     return ProtectionBook.ready(canonical, canonical)

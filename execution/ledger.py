@@ -49,6 +49,120 @@ def _bnb_purpose_clause(purpose: str | None) -> tuple[str, tuple[Any, ...]]:
     return " AND purpose = ?", (arm,)
 
 
+LEDGER_REGISTRY_ENV = "BINANCE_SPOT_LEDGER_REGISTRY"
+_BINDING_TABLE = "spot_ledger_binding"
+
+
+def load_ledger_registry(
+    environ: Any | None = None,
+) -> tuple[list[Path] | None, str | None]:
+    """Explicit ledger paths for this account. A missing registry is unmapped.
+
+    The file is operator configuration, not a filename guess. It does not
+    contain an account uid. The uid is read from each ledger's binding row.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(LEDGER_REGISTRY_ENV) if hasattr(env, "get") else None
+    if raw is None or not str(raw).strip():
+        return None, "ledger_registry_unmapped"
+    path = Path(str(raw).strip()).expanduser()
+    if not path.is_file():
+        return None, "ledger_registry_unmapped"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "ledger_registry_unmapped"
+    listed = payload.get("ledgers") if isinstance(payload, dict) else None
+    if not isinstance(listed, list) or not listed:
+        return None, "ledger_registry_unmapped"
+    paths: list[Path] = []
+    for item in listed:
+        if not isinstance(item, str) or not item.strip():
+            return None, "ledger_registry_unmapped"
+        paths.append(Path(item).expanduser().resolve())
+    return paths, None
+
+
+def initialize_spot_ledger_binding(path: str | Path, account_uid: str) -> str | None:
+    """Write the account uid onto one already initialized ledger.
+
+    Not called on process start and not a migration of existing rows.
+    ``account_uid`` must be the uid from ``GET /api/v3/account``. If that
+    payload has no uid, do not call this and do not invent one: live buys
+    stay ``ledger_account_unbound``.
+    """
+    uid = str(account_uid or "").strip()
+    if not uid or not uid.isdigit():
+        return "ledger_account_unbound"
+    file = Path(path)
+    if not file.is_file():
+        return "ledger_schema_uninitialized"
+    conn = sqlite3.connect(str(file))
+    try:
+        have = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'binance_spot_positions'"
+        ).fetchone()
+        if have is None:
+            return "ledger_schema_uninitialized"
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_BINDING_TABLE} (
+                account_uid TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(f"DELETE FROM {_BINDING_TABLE}")
+        conn.execute(
+            f"INSERT INTO {_BINDING_TABLE} (account_uid) VALUES (?)",
+            (uid,),
+        )
+        conn.commit()
+        return None
+    except sqlite3.Error:
+        return "ledger_schema_uninitialized"
+    finally:
+        conn.close()
+
+
+def read_ledger_account_uid(path: str | Path) -> tuple[str | None, str | None]:
+    """Uid stored on one ledger, or why the book cannot be used.
+
+    A missing file is ``peer_ledger_absent``, not an empty book. Zero
+    position rows are empty only after the positions table and the binding
+    row are both present.
+    """
+    file = Path(path)
+    if not file.is_file():
+        return None, "peer_ledger_absent"
+    uri = "file:" + file.resolve().as_posix() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    except sqlite3.Error:
+        return None, "peer_ledger_unreadable"
+    try:
+        positions = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'binance_spot_positions'"
+        ).fetchone()
+        if positions is None:
+            return None, "ledger_schema_uninitialized"
+        binding = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (_BINDING_TABLE,),
+        ).fetchone()
+        if binding is None:
+            return None, "ledger_account_unbound"
+        row = conn.execute(
+            f"SELECT account_uid FROM {_BINDING_TABLE} LIMIT 1"
+        ).fetchone()
+        if row is None or not str(row[0] or "").strip():
+            return None, "ledger_account_unbound"
+        return str(row[0]).strip(), None
+    except sqlite3.Error:
+        return None, "peer_ledger_unreadable"
+    finally:
+        conn.close()
+
+
 def peer_live_bnb_ledger_path(path: str | Path) -> Path | None:
     """The other arm's ledger file when ``path`` is one of the two named books."""
     current = Path(path)
@@ -83,11 +197,7 @@ def read_peer_spot_blocks(path: str | Path) -> tuple[list[dict[str, Any]], str |
         if have is None:
             return [], "peer_ledger_unreadable"
         rows = conn.execute(
-            """
-            SELECT * FROM binance_spot_positions
-            WHERE status NOT IN ('closed', 'oco_filled', 'closed_canceled')
-            ORDER BY id ASC
-            """
+            "SELECT * FROM binance_spot_positions ORDER BY id ASC"
         ).fetchall()
         return [dict(row) for row in rows], None
     except sqlite3.Error:
@@ -1036,7 +1146,14 @@ class ExecutionLedger:
         rows = self.conn.execute(
             f"""
             SELECT * FROM binance_spot_positions
-            WHERE status NOT IN ('closed', 'oco_filled', 'closed_canceled')
+            WHERE (
+                status NOT IN ('closed', 'oco_filled', 'closed_canceled')
+                OR (
+                    residual_qty IS NOT NULL
+                    AND residual_qty != ''
+                    AND residual_qty != '0'
+                )
+            )
             {clause}
             ORDER BY id ASC
             """,
