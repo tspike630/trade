@@ -822,6 +822,63 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
             if call[0] == "new_order" and parse_qs(call[1]).get("side") == ["BUY"]
         )
         self.assertEqual(buys_after, buys_before)
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(client, purposes) as gw:
+                other = gw.process_one(
+                    _decision_row(
+                        mode="live_stub",
+                        decision_log_id=147903,
+                        purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                        token_address="ETHUSDT",
+                        pair_address="ETH/USDT",
+                        extras=_classic_extras(binance_symbol="ETHUSDT"),
+                    )
+                )
+                kept = gw.ledger.binance_spot_position_by_decision(147901)
+        self.assertEqual(other["error"], "unprotected_position_blocks_buy", other)
+        assert kept is not None
+        self.assertEqual(kept["status"], "closed_dust")
+        self.assertEqual(kept["residual_qty"], "0.009")
+        kept_id = int(kept["id"])
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(client, purposes) as gw:
+                gw.ledger.update_binance_spot_position(kept_id, {"status": "closed_canceled"})
+                cleared = gw.process_one(
+                    _decision_row(
+                        mode="live_stub",
+                        decision_log_id=147904,
+                        purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                        token_address="ETHUSDT",
+                        pair_address="ETH/USDT",
+                        extras=_classic_extras(binance_symbol="ETHUSDT"),
+                    )
+                )
+                still = gw.ledger.binance_spot_position_by_id(kept_id)
+        self.assertNotEqual(cleared["error"], "unprotected_position_blocks_buy", cleared)
+        assert still is not None
+        self.assertEqual(still["id"], kept_id)
+        self.assertEqual(still["status"], "closed_canceled")
+        self.assertEqual(still["residual_qty"], "0.009")
+
+    def test_unreadable_peer_ledger_blocks_the_buy(self) -> None:
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        (self.root / "execution_ledger_live_bnb_boll_fade.db").write_bytes(b"not a sqlite ledger")
+        client = _Client()
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with ExecutionGateway(
+                decision_db=self.root / "decision.db",
+                ledger_path=classic,
+                paper_enabled=False,
+                pm_enabled=False,
+                accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC}),
+                binance_spot=_adapter(self.root, client, auto_flatten_on_oco_fail=True),
+            ) as gw:
+                refused = gw.process_one(_decision_row(mode="live_stub"))
+        self.assertEqual(refused["error"], "protection_status_unknown", refused)
+        self.assertEqual(
+            [call for call in client.calls if call[0] == "new_order"],
+            [],
+        )
 
     def test_unknown_oco_blocks_known_predicates_and_a_valid_other_symbol_is_not_those(self) -> None:
         class _Timeout:
@@ -888,9 +945,34 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 )
                 other = gw.process_one(_eth(PURPOSE_LIVE_BNB_BOLL_FADE, 147913))
         self.assertEqual(same_arm["error"], "oco_failed_blocks_buy", same_arm)
-        self.assertEqual(same_symbol["error"], "cross_arm_symbol_blocks_buy", same_symbol)
-        self.assertNotEqual(other["error"], "symbol_not_trading", other)
-        self.assertNotIn(other["error"], {"oco_failed_blocks_buy", "cross_arm_symbol_blocks_buy"})
+        self.assertEqual(same_symbol["error"], "oco_failed_blocks_buy", same_symbol)
+        self.assertEqual(other["error"], "oco_failed_blocks_buy", other)
+        self.assertNotEqual(other["error"], "symbol_not_trading")
+        eth_buys = [
+            call
+            for call in client.calls
+            if call[0] == "new_order" and parse_qs(call[1]).get("symbol") == ["ETHUSDT"]
+        ]
+        self.assertEqual(eth_buys, [])
+        self.assertEqual(sum(1 for call in client.calls if call[0] == "new_oco"), 1)
+        kept_id = int(row["id"])
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(client, purposes) as gw:
+                current = gw.ledger.binance_spot_position_by_id(kept_id)
+                assert current is not None
+                gw.ledger.update_binance_spot_position(
+                    kept_id,
+                    {
+                        "status": "oco_working",
+                        "protection": "exchange_oco",
+                        "oco_order_list_id": "42",
+                        "oco_above_order_id": "11",
+                        "oco_below_order_id": "10",
+                    },
+                )
+                resolved = gw.process_one(_eth(PURPOSE_LIVE_BNB_BOLL_FADE, 147914))
+                still = gw.ledger.binance_spot_position_by_id(kept_id)
+        self.assertNotEqual(resolved["error"], "oco_failed_blocks_buy", resolved)
         eth_buys = [
             parse_qs(call[1])
             for call in client.calls
@@ -898,8 +980,10 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         ]
         self.assertEqual(len(eth_buys), 1)
         self.assertEqual(eth_buys[0]["side"], ["BUY"])
-        # The BNB list was not posted again. ETH is a separate buy, so it gets its own OCO.
-        self.assertEqual(sum(1 for call in client.calls if call[0] == "new_oco"), 2)
+        assert still is not None
+        self.assertEqual(still["id"], kept_id)
+        self.assertEqual(still["status"], "oco_working")
+        self.assertEqual(still["symbol"], "BNBUSDT")
 
 
 class ClassicGatewayTests(unittest.TestCase):

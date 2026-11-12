@@ -738,6 +738,57 @@ def buy_exposure_block(
     return None
 
 
+def account_unresolved_halt(rows: object) -> str | None:
+    """Block every new BUY while this account has an unresolved spot row.
+
+    The rows are this process's book plus its named peer book. A verified
+    working OCO and a full close are resolved. ``closed_canceled`` is the
+    existing operator clear. A dust remainder is not cleared here.
+    Another account's ledger is not in ``rows``.
+    """
+    held = rows if isinstance(rows, list) else []
+    for row in held:
+        if not isinstance(row, dict):
+            continue
+        purpose = str(row.get("purpose") or "").strip()
+        if purpose and purpose not in LIVE_BNB_SPOT_PURPOSES:
+            continue
+        reason = _unresolved_row_reason(row)
+        if reason:
+            return reason
+    return None
+
+
+def _unresolved_row_reason(row: dict[str, Any]) -> str | None:
+    if partial_dust_residual(row):
+        return "unprotected_position_blocks_buy"
+    status = str(row.get("status") or "")
+    if not status or status in _TERMINAL_POSITION or status == "flat":
+        return None
+    if status == "oco_working":
+        return None
+    if status == "open" and str(row.get("protection") or "") == "exchange_oco" and _position_ids_verified(row):
+        return None
+    if status == "held_naked":
+        return "naked_holds_new_buys"
+    if status == "qty_unconfirmed":
+        return "parent_fill_incomplete"
+    if status in {"oco_failed", "oco_unknown"}:
+        return "oco_failed_blocks_buy"
+    if status == "time_stop_unknown":
+        return "time_stop_unconfirmed_blocks_buy"
+    if status == "maker_cancel_unknown":
+        return "maker_resting_blocks_buy"
+    if status == "maker_resting":
+        filled = _decimal_text(row.get("quantity"))
+        if filled is not None and Decimal(filled) > 0:
+            return "unprotected_position_blocks_buy"
+        return None
+    if status == "exit_submitted":
+        return "unprotected_position_blocks_buy"
+    return "unprotected_position_blocks_buy"
+
+
 def cross_arm_symbol_block(
     rows: object,
     *,

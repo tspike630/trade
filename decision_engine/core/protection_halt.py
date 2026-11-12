@@ -52,7 +52,10 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote
 
-from execution.executors.binance_spot_gate import buy_exposure_block
+from execution.executors.binance_spot_gate import (
+    account_unresolved_halt,
+    buy_exposure_block,
+)
 
 _LEDGER_ENV = (
     "DECISION_EXECUTION_LEDGER",
@@ -225,6 +228,9 @@ def purpose_halt_reason(purpose: str, book: ProtectionBook) -> str | None:
         return None
     if book.error:
         return "protection_status_unknown"
+    unresolved = account_unresolved_halt(list(book.positions) + list(book.canonical))
+    if unresolved:
+        return unresolved
     return buy_exposure_block(
         list(book.positions),
         list(book.canonical),

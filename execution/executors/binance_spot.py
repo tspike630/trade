@@ -1320,6 +1320,7 @@ from execution.binance_ws_stream import default_max_age_ms  # noqa: E402
 from execution.executors.binance_spot_gate import (  # noqa: E402
     REST_BOOK,
     account_book_block,
+    account_unresolved_halt,
     buy_exposure_block,
     cross_arm_symbol_block,
     funding_after_reservation,
@@ -1479,6 +1480,7 @@ class BinanceSpotAdapter:
         self.max_hold_sec = max_hold_sec
         self.buy_blocks: list[dict[str, Any]] = []
         self.peer_buy_blocks: list[dict[str, Any]] = []
+        self.peer_book_error: str | None = None
         self.canonical_rows: list[dict[str, Any]] = []
         self._size_plan: dict[str, Any] | None = None
         self._entry_mark: str | None = None
@@ -1972,6 +1974,12 @@ class BinanceSpotAdapter:
         if not decision.isdigit():
             return "invalid_oco_client_id"
         purpose = str(sig.get("purpose") or "")
+        if self.peer_book_error:
+            return "protection_status_unknown"
+        shared = list(self.buy_blocks) + list(self.peer_buy_blocks)
+        unresolved = account_unresolved_halt(shared + list(self.canonical_rows))
+        if unresolved:
+            return unresolved
         held = buy_exposure_block(
             self.buy_blocks,
             self.canonical_rows,
@@ -1980,7 +1988,6 @@ class BinanceSpotAdapter:
         )
         if held:
             return held
-        shared = list(self.buy_blocks) + list(self.peer_buy_blocks)
         other_arm = cross_arm_symbol_block(shared, purpose=purpose, symbol=symbol)
         if other_arm:
             return other_arm

@@ -60,6 +60,42 @@ def peer_live_bnb_ledger_path(path: str | Path) -> Path | None:
     return None
 
 
+def read_peer_spot_blocks(path: str | Path) -> tuple[list[dict[str, Any]], str | None]:
+    """Rows from the named peer book, or an error when that file cannot be read.
+
+    A missing file is an empty book: the other arm has not created one.
+    A file that is not a readable spot ledger is ``peer_ledger_unreadable``.
+    The caller fails closed on that error. This does not open any other account.
+    """
+    file = Path(path)
+    if not file.is_file():
+        return [], None
+    uri = "file:" + file.resolve().as_posix() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    except sqlite3.Error:
+        return [], "peer_ledger_unreadable"
+    try:
+        conn.row_factory = sqlite3.Row
+        have = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'binance_spot_positions'"
+        ).fetchone()
+        if have is None:
+            return [], "peer_ledger_unreadable"
+        rows = conn.execute(
+            """
+            SELECT * FROM binance_spot_positions
+            WHERE status NOT IN ('closed', 'oco_filled', 'closed_canceled')
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows], None
+    except sqlite3.Error:
+        return [], "peer_ledger_unreadable"
+    finally:
+        conn.close()
+
+
 def read_spot_buy_blocks_readonly(path: str | Path) -> list[dict[str, Any]]:
     """Non-terminal spot rows from another file. Missing file or table is empty.
 

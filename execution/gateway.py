@@ -66,6 +66,7 @@ from execution.ledger import (
     _utc,
     buy_reservation_lock,
     peer_live_bnb_ledger_path,
+    read_peer_spot_blocks,
     read_spot_buy_blocks_readonly,
 )
 from execution.order_events import init_events
@@ -1336,11 +1337,11 @@ class ExecutionGateway:
                         if row.get("id") not in own_ids
                     ]
                     peer_path = peer_live_bnb_ledger_path(self.ledger.path)
-                    other_book = (
-                        read_spot_buy_blocks_readonly(peer_path)
-                        if peer_path is not None
-                        else []
-                    )
+                    if peer_path is None:
+                        other_book, peer_error = [], None
+                    else:
+                        other_book, peer_error = read_peer_spot_blocks(peer_path)
+                    adapter.peer_book_error = peer_error
                     adapter.buy_blocks = own
                     adapter.peer_buy_blocks = same_book + other_book
                     book = self.ledger.mcp_book()
