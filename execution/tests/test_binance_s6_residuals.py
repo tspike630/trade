@@ -115,7 +115,7 @@ class _Client:
     def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_order", signed_query, api_key))
         if "side=BUY" in signed_query:
-            return {"orderId": "99", "status": "FILLED", "executedQty": "1.239"}
+            return {"orderId": "99", "status": "FILLED", "executedQty": "1.239", "fills": [{"tradeId": 1, "qty": "1.239", "commission": "0", "commissionAsset": "BNB"}]}
         return {"orderId": "77", "status": "FILLED", "executedQty": "1.23"}
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
@@ -140,6 +140,24 @@ class _Client:
         if order_id in self.legs:
             return self.legs[order_id]
         raise BinanceRequestError(400)
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        self.calls.append(("my_trades", signed_query, api_key))
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        return [
+            {
+                "symbol": symbol,
+                "id": 1,
+                "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+                "qty": "1.239",
+                "commission": "0",
+                "commissionAsset": "BNB",
+            }
+        ]
 
     def ticker_price(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("ticker_price", symbol))

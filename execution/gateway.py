@@ -1625,10 +1625,22 @@ class ExecutionGateway:
         outcomes: list[dict[str, Any]] = []
         for row in positions:
             if row.get("status") == "qty_unconfirmed":
-                qty = adapter.refresh_filled_qty(dict(row))
-                if qty:
-                    saved_qty = self.ledger.confirm_binance_spot_qty(int(row["id"]), qty)
+                net, block = adapter.refresh_filled_qty(dict(row))
+                if net:
+                    saved_qty = self.ledger.confirm_binance_spot_qty(int(row["id"]), net)
                     if isinstance(saved_qty, dict) and saved_qty.get("status") == "open":
+                        row = saved_qty
+                elif block == "fee_unverified":
+                    saved_qty = self.ledger.update_binance_spot_position(
+                        int(row["id"]),
+                        {
+                            "status": "oco_failed",
+                            "protection": "oco_pending",
+                            "last_error": "fee_unverified",
+                            "quantity": None,
+                        },
+                    )
+                    if isinstance(saved_qty, dict):
                         row = saved_qty
             symbol = str(row.get("symbol") or "")
             if marks is not None and symbol in marks:

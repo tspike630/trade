@@ -139,6 +139,8 @@ class _Book:
         self.canceled = False
         self.partial_qty = "100"
         self.partial_quote = "13.206"
+        self.base_fee = "0"
+        self.trades_missing = False
 
     def exchange_info(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("exchange_info", symbol))
@@ -199,6 +201,30 @@ class _Book:
             "cummulativeQuoteQty": self.partial_quote,
             "price": "0.13206",
         }
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        self.calls.append(("my_trades", signed_query, api_key))
+        form = parse_qs(signed_query)
+        if form.get("fromId") or self.trades_missing:
+            return []
+        symbol = (form.get("symbol") or [self.symbol])[0]
+        order_id = (form.get("orderId") or ["810"])[0]
+        qty = str(self.ack.get("executedQty") or "0")
+        if self.canceled:
+            qty = str(self.partial_qty or "0")
+        if qty in {"", "0", "0.0", "0.00"}:
+            return []
+        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        return [
+            {
+                "symbol": symbol,
+                "id": 1,
+                "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+                "qty": qty,
+                "commission": self.base_fee,
+                "commissionAsset": base,
+            }
+        ]
 
     def cancel_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("cancel_order", signed_query, api_key))
@@ -521,6 +547,7 @@ class RestingLimitExecutionTests(unittest.TestCase):
                 "status": "FILLED",
                 "executedQty": "295",
                 "cummulativeQuoteQty": "38.9577",
+                "fills": [{"tradeId": 1, "qty": "295", "commission": "0", "commissionAsset": "INIT"}],
             }
 
         client.get_order = _filled  # type: ignore[method-assign]
@@ -677,6 +704,7 @@ class RestingLimitExecutionTests(unittest.TestCase):
                 "status": "FILLED",
                 "executedQty": "295",
                 "cummulativeQuoteQty": "38.9577",
+                "fills": [{"tradeId": 1, "qty": "295", "commission": "0", "commissionAsset": "INIT"}],
                 "symbol": "INITUSDT",
             },
         )
@@ -702,6 +730,7 @@ class RestingLimitExecutionTests(unittest.TestCase):
                 "status": "FILLED",
                 "executedQty": "295",
                 "cummulativeQuoteQty": "38.9577",
+                "fills": [{"tradeId": 1, "qty": "295", "commission": "0", "commissionAsset": "INIT"}],
                 "symbol": "INITUSDT",
             },
         )
@@ -730,6 +759,7 @@ class RestingLimitExecutionTests(unittest.TestCase):
                 "status": "FILLED",
                 "executedQty": "295",
                 "cummulativeQuoteQty": "38.9577",
+                "fills": [{"tradeId": 1, "qty": "295", "commission": "0", "commissionAsset": "INIT"}],
                 "symbol": "INITUSDT",
             },
         )
@@ -783,6 +813,72 @@ class RestingLimitExecutionTests(unittest.TestCase):
         self.assertEqual(sell["quantity"], ["100"])
         self.assertIn("oco_failed_auto_flattened", str(failed.get("error")))
 
+    def test_partial_without_ack_fills_uses_the_same_fee_net_for_oco_and_sell(self) -> None:
+        filters = [
+            {"filterType": "LOT_SIZE", "minQty": "1", "maxQty": "90000000", "stepSize": "0.1"},
+            {"filterType": "MARKET_LOT_SIZE", "minQty": "1", "maxQty": "90000000", "stepSize": "0.1"},
+            {"filterType": "PRICE_FILTER", "minPrice": "0.00001000", "maxPrice": "100000", "tickSize": "0.00001000"},
+            {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": True},
+        ]
+
+        def _client(*, reject_oco: bool, hide_trades: bool) -> _Book:
+            client = _Book(
+                symbol="INITUSDT",
+                filters=filters,
+                marks=[_MARK_ABOVE_TP],
+                oco_error=BinanceRequestError(400, code=-2010, msg="Account has insufficient balance")
+                if reject_oco
+                else None,
+                ack={
+                    "orderId": "810",
+                    "status": "NEW",
+                    "executedQty": "0",
+                    "symbol": "INITUSDT",
+                },
+            )
+            client.partial_qty = "100.4"
+            client.base_fee = "0.4"
+            client.trades_missing = hide_trades
+            return client
+
+        def _rest_then_reconcile(client: _Book) -> tuple[BinanceSpotAdapter, dict[str, Any], dict[str, Any]]:
+            adapter = self._adapter(client, auto_flatten_on_oco_fail=True)
+            with mock.patch.dict(os.environ, self._env()):
+                rested = adapter.execute(self._limit_signal(quantity="295"))
+            self.assertEqual(rested["error"], "maker_entry_resting", rested)
+            self.assertIsNone(rested.get("sellable_qty"))
+            self.assertEqual(_names(client, "new_oco"), [])
+            arm = dict(rested["arm_position"])
+            arm["id"] = 1
+            with mock.patch.dict(os.environ, self._env()):
+                adopted = adapter.reconcile_resting_entry(
+                    arm,
+                    mark="0.13210",
+                    now_ms=1_700_000_010_000,
+                )
+            return adapter, rested, adopted
+
+        covered = _client(reject_oco=False, hide_trades=False)
+        _adapter, _rested, adopted = _rest_then_reconcile(covered)
+        self.assertEqual(adopted["book"], "oco_working", adopted)
+        oco_qty = Decimal(_form(covered, "new_oco")["quantity"][0])
+        self.assertEqual(oco_qty, Decimal("100"))
+        self.assertNotEqual(oco_qty, Decimal("100.4"))
+        self.assertTrue(_names(covered, "my_trades"))
+
+        rejected = _client(reject_oco=True, hide_trades=False)
+        _adapter, _rested, failed = _rest_then_reconcile(rejected)
+        sell_qty = Decimal(_form(rejected, "new_order", side="SELL")["quantity"][0])
+        self.assertEqual(sell_qty, Decimal("100"))
+        self.assertNotEqual(sell_qty, Decimal("100.4"))
+        self.assertIn("oco_failed_auto_flattened", str(failed.get("error")))
+
+        hidden = _client(reject_oco=False, hide_trades=True)
+        _adapter, _rested, blocked = _rest_then_reconcile(hidden)
+        self.assertEqual(blocked["error"], "fee_unverified", blocked)
+        self.assertEqual(_names(hidden, "new_oco"), [])
+        self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in hidden.calls))
+
     def test_post_fill_mark_through_the_stop_reanchors_or_flattens(self) -> None:
         def _arm(client: _Book) -> dict[str, Any]:
             adapter = self._adapter(client, reanchor_oco_on_fill=True, auto_flatten_on_oco_fail=True)
@@ -804,6 +900,7 @@ class RestingLimitExecutionTests(unittest.TestCase):
                 "status": "FILLED",
                 "executedQty": "295",
                 "cummulativeQuoteQty": "38.9577",
+                "fills": [{"tradeId": 1, "qty": "295", "commission": "0", "commissionAsset": "INIT"}],
             }
 
         re_client.get_order = _filled_entry  # type: ignore[method-assign]
@@ -834,6 +931,7 @@ class RestingLimitExecutionTests(unittest.TestCase):
                 "status": "FILLED",
                 "executedQty": "295",
                 "cummulativeQuoteQty": "38.9577",
+                "fills": [{"tradeId": 1, "qty": "295", "commission": "0", "commissionAsset": "INIT"}],
             }
 
         flat_client.get_order = _filled_entry  # type: ignore[method-assign]
@@ -864,6 +962,7 @@ class RestingLimitExecutionTests(unittest.TestCase):
                 "status": "FILLED",
                 "executedQty": "295",
                 "cummulativeQuoteQty": "38.9577",
+                "fills": [{"tradeId": 1, "qty": "295", "commission": "0", "commissionAsset": "INIT"}],
             }
 
         tp_client.get_order = _filled_tp  # type: ignore[method-assign]

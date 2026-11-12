@@ -122,7 +122,21 @@ class _Client:
         if "side=SELL" in signed_query:
             qty = parse_qs(signed_query).get("quantity", ["1.23"])[0]
             return {"orderId": "77", "status": "FILLED", "executedQty": qty, "origQty": qty}
-        return {"orderId": "99", "status": "FILLED", "executedQty": "1.239", "symbol": "BNBUSDT"}
+        return {"orderId": "99", "status": "FILLED", "executedQty": "1.239", "symbol": "BNBUSDT", "fills": [{"tradeId": 1, "qty": "1.239", "commission": "0", "commissionAsset": "BNB"}]}
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        return [{"symbol": symbol, "id": 1, "orderId": int(order_id) if str(order_id).isdigit() else order_id, "qty": "1.239", "commission": "0", "commissionAsset": "BNB"}]
+
+    def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        form = parse_qs(signed_query)
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        return {"symbol": symbol, "orderId": int(order_id) if str(order_id).isdigit() else order_id, "side": "BUY", "status": "FILLED", "executedQty": "1.239", "origQty": "1.239"}
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_oco", signed_query, api_key))
@@ -327,6 +341,7 @@ class ConsumerGateTests(unittest.TestCase):
                     "executedQty": "1",
                     "cummulativeQuoteQty": "48.02",
                     "symbol": "BNBUSDT",
+                    "fills": [{"tradeId": 1, "qty": "1", "commission": "0", "commissionAsset": "BNB"}],
                 }
 
         client = _AverageFill()

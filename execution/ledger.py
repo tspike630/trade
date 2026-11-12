@@ -1269,6 +1269,7 @@ class ExecutionLedger:
                 "initial_stop_price",
                 "entry_limit_price",
                 "created_at_ms",
+                "last_error",
             )
             if key in spec and spec.get(key) not in (None, "")
         }

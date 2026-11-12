@@ -198,6 +198,30 @@ class _Exchange:
             return self.exit_order
         return self.entry
 
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        qty = str(self.entry.get("executedQty") or "0")
+        exit_order = self.exit_order if isinstance(self.exit_order, dict) else None
+        if exit_order is not None and str(exit_order.get("orderId")) == str(order_id):
+            qty = str(exit_order.get("executedQty") or qty)
+        if qty in {"", "0", "0.0", "0.00"}:
+            return []
+        base = symbol[:-4] if symbol.endswith("USDT") else "BNB"
+        return [
+            {
+                "symbol": symbol,
+                "id": 1,
+                "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+                "qty": qty,
+                "commission": "0",
+                "commissionAsset": base,
+            }
+        ]
+
     def cancel_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.entry_cancels.append(signed_query)
         if self.cancel_error is not None:

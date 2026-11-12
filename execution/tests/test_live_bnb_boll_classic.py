@@ -109,6 +109,14 @@ class _Client:
             "status": "FILLED",
             "executedQty": "1.239",
             "symbol": "BNBUSDT",
+            "fills": [
+                {
+                    "tradeId": 1,
+                    "qty": "1.239",
+                    "commission": "0",
+                    "commissionAsset": "BNB",
+                }
+            ],
         }
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
@@ -668,6 +676,7 @@ class ClassicMarketProtectionTests(unittest.TestCase):
                     "executedQty": "0.25",
                     "cummulativeQuoteQty": "25.5",
                     "symbol": "BNBUSDT",
+                    "fills": [{"tradeId": 1, "qty": "0.25", "commission": "0", "commissionAsset": "BNB"}],
                 }
 
             def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
@@ -711,6 +720,7 @@ class ClassicMarketProtectionTests(unittest.TestCase):
                     "executedQty": "0.25",
                     "cummulativeQuoteQty": "25.5",
                     "symbol": "BNBUSDT",
+                    "fills": [{"tradeId": 1, "qty": "0.25", "commission": "0", "commissionAsset": "BNB"}],
                 }
 
             def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
@@ -1642,6 +1652,111 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                     )
                 )
         self.assertEqual(unsupported["error"], "entry_origin_unverified", unsupported)
+
+    def test_fill_without_ack_fills_places_the_oco_from_mytrades(self) -> None:
+        class _Ack:
+            def __init__(self, complete: bool) -> None:
+                self.complete = complete
+                self.orders: list[str] = []
+                self.ocos: list[str] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _trading_info(symbol)
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.orders.append(signed_query)
+                form = parse_qs(signed_query)
+                if form.get("side") == ["SELL"]:
+                    raise AssertionError("unknown fee must not sell gross")
+                return {
+                    "orderId": 99,
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                    "symbol": (form.get("symbol") or ["BNBUSDT"])[0],
+                    "cummulativeQuoteQty": "25.5",
+                }
+
+            def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+                form = parse_qs(signed_query)
+                symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+                order_id = int((form.get("orderId") or ["99"])[0])
+                if form.get("fromId"):
+                    if not self.complete:
+                        return []
+                    return [
+                        {
+                            "symbol": symbol,
+                            "id": 1001,
+                            "orderId": order_id,
+                            "qty": "0.05",
+                            "commission": "0.0002",
+                            "commissionAsset": "BNB",
+                        }
+                    ]
+                return [
+                    {
+                        "symbol": symbol,
+                        "id": index,
+                        "orderId": order_id,
+                        "qty": "0.0002",
+                        "commission": "0.0000008",
+                        "commissionAsset": "BNB",
+                    }
+                    for index in range(1, 1001)
+                ]
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.ocos.append(signed_query)
+                body = _working()
+                body["symbol"] = "BNBUSDT"
+                return body
+
+            def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                form = parse_qs(signed_query)
+                order_id = (form.get("orderId") or ["99"])[0]
+                status = "PARTIALLY_FILLED" if order_id == "40" else "FILLED"
+                executed = "0.10" if order_id == "40" else "0.25"
+                return {
+                    "symbol": (form.get("symbol") or ["BNBUSDT"])[0],
+                    "orderId": int(order_id),
+                    "side": "BUY",
+                    "status": status,
+                    "executedQty": executed,
+                    "origQty": "0.25",
+                }
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                return _working()
+
+        purposes = frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSE_LIVE_BNB_BOLL_FADE})
+        complete = _Ack(True)
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(complete, purposes) as gw:
+                opened = gw.process_one(_decision_row(mode="live_stub", decision_log_id=147980))
+        self.assertEqual(opened["executed"], 1, opened)
+        self.assertEqual(len(complete.ocos), 1)
+        self.assertEqual(parse_qs(complete.ocos[0]).get("quantity"), ["0.24"])
+        self.assertEqual(opened["exec_result"]["sellable_qty"], "0.249")
+
+        incomplete = _Ack(False)
+        for name in ("ledger.db", "other-carrier.db", "registry.json"):
+            path = self.root / name
+            if path.exists():
+                path.unlink()
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(incomplete, purposes) as gw:
+                blocked = gw.process_one(_decision_row(mode="live_stub", decision_log_id=147981))
+                held = gw.ledger.binance_spot_position_by_decision(147981)
+        self.assertEqual(blocked["error"], "fee_unverified", blocked)
+        self.assertEqual(incomplete.ocos, [])
+        self.assertFalse(any(parse_qs(query).get("side") == ["SELL"] for query in incomplete.orders))
+        assert held is not None
+        self.assertEqual(held["status"], "oco_failed")
+        self.assertEqual(held["last_error"], "fee_unverified")
+        self.assertFalse(held.get("quantity"))
 
     def test_forged_working_list_and_zeroed_qty_do_not_unlock(self) -> None:
         class _Echo:

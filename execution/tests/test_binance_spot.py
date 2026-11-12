@@ -413,6 +413,74 @@ class HttpClientShapeTests(unittest.TestCase):
         self.assertNotIn("test-secret", seen["data"])
         self.assertEqual(seen["key"], "test-key")
 
+    def test_my_trades_gets_the_official_route_and_pages(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def opener(request: urllib.request.Request, timeout: float) -> tuple[int, bytes]:
+            calls.append((request.get_method(), request.full_url))
+            query = request.full_url.split("?", 1)[1]
+            from_id = "fromId=" in query
+            if from_id:
+                body = [
+                    {
+                        "symbol": "BNBUSDT",
+                        "id": 1001,
+                        "orderId": 99,
+                        "qty": "0.05",
+                        "commission": "0.0002",
+                        "commissionAsset": "BNB",
+                    }
+                ]
+            else:
+                body = [
+                    {
+                        "symbol": "BNBUSDT",
+                        "id": index,
+                        "orderId": 99,
+                        "qty": "0.0002",
+                        "commission": "0.0000008",
+                        "commissionAsset": "BNB",
+                    }
+                    for index in range(1, 1001)
+                ]
+            return 200, json.dumps(body).encode("utf-8")
+
+        with mock.patch(
+            "execution.executors.binance_spot.urllib.request.urlopen",
+            side_effect=AssertionError("live binance HTTP is disabled in tests"),
+        ):
+            client = BinanceSpotHttpClient(
+                base_url="https://api.binance.test",
+                opener=opener,
+            )
+            adapter = BinanceSpotAdapter(
+                client=client,
+                api_key="test-key",
+                api_secret="test-secret",
+                clock_ms=lambda: 1_700_000_000_000,
+            )
+            signed = sign_query(
+                [
+                    ("symbol", "BNBUSDT"),
+                    ("orderId", "99"),
+                    ("limit", "1000"),
+                    ("recvWindow", "5000"),
+                    ("timestamp", "1700000000000"),
+                ],
+                "test-secret",
+            )
+            one = client.my_trades(signed, api_key="test-key")
+            self.assertEqual(len(one), 1000)
+            self.assertEqual(calls[0][0], "GET")
+            self.assertTrue(calls[0][1].startswith("https://api.binance.test/api/v3/myTrades?"))
+            self.assertNotIn("api.binance.com", calls[0][1])
+            calls.clear()
+            trades = adapter._order_trades(symbol="BNBUSDT", order_id="99")
+        assert trades is not None
+        self.assertEqual(len(trades), 1001)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("fromId=1001", calls[1][1])
+
 
 class GatewayHookTests(unittest.TestCase):
     def setUp(self) -> None:

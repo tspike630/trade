@@ -88,7 +88,7 @@ class _LatencyTrackingClient:
             "status": "FILLED",
             "executedQty": "1.00",
             "cummulativeQuoteQty": "100.00",
-            "fills": [],
+            "fills": [{"tradeId": 1, "qty": "1.00", "commission": "0", "commissionAsset": "SOL"}],
         }
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict:

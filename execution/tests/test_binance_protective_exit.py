@@ -106,6 +106,7 @@ class _Client:
                 "orderId": "99",
                 "status": "FILLED",
                 "executedQty": "1.239",
+                "fills": [{"tradeId": 1, "qty": "1.239", "commission": "0", "commissionAsset": "BNB"}],
             }
         return {"orderId": "77", "status": "FILLED"}
 
@@ -488,10 +489,27 @@ class ProtectiveExitTests(unittest.TestCase):
             self.assertNotIn("test-secret", signed_query)
             if "origClientOrderId" in signed_query:
                 raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
-            return {"orderId": "99", "status": "FILLED", "executedQty": "1.239"}
+            return {"orderId": "99", "symbol": "BNBUSDT", "side": "BUY", "status": "FILLED", "executedQty": "1.239", "origQty": "1.239"}
 
         self.client.new_order = new_order  # type: ignore[method-assign]
         self.client.get_order = get_order  # type: ignore[method-assign]
+
+        def my_trades(signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+            form = parse_qs(signed_query)
+            if form.get("fromId"):
+                return []
+            return [
+                {
+                    "symbol": "BNBUSDT",
+                    "id": 1,
+                    "orderId": 99,
+                    "qty": "1.239",
+                    "commission": "0",
+                    "commissionAsset": "BNB",
+                }
+            ]
+
+        self.client.my_trades = my_trades  # type: ignore[method-assign]
         self.adapter.client = self.client
         env = _env(self.root, enabled="1")
         with mock.patch.dict(os.environ, env):

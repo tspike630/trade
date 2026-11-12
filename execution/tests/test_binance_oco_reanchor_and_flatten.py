@@ -107,6 +107,7 @@ class _SlippageAndFlattenClient:
             "executedQty": "1.082",
             "cummulativeQuoteQty": "51.957640",
             "symbol": "DASHUSDT",
+            "fills": [{"tradeId": 1, "qty": "1.082", "commission": "0", "commissionAsset": "DASH"}],
         }
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:

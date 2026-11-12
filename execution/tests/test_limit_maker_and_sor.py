@@ -69,7 +69,7 @@ class _MakerAndSorMockClient:
             "executedQty": "1.00",
             "cummulativeQuoteQty": "99.95",
             "time": 1_700_000_000_000,
-            "fills": [],
+            "fills": [{"tradeId": 1, "qty": "1.00", "commission": "0", "commissionAsset": "SOL"}],
         }
         self.new_order_queries: list[str] = []
         self.cancel_order_queries: list[str] = []
@@ -101,7 +101,7 @@ class _MakerAndSorMockClient:
             "status": "FILLED",
             "executedQty": "1.00",
             "cummulativeQuoteQty": "99.95",
-            "fills": [],
+            "fills": [{"tradeId": 1, "qty": "1.00", "commission": "0", "commissionAsset": "SOL"}],
         }
 
     def get_order(self, signed_query: str, *, api_key: str) -> dict:
@@ -274,7 +274,7 @@ class LimitMakerAndSorTests(unittest.TestCase):
                 "executedQty": "1.00",
                 "cummulativeQuoteQty": "99.95",
                 "time": 1_700_000_000_000,
-                "fills": [],
+                "fills": [{"tradeId": 1, "qty": "1.00", "commission": "0", "commissionAsset": "SOL"}],
             }
         )
         with tempfile.TemporaryDirectory() as tmp:

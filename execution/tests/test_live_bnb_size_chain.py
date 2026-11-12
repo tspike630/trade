@@ -73,7 +73,45 @@ class _Client:
         self.calls.append(("new_order", signed_query, api_key))
         if "side=SELL" in signed_query:
             return {"orderId": "77", "status": "FILLED", "executedQty": "1.23"}
-        return {"orderId": "99", "status": "FILLED", "executedQty": "1.239"}
+        return {"orderId": "99", "status": "FILLED", "executedQty": "1.239", "fills": [{"tradeId": 1, "qty": "1.239", "commission": "0", "commissionAsset": "BNB"}]}
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        if str(order_id) == "77":
+            qty = "1.23"
+        elif str(order_id) == "99":
+            qty = "1.239"
+        else:
+            return []
+        return [{
+            "symbol": symbol,
+            "id": int(order_id),
+            "orderId": int(order_id),
+            "qty": qty,
+            "commission": "0",
+            "commissionAsset": "BNB",
+        }]
+
+    def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        form = parse_qs(signed_query)
+        if form.get("origClientOrderId"):
+            raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or [""])[0]
+        if str(order_id) != "99":
+            raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+        return {
+            "symbol": symbol,
+            "orderId": 99,
+            "side": "BUY",
+            "status": "FILLED",
+            "executedQty": "1.239",
+            "origQty": "1.239",
+        }
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_oco", signed_query, api_key))
