@@ -112,6 +112,8 @@ class _Book:
         ack: dict[str, Any] | None = None,
         oco_error: Exception | None = None,
         ticker_error: Exception | None = None,
+        asks: list[list[str]] | None = None,
+        book_error: Exception | None = None,
     ) -> None:
         self.symbol = symbol
         self.filters = filters
@@ -125,6 +127,8 @@ class _Book:
         }
         self.oco_error = oco_error
         self.ticker_error = ticker_error
+        self.asks = asks if asks is not None else [["0.15000", "1000"]]
+        self.book_error = book_error
         self.calls: list[tuple[Any, ...]] = []
         self.lookup_count = 0
         self.canceled = False
@@ -145,6 +149,14 @@ class _Book:
         if self.ticker_error is not None and self.calls.count(("ticker_price", symbol)) > 1:
             raise self.ticker_error
         return {"symbol": symbol, "price": price}
+
+    def order_book(self, symbol: str, limit: int = 5) -> dict[str, Any]:
+        self.calls.append(("order_book", symbol))
+        if self.book_error is not None:
+            raise self.book_error
+        ask_px = Decimal(self.asks[0][0])
+        bid_px = ask_px - Decimal("0.00001")
+        return {"bids": [[format(bid_px, "f"), "1000"]], "asks": self.asks}
 
     def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_order", signed_query, api_key))
@@ -219,9 +231,13 @@ class PreflightGeometryTests(unittest.TestCase):
             mark=_MARK_ABOVE_TP,
             mark_source="rest_fallback",
             filters=_INIT_FILTERS,
+            resting_ceiling="0.15000",
+            ceiling_source="rest_book",
         )
         self.assertIsNone(err)
         self.assertEqual(diag["reference"], "planned_entry")
+        self.assertEqual(diag["ceiling_price"], "0.15")
+        self.assertEqual(diag["ceiling_source"], "rest_book")
         self.assertEqual(diag["reference_price"], "0.13206")
         self.assertEqual(diag["aligned_limit"], "0.13206")
         self.assertEqual(diag["aligned_stop"], "0.13061")
@@ -270,18 +286,31 @@ class PreflightGeometryTests(unittest.TestCase):
         )
         self.assertEqual(missing_err, "mark_unavailable")
         self.assertIsNone(missing["reference"])
-        crossed, crossed_err = buy_entry_oco_preflight(
+        no_ask, no_ask_err = buy_entry_oco_preflight(
             order_type="LIMIT",
-            limit_price="0.13350",
+            limit_price=_LIMIT,
             stop_price=_STOP,
             take_profit_price=_TP,
-            mark="0.13300",
+            mark=_MARK_ABOVE_TP,
             mark_source="rest_fallback",
             filters=_INIT_FILTERS,
         )
+        self.assertEqual(no_ask_err, "ask_unavailable")
+        crossed, crossed_err = buy_entry_oco_preflight(
+            order_type="LIMIT",
+            limit_price=_LIMIT,
+            stop_price=_STOP,
+            take_profit_price=_TP,
+            mark=_MARK_ABOVE_TP,
+            mark_source="rest_fallback",
+            filters=_INIT_FILTERS,
+            resting_ceiling="0.13206",
+            ceiling_source="rest_book",
+        )
         self.assertEqual(crossed_err, "limit_would_cross")
-        self.assertEqual(crossed["reference"], "live_mark")
-        self.assertEqual(crossed["aligned_take_profit"], "0.13591")
+        self.assertEqual(crossed["reference"], "planned_entry")
+        self.assertEqual(crossed["ceiling_price"], "0.13206")
+        self.assertGreater(Decimal(crossed["mark"]), Decimal(crossed["aligned_limit"]))
 
     def test_tick_alignment_that_leaves_the_band_does_not_rewrite_the_target(self) -> None:
         diag, err = buy_entry_oco_preflight(
@@ -292,6 +321,8 @@ class PreflightGeometryTests(unittest.TestCase):
             mark=_MARK_ABOVE_TP,
             mark_source="rest_fallback",
             filters=_INIT_FILTERS,
+            resting_ceiling="0.15000",
+            ceiling_source="rest_book",
         )
         self.assertEqual(err, "oco_price_restriction")
         self.assertEqual(diag["aligned_limit"], "0.13591")
@@ -364,68 +395,143 @@ class RestingLimitExecutionTests(unittest.TestCase):
             "extras": extras,
         }
 
-    def test_signal_geometry_rests_a_limit_and_does_not_oco_before_the_fill(self) -> None:
+    def test_above_band_rest_is_refused_while_flatten_is_off(self) -> None:
         client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=[_MARK_ABOVE_TP])
         adapter = self._adapter(client)
         with mock.patch.dict(os.environ, self._env()):
             result = adapter.execute(self._limit_signal())
-        self.assertEqual(result["error"], "maker_entry_resting", result)
-        self.assertTrue(result["submitted"])
-        self.assertEqual(result["executed"], 0)
-        self.assertFalse(result["consumer_allowed"])
-        buy = _form(client, "new_order", side="BUY")
-        self.assertEqual(buy["type"], ["LIMIT"])
-        self.assertEqual(buy["timeInForce"], ["GTC"])
-        self.assertEqual(buy["price"], ["0.13206"])
-        self.assertNotIn("MARKET", buy["type"])
+        self.assertEqual(result["error"], "resting_protection_unconfigured", result)
+        self.assertFalse(result["submitted"])
+        self.assertIsNone(result.get("arm_position"))
+        self.assertEqual(_names(client, "new_order"), [])
         self.assertEqual(_names(client, "new_oco"), [])
-        self.assertEqual(result["exit_plan"]["take_profit_price"], "0.135912")
-        self.assertEqual(result["exit_plan"]["stop_price"], "0.1306188")
         pre = result["oco_preflight"]
         self.assertEqual(pre["reference"], "planned_entry")
-        self.assertEqual(pre["reference_price"], "0.13206")
-        self.assertEqual(pre["mark"], "0.144")
-        self.assertEqual(pre["mark_source"], "rest_fallback")
-        self.assertEqual(pre["aligned_stop"], "0.13061")
-        self.assertEqual(pre["aligned_take_profit"], "0.13591")
         self.assertEqual(pre["aligned_limit"], "0.13206")
-        self.assertNotEqual(pre["mark"], _PRICE_USD)
-        self.assertNotIn(_API_KEY, json.dumps(result))
-        self.assertNotIn(_API_SECRET, json.dumps(result))
+        self.assertEqual(pre["ceiling_source"], "rest_book")
+        self.assertEqual(pre["ceiling_price"], "0.15")
+        self.assertFalse(pre["mark_inside_band"])
+        self.assertEqual(result["exit_plan"]["take_profit_price"], "0.135912")
         public = _binance_public_result(result)
-        self.assertEqual(public["oco_preflight"]["mark"], "0.144")
-        self.assertEqual(public["oco_preflight"]["reference"], "planned_entry")
+        self.assertEqual(public["oco_preflight"]["aligned_stop"], "0.13061")
+        self.assertNotIn(_API_KEY, json.dumps(result))
 
-    def test_stale_ws_is_not_the_resting_reference(self) -> None:
-        class _Stale:
-            def get_ticker_price(self, symbol: str) -> dict[str, Any]:
-                return {"price": "0.13200", "source": "ws_l1", "ws_age_ms": 900_000}
-
+    def test_reanchor_alone_does_not_admit_an_above_band_rest(self) -> None:
         client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=[_MARK_ABOVE_TP])
-        adapter = self._adapter(client, ws_cache=_Stale())
+        adapter = self._adapter(client, reanchor_oco_on_fill=True, auto_flatten_on_oco_fail=False)
+        with mock.patch.dict(os.environ, self._env()):
+            result = adapter.execute(self._limit_signal())
+        self.assertEqual(result["error"], "resting_protection_unconfigured")
+        self.assertEqual(_names(client, "new_order"), [])
+
+    def test_configured_flatten_rests_the_limit_without_an_oco(self) -> None:
+        client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=[_MARK_ABOVE_TP])
+        adapter = self._adapter(client, auto_flatten_on_oco_fail=True)
         with mock.patch.dict(os.environ, self._env()):
             result = adapter.execute(self._limit_signal())
         self.assertEqual(result["error"], "maker_entry_resting", result)
-        self.assertEqual(result["oco_preflight"]["mark"], "0.144")
-        self.assertEqual(result["oco_preflight"]["mark_source"], "rest_fallback")
+        buy = _form(client, "new_order", side="BUY")
+        self.assertEqual(buy["type"], ["LIMIT"])
+        self.assertEqual(buy["price"], ["0.13206"])
+        self.assertEqual(_names(client, "new_oco"), [])
+        self.assertEqual(result["oco_preflight"]["ceiling_source"], "rest_book")
+
+    def test_in_band_passive_limit_still_rests_with_the_deployed_defaults(self) -> None:
+        client = _Book(
+            symbol="INITUSDT",
+            filters=_INIT_FILTERS,
+            marks=["0.13300"],
+            asks=[["0.13350", "1000"]],
+        )
+        adapter = self._adapter(client)
+        with mock.patch.dict(os.environ, self._env()):
+            result = adapter.execute(self._limit_signal())
+        self.assertEqual(result["error"], "maker_entry_resting", result)
+        self.assertEqual(_form(client, "new_order", side="BUY")["type"], ["LIMIT"])
+        self.assertEqual(_names(client, "new_oco"), [])
+        self.assertTrue(result["oco_preflight"]["mark_inside_band"])
+
+    def test_last_above_the_limit_does_not_hide_an_ask_at_or_through_it(self) -> None:
+        for ask in ("0.13206", "0.13200"):
+            client = _Book(
+                symbol="INITUSDT",
+                filters=_INIT_FILTERS,
+                marks=[_MARK_ABOVE_TP],
+                asks=[[ask, "1000"]],
+            )
+            adapter = self._adapter(client)
+            with mock.patch.dict(os.environ, self._env()):
+                result = adapter.execute(self._limit_signal())
+            self.assertEqual(result["error"], "limit_would_cross", ask)
+            self.assertEqual(_names(client, "new_order"), [], ask)
+            self.assertGreater(Decimal(result["oco_preflight"]["mark"]), Decimal("0.13206"))
+
+    def test_stale_ws_ask_is_not_the_executable_ask(self) -> None:
+        class _Stale:
+            def get_ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {
+                    "price": _MARK_ABOVE_TP,
+                    "best_bid": "0.14900",
+                    "best_ask": "0.15000",
+                    "source": "ws_l1",
+                    "ws_age_ms": 900_000,
+                }
+
+        client = _Book(
+            symbol="INITUSDT",
+            filters=_INIT_FILTERS,
+            marks=[_MARK_ABOVE_TP],
+            asks=[["0.13200", "1000"]],
+        )
+        adapter = self._adapter(client, ws_cache=_Stale())
+        with mock.patch.dict(os.environ, self._env()):
+            result = adapter.execute(self._limit_signal())
+        self.assertEqual(result["error"], "limit_would_cross", result)
+        self.assertEqual(result["oco_preflight"]["ceiling_source"], "rest_book")
+        self.assertEqual(result["oco_preflight"]["ceiling_price"], "0.132")
+        self.assertEqual(_names(client, "new_order"), [])
+
+    def test_missing_ask_fails_closed(self) -> None:
+        client = _Book(
+            symbol="INITUSDT",
+            filters=_INIT_FILTERS,
+            marks=[_MARK_ABOVE_TP],
+            book_error=TimeoutError("book down"),
+        )
+        adapter = self._adapter(client)
+        with mock.patch.dict(os.environ, self._env()):
+            result = adapter.execute(self._limit_signal())
+        self.assertEqual(result["error"], "maker_book_unavailable")
+        self.assertEqual(_names(client, "new_order"), [])
         self.assertEqual(_names(client, "new_oco"), [])
 
-    def test_fresh_ws_mark_is_persisted_as_the_source(self) -> None:
+    def test_fresh_ws_ask_is_the_ceiling(self) -> None:
         class _Fresh:
             def get_ticker_price(self, symbol: str) -> dict[str, Any]:
-                return {"price": _MARK_ABOVE_TP, "source": "ws_l1", "ws_age_ms": 50}
+                return {
+                    "price": _MARK_ABOVE_TP,
+                    "best_bid": "0.14300",
+                    "best_ask": "0.14500",
+                    "source": "ws_l1",
+                    "ws_age_ms": 50,
+                }
 
         client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=[])
+        client.order_book = lambda symbol, limit=5: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("fresh ws ask must not fall through to REST")
+        )
         client.ticker_price = lambda symbol: (_ for _ in ()).throw(  # type: ignore[method-assign]
-            AssertionError("fresh ws must not fall through to REST")
+            AssertionError("fresh ws mark must not fall through to REST")
         )
         adapter = self._adapter(client, ws_cache=_Fresh())
         with mock.patch.dict(os.environ, self._env()):
             result = adapter.execute(self._limit_signal())
-        self.assertEqual(result["error"], "maker_entry_resting", result)
+        self.assertEqual(result["error"], "resting_protection_unconfigured", result)
         self.assertEqual(result["oco_preflight"]["mark_source"], "ws_l1")
-        self.assertEqual(result["oco_preflight"]["mark"], "0.144")
-        self.assertEqual(result["mark_telemetry"]["mark_ws_age_ms"], 50)
+        self.assertEqual(result["oco_preflight"]["ceiling_source"], "ws_bbo")
+        self.assertEqual(result["oco_preflight"]["ceiling_price"], "0.145")
+        self.assertEqual(result["oco_preflight"]["ask_age_ms"], 50)
+        self.assertEqual(_names(client, "new_order"), [])
 
     def test_missing_mark_refuses_a_limit_even_when_price_usd_is_present(self) -> None:
         client = _Book(
@@ -444,7 +550,12 @@ class RestingLimitExecutionTests(unittest.TestCase):
         self.assertIsNone(result["oco_preflight"]["mark"])
 
     def test_marketable_limit_is_not_sent_and_is_not_rewritten_to_market(self) -> None:
-        client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=["0.13300"])
+        client = _Book(
+            symbol="INITUSDT",
+            filters=_INIT_FILTERS,
+            marks=["0.13400"],
+            asks=[["0.13350", "1000"]],
+        )
         adapter = self._adapter(client)
         with mock.patch.dict(os.environ, self._env()):
             result = adapter.execute(self._limit_signal(limit_price="0.13350"))
@@ -488,7 +599,7 @@ class RestingLimitExecutionTests(unittest.TestCase):
                 "symbol": "INITUSDT",
             },
         )
-        adapter = self._adapter(client)
+        adapter = self._adapter(client, auto_flatten_on_oco_fail=True)
         with mock.patch.dict(os.environ, self._env()):
             result = adapter.execute(self._limit_signal())
         self.assertTrue(result["ok"], result)
@@ -513,7 +624,11 @@ class RestingLimitExecutionTests(unittest.TestCase):
                 "symbol": "INITUSDT",
             },
         )
-        adapter = self._adapter(client, reanchor_oco_on_fill=True)
+        adapter = self._adapter(
+            client,
+            reanchor_oco_on_fill=True,
+            auto_flatten_on_oco_fail=True,
+        )
         with mock.patch.dict(os.environ, self._env()):
             result = adapter.execute(self._limit_signal())
         self.assertTrue(result["ok"], result)
@@ -547,7 +662,7 @@ class RestingLimitExecutionTests(unittest.TestCase):
 
     def test_partial_fill_cancels_the_remainder_and_protects_only_the_fill(self) -> None:
         client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=[_MARK_ABOVE_TP])
-        adapter = self._adapter(client)
+        adapter = self._adapter(client, auto_flatten_on_oco_fail=True)
         with mock.patch.dict(os.environ, self._env()):
             rested = adapter.execute(self._limit_signal(quantity="200"))
         self.assertEqual(rested["error"], "maker_entry_resting")
@@ -651,6 +766,36 @@ class RestingLimitExecutionTests(unittest.TestCase):
         self.assertEqual(_form(flat_client, "new_order", side="SELL")["type"], ["MARKET"])
         self.assertIn("oco_unprotectable", str(flattened.get("error")))
 
+        tp_client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=[_MARK_ABOVE_TP])
+        tp_adapter = self._adapter(tp_client, auto_flatten_on_oco_fail=True)
+        with mock.patch.dict(os.environ, self._env()):
+            rested = tp_adapter.execute(self._limit_signal())
+        tp_arm = dict(rested["arm_position"])
+        tp_arm["id"] = 1
+
+        def _filled_tp(signed_query: str, *, api_key: str) -> dict[str, Any]:
+            tp_client.calls.append(("get_order", signed_query, api_key))
+            if "origClientOrderId" in parse_qs(signed_query):
+                raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+            return {
+                "orderId": "810",
+                "symbol": "INITUSDT",
+                "status": "FILLED",
+                "executedQty": "295",
+                "cummulativeQuoteQty": "38.9577",
+            }
+
+        tp_client.get_order = _filled_tp  # type: ignore[method-assign]
+        with mock.patch.dict(os.environ, self._env()):
+            through_tp = tp_adapter.reconcile_resting_entry(
+                tp_arm,
+                mark="0.15000",
+                now_ms=1_700_000_010_000,
+            )
+        self.assertEqual(_names(tp_client, "new_oco"), [])
+        self.assertEqual(_form(tp_client, "new_order", side="SELL")["type"], ["MARKET"])
+        self.assertIn("oco_unprotectable", str(through_tp.get("error")))
+
     def test_receipt_persists_the_preflight_without_credentials(self) -> None:
         client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=[_MARK_ABOVE_TP])
         adapter = self._adapter(client)
@@ -690,10 +835,13 @@ class RestingLimitExecutionTests(unittest.TestCase):
                     (148630,),
                 ).fetchone()
         self.assertEqual(processed["executed"], 0)
+        self.assertEqual(processed["error"], "resting_protection_unconfigured")
+        self.assertEqual(_names(client, "new_order"), [])
         assert stored is not None
         receipt = json.loads(stored["receipt_json"])
         pre = receipt["exec_result"]["oco_preflight"]
         self.assertEqual(pre["reference"], "planned_entry")
+        self.assertEqual(pre["ceiling_source"], "rest_book")
         self.assertEqual(pre["mark_source"], "rest_fallback")
         self.assertEqual(pre["aligned_stop"], "0.13061")
         self.assertEqual(pre["aligned_take_profit"], "0.13591")

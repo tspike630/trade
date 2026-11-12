@@ -415,11 +415,10 @@ def buy_entry_oco_preflight(
 
     A missing or non-positive mark is ``mark_unavailable``. ``MARKET`` must
     keep the fresh mark strictly inside the tick-aligned stop and take-profit.
-    ``LIMIT`` is a resting buy only when that same fresh mark is strictly
-    above the tick-aligned limit. ``LIMIT_MAKER`` is resting only when a
-    fresh ask ceiling is strictly above the tick-aligned limit. The order
-    type string alone is not that proof. The signal's ``price_usd`` is not a
-    mark and is not read here.
+    A resting buy is passive only when ``resting_ceiling`` is a fresh
+    executable ask strictly above the tick-aligned limit. The last price is
+    not that proof. A missing ask is ``ask_unavailable``. The order type
+    string alone is not proof, and ``price_usd`` is not read here.
     """
     kind = str(order_type or "").strip().upper()
     source = None if mark_source in (None, "") else str(mark_source)
@@ -460,18 +459,13 @@ def buy_entry_oco_preflight(
         if diag["mark_inside_band"] is not True:
             return diag, "oco_price_restriction"
         return diag, None
-    if kind == "LIMIT":
-        ceiling_n = mark_n
-        ceiling_label = "live_mark"
-    elif kind == "LIMIT_MAKER":
+    if kind in {"LIMIT", "LIMIT_MAKER"}:
         ceiling_n = _to_decimal(resting_ceiling)
         if ceiling_n is None or ceiling_n <= 0:
-            ceiling_n = mark_n
-            ceiling_label = "live_mark"
-        else:
-            ceiling_label = (
-                str(ceiling_source).strip() if ceiling_source not in (None, "") else "best_ask"
-            )
+            return diag, "ask_unavailable"
+        ceiling_label = (
+            str(ceiling_source).strip() if ceiling_source not in (None, "") else "best_ask"
+        )
     else:
         return diag, "invalid_order_type"
     limit_n = _to_decimal(limit_price)
@@ -490,8 +484,6 @@ def buy_entry_oco_preflight(
     diag["reference"] = "planned_entry"
     diag["reference_price"] = diag["aligned_limit"]
     if aligned_limit >= ceiling_n:
-        diag["reference"] = "live_mark"
-        diag["reference_price"] = diag["mark"]
         return diag, "limit_would_cross"
     if not (aligned["below_stop"] < aligned_limit < aligned["above"]):
         return diag, "oco_price_restriction"

@@ -1468,6 +1468,7 @@ class BinanceSpotAdapter:
         self._oco_preflight: dict[str, Any] | None = None
         self._resting_ceiling: str | None = None
         self._resting_ceiling_source: str | None = None
+        self._resting_ask_age_ms: int | None = None
 
     def _active_ws_cache(self) -> Any | None:
         if self.ws_cache is not None:
@@ -1590,6 +1591,8 @@ class BinanceSpotAdapter:
             if fresh == "crossed":
                 saw_crossed = True
             elif isinstance(fresh, tuple):
+                self._resting_ceiling_source = "ws_bbo"
+                self._resting_ask_age_ms = self._ws_age_ms(ws_tick) if isinstance(ws_tick, dict) else None
                 return fresh[0], fresh[1], None
         depth_fn = getattr(client, "order_book", None) if client is not None else None
         if callable(depth_fn):
@@ -1613,6 +1616,8 @@ class BinanceSpotAdapter:
                         require_age=False,
                     )
                     if isinstance(fresh, tuple):
+                        self._resting_ceiling_source = "rest_book"
+                        self._resting_ask_age_ms = None
                         return fresh[0], fresh[1], None
                     if fresh == "crossed":
                         return None, None, "orderbook_crossed"
@@ -1702,6 +1707,31 @@ class BinanceSpotAdapter:
         self._mark_telemetry = {"mark_source": "rest_fallback"}
         return str(mark).strip(), None
 
+    def _refuse_protected_buy(
+        self,
+        *,
+        error: str,
+        symbol: str,
+        gates: dict[str, Any],
+        plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Stop before ``new_order``. The receipt keeps the preflight, not a position."""
+        return self._finish(
+            _result(
+                ok=False,
+                dry_run=False,
+                executed=0,
+                submitted=False,
+                error=error,
+                symbol=symbol,
+                order=None,
+                exchange_order_id=None,
+                gates=gates,
+                exit_plan=plan,
+                consumer_allowed=False,
+            )
+        )
+
     def _resting_limit_preflight(
         self,
         *,
@@ -1735,22 +1765,30 @@ class BinanceSpotAdapter:
                 "mark_inside_band": None,
             }
             self._oco_preflight = diag
-            refused = self._finish(
-                _result(
-                    ok=False,
-                    dry_run=False,
-                    executed=0,
-                    submitted=False,
-                    error=price_error,
-                    symbol=symbol,
-                    order=None,
-                    exchange_order_id=None,
-                    gates=gates,
-                    exit_plan=plan,
-                    consumer_allowed=False,
-                )
+            return extras, plan, pairs, self._refuse_protected_buy(
+                error=price_error,
+                symbol=symbol,
+                gates=gates,
+                plan=plan,
             )
-            return extras, plan, pairs, refused
+        if order_type in {"LIMIT", "LIMIT_MAKER"} and not self._resting_ceiling:
+            _bid, ask, book_err = self._maker_top_of_book(self.client, symbol)
+            if book_err or not ask:
+                self._oco_preflight = {
+                    "order_type": order_type,
+                    "reference": None,
+                    "mark": self._entry_mark,
+                    "mark_source": mark_source,
+                    "ceiling_source": None,
+                    "mark_inside_band": None,
+                }
+                return extras, plan, pairs, self._refuse_protected_buy(
+                    error=book_err or "ask_unavailable",
+                    symbol=symbol,
+                    gates=gates,
+                    plan=plan,
+                )
+            self._resting_ceiling = ask
         diag, pre_err = buy_entry_oco_preflight(
             order_type=order_type or "",
             limit_price=raw_limit,
@@ -1759,27 +1797,34 @@ class BinanceSpotAdapter:
             mark=self._entry_mark,
             mark_source=mark_source,
             filters=filters,
-            resting_ceiling=self._resting_ceiling if order_type == "LIMIT_MAKER" else None,
-            ceiling_source=self._resting_ceiling_source if order_type == "LIMIT_MAKER" else None,
+            resting_ceiling=self._resting_ceiling,
+            ceiling_source=self._resting_ceiling_source,
         )
+        if isinstance(diag, dict):
+            diag["ask_age_ms"] = self._resting_ask_age_ms
         self._oco_preflight = diag
-        if pre_err:
-            refused = self._finish(
-                _result(
-                    ok=False,
-                    dry_run=False,
-                    executed=0,
-                    submitted=False,
-                    error=pre_err,
-                    symbol=symbol,
-                    order=None,
-                    exchange_order_id=None,
-                    gates=gates,
-                    exit_plan=plan,
-                    consumer_allowed=False,
-                )
+        if pre_err is None and diag.get("mark_inside_band") is False and not self._auto_flatten_enabled():
+            # Deployed defaults leave reanchor and auto-flatten off. An
+            # above-band resting fill cannot host the original OCO, and
+            # blocking the next buy does not close the fill. Do not send
+            # the order unless the existing auto-flatten switch is on.
+            # Reanchor alone is not that switch: a failed OCO would still
+            # leave the coins. A flatten the exchange then rejects remains
+            # the existing emergency residual; this path stays shut until
+            # the operator sets BINANCE_SPOT_AUTO_FLATTEN_ON_OCO_FAIL.
+            return extras, plan, pairs, self._refuse_protected_buy(
+                error="resting_protection_unconfigured",
+                symbol=symbol,
+                gates=gates,
+                plan=plan,
             )
-            return extras, plan, pairs, refused
+        if pre_err:
+            return extras, plan, pairs, self._refuse_protected_buy(
+                error=pre_err,
+                symbol=symbol,
+                gates=gates,
+                plan=plan,
+            )
         aligned = diag.get("aligned_limit")
         current = dict(pairs).get("price")
         aligned_n = _to_decimal(aligned)
@@ -1791,40 +1836,20 @@ class BinanceSpotAdapter:
                 stamped["limit_price"] = aligned
             floor_error = entry_notional_floor_error(stamped)
             if floor_error:
-                refused = self._finish(
-                    _result(
-                        ok=False,
-                        dry_run=False,
-                        executed=0,
-                        submitted=False,
-                        error=floor_error,
-                        symbol=symbol,
-                        order=None,
-                        exchange_order_id=None,
-                        gates=gates,
-                        exit_plan=plan,
-                        consumer_allowed=False,
-                    )
+                return extras, plan, pairs, self._refuse_protected_buy(
+                    error=floor_error,
+                    symbol=symbol,
+                    gates=gates,
+                    plan=plan,
                 )
-                return extras, plan, pairs, refused
             rebuilt, qty_error = self._preview_pairs(sig, stamped, symbol)
             if qty_error or rebuilt is None:
-                refused = self._finish(
-                    _result(
-                        ok=False,
-                        dry_run=False,
-                        executed=0,
-                        submitted=False,
-                        error=qty_error or "missing_order_qty",
-                        symbol=symbol,
-                        order=None,
-                        exchange_order_id=None,
-                        gates=gates,
-                        exit_plan=plan,
-                        consumer_allowed=False,
-                    )
+                return extras, plan, pairs, self._refuse_protected_buy(
+                    error=qty_error or "missing_order_qty",
+                    symbol=symbol,
+                    gates=gates,
+                    plan=plan,
                 )
-                return extras, plan, pairs, refused
             extras = stamped
             pairs = rebuilt
         return extras, plan, pairs, None
@@ -2450,6 +2475,7 @@ class BinanceSpotAdapter:
         self._oco_preflight = None
         self._resting_ceiling = None
         self._resting_ceiling_source = None
+        self._resting_ask_age_ms = None
         gates = self._gates()
         purpose = str(sig.get("purpose") or "").strip()
         if not is_live_bnb_spot_purpose(purpose):
@@ -2971,7 +2997,6 @@ class BinanceSpotAdapter:
                         )
                     )
                 self._resting_ceiling = best_ask_px
-                self._resting_ceiling_source = "best_ask"
                 raw_lim, _ = _chosen_limit_raw(extras)
                 filters = _symbol_filters(info, symbol) or []
                 pegged_px, was_clamped, peg_err = peg_maker_buy_price(
@@ -3083,7 +3108,7 @@ class BinanceSpotAdapter:
                                     plan["entry_price"] = sor_spec["price"]
                                     plan["sor_routed"] = "limit_maker_at_best_bid"
                                     self._resting_ceiling = str(ob_metrics.get("best_ask") or "")
-                                    self._resting_ceiling_source = "best_ask"
+                                    self._resting_ceiling_source = "rest_book"
                                     ob_metrics["sor_routed"] = "limit_maker_at_best_bid"
                                     ob_metrics["sor_original_block"] = ob_error
                                     ob_metrics["sor_maker_price"] = sor_spec["price"]
