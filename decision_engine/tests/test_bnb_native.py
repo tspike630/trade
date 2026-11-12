@@ -135,6 +135,38 @@ class FactorMathTests(unittest.TestCase):
         mixed[-1] = (*bars[-1][:5], 3.0, 50.0)
         self.assertAlmostEqual(_trailing_hour_volume(mixed, 11), 11 * 3.0 + 50.0)
 
+    def test_trailing_hour_reads_stored_quote_index_not_rest_json(self) -> None:
+        """Stored bar[6] is quote. REST JSON bar[6] is close time and bar[7] is quote."""
+        open_ms = 1_700_000_000_000
+        rest_close_time = open_ms + 5 * 60 * 1000
+        rest_quote = 80.0
+        zero_quote = (open_ms, 1.0, 1.0, 1.0, 1.0, 9.0, 0.0)
+        self.assertEqual(len(zero_quote), 7)
+        self.assertNotEqual(zero_quote[6], rest_close_time)
+        self.assertNotEqual(zero_quote[6], rest_quote)
+        self.assertAlmostEqual(_trailing_hour_volume([zero_quote], 0), 0.0)
+        quoted = (open_ms, 1.0, 1.0, 1.0, 1.0, 9.0, rest_quote)
+        self.assertAlmostEqual(_trailing_hour_volume([quoted], 0), rest_quote)
+        missing = (open_ms, 1.0, 1.0, 1.0, 1.0, 9.0, None)
+        self.assertAlmostEqual(_trailing_hour_volume([missing], 0), 9.0)
+
+    def test_trailing_hour_excludes_the_bar_that_closed_exactly_one_hour_earlier(self) -> None:
+        """Close clock is open_ms + 5m. Close == window start is outside the hour."""
+        step = 5 * 60 * 1000
+        start = 1_700_000_000_000
+        bars = [
+            (start + index * step, 1.0, 1.0, 1.0, 1.0, 4.0, 7.0) for index in range(13)
+        ]
+        last_close = bars[12][0] + step
+        window_start = last_close - 60 * 60 * 1000
+        self.assertEqual(bars[0][0] + step, window_start)
+        self.assertAlmostEqual(_trailing_hour_volume(bars, 12), 12 * 7.0)
+        # The excluded bar's base volume must not leak in when its quote is 0.
+        excluded = (*bars[0][:5], 100.0, 0.0)
+        kept = list(bars)
+        kept[0] = excluded
+        self.assertAlmostEqual(_trailing_hour_volume(kept, 12), 12 * 7.0)
+
     def test_kline_volume_strength_follows_quote_not_base(self) -> None:
         closes = [100.0] * 24
         quotes = [10.0] * 23 + [400.0]
@@ -155,6 +187,13 @@ class FactorMathTests(unittest.TestCase):
         self.assertNotAlmostEqual(
             from_quote["volume_strength"], flat_base["volume_strength"]
         )
+
+    def test_zero_quote_hour_does_not_borrow_base_volume(self) -> None:
+        closes = [100.0] * 24
+        bars = _bars(closes, volume=50.0, quote=0.0)
+        now = bars[-1][0] + 5 * 60 * 1000
+        self.assertIsNone(factors_from_klines(bars, now_ms=now))
+        self.assertAlmostEqual(_trailing_hour_volume(bars, len(bars) - 1), 0.0)
 
     def test_forming_bar_is_dropped(self) -> None:
         closed = _bars([100.0] * 20)

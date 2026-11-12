@@ -585,12 +585,22 @@ def _boll_lower(closes: Sequence[float]) -> float | None:
 
 
 def _trailing_hour_volume(bars: Sequence[Candle], index: int) -> float:
-    """Trailing 1h volume ending at ``bars[index]``.
+    """Trailing 1h volume ending at the close of ``bars[index]``.
 
-    Prefer quote volume (USDT, candle index 6), the same unit
+    The stored candle is ``(open_ms, open, high, low, close, base_volume,
+    quote_volume)``. Quote volume (USDT) is index 6. Base volume is index 5.
+    Raw Binance kline JSON is a different layout: index 6 is close time and
+    index 7 is quote volume. Do not read this tuple with those REST indexes.
+
+    Prefer quote volume, the same unit
     ``indicators.binance_spot.price_series_from_klines`` sums into
-    ``volume_h1``. Fall back to base-asset volume (index 5) only when that
-    bar's quote volume is missing. A present zero stays zero.
+    ``volume_h1``. Fall back to base-asset volume only when this bar's quote
+    is missing (``None``). A stored zero is a real zero and stays in the sum.
+
+    The window end is the bar close, ``open_ms + 5m``. A bar whose close is
+    less than or equal to that end minus one hour is excluded. This helper
+    does not drop a still-forming bar; ``factors_from_klines`` does that
+    before it asks for the trailing hour.
     """
     close_ms = int(bars[index][0]) + KLINE_MS
     start = close_ms - HOUR_SEC * 1000
