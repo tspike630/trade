@@ -755,14 +755,23 @@ class Store:
     # --- pending enrich queue ---
 
     def add_pending_enrich(self, chain_id: str, token_address: str) -> None:
-        chain_id = norm_chain(chain_id)
-        token_address = norm_address(token_address)
-        self._conn.execute(
+        self.add_pending_enrich_many([(chain_id, token_address)])
+
+    def add_pending_enrich_many(self, rows: list[tuple[str, str]]) -> None:
+        """Insert pending rows in one transaction. Existing rows stay (OR IGNORE)."""
+        if not rows:
+            return
+        now = _utc_now_iso()
+        payload = [
+            (norm_chain(chain_id), norm_address(token_address), now)
+            for chain_id, token_address in rows
+        ]
+        self._conn.executemany(
             """
             INSERT OR IGNORE INTO pending_enrich (chain_id, token_address, added_at)
             VALUES (?, ?, ?)
             """,
-            (chain_id, token_address, _utc_now_iso()),
+            payload,
         )
         self._conn.commit()
 

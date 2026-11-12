@@ -16,6 +16,25 @@ except ImportError:
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var. Unset, blank, and non-numeric values keep ``default``."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var. Unset and blank keep ``default``."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 BASE_URL = "https://api.dexscreener.com"
 
 POLL_INTERVAL_SECONDS = 60
@@ -24,6 +43,15 @@ PROFILE_POLL_INTERVAL_SEC = 60
 BATCH_SIZE = 30
 # P2-20: rows of pending_enrich loaded into one cycle. Full backlog stays in the table.
 PENDING_ENRICH_LOAD_CAP = int(os.environ.get("PENDING_ENRICH_LOAD_CAP", "300"))
+# Batch-count cap applied after _plan_batches. 0 = off (current behavior).
+# Orthogonal to PENDING_ENRICH_LOAD_CAP, which only limits rows loaded from the table.
+ENRICH_BATCHES_PER_CYCLE_CAP = _env_int("ENRICH_BATCHES_PER_CYCLE_CAP", 0)
+# Mid-enrich heartbeat. Default off so heartbeat.json cadence is unchanged until set.
+# Once enabled, interval/K below apply even if those vars are unset.
+ENRICH_SEGMENT_HEARTBEAT = _env_flag("ENRICH_SEGMENT_HEARTBEAT", False)
+ENRICH_HEARTBEAT_MIN_INTERVAL_SEC = _env_int("ENRICH_HEARTBEAT_MIN_INTERVAL_SEC", 30)
+# 0 = time trigger only. Values <= 0 for the interval are treated as 30s at write time.
+ENRICH_HEARTBEAT_EVERY_K_BATCHES = _env_int("ENRICH_HEARTBEAT_EVERY_K_BATCHES", 10)
 REQUEST_TIMEOUT_SECONDS = 30.0
 
 MAX_RETRIES = 4

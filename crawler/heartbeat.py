@@ -13,6 +13,23 @@ from logging_setup import get_logger
 
 log = get_logger("heartbeat")
 
+_HEARTBEAT_STAT_KEYS = (
+    "cycle_number",
+    "tokens_total",
+    "pairs_total",
+    "enrich_batches",
+    "validation_errors",
+    "alerts_emitted",
+    "enrich_pending_remaining",
+    "interrupted",
+)
+
+# Present only when the caller passes them. Omitted keys keep the legacy payload.
+_HEARTBEAT_EXTRA_STAT_KEYS = (
+    "batches_done",
+    "batches_total_est",
+)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -37,31 +54,31 @@ def write_heartbeat(
     last_error: str | None = None,
     counters: dict[str, Any] | None = None,
     path: str | Path | None = None,
+    phase: str | None = None,
+    extra_stats: dict[str, Any] | None = None,
 ) -> Path:
     path = Path(path or HEARTBEAT_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    stats_out = {
+        k: stats.get(k)
+        for k in _HEARTBEAT_STAT_KEYS
+        if stats
+    }
+    if extra_stats:
+        for key in _HEARTBEAT_EXTRA_STAT_KEYS:
+            if key in extra_stats and extra_stats[key] is not None:
+                stats_out[key] = extra_stats[key]
+    payload: dict[str, Any] = {
         "timestamp": _utc_now_iso(),
         "cycle_id": cycle_id,
         "status": status,
         "last_error": last_error,
         "pid": os.getpid(),
-        "stats": {
-            k: stats.get(k)
-            for k in (
-                "cycle_number",
-                "tokens_total",
-                "pairs_total",
-                "enrich_batches",
-                "validation_errors",
-                "alerts_emitted",
-                "enrich_pending_remaining",
-                "interrupted",
-            )
-            if stats
-        },
+        "stats": stats_out,
         "counters": counters or {},
     }
+    if phase is not None:
+        payload["phase"] = phase
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     log.info(
         "heartbeat written path=%s status=%s cycle_id=%s",
