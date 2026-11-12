@@ -191,6 +191,16 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
         value = result.get(key)
         if isinstance(value, str) and value:
             published[key] = value
+    incident = result.get("protection_incident")
+    if isinstance(incident, dict):
+        published["protection_incident"] = {
+            "state": incident.get("state"),
+            "store": incident.get("store"),
+            "event": incident.get("event"),
+            "delivered": False,
+            "transport": "none",
+            "integrations_required": incident.get("integrations_required"),
+        }
     exchange_error = public_exchange_error(result.get("exchange_error"))
     if exchange_error is not None:
         published["exchange_error"] = exchange_error
@@ -610,6 +620,28 @@ class ExecutionGateway:
                 (
                     "rejected",
                     {"stage": "position_manager", "reason": exec_error},
+                )
+            )
+            return events
+        incident = (
+            fill_receipt.get("protection_incident")
+            if isinstance(fill_receipt, dict)
+            else None
+        )
+        if isinstance(incident, dict) and incident.get("state"):
+            events.append(
+                (
+                    "rejected",
+                    {
+                        "stage": "protection",
+                        "error": exec_error,
+                        "protection_state": fill_receipt.get("protection_state")
+                        if isinstance(fill_receipt, dict)
+                        else None,
+                        "delivered": False,
+                        "transport": "none",
+                        "integrations_required": incident.get("integrations_required"),
+                    },
                 )
             )
             return events
@@ -1146,6 +1178,8 @@ class ExecutionGateway:
             "stop_price": armed.get("stop_price"),
             "take_profit_price": armed.get("take_profit_price"),
             "purpose": armed.get("purpose"),
+            "residual_qty": armed.get("residual_qty"),
+            "exit_filled_qty": armed.get("exit_filled_qty"),
         }
         exec_result["held_position"] = receipt_body["held_position"]
 

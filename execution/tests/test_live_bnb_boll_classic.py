@@ -32,7 +32,10 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
     REST_BOOK,
     buy_exposure_block,
 )
-from execution.executors.binance_spot_protect import ENTRY_MIN_NOTIONAL_USDT  # noqa: E402
+from execution.executors.binance_spot_protect import (  # noqa: E402
+    ENTRY_MIN_NOTIONAL_USDT,
+    sellable_base_qty,
+)
 from execution.gateway import BINANCE_SPOT_EXECUTOR, ExecutionGateway  # noqa: E402
 from execution.ledger import ExecutionLedger  # noqa: E402
 from execution.run import _peer_isolation_guard, tick_live_bnb_exits  # noqa: E402
@@ -577,9 +580,13 @@ class ClassicMarketProtectionTests(unittest.TestCase):
         self.assertEqual(len(sells), 1)
         self.assertEqual(sells[0]["type"], ["MARKET"])
         self.assertEqual(sells[0]["quantity"], ["0.24"])
-        self.assertEqual(result["protection_state"], "exited", result)
-        self.assertEqual(result["arm_position"]["status"], "closed")
-        self.assertNotEqual(result["arm_position"]["status"], "oco_failed")
+        self.assertEqual(result["protection_state"], "dust_residual", result)
+        self.assertEqual(result["arm_position"]["status"], "closed_dust")
+        self.assertEqual(result["arm_position"]["protection"], "dust_abandon")
+        self.assertEqual(result["arm_position"]["residual_qty"], "0.009")
+        self.assertEqual(result["arm_position"]["exit_filled_qty"], "0.24")
+        self.assertNotEqual(result["protection_state"], "exited")
+        self.assertFalse(result["protection_incident"]["delivered"])
 
     def test_oco_timeout_does_not_sell_or_repost_before_reconciliation(self) -> None:
         class _Timeout:
@@ -663,6 +670,236 @@ class ClassicMarketProtectionTests(unittest.TestCase):
         self.assertEqual(result["manual_action"], "halt_new_buys_and_manually_close_or_protect_the_fill")
         self.assertFalse(result["consumer_allowed"])
         self.assertNotEqual(result["arm_position"]["status"], "closed")
+
+
+def _trading_info(symbol: str) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "status": "TRADING",
+        "quoteAsset": "USDT",
+        "isSpotTradingAllowed": True,
+        "filters": _FILTERS,
+    }
+
+
+class FillNetTests(unittest.TestCase):
+    """Commission is subtracted only when it is the traded base. Do not change that."""
+
+    def test_third_asset_quote_and_two_base_fills(self) -> None:
+        eth = {
+            "executedQty": "1.5",
+            "fills": [
+                {"qty": "1.5", "commission": "0.0001", "commissionAsset": "BNB"},
+            ],
+        }
+        self.assertEqual(sellable_base_qty(eth, "ETHUSDT"), "1.5")
+        quote_fee = {
+            "executedQty": "0.25",
+            "fills": [
+                {"qty": "0.25", "commission": "0.01", "commissionAsset": "USDT"},
+            ],
+        }
+        self.assertEqual(sellable_base_qty(quote_fee, "BNBUSDT"), "0.25")
+        two = {
+            "executedQty": "0.25",
+            "fills": [
+                {"qty": "0.10", "commission": "0.0004", "commissionAsset": "BNB"},
+                {"qty": "0.15", "commission": "0.0006", "commissionAsset": "BNB"},
+            ],
+        }
+        self.assertEqual(sellable_base_qty(two, "BNBUSDT"), "0.249")
+        missing = {"executedQty": "0.25"}
+        self.assertEqual(sellable_base_qty(missing, "BNBUSDT"), "0.25")
+
+
+class ClassicGatewayProtectionTests(unittest.TestCase):
+    """The adapter result is not the book. These go through the gateway ledger."""
+
+    def setUp(self) -> None:
+        self._net = mock.patch(
+            "execution.executors.binance_spot.urllib.request.urlopen",
+            side_effect=AssertionError("live binance HTTP is disabled in tests"),
+        )
+        self._net.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._net.stop()
+        self._tmp.cleanup()
+
+    def _gateway(self, client: Any, purposes: frozenset[str]) -> ExecutionGateway:
+        return ExecutionGateway(
+            decision_db=self.root / "decision.db",
+            ledger_path=self.root / "ledger.db",
+            paper_enabled=False,
+            pm_enabled=False,
+            accept_purposes=purposes,
+            binance_spot=_adapter(self.root, client, auto_flatten_on_oco_fail=True),
+        )
+
+    def test_dust_remainder_is_persisted_and_blocks_the_next_same_purpose_buy(self) -> None:
+        class _Book:
+            def __init__(self) -> None:
+                self.calls: list[tuple[Any, ...]] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _trading_info(symbol)
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_order", signed_query))
+                form = parse_qs(signed_query)
+                if form.get("side") == ["SELL"]:
+                    qty = form.get("quantity", ["0"])[0]
+                    return {
+                        "orderId": "7701",
+                        "status": "FILLED",
+                        "executedQty": qty,
+                        "origQty": qty,
+                        "symbol": "BNBUSDT",
+                    }
+                return {
+                    "orderId": "99",
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                    "cummulativeQuoteQty": "25.5",
+                    "fills": [
+                        {"commission": "0.001", "commissionAsset": "BNB", "qty": "0.25"}
+                    ],
+                    "symbol": "BNBUSDT",
+                }
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_oco", signed_query))
+                raise BinanceRequestError(400, code=-2010, msg="Account has insufficient balance")
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+
+            def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+
+        client = _Book()
+        purposes = frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSE_LIVE_BNB_BOLL_FADE})
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(client, purposes) as gw:
+                opened = gw.process_one(_decision_row(mode="live_stub"))
+                row = gw.ledger.binance_spot_position_by_decision(147901)
+                events = gw.ledger.conn.execute(
+                    "SELECT event, detail_json FROM order_events WHERE event = 'rejected'"
+                ).fetchall()
+        self.assertEqual(opened["exec_result"]["protection_state"], "dust_residual", opened)
+        self.assertNotEqual(opened["exec_result"]["protection_state"], "exited")
+        self.assertFalse(opened["exec_result"]["protection_incident"]["delivered"])
+        assert row is not None
+        self.assertEqual(row["status"], "closed_dust")
+        self.assertEqual(row["protection"], "dust_abandon")
+        self.assertNotEqual(row["protection"], "auto_flatten")
+        self.assertEqual(row["residual_qty"], "0.009")
+        self.assertEqual(row["exit_filled_qty"], "0.24")
+        self.assertTrue(events)
+        detail = json.loads(events[-1][1])
+        self.assertEqual(detail["delivered"], False)
+        self.assertEqual(detail["transport"], "none")
+        self.assertEqual(detail["protection_state"], "dust_residual")
+        buys_before = sum(
+            1
+            for call in client.calls
+            if call[0] == "new_order" and parse_qs(call[1]).get("side") == ["BUY"]
+        )
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(client, purposes) as gw:
+                again = gw.process_one(
+                    _decision_row(mode="live_stub", decision_log_id=147902)
+                )
+        self.assertEqual(again["error"], "unprotected_position_blocks_buy", again)
+        buys_after = sum(
+            1
+            for call in client.calls
+            if call[0] == "new_order" and parse_qs(call[1]).get("side") == ["BUY"]
+        )
+        self.assertEqual(buys_after, buys_before)
+
+    def test_unknown_oco_blocks_known_predicates_and_a_valid_other_symbol_is_not_those(self) -> None:
+        class _Timeout:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _trading_info(symbol)
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_order", signed_query))
+                return {
+                    "orderId": "99",
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                    "cummulativeQuoteQty": "25.5",
+                    "fills": [],
+                    "symbol": parse_qs(signed_query).get("symbol", ["BNBUSDT"])[0],
+                }
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_oco", signed_query))
+                raise TimeoutError("timed out")
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("get_order_list", signed_query))
+                raise TimeoutError("list timed out")
+
+        client = _Timeout()
+        purposes = frozenset({PURPOSE_LIVE_BNB_BOLL_CLASSIC, PURPOSE_LIVE_BNB_BOLL_FADE})
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(client, purposes) as gw:
+                opened = gw.process_one(_decision_row(mode="live_stub"))
+                self.assertEqual(opened["exec_result"]["protection_state"], "unprotected", opened)
+                list(gw.tick_binance_protective_exits({"BNBUSDT": "102"}))
+                row = gw.ledger.binance_spot_position_by_decision(147901)
+        assert row is not None
+        self.assertEqual(row["status"], "oco_unknown")
+        self.assertEqual(sum(1 for call in client.calls if call[0] == "new_oco"), 1)
+        self.assertFalse(any(parse_qs(call[1]).get("side") == ["SELL"] for call in client.calls if call[0] == "new_order"))
+
+        def _eth(purpose: str, decision_id: int) -> dict[str, Any]:
+            return _decision_row(
+                mode="live_stub",
+                decision_log_id=decision_id,
+                purpose=purpose,
+                token_address="ETHUSDT",
+                pair_address="ETH/USDT",
+                extras=_classic_extras(binance_symbol="ETHUSDT"),
+            )
+
+        with mock.patch.dict(os.environ, _env(self.root)):
+            with self._gateway(client, purposes) as gw:
+                same_arm = gw.process_one(_eth(PURPOSE_LIVE_BNB_BOLL_CLASSIC, 147911))
+                same_symbol = gw.process_one(
+                    _decision_row(
+                        mode="live_stub",
+                        decision_log_id=147912,
+                        purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                    )
+                )
+                other = gw.process_one(_eth(PURPOSE_LIVE_BNB_BOLL_FADE, 147913))
+        self.assertEqual(same_arm["error"], "oco_failed_blocks_buy", same_arm)
+        self.assertEqual(same_symbol["error"], "cross_arm_symbol_blocks_buy", same_symbol)
+        self.assertNotEqual(other["error"], "symbol_not_trading", other)
+        self.assertNotIn(other["error"], {"oco_failed_blocks_buy", "cross_arm_symbol_blocks_buy"})
+        eth_buys = [
+            parse_qs(call[1])
+            for call in client.calls
+            if call[0] == "new_order" and parse_qs(call[1]).get("symbol") == ["ETHUSDT"]
+        ]
+        self.assertEqual(len(eth_buys), 1)
+        self.assertEqual(eth_buys[0]["side"], ["BUY"])
+        # The BNB list was not posted again. ETH is a separate buy, so it gets its own OCO.
+        self.assertEqual(sum(1 for call in client.calls if call[0] == "new_oco"), 2)
 
 
 class ClassicGatewayTests(unittest.TestCase):

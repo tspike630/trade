@@ -575,6 +575,25 @@ def protective_exit_reason(
     return None
 
 
+def _protection_incident(state: str) -> dict[str, Any]:
+    """Local evidence only. Nothing is sent to an operator or an outside service.
+
+    The durable copy is the position row plus the gateway ``order_events``
+    ``rejected`` detail. A log line is not that record.
+    """
+    return {
+        "state": state,
+        "store": "binance_spot_positions",
+        "event": "rejected",
+        "delivered": False,
+        "transport": "none",
+        "integrations_required": (
+            "Read binance_spot_positions and order_events. "
+            "No webhook, email, or chat message is sent."
+        ),
+    }
+
+
 def filled_base_qty(placed: dict[str, Any] | None) -> str | None:
     """Base qty the exchange says filled. Quote notional is not converted."""
     if not isinstance(placed, dict):
@@ -1732,6 +1751,30 @@ class BinanceSpotAdapter:
             )
         )
 
+    def _copy_exit_onto_arm(
+        self,
+        arm: dict[str, Any],
+        row: dict[str, Any],
+        oco_fields: dict[str, Any] | None = None,
+    ) -> None:
+        keys = (
+            "status",
+            "protection",
+            "quantity",
+            "exit_order_id",
+            "exit_reason",
+            "exit_client_order_id",
+            "exit_filled_qty",
+            "residual_qty",
+            "residual_quote",
+            "last_error",
+        )
+        for key in keys:
+            if row.get(key) is not None:
+                arm[key] = row[key]
+                if oco_fields is not None:
+                    oco_fields[key] = row[key]
+
     def _label_fill_protection(self, result: dict[str, Any], *, qty: str) -> dict[str, Any]:
         """Name a filled buy that is not a verified OCO and not a filled exit.
 
@@ -1746,10 +1789,19 @@ class BinanceSpotAdapter:
         if status == "oco_working" and protection == PROTECTION_EXCHANGE:
             result["protection_state"] = "oco_working"
             return result
-        if status == "closed" and protection == PROTECTION_AUTO_FLATTEN:
+        if status == "closed_dust" or protection == PROTECTION_DUST:
+            result["protection_state"] = "dust_residual"
+            result["manual_action"] = "residual_below_min_is_not_a_complete_exit"
+            result["protection_incident"] = _protection_incident("dust_residual")
+            return result
+        residual = _to_decimal(arm.get("residual_qty"))
+        if status == "closed" and protection == PROTECTION_AUTO_FLATTEN and (
+            residual is None or residual <= Decimal("0.00000001")
+        ):
             result["protection_state"] = "exited"
             return result
         result["protection_state"] = "unprotected"
+        result["protection_incident"] = _protection_incident("unprotected")
         result["manual_action"] = "halt_new_buys_and_manually_close_or_protect_the_fill"
         log.error(
             "binance_spot_unprotected symbol=%s qty=%s status=%s error=%s",
@@ -1967,6 +2019,10 @@ class BinanceSpotAdapter:
                 exchange_error=exchange_error,
             )
         symbol = str(row.get("symbol") or "")
+        if not isinstance(info, dict):
+            loaded, _load_error = self._load_symbol_info(row, gates)
+            if isinstance(loaded, dict):
+                info = loaded
         qty = _positive_decimal(row.get("quantity"))
         client_id = flatten_client_order_id(row.get("decision_log_id"))
         if not is_spot_usdt_symbol(symbol) or qty is None or client_id is None:
@@ -2056,6 +2112,8 @@ class BinanceSpotAdapter:
                 protection=PROTECTION_AUTO_FLATTEN,
                 error_prefix=f"oco_failed_auto_flattened:{oco_error}",
                 exchange_error=exchange_error,
+                mark=mark,
+                info=info if isinstance(info, dict) else None,
             )
         if str(row.get("last_error") or "").startswith("flatten_submit_unknown"):
             return self._oco_failed(
@@ -2114,6 +2172,8 @@ class BinanceSpotAdapter:
             protection=PROTECTION_AUTO_FLATTEN,
             error_prefix=f"oco_failed_auto_flattened:{oco_error}",
             exchange_error=exchange_error,
+            mark=mark,
+            info=info if isinstance(info, dict) else None,
         )
 
     def _buy_with_native_oco(
@@ -2267,9 +2327,7 @@ class BinanceSpotAdapter:
                     oco_error=detail,
                     save=save,
                 )
-                for k in ("status", "protection", "exit_order_id", "exit_reason", "exit_client_order_id", "last_error"):
-                    if row.get(k) is not None:
-                        arm[k] = row[k]
+                self._copy_exit_onto_arm(arm, row)
                 return self._label_fill_protection(
                     _result(
                         ok=False,
@@ -2386,11 +2444,7 @@ class BinanceSpotAdapter:
                 save=save,
                 exchange_error=exch_err,
             )
-            for k in ("status", "protection", "exit_order_id", "exit_reason", "exit_client_order_id", "last_error"):
-                if row.get(k) is not None:
-                    arm[k] = row[k]
-            if row.get("last_error"):
-                oco_fields["last_error"] = row["last_error"]
+            self._copy_exit_onto_arm(arm, row, oco_fields)
             return self._label_fill_protection(
                 _result(
                     ok=False,
@@ -4605,6 +4659,8 @@ class BinanceSpotAdapter:
         error_prefix: str,
         order: dict[str, str] | None = None,
         exchange_error: dict[str, Any] | None = None,
+        mark: object = None,
+        info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Close only a sell that filled the whole remaining qty. A zero or partial fill stays open."""
         order_id = _exit_order_accepted(placed)
@@ -4623,21 +4679,49 @@ class BinanceSpotAdapter:
             )
         held = _to_decimal(row.get("quantity")) or Decimal("0")
         executed = _to_decimal(placed.get("executedQty")) or Decimal("0")
-        orig = _to_decimal(placed.get("origQty") or placed.get("origQuantity"))
         prior_id = str(row.get("exit_order_id") or "")
         accounted = (
             _to_decimal(row.get("exit_filled_qty")) or Decimal("0")
             if prior_id == str(order_id)
             else Decimal("0")
         )
-        if orig is not None:
-            remainder = orig - executed
-        else:
-            delta = executed - accounted
-            if delta < 0:
-                delta = Decimal("0")
-            remainder = held - delta
-        full = executed > 0 and remainder <= Decimal("0.00000001")
+        # The sell's origQty is the size of that order. Completing it does
+        # not close a larger hold. The remainder is held minus executedQty.
+        delta = executed - accounted
+        if delta < 0:
+            delta = Decimal("0")
+        remainder = held - delta
+        full = delta > 0 and remainder <= Decimal("0.00000001")
+        lot_residual = _to_decimal(row.get("residual_qty"))
+        if full and lot_residual is not None and lot_residual > Decimal("0.00000001"):
+            # The sell filled its own quantity. A lot remainder was stored
+            # aside and was not part of that order. That is not a flat close.
+            residual_text = _decimal_text(lot_residual)
+            fields = dust_archive_fields(
+                quantity=residual_text,
+                mark=mark if mark is not None else row.get("entry_price"),
+                stop=row.get("stop_price"),
+                detail="oco_lot_residual",
+            )
+            fields["quantity"] = residual_text
+            fields["exit_order_id"] = order_id
+            fields["exit_client_order_id"] = client_id
+            fields["exit_filled_qty"] = _decimal_text(delta)
+            save(fields)
+            out = self._coverage(
+                row,
+                book="closed_dust",
+                submitted=False,
+                error="dust_untradable",
+                protection=PROTECTION_DUST,
+                reason="dust_abandon",
+                order=order,
+                quantity=residual_text,
+                exchange_error=exchange_error,
+            )
+            out["exchange_order_id"] = order_id
+            out["exit_client_order_id"] = client_id
+            return out
         if full:
             sold = _decimal_text(executed)
             save(
@@ -4669,6 +4753,41 @@ class BinanceSpotAdapter:
             out["exit_client_order_id"] = client_id
             return out
         kept = _decimal_text(held if remainder < 0 else remainder)
+        if (
+            reason != "time_stop_max_hold"
+            and isinstance(info, dict)
+            and remainder > Decimal("0.00000001")
+            and kept is not None
+        ):
+            _sized, size_error = size_exit_quantity(
+                info, str(row.get("symbol") or ""), kept, mark
+            )
+            if dust_detail(size_error):
+                fields = dust_archive_fields(
+                    quantity=kept,
+                    mark=mark,
+                    stop=row.get("stop_price"),
+                    detail=size_error or "exit_qty_below_min",
+                )
+                fields["quantity"] = kept
+                fields["exit_order_id"] = order_id
+                fields["exit_client_order_id"] = client_id
+                fields["exit_filled_qty"] = _decimal_text(delta)
+                save(fields)
+                out = self._coverage(
+                    row,
+                    book="closed_dust",
+                    submitted=False,
+                    error="dust_untradable",
+                    protection=PROTECTION_DUST,
+                    reason="dust_abandon",
+                    order=order,
+                    quantity=kept,
+                    exchange_error=exchange_error,
+                )
+                out["exchange_order_id"] = order_id
+                out["exit_client_order_id"] = client_id
+                return out
         book = "time_stop_unknown" if reason == "time_stop_max_hold" else "oco_failed"
         open_protection = PROTECTION_TIME_STOP if reason == "time_stop_max_hold" else PROTECTION_PENDING
         save(

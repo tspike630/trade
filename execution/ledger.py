@@ -991,14 +991,16 @@ class ExecutionLedger:
 
         A protected open blocks a new BUY of that same symbol. Another symbol
         on the arm is not stacked onto that row. Unsafe rows still block the
-        arm. ``purpose`` omitted returns every arm. Callers that pass a
+        arm. A ``closed_dust`` row is included so a partial-exit remainder
+        can still block; a whole-qty dust abandon does not.
+        ``purpose`` omitted returns every arm. Callers that pass a
         purpose leave the other arm's open position out of this list.
         """
         clause, params = _bnb_purpose_clause(purpose)
         rows = self.conn.execute(
             f"""
             SELECT * FROM binance_spot_positions
-            WHERE status NOT IN ('closed', 'closed_dust', 'oco_filled', 'closed_canceled')
+            WHERE status NOT IN ('closed', 'oco_filled', 'closed_canceled')
             {clause}
             ORDER BY id ASC
             """,

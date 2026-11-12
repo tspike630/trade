@@ -260,7 +260,7 @@ class SizeChainTests(unittest.TestCase):
                 )
             finally:
                 gw.__exit__(None, None, None)
-        self.assertEqual(receipt["exec_result"]["protection_state"], "exited", receipt)
+        self.assertEqual(receipt["exec_result"]["protection_state"], "dust_residual", receipt)
         self.assertTrue(
             any(c[0] == "new_order" and "side=SELL" in c[1] for c in self.client.calls)
         )

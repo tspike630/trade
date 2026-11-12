@@ -31,6 +31,7 @@ import sqlite3
 import sys
 from collections import Counter
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -202,6 +203,7 @@ def build_tca_report(
     oco_working_count = 0
     oco_filled_count = 0
     unprotected_open_count = 0
+    dust_residual_count = 0
 
     exit_counts: Counter[str] = Counter()
     gross_returns_bps: list[float] = []
@@ -224,6 +226,19 @@ def build_tca_report(
         elif status in {"open", "oco_failed", "oco_unknown", "qty_unconfirmed", "held_naked"}:
             if protection != "exchange_oco":
                 unprotected_open_count += 1
+        elif status == "closed_dust":
+            residual = pos.get("residual_qty")
+            sold = pos.get("exit_filled_qty")
+            try:
+                if (
+                    residual not in (None, "")
+                    and sold not in (None, "")
+                    and Decimal(str(residual)) > 0
+                    and Decimal(str(sold)) > 0
+                ):
+                    dust_residual_count += 1
+            except Exception:
+                dust_residual_count += 1
 
         if protection == "auto_flatten" or str(pos.get("exit_reason") or "") == "oco_failed_auto_flatten":
             auto_flattened_count += 1
@@ -343,7 +358,8 @@ def build_tca_report(
             "oco_reanchored_saves": reanchored_count,
             "auto_flatten_rescues": auto_flattened_count,
             "unprotected_open_count": unprotected_open_count,
-            "zero_naked_exposure": unprotected_open_count == 0,
+            "dust_residual_count": dust_residual_count,
+            "zero_naked_exposure": unprotected_open_count == 0 and dust_residual_count == 0,
         },
         "realized_performance": {
             "closed_with_price": len(net_returns_bps),

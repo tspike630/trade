@@ -304,9 +304,10 @@ class ConsumerGateTests(unittest.TestCase):
             naked = failed.execute(_buy(147842))
         self.assertFalse(naked["consumer_allowed"])
         self.assertEqual(naked["executed"], 0)
-        self.assertEqual(naked["protection_state"], "exited", naked)
-        self.assertEqual(naked["arm_position"]["status"], "closed")
-        self.assertTrue(str(naked["error"]).startswith("oco_failed_auto_flattened:"))
+        self.assertEqual(naked["protection_state"], "dust_residual", naked)
+        self.assertEqual(naked["arm_position"]["status"], "closed_dust")
+        self.assertEqual(naked["arm_position"]["protection"], "dust_abandon")
+        self.assertEqual(naked["error"], "dust_untradable")
 
     def test_fill_average_is_the_ledger_entry_and_signal_stays_on_the_plan(self) -> None:
         """Signal 48.08, exchange average 48.02. The new row stores 48.02.

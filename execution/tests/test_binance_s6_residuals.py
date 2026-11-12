@@ -432,10 +432,10 @@ class ResidualS6Tests(unittest.TestCase):
                 row = gw.ledger.binance_spot_position_by_decision(11)
         self.assertEqual(opened["executed"], 0)
         assert row is not None
-        self.assertEqual(row["status"], "closed")
-        self.assertEqual(row["protection"], "auto_flatten")
+        self.assertEqual(row["status"], "closed_dust")
+        self.assertEqual(row["protection"], "dust_abandon")
         self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
-        self.assertEqual(opened["exec_result"]["protection_state"], "exited")
+        self.assertEqual(opened["exec_result"]["protection_state"], "dust_residual")
 
     def test_exchange_fill_and_expiry_are_reconciled(self) -> None:
         env = _env(self.root, enabled="1")
@@ -545,8 +545,8 @@ class ResidualS6Tests(unittest.TestCase):
                 )
                 woke_row = gw.ledger.binance_spot_position_by_decision(11)
         assert woke_row is not None
-        self.assertEqual(woke_row["status"], "closed", woke)
-        self.assertEqual(woke_row["protection"], "auto_flatten")
+        self.assertEqual(woke_row["status"], "closed_dust", woke)
+        self.assertEqual(woke_row["protection"], "dust_abandon")
         self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
 
     def test_entry_floor_fee_and_dust_archive(self) -> None:

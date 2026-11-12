@@ -452,7 +452,24 @@ def row_quote_usdt(row: object) -> Decimal | None:
     return Decimal(qty) * Decimal(price)
 
 
+def partial_dust_residual(row: dict[str, Any]) -> bool:
+    """A sell left a below-min remainder. That row is not a flat close.
+
+    A dust archive with no exit fill is the older whole-qty abandon and
+    stays terminal. This one still blocks the same arm.
+    """
+    if str(row.get("status") or "") != "closed_dust":
+        return False
+    residual = _decimal_text(row.get("residual_qty"))
+    sold = _decimal_text(row.get("exit_filled_qty"))
+    if residual is None or sold is None:
+        return False
+    return Decimal(residual) > 0 and Decimal(sold) > 0
+
+
 def _nonterminal_spot_row(row: dict[str, Any]) -> bool:
+    if partial_dust_residual(row):
+        return True
     status = str(row.get("status") or "")
     if not status or status == "flat" or status in _TERMINAL_POSITION:
         return False
@@ -684,6 +701,8 @@ def buy_exposure_block(
         if not isinstance(row, dict) or not _row_blocks_arm(row, arm):
             continue
         status = str(row.get("status") or "")
+        if partial_dust_residual(row):
+            return "unprotected_position_blocks_buy"
         if not status or status in _TERMINAL_POSITION:
             continue
         if status == "qty_unconfirmed":

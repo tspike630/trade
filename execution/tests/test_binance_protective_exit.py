@@ -469,11 +469,11 @@ class ProtectiveExitTests(unittest.TestCase):
                     {"BNBUSDT": "98"},
                 )
                 row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertEqual(exits[0]["position_status"], "closed", exits[0])
-        self.assertEqual(row["protection"], "auto_flatten")
+        self.assertEqual(exits[0]["position_status"], "closed_dust", exits[0])
+        self.assertEqual(row["protection"], "dust_abandon")
         self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
         assert row is not None
-        self.assertEqual(row["status"], "closed")
+        self.assertEqual(row["status"], "closed_dust")
         self.assertIn("orderId=99", next(call[1] for call in self.client.calls if call[0] == "get_order"))
         self.assertEqual(_sell_forms(self.client)[0]["side"], ["SELL"])
 
