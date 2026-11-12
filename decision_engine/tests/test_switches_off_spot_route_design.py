@@ -18,14 +18,16 @@ Sources, all in decision_engine/core/regime_strategy_router.py:
   only when Kelly is enabled. Lines 720-724 expand take-profit only when
   Kelly is on or EXPAND_REGIME_OCO_TP is truthy.
 
-AGENTS.md still summarizes state 3 as an unconditional obi and volume_z
-reject. That sentence is coarser than the router comments and these tests.
-It is not a second parameter set.
+杨于 2026-11-12 13:08 HKT 裁定保留这套当前实现，并覆盖 AGENTS.md
+原先第 12、14 行的无条件写法。缺 `obi` 或缺 `volume_z` 不因该项拒绝。
+巨量但 `whale_retail_divergence` 缺失仍放行。熊向门槛以源码为准：
+`0.45 < whale_div <= 0.72`，浅跌是 `boll_z > -2.25`。
 """
 
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import tempfile
 import unittest
@@ -45,8 +47,10 @@ from decision_engine.core.regime_strategy_router import (
     REGIME_3_CROSS_ASSET_BULL_PULLBACK,
     REGIME_5_CRISIS_LIQUIDATION_HALT,
     apply_five_state_regime_router,
+    evaluate_five_state_regime,
 )
 from execution.executors.binance_perp_short import BinancePerpShortAdapter
+from execution.executors.binance_spot_protect import resolve_entry_size
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SWITCHES = (
@@ -132,6 +136,87 @@ class SwitchesOffSpotRouteDesignTests(unittest.TestCase):
 
         shallow = _route({"whale_retail_divergence": 0.60, "boll_z": -1.0})
         self.assertEqual(shallow, [])
+
+    def test_yang_2026_11_12_1308_hkt_boundaries_with_switches_off(self) -> None:
+        for key in (
+            "ENABLE_PERP_SHORT_ENGINE",
+            "BINANCE_PERP_SHORT_LIVE_ENABLED",
+            OPTIMAL_KELLY_ENV,
+            EXPAND_OCO_TP_ENV,
+        ):
+            self.assertNotIn(key, os.environ)
+        bull = {"xs_breadth_1h": 0.75, "nvda_1h_ret_pct": 1.60, "xs_rank_pct_1h": 0.85}
+        above_obi = math.nextafter(-0.25, 0.0)
+        above_taker = math.nextafter(0.45, 1.0)
+        below_z = math.nextafter(3.8, 0.0)
+        above_whale = math.nextafter(0.65, 1.0)
+        thin_cases = (
+            ({"obi_top5": -0.25}, False),
+            ({"obi_top5": -0.25, "taker_buy_ratio": 0.45}, False),
+            ({"obi_top5": -0.25, "taker_buy_ratio": above_taker}, True),
+            ({"obi_top5": above_obi, "taker_buy_ratio": 0.45}, True),
+            ({"taker_buy_ratio": 0.20}, True),
+        )
+        for extra, allow in thin_cases:
+            decision = evaluate_five_state_regime({**bull, **extra})
+            self.assertEqual(decision.allow_buy, allow, extra)
+        volume_cases = (
+            ({"volume_z": 3.8}, True),
+            ({"volume_z": 4.2}, True),
+            ({"volume_z": 3.8, "whale_retail_divergence": 0.65}, False),
+            ({"volume_z": 4.2, "whale_retail_divergence": 0.65}, False),
+            ({"volume_z": 3.8, "whale_retail_divergence": above_whale}, True),
+            ({"volume_z": below_z, "whale_retail_divergence": 0.40}, True),
+            ({"whale_retail_divergence": 0.40}, True),
+        )
+        for extra, allow in volume_cases:
+            decision = evaluate_five_state_regime({**bull, **extra})
+            self.assertEqual(decision.allow_buy, allow, extra)
+
+        just_under_bull = math.nextafter(1.35, 0.0)
+        just_over_bear_low = math.nextafter(0.45, 1.0)
+        just_over_bear_high = math.nextafter(0.72, 1.0)
+        just_shallower = math.nextafter(-2.25, 0.0)
+        bull_row = _route({"whale_retail_divergence": 1.35})
+        self.assertEqual(bull_row[0]["regime_playbook"], "tech_boll_fade_whale_bull_skew")
+        self.assertAlmostEqual(bull_row[0]["size_pct"], 0.054, places=6)
+        self.assertAlmostEqual(bull_row[0]["regime_size_multiplier"], 1.08, places=6)
+        capped = _route({"whale_retail_divergence": 1.35, "funding_z": 0.80})
+        self.assertEqual(capped[0]["regime_playbook"], "tech_boll_fade_whale_bull_skew")
+        hotter = _route({"whale_retail_divergence": 1.35, "funding_z": math.nextafter(0.80, 1.0)})
+        self.assertEqual(hotter[0]["regime_playbook"], "tech_boll_fade_standard")
+        self.assertAlmostEqual(hotter[0]["size_pct"], 0.05, places=6)
+        plain = _route({"whale_retail_divergence": just_under_bull})
+        self.assertEqual(plain[0]["regime_playbook"], "tech_boll_fade_standard")
+
+        at_low = _route({"whale_retail_divergence": 0.45, "boll_z": -1.0})
+        self.assertEqual(at_low[0]["regime_playbook"], "tech_boll_fade_standard")
+        self.assertEqual(_route({"whale_retail_divergence": just_over_bear_low, "boll_z": just_shallower}), [])
+        self.assertEqual(_route({"whale_retail_divergence": 0.72, "boll_z": -1.0}), [])
+        self.assertEqual(
+            _route({"whale_retail_divergence": just_over_bear_high, "boll_z": -1.0})[0]["regime_playbook"],
+            "tech_boll_fade_standard",
+        )
+        on_line = _route({"whale_retail_divergence": 0.60, "boll_z": -2.25})
+        self.assertEqual(on_line[0]["regime_playbook"], "tech_boll_fade_whale_bear_skew")
+        self.assertAlmostEqual(on_line[0]["size_pct"], 0.0425, places=6)
+        self.assertAlmostEqual(on_line[0]["regime_size_multiplier"], 0.85, places=6)
+        missing_boll = _route({"whale_retail_divergence": 0.60})
+        self.assertEqual(missing_boll[0]["regime_playbook"], "tech_boll_fade_whale_bear_skew")
+        self.assertAlmostEqual(missing_boll[0]["size_pct"], 0.0425, places=6)
+        deep = _route({"whale_retail_divergence": 0.60, "boll_z": -2.45})
+        self.assertAlmostEqual(deep[0]["size_pct"], 0.0425, places=6)
+
+        kept = _route(_bull(volume_z=4.2), take_profit=103.0)
+        self.assertAlmostEqual(kept[0]["size_pct"], 0.0575, places=6)
+        self.assertEqual(kept[0]["take_profit_price"], 103.0)
+        self.assertNotIn("regime_tp_expanded", kept[0])
+        _extras, reason, _plan = resolve_entry_size(
+            {"action": "buy", "size_pct": 0.05},
+            {},
+            environ={},
+        )
+        self.assertEqual(reason, "missing_book_usdt")
 
     def test_each_switch_changes_only_its_own_boundary(self) -> None:
         os.environ[OPTIMAL_KELLY_ENV] = "1"
