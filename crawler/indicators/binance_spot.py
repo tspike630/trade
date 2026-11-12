@@ -654,11 +654,24 @@ def upsert_klines(
 
 
 def upsert_indicator(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """Insert or update one tech_boll row.
+
+    Only ``_INDICATOR_COLS`` are written. ``ensure_schema`` also adds nullable
+    columns this job does not compute (funding and perp fields). ``INSERT OR
+    REPLACE`` would delete the row and null those columns on every kline
+    refresh, so the conflict update lists the owned columns only.
+    """
     ensure_schema(conn)
     placeholders = ", ".join("?" for _ in _INDICATOR_COLS)
     names = ", ".join(_INDICATOR_COLS)
+    updates = ", ".join(
+        f"{col}=excluded.{col}" for col in _INDICATOR_COLS if col != "symbol"
+    )
     conn.execute(
-        f"INSERT OR REPLACE INTO binance_indicators ({names}) VALUES ({placeholders})",
+        f"""
+        INSERT INTO binance_indicators ({names}) VALUES ({placeholders})
+        ON CONFLICT(symbol) DO UPDATE SET {updates}
+        """,
         tuple(row.get(col) for col in _INDICATOR_COLS),
     )
 
