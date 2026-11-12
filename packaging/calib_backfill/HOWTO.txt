@@ -1,0 +1,44 @@
+Self-contained public calibration package
+Does not start a trader, does not edit environment variables, and does not
+replace the live engine. It does not import decision_engine.core.news_shock_gate.
+
+Create an isolated environment from this directory:
+
+  python3 -m venv .venv
+  .venv/bin/pip install -r packaging/calib_backfill/requirements.txt
+  .venv/bin/python -m unittest decision_engine.tests.test_public_backfill_calibration
+
+Offline fixture, no network:
+
+  PYTHONPATH=. python3 packaging/calib_backfill/selfcheck_offline.py
+
+Full collection stays on the machine that can reach the exchanges. This cloud
+run is not that collection.
+
+  PYTHONPATH=. .venv/bin/python scripts/run_public_backfill.py \
+    --out /var/calib-public --days 45 --ccxt-days 30
+  PYTHONPATH=. .venv/bin/python scripts/run_news_oos_calibration.py \
+    --news-db /path/news_events.db \
+    --vision-db /var/calib-public/vision.db \
+    --out /var/calib-public/news_oos.json
+
+A second run skips a Vision url whose manifest sha256 matches the local cache,
+and skips a CCXT prefix that is already stored.
+
+News clock is fetched_at. A row is late when fetched_at - published_at is more
+than 90 minutes. The output also counts the same rows at 60, 180, and 360
+minutes. 1906 / 1325 / 581 is a parent pre-count under the 90-minute rule and
+is not the result. 1859 / 164 is an older inventory and is not this count.
+
+The live OnchainCalibration is not constructed. Current archives cannot
+identify heat_evolution, obi_top5, or whale_retail_divergence. Book depth is
+not top-5. Top-trader ratio is not the whale/retail divergence. Only
+taker_buy_quote_volume / quote_volume matches the live taker_buy_ratio
+definition, and even a significant result stays partial: the live judgment
+still requires the missing series.
+
+Coinbase USD is not pooled with USDT. Without a second USD venue or a
+timestamped USDTUSD series it stays not_calibrated. OKX/Bybit wick and
+breakout labels use a frozen 30 bp wick, a quiet peer, a 12-bar breakout,
+three bars forward, and 10 bp round-trip cost. Fewer than 30 test clusters
+returns insufficient.

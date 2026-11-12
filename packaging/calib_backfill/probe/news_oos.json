@@ -1,0 +1,68 @@
+{
+  "schema_version": "news_oos_v1",
+  "status": "news_db_absent",
+  "unlock": false,
+  "production_attested": false,
+  "synthetic": false,
+  "x_watch_history": "closed",
+  "x_watch_online_accumulation": "off",
+  "hardcoded_row_counts": false,
+  "clock": "fetched_at",
+  "late_archive_minutes": 90,
+  "horizon_min": 60,
+  "embargo_min": 60,
+  "cost_bps_round_trip": 10.0,
+  "predictive_rows": 0,
+  "test_clusters": 0,
+  "holm_p": [],
+  "series": [
+    "taker_buy_quote_share",
+    "count_toptrader_long_short_ratio",
+    "book_depth_imbalance_pct_1"
+  ],
+  "gate_series": [
+    "obi_top5",
+    "taker_buy_ratio",
+    "whale_retail_divergence",
+    "heat_evolution"
+  ],
+  "heat_available": false,
+  "archive_assumption": "Exchange create_time is treated as the print time a live API could have shown. The vision file's later download time is not a feature. Historical publication lag of the archive itself is unknown.",
+  "lag_sensitivity_minutes": [
+    0,
+    5,
+    15
+  ],
+  "news_db_sha256": null,
+  "split_times": {
+    "train_end": null,
+    "validation_end": null,
+    "test_end": null
+  },
+  "hypotheses": [],
+  "calibration": null,
+  "false_positive_rate": null,
+  "classification_accuracy": null,
+  "export_spec": {
+    "schema": "news_export_v1",
+    "clock": "fetched_at",
+    "columns": [
+      "id",
+      "source",
+      "source_tier",
+      "published_at",
+      "fetched_at",
+      "onchain_status",
+      "url_sha256",
+      "title_sha256",
+      "title_bases"
+    ],
+    "notes": [
+      "Do not replace fetched_at with published_at.",
+      "title_bases is the frozen CORE_BASES mention list.",
+      "A row with no mention is a BTC benchmark, and that assumption is flagged.",
+      "1859 and 164 are not constants in this study."
+    ]
+  },
+  "rows_in_input": null
+}
