@@ -184,6 +184,9 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
             result.get("oco_fields") if isinstance(result.get("oco_fields"), dict) else None
         ),
     }
+    preflight = result.get("oco_preflight")
+    if isinstance(preflight, dict):
+        published["oco_preflight"] = dict(preflight)
     exchange_error = public_exchange_error(result.get("exchange_error"))
     if exchange_error is not None:
         published["exchange_error"] = exchange_error

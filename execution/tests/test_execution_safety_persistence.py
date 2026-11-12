@@ -889,7 +889,8 @@ class PersistenceSafetyTests(unittest.TestCase):
         )
         self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["LIMIT"])
         self.assertEqual(parse_qs(client.orders[-1]).get("timeInForce"), ["GTC"])
-        self.assertNotEqual(explicit["error"], "maker_entry_resting")
+        self.assertEqual(explicit["error"], "maker_entry_resting")
+        self.assertEqual(client.ocos, [])
 
         none = adapter.execute(
             self._buy({"recommended_order_type": "NONE", "quote_order_qty": "20"}, 72, limit=False)

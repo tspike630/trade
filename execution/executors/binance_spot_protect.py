@@ -399,6 +399,105 @@ def protective_band_error(
     return error
 
 
+def buy_entry_oco_preflight(
+    *,
+    order_type: str,
+    limit_price: object,
+    stop_price: object,
+    take_profit_price: object,
+    mark: object,
+    mark_source: object,
+    filters: list[Any],
+    resting_ceiling: object = None,
+    ceiling_source: object = None,
+) -> tuple[dict[str, Any], str | None]:
+    """Choose the pre-submit reference for a long entry. Prices are not rewritten.
+
+    A missing or non-positive mark is ``mark_unavailable``. ``MARKET`` must
+    keep the fresh mark strictly inside the tick-aligned stop and take-profit.
+    ``LIMIT`` is a resting buy only when that same fresh mark is strictly
+    above the tick-aligned limit. ``LIMIT_MAKER`` is resting only when a
+    fresh ask ceiling is strictly above the tick-aligned limit. The order
+    type string alone is not that proof. The signal's ``price_usd`` is not a
+    mark and is not read here.
+    """
+    kind = str(order_type or "").strip().upper()
+    source = None if mark_source in (None, "") else str(mark_source)
+    diag: dict[str, Any] = {
+        "order_type": kind or None,
+        "reference": None,
+        "reference_price": None,
+        "mark": None,
+        "mark_source": source,
+        "ceiling_price": None,
+        "ceiling_source": None,
+        "aligned_stop": None,
+        "aligned_take_profit": None,
+        "aligned_limit": None,
+        "planned_limit": None,
+        "mark_inside_band": None,
+    }
+    mark_n = _to_decimal(mark)
+    if mark_n is None or mark_n <= 0:
+        return diag, "mark_unavailable"
+    diag["mark"] = _decimal_text(mark_n)
+    aligned, align_error = aligned_oco_prices(
+        stop_price=str(stop_price or ""),
+        take_profit_price=str(take_profit_price or ""),
+        filters=filters,
+        mark=None,
+    )
+    if align_error or aligned is None:
+        return diag, align_error or "oco_prices_crossed"
+    diag["aligned_stop"] = _decimal_text(aligned["below_stop"])
+    diag["aligned_take_profit"] = _decimal_text(aligned["above"])
+    diag["mark_inside_band"] = aligned["below_stop"] < mark_n < aligned["above"]
+    if kind == "MARKET":
+        diag["reference"] = "live_mark"
+        diag["reference_price"] = diag["mark"]
+        diag["ceiling_price"] = diag["mark"]
+        diag["ceiling_source"] = "live_mark"
+        if diag["mark_inside_band"] is not True:
+            return diag, "oco_price_restriction"
+        return diag, None
+    if kind == "LIMIT":
+        ceiling_n = mark_n
+        ceiling_label = "live_mark"
+    elif kind == "LIMIT_MAKER":
+        ceiling_n = _to_decimal(resting_ceiling)
+        if ceiling_n is None or ceiling_n <= 0:
+            ceiling_n = mark_n
+            ceiling_label = "live_mark"
+        else:
+            ceiling_label = (
+                str(ceiling_source).strip() if ceiling_source not in (None, "") else "best_ask"
+            )
+    else:
+        return diag, "invalid_order_type"
+    limit_n = _to_decimal(limit_price)
+    if limit_n is None or limit_n <= 0:
+        return diag, "missing_limit_price"
+    diag["planned_limit"] = _decimal_text(limit_n)
+    tick_n = _to_decimal(_tick_size(filters))
+    if tick_n is None or tick_n <= 0:
+        return diag, "oco_missing_tick"
+    aligned_limit = _align(limit_n, tick_n, ROUND_DOWN)
+    if aligned_limit <= 0:
+        return diag, "invalid_limit_price"
+    diag["aligned_limit"] = _decimal_text(aligned_limit)
+    diag["ceiling_price"] = _decimal_text(ceiling_n)
+    diag["ceiling_source"] = ceiling_label
+    diag["reference"] = "planned_entry"
+    diag["reference_price"] = diag["aligned_limit"]
+    if aligned_limit >= ceiling_n:
+        diag["reference"] = "live_mark"
+        diag["reference_price"] = diag["mark"]
+        return diag, "limit_would_cross"
+    if not (aligned["below_stop"] < aligned_limit < aligned["above"]):
+        return diag, "oco_price_restriction"
+    return diag, None
+
+
 def reanchor_oco_prices_to_fill(
     *,
     signal_entry_price: object,

@@ -1339,6 +1339,7 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     sor_maker_fallback_spec,
     trailing_ratchet_enabled,
     protective_band_error,
+    buy_entry_oco_preflight,
     is_request_timeout,
     ENTRY_MIN_NOTIONAL_USDT,
     reanchor_oco_on_fill_enabled,
@@ -1464,6 +1465,9 @@ class BinanceSpotAdapter:
         self._entry_mark: str | None = None
         self._orderbook_metrics: dict[str, Any] | None = None
         self._mark_telemetry: dict[str, Any] | None = None
+        self._oco_preflight: dict[str, Any] | None = None
+        self._resting_ceiling: str | None = None
+        self._resting_ceiling_source: str | None = None
 
     def _active_ws_cache(self) -> Any | None:
         if self.ws_cache is not None:
@@ -1697,6 +1701,133 @@ class BinanceSpotAdapter:
             return None, "mark_unavailable"
         self._mark_telemetry = {"mark_source": "rest_fallback"}
         return str(mark).strip(), None
+
+    def _resting_limit_preflight(
+        self,
+        *,
+        sig: dict[str, Any],
+        extras: dict[str, Any],
+        plan: dict[str, Any],
+        pairs: list[tuple[str, str]],
+        info: dict[str, Any],
+        symbol: str,
+        gates: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], list[tuple[str, str]], dict[str, Any] | None]:
+        """Bracket a resting buy by its planned entry. A refusal is already finished."""
+        order_type = _parse_order_type(
+            extras.get("order_type", extras.get("binance_order_type"))
+        )
+        raw_limit, price_error = _chosen_limit_raw(extras)
+        tel = getattr(self, "_mark_telemetry", None)
+        mark_source = tel.get("mark_source") if isinstance(tel, dict) else None
+        filters = _symbol_filters(info, symbol) or []
+        if price_error:
+            diag = {
+                "order_type": order_type,
+                "reference": None,
+                "reference_price": None,
+                "mark": self._entry_mark,
+                "mark_source": mark_source,
+                "aligned_stop": None,
+                "aligned_take_profit": None,
+                "aligned_limit": None,
+                "planned_limit": None,
+                "mark_inside_band": None,
+            }
+            self._oco_preflight = diag
+            refused = self._finish(
+                _result(
+                    ok=False,
+                    dry_run=False,
+                    executed=0,
+                    submitted=False,
+                    error=price_error,
+                    symbol=symbol,
+                    order=None,
+                    exchange_order_id=None,
+                    gates=gates,
+                    exit_plan=plan,
+                    consumer_allowed=False,
+                )
+            )
+            return extras, plan, pairs, refused
+        diag, pre_err = buy_entry_oco_preflight(
+            order_type=order_type or "",
+            limit_price=raw_limit,
+            stop_price=plan.get("stop_price"),
+            take_profit_price=plan.get("take_profit_price"),
+            mark=self._entry_mark,
+            mark_source=mark_source,
+            filters=filters,
+            resting_ceiling=self._resting_ceiling if order_type == "LIMIT_MAKER" else None,
+            ceiling_source=self._resting_ceiling_source if order_type == "LIMIT_MAKER" else None,
+        )
+        self._oco_preflight = diag
+        if pre_err:
+            refused = self._finish(
+                _result(
+                    ok=False,
+                    dry_run=False,
+                    executed=0,
+                    submitted=False,
+                    error=pre_err,
+                    symbol=symbol,
+                    order=None,
+                    exchange_order_id=None,
+                    gates=gates,
+                    exit_plan=plan,
+                    consumer_allowed=False,
+                )
+            )
+            return extras, plan, pairs, refused
+        aligned = diag.get("aligned_limit")
+        current = dict(pairs).get("price")
+        aligned_n = _to_decimal(aligned)
+        if aligned_n is not None and _to_decimal(current) != aligned_n:
+            stamped = dict(extras)
+            if stamped.get("price") not in (None, ""):
+                stamped["price"] = aligned
+            if stamped.get("limit_price") not in (None, "") or stamped.get("price") in (None, ""):
+                stamped["limit_price"] = aligned
+            floor_error = entry_notional_floor_error(stamped)
+            if floor_error:
+                refused = self._finish(
+                    _result(
+                        ok=False,
+                        dry_run=False,
+                        executed=0,
+                        submitted=False,
+                        error=floor_error,
+                        symbol=symbol,
+                        order=None,
+                        exchange_order_id=None,
+                        gates=gates,
+                        exit_plan=plan,
+                        consumer_allowed=False,
+                    )
+                )
+                return extras, plan, pairs, refused
+            rebuilt, qty_error = self._preview_pairs(sig, stamped, symbol)
+            if qty_error or rebuilt is None:
+                refused = self._finish(
+                    _result(
+                        ok=False,
+                        dry_run=False,
+                        executed=0,
+                        submitted=False,
+                        error=qty_error or "missing_order_qty",
+                        symbol=symbol,
+                        order=None,
+                        exchange_order_id=None,
+                        gates=gates,
+                        exit_plan=plan,
+                        consumer_allowed=False,
+                    )
+                )
+                return extras, plan, pairs, refused
+            extras = stamped
+            pairs = rebuilt
+        return extras, plan, pairs, None
 
     def _repost_band(self, row: dict[str, Any], mark: object) -> tuple[bool, str | None]:
         """True only when the original stop and take-profit still bracket ``mark``."""
@@ -2009,26 +2140,58 @@ class BinanceSpotAdapter:
         def save(fields: dict[str, Any]) -> None:
             row.update(fields)
 
-        band_error: str | None = None
-        for candidate in (getattr(self, "_entry_mark", None), fill_price):
-            if not filters or _to_decimal(candidate) is None:
-                continue
-            band_error = protective_band_error(
-                stop_price=str(row.get("stop_price") or ""),
-                take_profit_price=str(row.get("take_profit_price") or ""),
-                mark=candidate,
-                filters=filters,
-            )
-            if band_error:
-                break
+        pre = getattr(self, "_oco_preflight", None)
+        strict_fill = (
+            isinstance(pre, dict)
+            and pre.get("reference") == "planned_entry"
+            and pre.get("mark_inside_band") is False
+        )
+        protect_mark = getattr(self, "_entry_mark", None)
+        anchors: tuple[object, ...] = (protect_mark, fill_price)
+        anchor_block: str | None = None
+        if strict_fill and isinstance(pre, dict):
+            # The pre-submit mark was allowed to sit outside the band. The
+            # fill is protected against the fill average and a fresh mark.
+            client_now = self.client if self.client is not None else self._trade_client()
+            if client_now is None:
+                fresh, fresh_err = None, "mark_unavailable"
+            else:
+                fresh, fresh_err = self._read_entry_mark(client_now, symbol)
+            noted = dict(pre)
+            noted["fill_mark"] = fresh
+            noted["fill_average"] = fill_price
+            if fresh_err:
+                noted["fill_mark_error"] = fresh_err
+            self._oco_preflight = noted
+            if fresh_err or _to_decimal(fresh) is None:
+                anchor_block = fresh_err or "mark_unavailable"
+            elif _to_decimal(fill_price) is None:
+                anchor_block = "fill_price_unavailable"
+            else:
+                anchors = (fresh, fill_price)
+                protect_mark = fresh
 
-        if band_error and self._reanchor_enabled() and filters:
+        band_error: str | None = anchor_block
+        if band_error is None:
+            for candidate in anchors:
+                if not filters or _to_decimal(candidate) is None:
+                    continue
+                band_error = protective_band_error(
+                    stop_price=str(row.get("stop_price") or ""),
+                    take_profit_price=str(row.get("take_profit_price") or ""),
+                    mark=candidate,
+                    filters=filters,
+                )
+                if band_error:
+                    break
+
+        if band_error and anchor_block is None and self._reanchor_enabled() and filters:
             reanchored, reanchor_err = reanchor_oco_prices_to_fill(
                 signal_entry_price=signal_entry,
                 stop_price=str(plan.get("stop_price") or ""),
                 take_profit_price=str(plan.get("take_profit_price") or ""),
                 fill_price=fill_price,
-                mark=getattr(self, "_entry_mark", None),
+                mark=protect_mark,
                 filters=filters,
             )
             if reanchored is not None and reanchor_err is None:
@@ -2047,7 +2210,7 @@ class BinanceSpotAdapter:
                 flat = self._auto_flatten_naked_position(
                     row,
                     info=info_obj,
-                    mark=fill_price or getattr(self, "_entry_mark", None),
+                    mark=fill_price or protect_mark,
                     oco_error=detail,
                     save=save,
                 )
@@ -2082,7 +2245,10 @@ class BinanceSpotAdapter:
                 **common,
             )
 
-        oco_mark = fill_price or getattr(self, "_entry_mark", None) or plan.get("entry_price")
+        if strict_fill:
+            oco_mark = protect_mark or fill_price
+        else:
+            oco_mark = fill_price or protect_mark or plan.get("entry_price")
         outcome = self._try_place_oco(row, oco_mark, save)
         oco_fields = {
             key: row.get(key)
@@ -2281,6 +2447,9 @@ class BinanceSpotAdapter:
         self._entry_mark = None
         self._orderbook_metrics = None
         self._mark_telemetry = None
+        self._oco_preflight = None
+        self._resting_ceiling = None
+        self._resting_ceiling_source = None
         gates = self._gates()
         purpose = str(sig.get("purpose") or "").strip()
         if not is_live_bnb_spot_purpose(purpose):
@@ -2710,14 +2879,33 @@ class BinanceSpotAdapter:
 
         if side_now == "BUY" and isinstance(plan, dict):
             mark, mark_error = self._read_entry_mark(client, symbol)
-            if mark_error:
+            order_type_now = _parse_order_type(
+                extras.get("order_type", extras.get("binance_order_type"))
+            )
+            tel = getattr(self, "_mark_telemetry", None)
+            mark_source = tel.get("mark_source") if isinstance(tel, dict) else None
+            if mark_error or mark is None:
+                self._oco_preflight = {
+                    "order_type": order_type_now,
+                    "reference": None,
+                    "reference_price": None,
+                    "mark": None,
+                    "mark_source": mark_source,
+                    "ceiling_price": None,
+                    "ceiling_source": None,
+                    "aligned_stop": None,
+                    "aligned_take_profit": None,
+                    "aligned_limit": None,
+                    "planned_limit": None,
+                    "mark_inside_band": None,
+                }
                 return self._finish(
                     _result(
                         ok=False,
                         dry_run=False,
                         executed=0,
                         submitted=False,
-                        error=mark_error,
+                        error=mark_error or "mark_unavailable",
                         symbol=symbol,
                         order=None,
                         exchange_order_id=None,
@@ -2726,23 +2914,29 @@ class BinanceSpotAdapter:
                         consumer_allowed=False,
                     )
                 )
-            if mark is not None:
-                self._entry_mark = mark
+            self._entry_mark = mark
+            # MARKET keeps the live-mark band. A resting limit is checked
+            # after pegging, against its own planned entry.
+            if order_type_now == "MARKET":
                 filters = _symbol_filters(info, symbol) or []
-                band_error = protective_band_error(
-                    stop_price=str(plan.get("stop_price") or ""),
-                    take_profit_price=str(plan.get("take_profit_price") or ""),
+                diag, pre_err = buy_entry_oco_preflight(
+                    order_type="MARKET",
+                    limit_price=None,
+                    stop_price=plan.get("stop_price"),
+                    take_profit_price=plan.get("take_profit_price"),
                     mark=mark,
+                    mark_source=mark_source,
                     filters=filters,
                 )
-                if band_error:
+                self._oco_preflight = diag
+                if pre_err:
                     return self._finish(
                         _result(
                             ok=False,
                             dry_run=False,
                             executed=0,
                             submitted=False,
-                            error=band_error,
+                            error=pre_err,
                             symbol=symbol,
                             order=None,
                             exchange_order_id=None,
@@ -2751,9 +2945,6 @@ class BinanceSpotAdapter:
                             consumer_allowed=False,
                         )
                     )
-            order_type_now = _parse_order_type(
-                extras.get("order_type", extras.get("binance_order_type"))
-            )
             if order_type_now == "LIMIT" and (
                 self._post_only_limit_enabled() or extras.get("post_only") is True
             ):
@@ -2779,6 +2970,8 @@ class BinanceSpotAdapter:
                             consumer_allowed=False,
                         )
                     )
+                self._resting_ceiling = best_ask_px
+                self._resting_ceiling_source = "best_ask"
                 raw_lim, _ = _chosen_limit_raw(extras)
                 filters = _symbol_filters(info, symbol) or []
                 pegged_px, was_clamped, peg_err = peg_maker_buy_price(
@@ -2889,6 +3082,8 @@ class BinanceSpotAdapter:
                                     plan = dict(plan)
                                     plan["entry_price"] = sor_spec["price"]
                                     plan["sor_routed"] = "limit_maker_at_best_bid"
+                                    self._resting_ceiling = str(ob_metrics.get("best_ask") or "")
+                                    self._resting_ceiling_source = "best_ask"
                                     ob_metrics["sor_routed"] = "limit_maker_at_best_bid"
                                     ob_metrics["sor_original_block"] = ob_error
                                     ob_metrics["sor_maker_price"] = sor_spec["price"]
@@ -2911,8 +3106,25 @@ class BinanceSpotAdapter:
                                 )
                             )
 
+        if side_now == "BUY" and isinstance(plan, dict):
+            final_type = _parse_order_type(
+                extras.get("order_type", extras.get("binance_order_type"))
+            )
+            if final_type in {"LIMIT", "LIMIT_MAKER"}:
+                extras, plan, pairs, refused = self._resting_limit_preflight(
+                    sig=sig,
+                    extras=extras,
+                    plan=plan,
+                    pairs=pairs,
+                    info=info,
+                    symbol=symbol,
+                    gates=gates,
+                )
+                if refused is not None:
+                    return refused
+
         posted = {key_name: value for key_name, value in pairs}
-        if posted.get("side") == "BUY" and posted.get("type") == "LIMIT_MAKER":
+        if posted.get("side") == "BUY" and posted.get("type") in {"LIMIT", "LIMIT_MAKER"}:
             if not _maker_entry_lifecycle_ready(client):
                 return self._finish(
                     _result(
@@ -2992,7 +3204,7 @@ class BinanceSpotAdapter:
         filled = filled_base_qty(placed)
         sellable = sellable_base_qty(placed, symbol) or filled
         ack_status = str(placed.get("status") or "").upper()
-        if side_now == "BUY" and order_type == "LIMIT_MAKER" and ack_status != "FILLED":
+        if side_now == "BUY" and order_type in {"LIMIT", "LIMIT_MAKER"} and ack_status != "FILLED":
             return self._finish(
                 self._resting_maker_ack(
                     sig,
@@ -3594,6 +3806,75 @@ class BinanceSpotAdapter:
             protection=PROTECTION_PENDING,
         )
 
+    def _fill_left_original_band(
+        self,
+        row: dict[str, Any],
+        mark: object,
+        fill: object,
+    ) -> str | None:
+        """Error when the current mark or the fill average is outside the original band."""
+        if _to_decimal(mark) is None:
+            return "mark_unavailable"
+        info, err = self._load_symbol_info(row, self._gates())
+        if err or not isinstance(info, dict):
+            return err or "oco_missing_lot_filter"
+        filters = _symbol_filters(info, str(row.get("symbol") or ""))
+        if not filters:
+            return "oco_missing_lot_filter"
+        band = protective_band_error(
+            stop_price=str(row.get("stop_price") or ""),
+            take_profit_price=str(row.get("take_profit_price") or ""),
+            mark=mark,
+            filters=filters,
+        )
+        if band:
+            return band
+        if _to_decimal(fill) is None:
+            return None
+        return protective_band_error(
+            stop_price=str(row.get("stop_price") or ""),
+            take_profit_price=str(row.get("take_profit_price") or ""),
+            mark=fill,
+            filters=filters,
+        )
+
+    def _reanchor_open_row(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        *,
+        mark: object,
+        fill_price: object,
+        signal_entry: object,
+    ) -> bool:
+        """Move stop and take-profit to the actual fill and mark. False leaves them unchanged."""
+        info, err = self._load_symbol_info(row, self._gates())
+        if err or not isinstance(info, dict):
+            return False
+        filters = _symbol_filters(info, str(row.get("symbol") or ""))
+        if not filters:
+            return False
+        reanchored, re_err = reanchor_oco_prices_to_fill(
+            signal_entry_price=signal_entry,
+            stop_price=str(row.get("stop_price") or ""),
+            take_profit_price=str(row.get("take_profit_price") or ""),
+            fill_price=fill_price,
+            mark=mark,
+            filters=filters,
+        )
+        if reanchored is None or re_err:
+            return False
+        save(
+            {
+                "stop_price": reanchored["stop_price"],
+                "take_profit_price": reanchored["take_profit_price"],
+            }
+        )
+        row["stop_price"] = reanchored["stop_price"]
+        row["take_profit_price"] = reanchored["take_profit_price"]
+        row["oco_reanchored"] = True
+        return True
+
     def _adopt_terminal_entry(
         self,
         row: dict[str, Any],
@@ -3624,12 +3905,55 @@ class BinanceSpotAdapter:
                     error="maker_fill_unconfirmed",
                     protection="maker_resting",
                 )
+            signal_entry = row.get("entry_limit_price") or row.get("entry_price")
             upd: dict[str, Any] = {"status": "open", "quantity": filled_qty}
             if avg_px:
                 upd["entry_price"] = avg_px
             save(upd)
-            ref_mark = mark if _to_decimal(mark) is not None else (avg_px or row.get("entry_price"))
-            return self.maintain_held_position(row, ref_mark, persist=persist)
+            if _to_decimal(mark) is None:
+                detail = "oco_unprotectable:mark_unavailable"
+                if self._auto_flatten_enabled():
+                    flat = self._auto_flatten_naked_position(
+                        row,
+                        info=None,
+                        mark=avg_px or signal_entry,
+                        oco_error=detail,
+                        save=save,
+                    )
+                    return flat
+                save(
+                    {
+                        "status": "oco_failed",
+                        "protection": PROTECTION_PENDING,
+                        "last_error": detail,
+                    }
+                )
+                return self._coverage(
+                    row,
+                    book="oco_failed",
+                    submitted=False,
+                    error=detail,
+                    protection=PROTECTION_PENDING,
+                )
+            left = self._fill_left_original_band(row, mark, avg_px)
+            if left and self._reanchor_enabled():
+                if self._reanchor_open_row(
+                    row,
+                    save,
+                    mark=mark,
+                    fill_price=avg_px,
+                    signal_entry=signal_entry,
+                ):
+                    left = None
+            if left and self._auto_flatten_enabled() and not self._reanchor_enabled():
+                return self._auto_flatten_naked_position(
+                    row,
+                    info=None,
+                    mark=mark,
+                    oco_error=f"oco_unprotectable:{left}",
+                    save=save,
+                )
+            return self.maintain_held_position(row, mark, persist=persist)
         save(
             {
                 "status": "closed_canceled",
@@ -4432,6 +4756,8 @@ class BinanceSpotAdapter:
         filters = _symbol_filters(info, str(row.get("symbol") or ""))
         if not filters:
             return self._oco_failed(row, save, "oco_missing_lot_filter")
+        if _to_decimal(mark) is None:
+            return self._oco_failed(row, save, "mark_unavailable")
         seq = int(row.get("oco_ratchet_count") or 0) if ratchet_seq is None else int(ratchet_seq)
         spec, spec_error = build_spot_oco(
             symbol=str(row.get("symbol") or ""),
@@ -4811,13 +5137,23 @@ class BinanceSpotAdapter:
         mark_tel = getattr(self, "_mark_telemetry", None)
         if isinstance(mark_tel, dict):
             result["mark_telemetry"] = dict(mark_tel)
+        preflight = getattr(self, "_oco_preflight", None)
+        if isinstance(preflight, dict):
+            result["oco_preflight"] = dict(preflight)
+        logged = result.get("oco_preflight") if isinstance(result.get("oco_preflight"), dict) else {}
         log.info(
-            "binance_spot symbol=%s dry_run=%s ok=%s submitted=%s error=%s",
+            "binance_spot symbol=%s dry_run=%s ok=%s submitted=%s error=%s reference=%s mark=%s mark_source=%s aligned_stop=%s aligned_tp=%s aligned_limit=%s",
             result.get("symbol"),
             result.get("dry_run"),
             result.get("ok"),
             result.get("submitted"),
             result.get("error"),
+            logged.get("reference"),
+            logged.get("mark"),
+            logged.get("mark_source"),
+            logged.get("aligned_stop"),
+            logged.get("aligned_take_profit"),
+            logged.get("aligned_limit"),
         )
         return result
 
