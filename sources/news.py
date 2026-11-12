@@ -26,7 +26,9 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
-from urllib.parse import urlparse, urlunparse
+import html
+import re
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
@@ -119,6 +121,22 @@ SOURCE_CATALOG: list[dict[str, Any]] = [
         "url": "https://www.federalreserve.gov/feeds/speeches.xml",
         "enabled": True,
     },
+    {
+        "id": "tg_binance_announcements",
+        "name": "Binance Announcements (Public Telegram)",
+        "tier": TIER_WHITELIST,
+        "kind": "telegram_web",
+        "url": "https://t.me/s/binance_announcements",
+        "enabled": True,
+    },
+    {
+        "id": "tg_bwenews",
+        "name": "BWEnews Wire (Public Telegram)",
+        "tier": TIER_WHITELIST,
+        "kind": "telegram_web",
+        "url": "https://t.me/s/BWEnews",
+        "enabled": True,
+    },
     # Rumor / lower-confidence — observe only; never promote without on-chain align
     {
         "id": "newsbtc",
@@ -165,18 +183,51 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_TRACKING_PARAMS = frozenset({"fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "spm", "ref_src", "ref_url"})
+_TG_POST_RE = re.compile(r'<div[^>]+data-post="([^"]+)"[^>]*>', re.IGNORECASE)
+_TG_TEXT_RE = re.compile(r'<div[^>]+class="[^"]*\btgme_widget_message_text\b[^"]*"[^>]*>(.*?)</div>', re.IGNORECASE | re.DOTALL)
+_TG_TIME_RE = re.compile(r'<time[^>]+datetime="([^"]+)"', re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
 def normalize_url(url: str) -> str:
-    """Strip fragments / trailing slash noise for idempotent URL dedup."""
+    """Strip fragments, trailing slashes, and UTM/marketing query noise for idempotent URL dedup."""
     if not url:
         return ""
     u = url.strip()
     try:
         p = urlparse(u)
-        # drop fragment; keep query (some feeds use it for article id)
         path = p.path.rstrip("/") or "/"
-        return urlunparse((p.scheme.lower(), p.netloc.lower(), path, "", p.query, ""))
+        kept = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+                if not (k.lower().startswith("utm_") or k.lower() in _TRACKING_PARAMS)]
+        return urlunparse((p.scheme.lower(), p.netloc.lower(), path, "", urlencode(kept, doseq=True), ""))
     except Exception:  # noqa: BLE001
         return u.rstrip("/")
+
+
+def parse_telegram_web_html(content: bytes, *, source_id: str, tier: str) -> list["NewsItem"]:
+    """Parse public Telegram preview HTML (https://t.me/s/<channel>) preserving exact UTC timestamps."""
+    parts = _TG_POST_RE.split(content.decode("utf-8", errors="replace"))
+    if len(parts) < 3:
+        return []
+    out: list[NewsItem] = []
+    for slug, block in reversed(list(zip(parts[1::2], parts[2::2]))[-MAX_ITEMS_PER_FEED:]):
+        slug = slug.strip().strip("/")
+        m_txt = _TG_TEXT_RE.search(block)
+        if not slug or "/" not in slug or m_txt is None:
+            continue
+        plain = re.sub(r"\s+", " ", html.unescape(_HTML_TAG_RE.sub(" ", re.sub(r"<br\s*/?>", " ", m_txt.group(1), flags=re.I)))).strip()
+        if not plain:
+            continue
+        m_time = _TG_TIME_RE.search(block)
+        published = parse_feed_datetime(m_time.group(1)) if m_time else None
+        link = normalize_url(f"https://t.me/{slug}")
+        out.append(NewsItem(
+            source=source_id, source_tier=tier, title=plain[:180], url=link,
+            published_at=published, summary=plain[:2000],
+            raw={"post": slug, "link": link, "published": published},
+        ))
+    return out
 
 
 def parse_feed_datetime(value: str | None) -> str | None:
@@ -415,7 +466,10 @@ def fetch_feed(
         resp = client.get(url)
         if resp.status_code != 200:
             return [], f"http_{resp.status_code}"
-        items = parse_rss_xml(resp.content, source_id=sid, tier=src["tier"])
+        if src.get("kind") == "telegram_web":
+            items = parse_telegram_web_html(resp.content, source_id=sid, tier=src["tier"])
+        else:
+            items = parse_rss_xml(resp.content, source_id=sid, tier=src["tier"])
         if not items:
             return [], "empty_or_unparsed"
         return items, None
@@ -493,11 +547,9 @@ def main(argv: list[str] | None = None) -> int:
             "Does not touch decision/JEV/paper/live."
         )
     )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Single pull of all enabled feeds (required for now)",
-    )
+    parser.add_argument("--once", action="store_true", help="Single pull of all enabled feeds")
+    parser.add_argument("--loop", action="store_true", help="Poll continuously every --interval seconds")
+    parser.add_argument("--interval", type=float, default=60.0, help="Loop interval seconds (default 60, min 5)")
     parser.add_argument(
         "--db",
         default=None,
@@ -531,13 +583,22 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
-    if not args.once:
-        parser.error("specify --once (scaffold has no --loop yet)")
+    if not args.once and not args.loop:
+        parser.error("specify --once or --loop")
 
     source_ids = None
     if args.sources:
         source_ids = [p.strip() for p in args.sources.split(",") if p.strip()]
 
+    if args.loop:
+        iv = max(5.0, float(args.interval))
+        while True:
+            try:
+                st = run_once(db_path=args.db, source_ids=source_ids, timeout_sec=args.timeout)
+                print(f"news --loop written={st['items_written']} seen={st['items_seen']} dup={st['items_dup']} ok={st['sources_ok']} fail={st['sources_fail']} total={st['db_total']}", flush=True)
+            except Exception as exc:
+                log.exception("news loop error: %s", exc)
+            time.sleep(iv)
     stats = run_once(db_path=args.db, source_ids=source_ids, timeout_sec=args.timeout)
     # Acceptance: print write count clearly
     print(
