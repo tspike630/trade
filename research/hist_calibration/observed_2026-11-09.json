@@ -1,0 +1,73 @@
+{
+  "kind": "one_closed_day_observed_on_this_vm",
+  "not_a_calibration": true,
+  "not_the_collection_agent_pull": true,
+  "symbol": "BTCUSDT",
+  "utc_day": "2026-11-09",
+  "files": [
+    {
+      "kind": "metrics",
+      "name": "BTCUSDT-metrics-2026-11-09.zip",
+      "nbytes": 11643,
+      "sha256": "28ffa40d89d8e3114a05b6d9b1b7b43907bb4f68cb2d7c6440b3b62a3f4c5b3d",
+      "csv_error": null,
+      "csv_rows": 289,
+      "header": [
+        "create_time",
+        "symbol",
+        "sum_open_interest",
+        "sum_open_interest_value",
+        "count_toptrader_long_short_ratio",
+        "sum_toptrader_long_short_ratio",
+        "count_long_short_ratio",
+        "sum_taker_long_short_vol_ratio"
+      ],
+      "parsed_rows": 288,
+      "first": {
+        "symbol": "BTCUSDT",
+        "create_time_ms": 1794186300000,
+        "account_long_short": 3.18550969,
+        "position_long_short": 1.990212
+      },
+      "obi_top5": null
+    },
+    {
+      "kind": "bookDepth",
+      "name": "BTCUSDT-bookDepth-2026-11-09.zip",
+      "nbytes": 560598,
+      "sha256": "c1af7258b574d6eb6d10d02ed73f2185829b2b757579918f94485c02df636a5a",
+      "csv_error": null,
+      "csv_rows": 34561,
+      "header": [
+        "timestamp",
+        "percentage",
+        "depth",
+        "notional"
+      ],
+      "series": "book_depth_percentage_band",
+      "parsed_rows": 34560,
+      "first": {
+        "ts_ms": 1794182401000,
+        "percentage": -5.0,
+        "depth": 7017.858,
+        "notional": 515428347.5958
+      },
+      "obi_top5": null
+    },
+    {
+      "kind": "klines",
+      "name": "BTCUSDT-5m-2026-11-09.zip",
+      "nbytes": 15362,
+      "sha256": "870ba60d3e4e02bda927865307f1b031cbc6d52a84264ad1f1d30c17b369a0d6",
+      "csv_error": null,
+      "csv_rows": 288,
+      "header": null,
+      "parsed_rows": 288,
+      "date_mismatches": 0,
+      "gaps": 0,
+      "duplicate_opens": 0,
+      "first_open_time_ms": 1794182400000,
+      "taker_buy_quote_present": true
+    }
+  ]
+}

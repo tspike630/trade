@@ -1,0 +1,65 @@
+Candidate decision-side package. Not PR 191. Not PR 208. No orders.
+
+Collection owns the official archive and CCXT downloads
+(bc-f2da23e7-bde3-5b87-b5e6-e4061c5a0599). Review owns the out-of-sample
+statistics (bc-7434c0fb-a9ec-5496-a406-5767f0851cd2). This package does not
+start those downloads and does not write the shared ccxt.db. Do not treat
+observed_2026-11-09.json as their result. It is one closed BTCUSDT day
+already cached on the authoring VM. The CHECKSUM sibling text was not kept;
+the sha256 values are of the zip bytes that were stored after that check.
+
+No git checkout is required. Unpack the source tar, then:
+
+  PYTHONPATH=. python3 -m research.hist_calibration analyze --news-db /path/to/news_events.db --out /tmp/hist-report.json
+  PYTHONPATH=. python3 -m unittest research.tests.test_hist_calibration research.tests.test_onchain_contract -q
+
+analyze is read-only. Pass --stage and --manifest together. A stage
+without a manifest, or with a checksum mismatch, is not study-ready.
+Two verified prices at the same open time are a conflict and neither price
+is used. Book depth stays a percentage band. activate exits 3 while the gates
+fail. x_watch is not enabled. bookDepth is not obi_top5.
+
+Stage tables, for the collection agent to fill, are created by stage-init
+and by the CCXT stage helper. They are not the live feed tables.
+
+  um_metrics(symbol, create_time_ms, account_long_short, position_long_short, source_url)
+  um_book_depth_band(symbol, ts_ms, percentage, depth, notional, source_url)
+  spot_klines(symbol, interval, open_time_ms, close_time_ms, quote_volume, taker_buy_quote, source_url)
+  hist_ccxt_ohlcv(exchange, symbol, quote, comparable_to_usdt, timeframe, ts, open, high, low, close, volume, source)
+
+account_long_short is count_toptrader_long_short_ratio.
+position_long_short is sum_toptrader_long_short_ratio.
+Spot open times above 1e14 are microseconds and are stored as milliseconds.
+
+
+Run from the repository root. The package does not import an executor and
+does not read a .env file. News on the box is not on this VM, so analyze
+here cannot be the box calibration.
+
+  python3 -m research.hist_calibration
+  python3 -m research.hist_calibration probe --symbol BTCUSDT --cache /tmp/hist-cache --out /tmp/hist-probe.json
+  python3 -m research.hist_calibration analyze --news-db /path/to/news_events.db --out /tmp/hist-report.json
+  python3 -m research.hist_calibration upsert-ccxt --stage /path/to/stage.db --target /path/to/ccxt.db
+  python3 -m research.hist_calibration rollback-ccxt --target /path/to/ccxt.db --manifest /path/to/ccxt.db.upsert-manifest.json
+  python3 -m research.hist_calibration activate --report /tmp/hist-report.json --out /tmp/candidate.json
+
+probe, analyze, and stage-init do not write ccxt.db or news_events.db.
+upsert-ccxt is the only write into an existing ccxt_ohlcv table, and it
+records inserted keys. activate writes a JSON file and does not change the
+router. If the report is not_ready, activate exits 3.
+
+Optional download dependency, only for the CCXT page inside probe:
+
+  python3 -m pip install -r research/requirements-hist.txt
+
+Binance Vision uses urllib from the standard library. Checksums are required.
+A checksum mismatch is not stored. bookDepth stays a percentage-band series.
+Top-trader account and position ratios stay in separate columns. Spot kline
+days are UTC. Coinbase is USD and is not pooled with USDT.
+
+The news counts 1859 and 164 are not arguments. analyze prints the counts it
+read. Late archives are fetched_at more than 90 minutes after published_at,
+the same lag as the decision gate. x_watch is not used as history. A
+calibration cut is written only when the existing audit gates pass
+(30 test events and 0.8 feature coverage, including a real obi_top5). This
+VM does not have that overlap.
