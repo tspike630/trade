@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import math
 import os
 import sqlite3
 import tempfile
@@ -155,6 +156,48 @@ class TestPerpShortAlphaEngineAndExecutor(unittest.TestCase):
 
         unlock_sig = by_playbook["unlock_cliff_short"]
         self.assertAlmostEqual(unlock_sig.notional_usdt or 0.0, 48.0, places=2)  # 15% of 320
+
+    def test_missing_book_does_not_open_unlock_short_and_call_only_smile_does_not_abort(self) -> None:
+        missing_book = evaluate_directional_short_candidates(
+            [
+                {
+                    "binance_symbol": "ALTXYZUSDT",
+                    "price_usd": 2.00,
+                    "in_unlock_blackout": 1,
+                    "funding_rate": 0.0001,
+                }
+            ],
+            book_usdt=320.0,
+        )
+        self.assertEqual(missing_book, [])
+
+        spot = 100.0
+        tte = 7.0 / 365.0
+        chain = []
+        for strike in (100, 103, 106, 110, 114):
+            moneyness = math.log(strike / spot) / math.sqrt(tte)
+            chain.append({"strike": strike, "iv_pct": 50.0 + 40.0 * moneyness * moneyness, "tte_years": tte})
+        mixed = evaluate_directional_short_candidates(
+            [
+                {
+                    "binance_symbol": "ALTXYZUSDT",
+                    "price_usd": 2.00,
+                    "in_unlock_blackout": 1,
+                    "obi_top5": -0.35,
+                    "taker_buy_ratio": 0.39,
+                    "funding_rate": 0.0001,
+                },
+                {
+                    "binance_symbol": "FETUSDT",
+                    "price_usd": spot,
+                    "option_chain": chain,
+                    "taker_buy_ratio": 0.20,
+                },
+            ],
+            book_usdt=320.0,
+            max_shorts=3,
+        )
+        self.assertEqual([row.playbook for row in mixed], ["unlock_cliff_short"])
 
     def test_hard_anti_squeeze_veto_blocks_open_and_emits_emergency_close(self) -> None:
         veto, reason = is_short_squeeze_veto({"funding_z": -1.4, "funding_rate": -0.0003})
