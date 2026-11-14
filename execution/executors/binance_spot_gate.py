@@ -748,3 +748,333 @@ def cross_arm_symbol_block(
         if buy is None or held_symbol is None or buy == held_symbol:
             return "cross_arm_symbol_blocks_buy"
     return None
+
+
+# Names the installed production ``binance_spot.py`` imports. They are not on
+# main, and the attached production zip did not include this module. The
+# readback and fee helpers below are the unmerged definitions that module
+# calls. ``buy_exposure_block`` is not changed. ``OCO_READBACK_VERIFIED_STATUS``
+# is only stored by the production writer; the attached sources never compare
+# it, and no git blob defines the token, so the stored value is ``verified``.
+OCO_READBACK_COLUMNS = (
+    "oco_readback_status",
+    "oco_readback_account_uid",
+    "oco_readback_symbol",
+    "oco_readback_entry_order_id",
+    "oco_readback_list_id",
+    "oco_readback_above_id",
+    "oco_readback_below_id",
+    "oco_readback_covered_qty",
+    "oco_readback_at_ms",
+)
+OCO_READBACK_VERIFIED_STATUS = "verified"
+
+_FINAL_ORDER_STATUS = frozenset(
+    {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"}
+)
+_LIVE_LEG_STATUS = frozenset({"NEW", "PARTIALLY_FILLED", "PENDING_NEW"})
+_ABOVE_LEG_TYPES = frozenset({"LIMIT_MAKER", "TAKE_PROFIT_LIMIT"})
+_BELOW_LEG_TYPES = frozenset({"STOP_LOSS_LIMIT", "STOP_LOSS"})
+_EVIDENCE_REASONS = frozenset({"oco_readback_unverified", "exit_readback_unverified"})
+
+
+def _nonneg_decimal(raw: object) -> Decimal | None:
+    """Finite decimal at least zero. Missing, bool, and negatives are unknown.
+
+    Zero is zero. ``_to_decimal`` on the spot module rejects zero, and the
+    production hold check uses this helper so a stored ``0`` is not invalid.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, str) and not raw.strip():
+        return None
+    try:
+        if isinstance(raw, Decimal):
+            number = raw
+        elif isinstance(raw, int):
+            number = Decimal(raw)
+        else:
+            number = Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite() or number < 0:
+        return None
+    return number
+
+
+def partial_dust_residual(row: dict[str, Any]) -> bool:
+    """A sell left a below-min remainder. That row is not a flat close.
+
+    A dust archive with no exit fill is the older whole-qty abandon and
+    stays terminal. This one still blocks the same arm.
+    """
+    if str(row.get("status") or "") != "closed_dust":
+        return False
+    residual = _decimal_text(row.get("residual_qty"))
+    sold = _decimal_text(row.get("exit_filled_qty"))
+    if residual is None or sold is None:
+        return False
+    return Decimal(residual) > 0 and Decimal(sold) > 0
+
+
+def _qty_invalid(raw: object) -> bool:
+    """A present quantity that is not a finite non-negative decimal."""
+    if raw is None or isinstance(raw, bool):
+        return isinstance(raw, bool)
+    if isinstance(raw, str) and not raw.strip():
+        return False
+    return _decimal_text(raw) is None or Decimal(_decimal_text(raw) or "0") < 0
+
+
+def _qty_zero(raw: object) -> bool:
+    """``0``, ``0.00``, and ``0E-8`` are the same zero. Missing is not zero."""
+    text = _decimal_text(raw)
+    return text is not None and Decimal(text) == 0
+
+
+def _positive_qty(raw: object) -> bool:
+    text = _decimal_text(raw)
+    return text is not None and Decimal(text) > 0
+
+
+def _zeroed_entry(row: dict[str, Any]) -> bool:
+    """Quantity written as zero does not close an entry.
+
+    Local ``exit_filled_qty`` equal to the entry is not a sell fill. Every
+    zero spelling is the same. A verified exit is an exchange read, elsewhere.
+    """
+    if not str(row.get("entry_order_id") or "").strip():
+        return False
+    if not _qty_zero(row.get("quantity")):
+        return False
+    if _positive_qty(row.get("residual_qty")):
+        return False
+    return True
+
+
+def _leg_remaining(leg: dict[str, Any]) -> Decimal | None:
+    """Open size of one leg. ``origQty`` alone is not the size still working."""
+    original = _decimal_text(leg.get("origQty"))
+    executed = _decimal_text(leg.get("executedQty"))
+    if original is None or executed is None:
+        return None
+    if Decimal(original) < 0 or Decimal(executed) < 0:
+        return None
+    remaining = Decimal(original) - Decimal(executed)
+    if remaining < 0:
+        return None
+    return remaining
+
+
+def hard_unresolved_halt(rows: object) -> str | None:
+    """Halt reasons that an exchange read on this call cannot clear."""
+    held = rows if isinstance(rows, list) else []
+    for row in held:
+        if not isinstance(row, dict):
+            continue
+        purpose = str(row.get("purpose") or "").strip()
+        if purpose and purpose not in LIVE_BNB_SPOT_PURPOSES:
+            continue
+        reason = row_unresolved_reason(row)
+        if reason and reason not in _EVIDENCE_REASONS:
+            return reason
+    return None
+
+
+def oco_readback_covers(
+    payload: object,
+    *,
+    symbol: str,
+    held_net: Decimal,
+    list_id: object,
+    above_id: object,
+    below_id: object,
+) -> bool:
+    """Each live protective leg must still cover ``held_net``.
+
+    Coverage is ``origQty - executedQty`` on the above leg and again on the
+    below leg. The larger leg does not stand in for the smaller one, and the
+    two legs are not added. The response ids must be the recorded ids.
+    """
+    if not isinstance(payload, dict) or held_net <= 0:
+        return False
+    if str(payload.get("listOrderStatus") or "").upper() != "EXECUTING":
+        return False
+    if str(payload.get("listStatusType") or "").upper() not in {"EXEC_STARTED", "EXECUTING"}:
+        return False
+    if str(payload.get("orderListId") or "") != str(list_id or "").strip():
+        return False
+    reported = str(payload.get("symbol") or "").strip().upper()
+    if not reported or reported != str(symbol or "").strip().upper():
+        return False
+    wanted_above = str(above_id or "").strip()
+    wanted_below = str(below_id or "").strip()
+    if _nonneg_id(wanted_above) is None or _nonneg_id(wanted_below) is None:
+        return False
+    if wanted_above == wanted_below:
+        return False
+    reports = payload.get("orderReports")
+    if not isinstance(reports, list):
+        return False
+    above = None
+    below = None
+    for row in reports:
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("type") or "").upper()
+        if above is None and kind in _ABOVE_LEG_TYPES:
+            above = row
+        if below is None and kind in _BELOW_LEG_TYPES:
+            below = row
+    if above is None or below is None:
+        return False
+    if str(above.get("orderId") or "").strip() != wanted_above:
+        return False
+    if str(below.get("orderId") or "").strip() != wanted_below:
+        return False
+    for leg in (above, below):
+        if str(leg.get("symbol") or reported).strip().upper() != reported:
+            return False
+        if str(leg.get("status") or "").upper() not in _LIVE_LEG_STATUS:
+            return False
+        remaining = _leg_remaining(leg)
+        if remaining is None or remaining < held_net:
+            return False
+    return True
+
+
+def final_executed_qty(payload: object) -> Decimal | None:
+    """Executed quantity once the remainder cannot fill.
+
+    ``PARTIALLY_FILLED`` and ``NEW`` are not final: the rest of the order
+    can still trade. A canceled or expired order's executed quantity is final.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("status") or "").strip().upper() not in _FINAL_ORDER_STATUS:
+        return None
+    text = _decimal_text(payload.get("executedQty"))
+    if text is None:
+        return None
+    number = Decimal(text)
+    if number <= 0:
+        return None
+    return number
+
+
+def account_order_base(
+    trades: object,
+    *,
+    symbol: str,
+    order_id: object,
+    side: str,
+    executed_qty: Decimal,
+) -> Decimal | None:
+    """Base effect of one final order from its own trades.
+
+    BUY returns executed quantity minus base-asset commission. SELL returns
+    executed quantity plus base-asset commission. A quote or third-asset
+    commission does not change the base. Duplicate trade ids count once.
+    A missing commission, a trade for another order, or a quantity sum that
+    is not ``executed_qty`` is unknown.
+    """
+    if not isinstance(trades, list) or executed_qty <= 0:
+        return None
+    wanted_side = str(side or "").strip().upper()
+    if wanted_side not in {"BUY", "SELL"}:
+        return None
+    wanted_symbol = str(symbol or "").strip().upper()
+    wanted_order = str(order_id or "").strip()
+    base = wanted_symbol[: -len("USDT")] if wanted_symbol.endswith("USDT") else ""
+    if not wanted_symbol or not wanted_order or not base:
+        return None
+    seen: dict[str, dict[str, Any]] = {}
+    for trade in trades:
+        if not isinstance(trade, dict):
+            return None
+        trade_id = str(trade.get("id") if trade.get("id") is not None else "").strip()
+        if not trade_id or trade_id in seen:
+            if not trade_id:
+                return None
+            continue
+        if str(trade.get("symbol") or "").strip().upper() != wanted_symbol:
+            return None
+        if str(trade.get("orderId") or "").strip() != wanted_order:
+            return None
+        seen[trade_id] = trade
+    if not seen:
+        return None
+    qty = Decimal("0")
+    base_fee = Decimal("0")
+    for trade in seen.values():
+        try:
+            part_qty = Decimal(str(trade.get("qty")).strip())
+            part_fee = Decimal(str(trade.get("commission")).strip())
+        except Exception:
+            return None
+        if not part_qty.is_finite() or part_qty <= 0:
+            return None
+        if "commission" not in trade or "commissionAsset" not in trade:
+            return None
+        if not part_fee.is_finite() or part_fee < 0:
+            return None
+        asset = str(trade.get("commissionAsset") or "").strip().upper()
+        if not asset:
+            return None
+        qty += part_qty
+        if asset == base:
+            base_fee += part_fee
+    if qty != executed_qty:
+        return None
+    effect = executed_qty - base_fee if wanted_side == "BUY" else executed_qty + base_fee
+    if not effect.is_finite() or effect <= 0:
+        return None
+    return effect
+
+
+def row_unresolved_reason(row: dict[str, Any]) -> str | None:
+    """Why this row still blocks a buy. Local ids and local fills do not clear it."""
+    if any(
+        _qty_invalid(row.get(key))
+        for key in ("quantity", "residual_qty", "exit_filled_qty", "entry_order_qty")
+    ):
+        return "unprotected_position_blocks_buy"
+    if _positive_qty(row.get("residual_qty")):
+        return "unprotected_position_blocks_buy"
+    if partial_dust_residual(row):
+        return "unprotected_position_blocks_buy"
+    status = str(row.get("status") or "")
+    if _zeroed_entry(row):
+        return "exit_readback_unverified"
+    if status == "oco_working" or (
+        status == "open" and str(row.get("protection") or "") == "exchange_oco"
+    ):
+        if (
+            _position_ids_verified(row)
+            and str(row.get("protection") or "") == "exchange_oco"
+            and _positive_qty(row.get("quantity"))
+        ):
+            return "oco_readback_unverified"
+        return "oco_failed_blocks_buy"
+    if status == "closed_canceled" and _positive_qty(row.get("quantity")):
+        return "unprotected_position_blocks_buy"
+    if not status or status in _TERMINAL_POSITION or status == "flat":
+        return None
+    if status == "held_naked":
+        return "naked_holds_new_buys"
+    if status == "qty_unconfirmed":
+        return "parent_fill_incomplete"
+    if status in {"oco_failed", "oco_unknown"}:
+        return "oco_failed_blocks_buy"
+    if status == "time_stop_unknown":
+        return "time_stop_unconfirmed_blocks_buy"
+    if status == "maker_cancel_unknown":
+        return "maker_resting_blocks_buy"
+    if status == "maker_resting":
+        filled = _decimal_text(row.get("quantity"))
+        if filled is not None and Decimal(filled) > 0:
+            return "unprotected_position_blocks_buy"
+        return None
+    if status == "exit_submitted":
+        return "unprotected_position_blocks_buy"
+    return "unprotected_position_blocks_buy"
