@@ -24,11 +24,11 @@
 
 PR220 的 gate 重建值 `fa2fc3dd…` 不是生产 `5c3022e0`。不得用 PR220 或 main 覆盖生产执行器、gate、gateway、ledger、engine、guards、halt。PR218 与 PR220 都未合并。PR220 是 LIMITED-PASS：专项 3 项由失败变通过，execution suite 相对未打补丁生产基线仍是 58 失败/错误。
 
-`decision_engine/core/regime_strategy_router.py` 生产与改动前 main 同为 `56a2df45`。本分支只在接受的买单上追加 `regime_classification`，不改分类、仓位或止盈公式。`decision_engine/run.py` 生产与改动前 main 同为 `a696ab8c`。本分支只增加 `--regime-v2-isolated-purpose`，不改默认的 `shadow_010` 隔离。
+`decision_engine/core/regime_strategy_router.py` 的生产字节是 `56a2df45`。本分支在那个分类器之后加了 `REGIME_V2_CONTRACT`。未设置时仍是生产分类和 0.55、鲸鱼分支。`decision_engine/run.py` 生产字节是 `a696ab8c`。本分支只多了隔离干跑旗标。
 
 ## t250u 草案（2026-11-14 11:56 HKT）
 
-这是规则草案，不是已切主通道的实现。本次没有新策略类，没有改执行器，没有改生产 `engine.py`。源码默认仍是关。`configs/live_regime_v2.env` 里路由器不读取的键不会改变仓位或止盈价。
+这是规则草案，不是已切主通道的实现。本次没有新策略类，没有改执行器，没有改生产 `engine.py`。源码默认仍是关。只有 `REGIME_V2_CONTRACT=1` 时，路由才使用定案仓位乘数，并记下定案止盈倍率。它不改 `take_profit_price`。成交均价上的止盈公式见 `docs/EXECUTION_PROTECTION_REVIEW_t250.md`，未批准前不产生订单。
 
 杨的定案：单笔目标名义 = 实时可用或权益基数 × 24% × 入场档位 × 状态乘数。24% 是现场 CLI 事实，不是新的凯利批准，也不是把历史余额写死。纯现货，不对冲。状态 4 乘数改为 0.30。状态 1 为 1.00 / 止盈 1.00，取消此前鲸鱼 1.08 / 0.85 与止盈 1.22 / 0.72。状态 2 仓位 1.20、止盈 1.35，且必须走已实装的逼空入场。状态 3 仓位 1.15、止盈 1.25，保留已批准的联合盘口与巨量条件。状态 4 只允许最严苛的布林深跌 `LIMIT_MAKER`，止盈 0.85。状态 5 仓位 0，禁止新开多。必需数据过期或缺失要闭锁，不能默认状态 1。
 
@@ -42,16 +42,16 @@ PR220 的 gate 重建值 `fa2fc3dd…` 不是生产 `5c3022e0`。不得用 PR220
 | 板块簇和总敞口 | `LIVE_BNB_CLUSTER_CAP_ENABLED=0` | `portfolio_clusters.py` 只在旗标打开时按簇计口数，不是名义总敞口。默认阈值未按定案给定 | 不打开，避免猜上限 |
 | 同币单笔单 OCO、跨 purpose 同币互斥 | 不改执行器 | `live_buy_guards.py` 在账本可读时挡住同一标的的第二笔买。PR218 的跨臂互斥在生产执行器里，本 PR 不改那些文件 | 保持，不在本草案里重写 |
 | 180 秒 OCO 回读后才允许异币 | 不新设旗标 | `binance_spot_gate.py` 默认回读 TTL 180 秒。回读通过后是否允许下一笔异币，本 PR 没有再证 | 阻断：不能把 TTL 常数说成已经实现「顺风横向开仓」 |
-| 永续关闭 | 两个永续旗标 = 0 | 路由仍会把 `require_perp_beta_hedge` 盖成 True。执行不读这个盖章去下空单 | 标签不是对冲，也不放宽仓位 |
+| 永续关闭 | 两个永续旗标 = 0。契约打开时 `require_perp_beta_hedge` 改为 False | 永续引擎只在 `ENABLE_PERP_SHORT_ENGINE` 打开时读这个标签。Beta 上限函数不读它，因此标签本身不放宽 beta。现网该引擎为 0 | 标签不再当成已对冲。执行器未改 |
 | 再挂靠 = 1 | 旗标保持 0，`REGIME_V2_REANCHOR_STATUS=blocked_behavior_mismatch` | 生产 `binance_spot_protect.py` L509–578：只在原止盈止损带包不住 `min/max(成交, 标记价)` 时，按信号价相对距离重算，止损距离下限 50 bps。不是每笔都按成交均价重锚，锚点也不是单独的成交均价。L3790 与 L5843 发生在首挂保护，不是持仓中途反复改单 | 阻断。只开旗标会谎称符合 |
 | 止盈倍率写进价格 | 草案记下 1.00 / 1.35 / 1.25 / 0.85 / 不适用 | `_expand_regime_take_profit` 只在 Kelly 或 `EXPAND_REGIME_OCO_TP` 打开时外扩状态 2/3，且不用 `tp_multiplier`。这两个开关保持 0。成交均价上的倍率公式没有定义 | 阻断。不把倍率乘到绝对币价上猜 |
-| 状态 1 取消鲸鱼分支 | 草案写 1.00 / 1.00 | 生产路由 L355–391 仍有 1.08 / 1.22 与 0.85 / 0.72，没有关闭旗标 | 阻断。配置表达不了。本 PR 不删分支，避免未测试地改变默认路径 |
+| 状态 1 取消鲸鱼分支 | `REGIME_V2_CONTRACT=1` 时不再使用 1.08 / 0.85 和 1.22 / 0.72 | 未设置该变量时，L355–391 的旧分支仍在 | 已接线。默认路径的回归测试仍覆盖旧分支 |
 | 状态 1 PostOnly 与盘口门 | 两个 PostOnly 旗标和 `BINANCE_SPOT_ORDERBOOK_GATE=1` | PostOnly 只把中性限价从 `LIMIT` 改成 `LIMIT_MAKER`（入场区 L630）。大单仍是 `MARKET`（L907） | 部分。不能说状态 1 全部变成 PostOnly |
-| 状态 2 逼空入场 | `REGIME_V2_STATE2_ENTRY_STATUS=module_not_called` | 仓库有 `funding_z_fade_v1`，阈值是绝对值 `>= 2.0`（`funding_z_fade.py` L28），不是 `-1.8`。现网发射器不调用它。生产包的 `strategies/` 没有这个文件。路由标签是 `funding_z_fade_and_squeeze_ratchet` | 阻断。不能用 `tech_boll_fade_v1` 代替逼空验收 |
+| 状态 2 逼空入场 | 契约打开时该路由 `allow_buy=False`，原因 `state2_entry_module_not_live` | `funding_z_fade_v1` 的阈值是绝对值 `>= 2.0`（`funding_z_fade.py` L28），不是 `<= -1.8`，也不读 COT。现网发射器不调用它。生产包的 `strategies/` 没有这个文件 | 闭锁。没有把 fade 标签当成逼空实现，也没有改 2.0 |
 | 状态 3 前 65% / 后 35% 与联合条件 | 不新设阈值 | 代码拒绝 `xs_rank_pct_1h < 0.35`（L293）。薄盘是 `obi <= -0.25` 且吃单缺失或 `<= 0.45`（L308）。巨量用无历史时 3.80，且要鲸鱼有值并 `<= 0.65`（L322） | 名次线与「剔除后 35%」一致，前提是名次越大越强。联合条件是 13:08 已批准的实现，定案正文没有改写它们 |
-| 状态 4 乘数 0.30、深跌档 | 草案写 0.30 与 `deep_tier_undefined` | 代码仍是 0.55（L275）。入场区的 `deep` 是 `low - 0.5 * span`（L509–510），用于拥挤跳过的价格记录，不是一条已测的独立深跌入场 | 阻断。不自造深跌阈值 |
-| 状态 5 与过期闭锁 | 草案写仓位 0、`fail_closed_not_implemented` | 危机条件命中时买单被丢。缺特征仍落到状态 1 标准剧本（L393–403） | 阻断。没有名为「12 道门禁」的清单。代码里能指出的停多条件见下 |
-| 状态 4 乘数从 0.55 改为 0.30 | 只写在草案键里 | 路由器不读该键 | 需要后续改码和测试，本次不做 |
+| 状态 4 乘数 0.30、深跌档 | 契约打开时该放行路由关闭，原因 `state4_deep_entry_undefined`，倍率记下 0.30 / 0.85 但不发出买单 | 未开契约时仍是 0.55。`low - 0.5 * span` 不是已测入场档 | 闭锁。没有把那条 deep 价格当成入场 |
+| 状态 5 与过期闭锁 | 契约打开时，缺分类输入的状态 1 不再放行，原因 `regime_required_inputs_missing`。危机路由仓位乘数为 0 | 未开契约时缺输入仍落到状态 1。没有名为「12 道门禁」的清单 | 缺输入闭锁已接线。12 道仍只列得出的真实模块，不凑数 |
+| 止盈倍率 | 契约打开时状态 1/2/3/4 的 `regime_tp_multiplier` 为 1.00 / 1.35 / 1.25 / 0.85 | `take_profit_price` 保持入场模块原值 | 倍率已驱动。价格未改，避免未定义的成交均价公式进入订单 |
 
 状态 5 代码里实际会停多的条件（生产路由 L130–183），不是 12 道的证明：宏观 `macro_halt`、解锁黑窗、跨所错位 `>= 35` bps、`xs_systemic_crash`、多头清算瀑布、负 gamma 且 `dvol_z >= 2`、NVDA `<= -2%`、SMH `<= -2%`。新闻危机覆盖是另一层（`_decision_after_news`）。广度 `< 12%` 写在模块文档 L37，if 里没有。其余「12 道」没有出处，不能宣称已经齐。
 

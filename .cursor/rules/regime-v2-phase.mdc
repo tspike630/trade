@@ -13,7 +13,7 @@ Keep source defaults off. `USE_OPTIMAL_KELLY_MATRIX`, `EXPAND_REGIME_OCO_TP`, `B
 
 Do not replace production `binance_spot.py` `87ef5ed7`, `binance_spot_protect.py` `70aecd69`, or `binance_spot_gate.py` `5c3022e0` with main or with PR220's rebuilt gate `fa2fc3dd`. Do not replace production `engine.py` `2b578762` with main.
 
-t250u (2026-11-14 11:56 HKT) is the ruling draft in AGENTS.md and configs/live_regime_v2.env. The draft is not the live router. Do not invent a squeeze entry, a deep-fade threshold, a take-profit price formula, or a 12-gate list. Do not set BINANCE_SPOT_REANCHOR_OCO_ON_FILL to 1 while production reanchor still uses min/max of fill and mark. Do not delete LIVE_TRADING_DISABLED. Do not replace production spot 87ef5ed7, protect 70aecd69, gate 5c3022e0, or engine 2b578762 with this branch.
+t250u is wired only when REGIME_V2_CONTRACT=1. That path sets size multipliers and TP multiplier stamps, drops the state-1 whale branch, and closes state 2 and state 4 instead of inventing entries. It does not rewrite take_profit_price. Do not set BINANCE_SPOT_REANCHOR_OCO_ON_FILL to 1. Execution-protection changes stay in docs/EXECUTION_PROTECTION_REVIEW_t250.md until Yang approves them. Do not delete LIVE_TRADING_DISABLED. Do not replace production spot 87ef5ed7, protect 70aecd69, gate 5c3022e0, or engine 2b578762 with this branch.
 
 Missing features still fall through to standard state 1; mark that `state1_unconfirmed` and block cutover. Do not invent a new reject for the 13:08 state-3 exceptions. Do not invent a seconds TTL for COT or treat an unlock-file mtime as freshness. A fresh production sample does not mean this checkout has the database.
 

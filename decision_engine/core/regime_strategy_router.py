@@ -672,6 +672,8 @@ def apply_five_state_regime_router(
                 overlay.meta.get("news_shock_keyword"),
             )
             news_meta = overlay.meta
+        classified = classification_inputs(base_row)
+        decision = _apply_v2_contract(decision, classified)
         regime_counts[decision.regime] = regime_counts.get(decision.regime, 0) + 1
 
         if not decision.allow_buy:
@@ -705,6 +707,9 @@ def apply_five_state_regime_router(
         out_sig["regime_tp_multiplier"] = decision.tp_multiplier
         out_sig["enable_trailing_ratchet"] = decision.enable_trailing_ratchet
         out_sig["require_perp_beta_hedge"] = decision.require_perp_beta_hedge
+        out_sig["regime_v2_contract"] = regime_v2_contract_enabled()
+        if regime_v2_contract_enabled():
+            out_sig["tp_price_policy"] = "unchanged_until_fill_formula_approved"
         wall_quote = extract_wall_mid_from_row(base_row)
         if wall_quote is not None:
             out_sig["wall_mid_price"] = wall_quote.wall_mid_price
@@ -753,6 +758,24 @@ def apply_five_state_regime_router(
 
 OPTIMAL_KELLY_ENV = "USE_OPTIMAL_KELLY_MATRIX"
 EXPAND_OCO_TP_ENV = "EXPAND_REGIME_OCO_TP"
+CONTRACT_ENV = "REGIME_V2_CONTRACT"
+
+# t250u sizes and static TP multipliers. Applied only when CONTRACT_ENV is on.
+# They do not rewrite take_profit_price. The fill-average price formula is not
+# unique in the current execution contract, so it stays out of the order.
+_CONTRACT_SIZE_MULTIPLIER = {
+    REGIME_1_POSITIVE_GAMMA_PINNED: 1.00,
+    REGIME_2_SHORT_SQUEEZE_BREAKOUT: 1.20,
+    REGIME_3_CROSS_ASSET_BULL_PULLBACK: 1.15,
+    REGIME_4_CROWDED_LONG_DEFENSIVE: 0.30,
+    REGIME_5_CRISIS_LIQUIDATION_HALT: 0.0,
+}
+_CONTRACT_TP_MULTIPLIER = {
+    REGIME_1_POSITIVE_GAMMA_PINNED: 1.00,
+    REGIME_2_SHORT_SQUEEZE_BREAKOUT: 1.35,
+    REGIME_3_CROSS_ASSET_BULL_PULLBACK: 1.25,
+    REGIME_4_CROWDED_LONG_DEFENSIVE: 0.85,
+}
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
 
@@ -782,6 +805,70 @@ OPTIMAL_FIVE_STATE_PYRAMID_MAX_PCT = {
     4: 0.050,
     5: 0.000,
 }
+
+
+def regime_v2_contract_enabled() -> bool:
+    """True only when the explicit v2 profile is sourced. Unset stays off."""
+    return os.environ.get(CONTRACT_ENV, "").strip().lower() in _TRUTHY
+
+
+def _apply_v2_contract(
+    decision: RegimeRoutingDecision,
+    classified: dict[str, Any],
+) -> RegimeRoutingDecision:
+    """Map a legacy route onto the t250u contract without inventing an entry.
+
+    State 2 stays closed: ``funding_z_fade_v1`` is a different threshold and is
+    not the live emitter. State 4 stays closed: no tested deep-fade tier exists.
+    Missing distinguishers do not fall through to a state-1 buy. Hedge stamps
+    are cleared so they cannot be read as permission to loosen beta.
+    """
+    if not regime_v2_contract_enabled():
+        return decision
+    size = _CONTRACT_SIZE_MULTIPLIER.get(decision.regime, decision.size_multiplier)
+    tp = _CONTRACT_TP_MULTIPLIER.get(decision.regime, decision.tp_multiplier)
+    allow = decision.allow_buy
+    reason = decision.reject_reason
+    playbook = decision.playbook
+    order_type = decision.recommended_order_type
+    if decision.regime == REGIME_1_POSITIVE_GAMMA_PINNED:
+        playbook = "tech_boll_fade_standard"
+        size = 1.00
+        tp = 1.00
+        order_type = "LIMIT_MAKER"
+        if state1_fallthrough_unconfirmed(playbook, classified):
+            allow = False
+            reason = "regime_required_inputs_missing"
+            size = 0.0
+            order_type = "NONE"
+        else:
+            allow = True
+            reason = None
+    elif decision.regime == REGIME_2_SHORT_SQUEEZE_BREAKOUT:
+        allow = False
+        reason = "state2_entry_module_not_live"
+        size = 0.0
+        order_type = "NONE"
+    elif decision.regime == REGIME_4_CROWDED_LONG_DEFENSIVE and decision.allow_buy:
+        allow = False
+        reason = "state4_deep_entry_undefined"
+        size = 0.0
+        order_type = "NONE"
+    elif decision.regime == REGIME_5_CRISIS_LIQUIDATION_HALT:
+        allow = False
+        size = 0.0
+        order_type = "NONE"
+    return RegimeRoutingDecision(
+        regime=decision.regime,
+        playbook=playbook,
+        allow_buy=allow,
+        reject_reason=reason,
+        size_multiplier=size,
+        tp_multiplier=tp,
+        enable_trailing_ratchet=False,
+        require_perp_beta_hedge=False,
+        recommended_order_type=order_type,
+    )
 
 
 def is_optimal_kelly_enabled(row: dict[str, Any] | None = None) -> bool:
