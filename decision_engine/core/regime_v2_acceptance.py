@@ -15,12 +15,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from decision_engine.core.binance_indicators import binance_indicators_fresh_sec
+from decision_engine.core.cityu_institutional_alpha import due_cftc_asof
 from decision_engine.core.macro_circuit_breaker import MAX_CROSS_ASSET_AGE_MS
 from decision_engine.core.news_shock_gate import NEWS_WINDOW_MIN
 from decision_engine.core.regime_strategy_router import (
     _STATE1_DISTINGUISHERS,
     state1_fallthrough_unconfirmed,
 )
+from decision_engine.core.volume_z_1h import source_close_is_fresh
 
 HKT = timezone(timedelta(hours=8))
 ENTRY_STRATEGY_ID = "tech_boll_fade_v1"
@@ -174,8 +176,237 @@ def _age_block(
     return None
 
 
+def _is_supplement(document: Mapping[str, Any]) -> bool:
+    derivatives = document.get("public_derivatives")
+    return isinstance(derivatives, dict) and "microstructure_max" in derivatives
+
+
+def supplement_clock_blocks(
+    document: Mapping[str, Any],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Judge the 11:34 HKT supplement by the clocks the readers already use.
+
+    A production path in the evidence file does not create that file here.
+    COT uses the publication cycle, not a seconds TTL. Unlock rows have no
+    collection clock, so file mtime is not a freshness result.
+    """
+    blocks: list[dict[str, str]] = []
+    observations: list[dict[str, str]] = []
+    now_ms = _as_int(document.get("now_ms"))
+    if now_ms is None:
+        try:
+            now_ms = int(_parse_hkt(str(document.get("written_hkt") or "")).timestamp() * 1000)
+        except (TypeError, ValueError):
+            return [_block("pack_as_of_unparsed", str(document.get("written_hkt")), source="production_evidence")], observations
+    fresh_ms = binance_indicators_fresh_sec() * 1000
+    as_of = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+
+    derivatives = document.get("public_derivatives")
+    if not isinstance(derivatives, dict):
+        blocks.append(_block("public_derivatives_missing", "supplement", source="production_evidence"))
+    else:
+        observations.append(
+            _block(
+                "production_store_present_in_evidence",
+                str(derivatives.get("path") or "public_derivatives.db"),
+                source="production_evidence",
+            )
+        )
+        micro = derivatives.get("microstructure_max")
+        obi_ms = None
+        if isinstance(micro, dict):
+            obi_ms = _as_int(micro.get("max_obi_top5_source_ts_ms"))
+        found = _age_block(
+            code="obi_top5_source_stale_or_absent",
+            detail="obi_top5_source_ts_ms",
+            ts_ms=obi_ms,
+            now_ms=now_ms,
+            window_ms=fresh_ms,
+            source="production_evidence",
+        )
+        if found is None:
+            observations.append(
+                _block("obi_top5_source.fresh", f"ts_ms={obi_ms} window_ms={fresh_ms}", source="production_evidence")
+            )
+        else:
+            blocks.append(found)
+        perp = derivatives.get("perp_counterparty_max")
+        perp_ms = _as_int(perp.get("max_ts_ms")) if isinstance(perp, dict) else None
+        found = _age_block(
+            code="binance_perp_counterparty.stale_or_absent",
+            detail="binance_perp_counterparty.ts_ms",
+            ts_ms=perp_ms,
+            now_ms=now_ms,
+            window_ms=fresh_ms,
+            source="production_evidence",
+        )
+        if found is None:
+            observations.append(
+                _block(
+                    "binance_perp_counterparty.fresh",
+                    f"ts_ms={perp_ms} window_ms={fresh_ms}",
+                    source="production_evidence",
+                )
+            )
+        else:
+            blocks.append(found)
+        columns = derivatives.get("token_unlock_schedule_columns")
+        clock_names = {"ts_ms", "source_ts_ms", "collected_at_ms", "fetched_at"}
+        has_record_clock = isinstance(columns, list) and any(str(name) in clock_names for name in columns)
+        if not has_record_clock:
+            observations.append(
+                _block(
+                    "token_unlock_record_clock_absent",
+                    "next_unlock_utc is recomputed at read time; mtime is not a freshness clock",
+                    source="production_evidence",
+                )
+            )
+
+    close_ms = _volume_z_close_ms(document)
+    if close_ms is None:
+        blocks.append(_block("volume_z_close_clock_absent", "source_close_time_ms", source="production_evidence"))
+    elif source_close_is_fresh(close_ms, now_ms):
+        observations.append(
+            _block(
+                "volume_z_source_close.fresh",
+                f"source_close_time_ms={close_ms} window_ms={fresh_ms}",
+                source="production_evidence",
+            )
+        )
+    else:
+        blocks.append(
+            _block(
+                "volume_z_source_close_stale",
+                f"source_close_time_ms={close_ms} window_ms={fresh_ms}",
+                source="production_evidence",
+            )
+        )
+    computed_ms = _volume_z_computed_ms(document)
+    if computed_ms is not None:
+        observations.append(
+            _block(
+                "volume_z_computed_at_not_the_reader_clock",
+                f"computed_at_ms={computed_ms} fresh_under_same_window="
+                f"{source_close_is_fresh(computed_ms, now_ms)}",
+                source="production_evidence",
+            )
+        )
+
+    news = document.get("news_events")
+    fetched = _nested_text(news, "max_clocks", "fetched_at", "raw") if isinstance(news, dict) else None
+    fetched_ms = _utc_ms(fetched or "")
+    collector = _collector_observed(document, "news_events collector process")
+    found = _age_block(
+        code="news_fetched_at_stale",
+        detail=f"fetched_at={fetched or 'absent'}; collector_observed={collector}",
+        ts_ms=fetched_ms,
+        now_ms=now_ms,
+        window_ms=NEWS_WINDOW_MIN * 60_000,
+        source="production_evidence",
+    )
+    if found is None and isinstance(news, dict):
+        observations.append(_block("news_fetched_at.fresh", fetched or "", source="production_evidence"))
+    elif found is not None:
+        blocks.append(found)
+
+    lseg = document.get("lseg_macro")
+    bar_ts = ""
+    if isinstance(lseg, dict):
+        bar_ts = str(lseg.get("cross_asset_bars_max_utc_ts") or "")
+        if not bar_ts:
+            bar_ts = _nested_text(lseg, "cross_asset_bars", "max_utc_ts", "raw") or ""
+    lseg_collector = _collector_observed(document, "lseg collector process")
+    found = _age_block(
+        code="lseg_cross_asset_bars_stale",
+        detail=f"cross_asset_bars.utc_ts={bar_ts or 'absent'}; collector_observed={lseg_collector}",
+        ts_ms=_utc_ms(bar_ts),
+        now_ms=now_ms,
+        window_ms=MAX_CROSS_ASSET_AGE_MS,
+        source="production_evidence",
+    )
+    if found is not None:
+        blocks.append(found)
+
+    cot_date = _cot_max_date(document)
+    due = due_cftc_asof(as_of).isoformat()
+    observations.append(
+        _block(
+            "cot_publication_cycle_not_a_ttl",
+            f"max_date={cot_date or 'absent'}; due_cftc_asof={due}; no seconds TTL is applied",
+            source="production_evidence",
+        )
+    )
+    return blocks, observations
+
+
+def _volume_z_close_ms(document: Mapping[str, Any]) -> int | None:
+    search = document.get("volume_z_search")
+    if isinstance(search, dict):
+        stored = search.get("decision_volume_z")
+        if isinstance(stored, dict):
+            raw = stored.get("max_source_close_time_ms")
+            if isinstance(raw, dict):
+                return _as_int(raw.get("raw"))
+            return _as_int(raw)
+    addendum = document.get("decision_volume_z")
+    if isinstance(addendum, dict):
+        return _as_int(addendum.get("max_source_close_time_ms"))
+    return None
+
+
+def _volume_z_computed_ms(document: Mapping[str, Any]) -> int | None:
+    addendum = document.get("decision_volume_z")
+    if isinstance(addendum, dict):
+        return _as_int(addendum.get("max_computed_at_ms"))
+    return None
+
+
+def _cot_max_date(document: Mapping[str, Any]) -> str | None:
+    cityu = document.get("cityu_institutional")
+    if not isinstance(cityu, dict):
+        return None
+    clocks = cityu.get("readonly_clocks")
+    if not isinstance(clocks, dict):
+        return None
+    cot = clocks.get("lseg_cftc_cot_positioning")
+    if not isinstance(cot, dict):
+        return None
+    raw = cot.get("max_date")
+    if isinstance(raw, dict):
+        text = str(raw.get("raw") or "").strip()
+        return text or None
+    text = str(raw or "").strip()
+    return text or None
+
+
+def _collector_observed(document: Mapping[str, Any], name: str) -> bool | None:
+    collectors = document.get("collectors_observed_this_check")
+    if not isinstance(collectors, dict):
+        return None
+    row = collectors.get(name)
+    if not isinstance(row, dict) or "observed" not in row and "observed_by_process_name_search" not in row:
+        return None
+    if "observed_by_process_name_search" in row:
+        return bool(row.get("observed_by_process_name_search"))
+    return bool(row.get("observed"))
+
+
+def _nested_text(value: object, *keys: str) -> str | None:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    if current is None:
+        return None
+    text = str(current).strip()
+    return text or None
+
+
 def pack_clock_blocks(document: Mapping[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Judge the 2026-11-14 evidence pack by record clocks, not file mtime."""
+    """Judge a 2026-11-14 evidence file by record clocks, not file mtime."""
+    if _is_supplement(document):
+        return supplement_clock_blocks(document)
     blocks: list[dict[str, str]] = []
     observations: list[dict[str, str]] = []
     written = str(document.get("written_hkt") or "")

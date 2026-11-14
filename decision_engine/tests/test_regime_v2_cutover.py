@@ -9,6 +9,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from decision_engine.core.regime_strategy_router import (
@@ -28,6 +29,8 @@ from decision_engine.core.regime_v2_acceptance import (
     profile_path,
     signal_blocks,
 )
+from decision_engine.core.cityu_institutional_alpha import due_cftc_asof
+from decision_engine.core.volume_z_1h import source_close_is_fresh
 from decision_engine.strategies.live_bnb_entry_zone import evaluate_entry_zone
 from execution.executors.binance_spot_protect import (
     max_hold_sec,
@@ -325,6 +328,127 @@ class ProfileAndPackTests(unittest.TestCase):
         self.assertIn("cot_store_not_in_pack", codes)
         self.assertIn("volume_z_store_not_in_pack", codes)
         self.assertIn("stablecoin_supply_not_a_router_input", {item["code"] for item in observations})
+
+    def test_supplement_clocks_use_reader_windows_and_do_not_invent_cot_or_unlock_ttl(self) -> None:
+        now_ms = 1794627280536
+        close_ms = 1794625199999
+        computed_ms = 1794625917744
+        self.assertTrue(source_close_is_fresh(close_ms, now_ms))
+        self.assertTrue(source_close_is_fresh(computed_ms, now_ms))
+        self.assertFalse(source_close_is_fresh(now_ms - 3_600_001, now_ms))
+        document = {
+            "written_hkt": "2026-11-14 11:34:40 HKT",
+            "now_ms": now_ms,
+            "mtime_hkt": "2026-11-14 11:34:40 HKT",
+            "public_derivatives": {
+                "path": "/workspace/dexscreener-crawler/data/counterparty/public_derivatives.db",
+                "exists": True,
+                "microstructure_max": {
+                    "max_obi_top5_source_ts_ms": 1794627068491,
+                    "max_obi_source_hkt": "2026-11-14 11:31:08 HKT",
+                },
+                "perp_counterparty_max": {
+                    "max_ts_ms": 1794626931000,
+                    "max_ts_hkt": "2026-11-14 11:28:51 HKT",
+                },
+                "token_unlock_schedule_columns": [
+                    "symbol",
+                    "next_unlock_utc",
+                    "hours_to_unlock",
+                    "in_unlock_blackout",
+                ],
+            },
+            "decision_volume_z": {
+                "max_source_close_time_ms": close_ms,
+                "max_computed_at_ms": computed_ms,
+            },
+            "news_events": {
+                "max_clocks": {"fetched_at": {"raw": "2026-11-13T11:33:42Z"}},
+            },
+            "lseg_macro": {"cross_asset_bars_max_utc_ts": "2026-11-09T10:00:00Z"},
+            "cityu_institutional": {
+                "exists": True,
+                "readonly_clocks": {
+                    "lseg_cftc_cot_positioning": {"max_date": {"raw": "2026-11-03"}},
+                },
+            },
+            "collectors_observed_this_check": {
+                "news_events collector process": {"observed_by_process_name_search": False},
+                "lseg collector process": {"observed_by_process_name_search": False},
+                "public_derivatives_loop": {"observed": True},
+            },
+        }
+        blocks, observations = pack_clock_blocks(document)
+        block_codes = {item["code"] for item in blocks}
+        observation_codes = {item["code"] for item in observations}
+        self.assertIn("obi_top5_source.fresh", observation_codes)
+        self.assertIn("binance_perp_counterparty.fresh", observation_codes)
+        self.assertIn("volume_z_source_close.fresh", observation_codes)
+        self.assertIn("volume_z_computed_at_not_the_reader_clock", observation_codes)
+        self.assertIn("news_fetched_at_stale", block_codes)
+        self.assertIn("lseg_cross_asset_bars_stale", block_codes)
+        self.assertNotIn("obi_top5_source_stale_or_absent", block_codes)
+        self.assertNotIn("cot_stale", block_codes)
+        self.assertNotIn("token_unlock_stale", block_codes)
+        cot = next(item for item in observations if item["code"] == "cot_publication_cycle_not_a_ttl")
+        self.assertIn("max_date=2026-11-03", cot["detail"])
+        self.assertIn("no seconds TTL", cot["detail"])
+        due = due_cftc_asof(datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc))
+        self.assertIn(f"due_cftc_asof={due.isoformat()}", cot["detail"])
+        self.assertNotEqual(due.isoformat(), "2026-11-03")
+        unlock = next(item for item in observations if item["code"] == "token_unlock_record_clock_absent")
+        self.assertIn("mtime is not a freshness clock", unlock["detail"])
+        news = next(item for item in blocks if item["code"] == "news_fetched_at_stale")
+        self.assertIn("collector_observed=False", news["detail"])
+
+    def test_production_evidence_does_not_create_local_databases(self) -> None:
+        env = parse_env_file(profile_path())
+        supplement = {
+            "now_ms": 1794627280536,
+            "public_derivatives": {
+                "exists": True,
+                "path": "/workspace/dexscreener-crawler/data/counterparty/public_derivatives.db",
+                "microstructure_max": {"max_obi_top5_source_ts_ms": 1794627068491},
+                "perp_counterparty_max": {"max_ts_ms": 1794626931000},
+                "token_unlock_schedule_columns": ["next_unlock_utc"],
+            },
+            "volume_z_search": {
+                "decision_volume_z": {"max_source_close_time_ms": {"raw": 1794625199999}},
+            },
+            "news_events": {"max_clocks": {"fetched_at": {"raw": "2026-11-13T11:33:42Z"}}},
+            "lseg_macro": {"cross_asset_bars_max_utc_ts": "2026-11-09T10:00:00Z"},
+            "cityu_institutional": {
+                "readonly_clocks": {
+                    "lseg_cftc_cot_positioning": {"max_date": {"raw": "2026-11-03"}},
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory(prefix="regime-v2-report-") as tmp:
+            root = Path(tmp)
+            report = build_report(
+                env=env,
+                root=_ROOT,
+                pack=supplement,
+                signals=[],
+                kill_present=True,
+                dry_run=True,
+                output_db=root / "decision.db",
+                source_db=root / "indicator_source.db",
+                isolated_prefix=root,
+                engine_exit_code=0,
+            )
+        codes = {item["code"] for item in report["blocks"]}
+        self.assertFalse(report["cutover_allowed"])
+        self.assertIn("public_derivatives_missing", codes)
+        self.assertIn("news_events_missing", codes)
+        self.assertIn("lseg_macro_missing", codes)
+        self.assertIn("news_fetched_at_stale", codes)
+        self.assertIn("lseg_cross_asset_bars_stale", codes)
+        self.assertNotIn("obi_top5_source_stale_or_absent", codes)
+        self.assertIn(
+            "production_store_present_in_evidence",
+            {item["code"] for item in report["observations"]},
+        )
 
     def test_safety_bytes_are_main_or_the_production_pack_not_a_third_file(self) -> None:
         for relative, allowed in _UNTOUCHED.items():

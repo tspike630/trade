@@ -61,12 +61,17 @@ PR220 的 gate 重建值 `fa2fc3dd…` 不是生产 `5c3022e0`。不得用 PR220
 
 ## 特征新鲜度
 
-文件 mtime 不是新鲜度。
+文件 mtime 不是新鲜度。生产三库在现网存在。本机 checkout 没有这些库文件，证据里的新鲜样本不能当成这里已经有库。
 
-- 对手盘、错位、Deribit：行内 `ts_ms`，窗口等于 `BINANCE_INDICATORS_FRESH_SEC`（默认 3600 秒）。盘口 OBI 用的是 `obi_top5_source_ts_ms`，不是表的 `ts_ms`。
-- 新闻：白名单行的 `fetched_at`，窗口 90 分钟。
-- LSEG 传染：`cross_asset_bars` 且 `interval='5min'` 的 `utc_ms`，窗口 30 分钟。
-- 11-14 11:20 HKT 证据包：永续 `ts_ms`、错位、Deribit 在 1 小时内；OBI 源时钟未入包；新闻 `max_time` 为空；LSEG 最新 bar 为 2026-11-09T10:00:00Z 且样本周期是 1h；解锁样本为空；城大 COT 库与 `volume_z` 指标库未入包。这些是阻断，不是绿。
+11:34:40 HKT 补充包（`now_ms=1794627280536`）按源码已有窗口：
+
+- OBI `obi_top5_source_ts_ms` 11:31:08、对手盘 `ts_ms` 11:28:51、`volume_z` 的 `source_close_time_ms` 10:59:59，都在 `BINANCE_INDICATORS_FRESH_SEC` 默认 3600 秒内。`computed_at` 11:11:57 也落在同一窗口，但读取用的是收盘时钟，不是 computed_at。
+- 新闻 `fetched_at` 2026-11-13 19:33:42 HKT，超过 `NEWS_WINDOW_MIN=90`。当时没有新闻采集进程。
+- LSEG `cross_asset_bars` 最新 2026-11-09 18:00:00 HKT，超过传染窗口 30 分钟。当时没有 LSEG 采集进程。
+- COT 在 `cityu_institutional.db`，`lseg_cftc_cot_positioning.max_date=2026-11-03`。读取用 `due_cftc_asof`（周二报告、周五 15:30 纽约发布），源码没有秒级 TTL，这里不另设。
+- `token_unlock_schedule` 没有采集时钟。`next_unlock_utc` 在读取时重算。mtime 不算新鲜。
+
+`data_adapter`、`binance_indicators`、`cityu_institutional_alpha`、`macro_circuit_breaker`、`signal_bus`、`perp_microstructure_and_beta_hedge`、`volume_z_1h`、`wall_mid_pricing` 与补充包生产字节一致。`engine.py` 生产仍是 `2b578762`（beta 复检），本分支不覆盖它。
 
 ## 验收
 
@@ -79,6 +84,8 @@ bash scripts/regime_v2_kill_dry_run.sh \
 
 `cutover_allowed` 仅在没有阻断时为真。缺库、过期、无信号、未确认状态 1、或仓位等于未裁定凯利比例，都不得切主通道。
 
-## 仍缺的现场材料
+## 等待裁定
 
-证据包没有：`data_adapter`、`bnb_spot_map`、`binance_indicators`、`volume_z_1h`、`cityu_institutional_alpha`、`macro_circuit_breaker`、`signal_bus`、`perp_microstructure_and_beta_hedge` 的生产哈希；没有整库，没有 `decision_log`，没有永续执行器（故意不打包）。城大 COT、1h `volume_z`、新闻行时钟、OBI 源时钟、解锁 `next_unlock_utc` 都不能从本包复原。状态 4 止盈 0.80 是否改写成交价、永续是否开启、独立入场模块是否另建、24% 之后的比例，都还要裁定。
+本地材料里没有独立的每态入场规范。路由器文档和实现（乘数 1.00/1.20/1.15/0.55/0）与 11-11 AGENTS 的凯利底仓、三阶棘轮、5% 和永续比例不是同一份契约。在杨确认哪一份是权威契约之前：不新建入场模块，不把 `tech_boll_fade_v1` 改名，不改 24% 基数，不开永续。状态 4 的 0.80 仍只盖章。
+
+本机仍没有三份特征库和 `dexscreener.db`。验收报告同时记下「现网证据里库存在且部分时钟新鲜」和「这里的文件不存在」。后者继续阻断主通道。
