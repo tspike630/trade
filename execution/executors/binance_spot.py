@@ -1871,18 +1871,50 @@ class BinanceSpotAdapter:
         return account_book_block(self.account_snapshot, book, expected)
 
     def _trade_client(self) -> Any:
-        """HTTP client for orders and OCO queries.
+        """HTTP client for orders.
 
         A restarted process builds ``default_live_bnb_adapter`` with no client.
-        The buy path already installs one before ``new_order``. Maintenance
-        uses the same client when the book is allowed to sign REST, instead
-        of reporting ``oco_requery_unsupported`` and hiding the last error.
+        The buy path installs one before ``new_order`` only when REST trading
+        is already allowed. Order-list reads use ``_order_list_reader``, which
+        can query without handing that client to a later buy.
         """
         if self.client is not None:
             return self.client
         if self.allow_rest_http:
             self.client = BinanceSpotHttpClient()
         return self.client
+
+    def _rest_book_selected(self) -> bool:
+        book = self.production_book
+        if book is None:
+            book = os.environ.get("BINANCE_SPOT_PRODUCTION_BOOK", "").strip() or None
+        return book == REST_BOOK
+
+    def _order_list_reader(self) -> Any:
+        """Client that can GET an official order list.
+
+        ``_trade_client`` installs nothing when the adapter was built with no
+        client and ``allow_rest_http`` is false. A live ``execution.run``
+        loop is that adapter: a stale account snapshot keeps REST trading
+        off, ``get_order_list`` is missing, and every maintenance tick
+        rewrites ``last_error`` to ``oco_requery_unsupported`` while the row
+        stays ``oco_working``. An injected client that cannot query does the
+        same thing when REST trading is already allowed.
+
+        The read uses ``BinanceSpotHttpClient`` in those two cases. It is
+        stored only when this adapter has no client and REST trading is
+        already allowed. A snapshot-blocked buy must not inherit the reader
+        and skip that gate. An injected order client stays installed.
+        """
+        current = self.client
+        if callable(getattr(current, "get_order_list", None)):
+            return current
+        if not self.allow_rest_http and not (current is None and self._rest_book_selected()):
+            return current
+        http = BinanceSpotHttpClient()
+        if current is None and self.allow_rest_http:
+            self.client = http
+        return http
 
     def _maker_top_of_book(
         self, client: Any, symbol: str
@@ -5421,6 +5453,18 @@ class BinanceSpotAdapter:
                     error="oco_lot_residual" if uncovered else None,
                 )
             if state == "filled":
+                fields = self._official_oco_fill_fields(row, recon)
+                if fields is not None:
+                    save(fields)
+                    return self._coverage(
+                        row,
+                        book="oco_filled",
+                        submitted=False,
+                        ok=True,
+                        protection=PROTECTION_EXCHANGE,
+                        error=None,
+                        reason=recon.get("exit_reason"),
+                    )
                 close_state = self._account_oco_execution(row, recon, save)
                 mapped = self._coverage_from_account(row, recon, close_state)
                 if mapped is not None:
@@ -7285,11 +7329,40 @@ class BinanceSpotAdapter:
             unprotected_qty="",
         )
 
+    def _official_oco_fill_fields(
+        self, row: dict[str, Any], recon: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Terminal close for a proved official fill. Missing qty is not a fill."""
+        executed = _to_decimal(recon.get("executed_qty"))
+        reason = recon.get("exit_reason")
+        if executed is None or not reason:
+            return None
+        fields: dict[str, Any] = {
+            "status": "oco_filled",
+            "protection": PROTECTION_EXCHANGE,
+            "exit_reason": reason,
+            "exit_order_id": recon.get("filled_order_id"),
+            "exit_filled_qty": _decimal_text(executed),
+            "oco_list_status": recon.get("list_status"),
+            "oco_order_list_id": recon.get("order_list_id"),
+            "oco_above_order_id": recon.get("above_order_id"),
+            "oco_below_order_id": recon.get("below_order_id"),
+            "last_error": None,
+        }
+        held = _to_decimal(row.get("quantity"))
+        if held is not None:
+            remainder = held - executed
+            if remainder <= Decimal("0.00000001"):
+                fields["residual_qty"] = "0"
+            else:
+                fields["residual_qty"] = _decimal_text(remainder)
+        return fields
+
     def _reconcile_oco(self, row: dict[str, Any]) -> dict[str, Any]:
         gates = self._gates()
         if not gates.get("live_enabled"):
             return {"state": "requery_failed", "error": "binance_spot_live_disabled"}
-        client = self._trade_client()
+        client = self._order_list_reader()
         query = getattr(client, "get_order_list", None) if client is not None else None
         if not callable(query):
             return {"state": "requery_failed", "error": "oco_requery_unsupported"}
@@ -7323,7 +7396,7 @@ class BinanceSpotAdapter:
         if not isinstance(payload, dict):
             return {"state": "requery_failed", "error": "oco_requery_failed"}
         if not payload.get("orderReports"):
-            legs = self._load_oco_legs(payload, symbol, key, secret)
+            legs = self._load_oco_legs(payload, symbol, key, secret, client)
             # A missing leg (-2013/-2011) or a leg-query failure does not
             # cancel a list the list endpoint still says is working.
             if legs is None and not oco_is_working(payload):
@@ -7343,8 +7416,10 @@ class BinanceSpotAdapter:
         symbol: str,
         key: str,
         secret: str,
+        client: Any | None = None,
     ) -> list[dict[str, Any]] | None:
-        client = self.client
+        if client is None:
+            client = self.client
         lookup = getattr(client, "get_order", None) if client is not None else None
         if not callable(lookup):
             return None

@@ -745,6 +745,7 @@ def classify_oco(payload: dict[str, Any], *, held_qty: str) -> dict[str, Any]:
     }
     executed = Decimal("0")
     filled_reason: str | None = None
+    filled_order_id: str | None = None
     any_open = False
     order_qty: Decimal | None = None
     for row in _reports(payload):
@@ -760,11 +761,16 @@ def classify_oco(payload: dict[str, Any], *, held_qty: str) -> dict[str, Any]:
                 filled_reason = "take_profit"
             elif leg in {"STOP_LOSS_LIMIT", "STOP_LOSS"}:
                 filled_reason = "stop_loss"
+            order_id = row.get("orderId")
+            if order_id not in (None, ""):
+                filled_order_id = str(order_id).strip() or filled_order_id
         if status not in _TERMINAL_LEG and status not in {"FILLED", "PARTIALLY_FILLED"}:
             any_open = True
     held = _to_decimal(held_qty) or Decimal("0")
     basis = order_qty if order_qty is not None else held
     base["executed_qty"] = _decimal_text(executed) if executed > 0 else "0"
+    if filled_order_id:
+        base["filled_order_id"] = filled_order_id
     if oco_is_working(payload):
         base["state"] = "partial_working" if executed > 0 else "working"
         if executed > 0 and basis > executed:
