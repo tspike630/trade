@@ -26,20 +26,41 @@ PR220 的 gate 重建值 `fa2fc3dd…` 不是生产 `5c3022e0`。不得用 PR220
 
 `decision_engine/core/regime_strategy_router.py` 生产与改动前 main 同为 `56a2df45`。本分支只在接受的买单上追加 `regime_classification`，不改分类、仓位或止盈公式。`decision_engine/run.py` 生产与改动前 main 同为 `a696ab8c`。本分支只增加 `--regime-v2-isolated-purpose`，不改默认的 `shadow_010` 隔离。
 
+## t250u 草案（2026-11-14 11:56 HKT）
+
+这是规则草案，不是已切主通道的实现。本次没有新策略类，没有改执行器，没有改生产 `engine.py`。源码默认仍是关。`configs/live_regime_v2.env` 里路由器不读取的键不会改变仓位或止盈价。
+
+杨的定案：单笔目标名义 = 实时可用或权益基数 × 24% × 入场档位 × 状态乘数。24% 是现场 CLI 事实，不是新的凯利批准，也不是把历史余额写死。纯现货，不对冲。状态 4 乘数改为 0.30。状态 1 为 1.00 / 止盈 1.00，取消此前鲸鱼 1.08 / 0.85 与止盈 1.22 / 0.72。状态 2 仓位 1.20、止盈 1.35，且必须走已实装的逼空入场。状态 3 仓位 1.15、止盈 1.25，保留已批准的联合盘口与巨量条件。状态 4 只允许最严苛的布林深跌 `LIMIT_MAKER`，止盈 0.85。状态 5 仓位 0，禁止新开多。必需数据过期或缺失要闭锁，不能默认状态 1。
+
+退出保护已锁，不再作为待问：`TRAILING_RATCHET=0`，`MAX_HOLD_SEC=0`，`AUTO_FLATTEN_ON_OCO_FAIL=1`。棘轮改单和定时强平不再采用 11-11 AGENTS 的写法。生产执行器保持 `87ef5ed7` / `70aecd69` / `5c3022e0`，含 maxhold r2 与 PR220 回读，不退回 `aca99a95`。
+
+## 配置能做的和做不到的
+
+| 定案 | 草案配置 | 现有代码 | 结论 |
+| --- | --- | --- | --- |
+| 24% × 入场档 × 状态乘数 | `REGIME_V2_POSITION_PCT=0.24` 只被干跑脚本当成 `--position-pct` | fade 臂：`live_bnb_entry_zone.py` 大单乘数 1.0（L912）、中性 0.5（L643、L961）。路由在乘数 ≠ 1 时再乘状态乘数（生产路由 L639–640） | 比例相乘这条路径存在。实时权益不在决策路由里读。执行侧用 `BINANCE_SPOT_BOOK_USDT`，启动脚本另把 `BINANCE_SPOT_REST_USDT_FREE` 设成同一个数。两套口径不唯一，本草案不私选 |
+| 板块簇和总敞口 | `LIVE_BNB_CLUSTER_CAP_ENABLED=0` | `portfolio_clusters.py` 只在旗标打开时按簇计口数，不是名义总敞口。默认阈值未按定案给定 | 不打开，避免猜上限 |
+| 同币单笔单 OCO、跨 purpose 同币互斥 | 不改执行器 | `live_buy_guards.py` 在账本可读时挡住同一标的的第二笔买。PR218 的跨臂互斥在生产执行器里，本 PR 不改那些文件 | 保持，不在本草案里重写 |
+| 180 秒 OCO 回读后才允许异币 | 不新设旗标 | `binance_spot_gate.py` 默认回读 TTL 180 秒。回读通过后是否允许下一笔异币，本 PR 没有再证 | 阻断：不能把 TTL 常数说成已经实现「顺风横向开仓」 |
+| 永续关闭 | 两个永续旗标 = 0 | 路由仍会把 `require_perp_beta_hedge` 盖成 True。执行不读这个盖章去下空单 | 标签不是对冲，也不放宽仓位 |
+| 再挂靠 = 1 | 旗标保持 0，`REGIME_V2_REANCHOR_STATUS=blocked_behavior_mismatch` | 生产 `binance_spot_protect.py` L509–578：只在原止盈止损带包不住 `min/max(成交, 标记价)` 时，按信号价相对距离重算，止损距离下限 50 bps。不是每笔都按成交均价重锚，锚点也不是单独的成交均价。L3790 与 L5843 发生在首挂保护，不是持仓中途反复改单 | 阻断。只开旗标会谎称符合 |
+| 止盈倍率写进价格 | 草案记下 1.00 / 1.35 / 1.25 / 0.85 / 不适用 | `_expand_regime_take_profit` 只在 Kelly 或 `EXPAND_REGIME_OCO_TP` 打开时外扩状态 2/3，且不用 `tp_multiplier`。这两个开关保持 0。成交均价上的倍率公式没有定义 | 阻断。不把倍率乘到绝对币价上猜 |
+| 状态 1 取消鲸鱼分支 | 草案写 1.00 / 1.00 | 生产路由 L355–391 仍有 1.08 / 1.22 与 0.85 / 0.72，没有关闭旗标 | 阻断。配置表达不了。本 PR 不删分支，避免未测试地改变默认路径 |
+| 状态 1 PostOnly 与盘口门 | 两个 PostOnly 旗标和 `BINANCE_SPOT_ORDERBOOK_GATE=1` | PostOnly 只把中性限价从 `LIMIT` 改成 `LIMIT_MAKER`（入场区 L630）。大单仍是 `MARKET`（L907） | 部分。不能说状态 1 全部变成 PostOnly |
+| 状态 2 逼空入场 | `REGIME_V2_STATE2_ENTRY_STATUS=module_not_called` | 仓库有 `funding_z_fade_v1`，阈值是绝对值 `>= 2.0`（`funding_z_fade.py` L28），不是 `-1.8`。现网发射器不调用它。生产包的 `strategies/` 没有这个文件。路由标签是 `funding_z_fade_and_squeeze_ratchet` | 阻断。不能用 `tech_boll_fade_v1` 代替逼空验收 |
+| 状态 3 前 65% / 后 35% 与联合条件 | 不新设阈值 | 代码拒绝 `xs_rank_pct_1h < 0.35`（L293）。薄盘是 `obi <= -0.25` 且吃单缺失或 `<= 0.45`（L308）。巨量用无历史时 3.80，且要鲸鱼有值并 `<= 0.65`（L322） | 名次线与「剔除后 35%」一致，前提是名次越大越强。联合条件是 13:08 已批准的实现，定案正文没有改写它们 |
+| 状态 4 乘数 0.30、深跌档 | 草案写 0.30 与 `deep_tier_undefined` | 代码仍是 0.55（L275）。入场区的 `deep` 是 `low - 0.5 * span`（L509–510），用于拥挤跳过的价格记录，不是一条已测的独立深跌入场 | 阻断。不自造深跌阈值 |
+| 状态 5 与过期闭锁 | 草案写仓位 0、`fail_closed_not_implemented` | 危机条件命中时买单被丢。缺特征仍落到状态 1 标准剧本（L393–403） | 阻断。没有名为「12 道门禁」的清单。代码里能指出的停多条件见下 |
+| 状态 4 乘数从 0.55 改为 0.30 | 只写在草案键里 | 路由器不读该键 | 需要后续改码和测试，本次不做 |
+
+状态 5 代码里实际会停多的条件（生产路由 L130–183），不是 12 道的证明：宏观 `macro_halt`、解锁黑窗、跨所错位 `>= 35` bps、`xs_systemic_crash`、多头清算瀑布、负 gamma 且 `dvol_z >= 2`、NVDA `<= -2%`、SMH `<= -2%`。新闻危机覆盖是另一层（`_decision_after_news`）。广度 `< 12%` 写在模块文档 L37，if 里没有。其余「12 道」没有出处，不能宣称已经齐。
+
 ## OCO / kill 红线（保留）
 
-- `LIVE_TRADING_DISABLED` 存在时不得启动 emitter。它只挡新买；`BINANCE_SPOT_BLOCK_SELL_ON_KILL=0`，保护性卖出不被杀开关本身挡住。
-- 原生 OCO 回读、逐 purpose 账本、急停继续有效。`BINANCE_SPOT_TRAILING_RATCHET=0`，`BINANCE_SPOT_MAX_HOLD_SEC=0`，`BINANCE_SPOT_REANCHOR_OCO_ON_FILL=0`。
-- 源码里上述开关以及 Kelly、EXPAND、永续、盘口、Maker、SOR 的默认都是未设置即关。历史 switches-off 行为不得靠改默认值放行。
-- 干跑不调用私有交易 API，不碰生产账本。验收必须 `--dry-run` 且 `--output-db` 在 `/tmp` 或 `/var/tmp`。`--output-db` 与 `--db` 不同时，原逻辑会把 purpose 改写成 `shadow_010`，从而不走进五态路由。验收脚本额外传 `--regime-v2-isolated-purpose`，只在 dry-run、输出库隔离、且 purpose 为 `live_bnb_boll_fade` 或 `live_bnb_boll_classic` 时保留原 purpose。不带该旗标的旧隔离行为不变。这个输出库不是消费者输入。
-
-## 策略入口与仓位（待裁定的保持原值）
-
-没有一份完整新规范定义独立入场模块。13:08 裁定保留已安装路由：状态 3 薄盘口与巨量是联合条件，巨量但鲸鱼缺失仍放行；状态 1 鲸鱼牛向 1.08、熊向区间 `0.45 < whale_div <= 0.72`、浅跌 `boll_z > -2.25` 拒绝。playbook 字符串不是另一个 `strategy_id`。入场仍是 `tech_boll_fade_v1` + `live_bnb_entry_zone`。只改名不能通过验收。
-
-2026-11-12 13:38 基准是账面的 24%（当时约 141.88 USDT，BOOK 591.18409897）。解除「24% 不动」的临时冻结没有指定新比例。`configs/live_regime_v2.env` 继续传 `--position-pct 0.24`，并标明 `pending_ruling`。不得自行改成 18.5%、20%、45%、35%、5%、95% 或三阶凯利。`USE_OPTIMAL_KELLY_MATRIX=0`。`EXPAND_REGIME_OCO_TP=0`（它只外扩状态 2/3，不会把状态 4 止盈收成 0.80）。状态 4 的 `tp_multiplier=0.80` 与 `require_perp_beta_hedge` 仍是盖章。0.80 未改写 `take_profit_price`。永续未授权：`ENABLE_PERP_SHORT_ENGINE=0`，`BINANCE_PERP_SHORT_LIVE_ENABLED=0`。盖章不是已对冲。
-
-缺分类特征时，路由仍会落到状态 1 标准剧本。这是现有代码，不是新政策。验收把这种买单标成 `state1_unconfirmed` 并阻断主通道。13:08 已允许的缺项（状态 3 缺 `obi`、缺 `volume_z`、巨量但鲸鱼缺失）不因此改成拒绝。
+- `LIVE_TRADING_DISABLED` 存在时不得启动 emitter，也不得删除这个文件。它只挡新买；`BINANCE_SPOT_BLOCK_SELL_ON_KILL=0`，保护性卖出不被杀开关本身挡住。
+- 原生 OCO 回读和逐 purpose 账本继续有效。`BINANCE_SPOT_TRAILING_RATCHET=0`，`BINANCE_SPOT_MAX_HOLD_SEC=0`，`BINANCE_SPOT_AUTO_FLATTEN_ON_OCO_FAIL=1`。再挂靠旗标保持 0，原因见上表。
+- 源码里这些开关未设置时的默认不变。历史 switches-off 测试不得靠改默认值放行。
+- 干跑不调用私有交易 API，不碰生产账本。验收必须 `--dry-run` 且 `--output-db` 在 `/tmp` 或 `/var/tmp`。隔离输出库不是消费者输入。无信号只说明这次影子没有候选，不是五态验收通过。
 
 ## 显式接通的门禁
 
@@ -47,11 +68,12 @@ PR220 的 gate 重建值 `fa2fc3dd…` 不是生产 `5c3022e0`。不得用 PR220
 
 | 开关 | 源码未设置 | 11-14 进程 | v2 配置 |
 | --- | --- | --- | --- |
-| Kelly / EXPAND / PERP / 白名单 / 逆波 | 关 | 0 | 0 |
-| TRAILING_RATCHET / MAX_HOLD_SEC / REANCHOR | 关 / 0 | 0 | 0 |
-| `BINANCE_SPOT_ORDERBOOK_GATE` | 关 | 未设置 | 1 |
-| `BINANCE_SPOT_POST_ONLY_LIMIT` 与 `LIVE_BNB_POST_ONLY_LIMIT` | 关 | 未设置 | 1 |
-| `BINANCE_SPOT_SOR_MAKER_FALLBACK` | 关 | 未设置 | 1 |
+| Kelly / EXPAND / PERP / 白名单 / 逆波 / 簇上限 / SOR | 关 | 0 或未设置 | 0。定案没有打开 SOR |
+| TRAILING_RATCHET / MAX_HOLD_SEC | 关 / 0 | 0 | 0 |
+| AUTO_FLATTEN_ON_OCO_FAIL | 未设置则关（保护文件 L74–78） | 1 | 1 |
+| REANCHOR_OCO_ON_FILL | 未设置则关 | 0 | 0。定案目标是 1，行为不符，见上表 |
+| `BINANCE_SPOT_ORDERBOOK_GATE` | 关 | 未设置 | 1。只覆盖执行侧盘口检查 |
+| `BINANCE_SPOT_POST_ONLY_LIMIT` 与 `LIVE_BNB_POST_ONLY_LIMIT` | 关 | 未设置 | 1。只改中性限价，不改大单市价 |
 | `DECISION_MACRO_GATE_ENABLED` + `DECISION_MACRO_DB` | 关 | 未设置 | 1，`data/lseg/lseg_macro.db` |
 | `PUBLIC_DERIVATIVES_DB_PATH` | 默认同名相对路径 | 未设置 | `data/counterparty/public_derivatives.db` |
 | `NEWS_EVENTS_DB_PATH` | 仓库根 `news_events.db` | 未设置 | `news_events.db` |
@@ -84,8 +106,12 @@ bash scripts/regime_v2_kill_dry_run.sh \
 
 `cutover_allowed` 仅在没有阻断时为真。缺库、过期、无信号、未确认状态 1、或仓位等于未裁定凯利比例，都不得切主通道。
 
-## 等待裁定
+## 数据刷新（只报告，不执行）
 
-本地材料里没有独立的每态入场规范。路由器文档和实现（乘数 1.00/1.20/1.15/0.55/0）与 11-11 AGENTS 的凯利底仓、三阶棘轮、5% 和永续比例不是同一份契约。在杨确认哪一份是权威契约之前：不新建入场模块，不把 `tech_boll_fade_v1` 改名，不改 24% 基数，不开永续。状态 4 的 0.80 仍只盖章。
+- 新闻最新 `fetched_at` 是 2026-11-13 19:33:42 HKT。当时没有新闻采集进程，停因未在包里写明。单次补数命令是 `.venv/bin/python -m sources.news --once --db /workspace/dexscreener-crawler/news_events.db`。本环境不跑。
+- LSEG 最新 bar 是 2026-11-09 18:00 HKT。现网脚本是 `import_lseg_bars_incremental.py`，需要一份含 `lseg_cityu_core_refresh_bars.csv` 和 `lseg_cityu_incremental_bars.csv` 的新 CSV 目录。fetch 脚本不在现网，也没有已验证的 CodeBook 会话。不新登录、不订阅。
+- FRED 在 `public_derivatives.db` 的 `macro_net_liquidity`，最新 as-of 是 2026-11-13。PID 1664610 每 300 秒仍在采集。这不是停更，不开第二个 loop。
 
-本机仍没有三份特征库和 `dexscreener.db`。验收报告同时记下「现网证据里库存在且部分时钟新鲜」和「这里的文件不存在」。后者继续阻断主通道。
+## 仍未切正式服务
+
+本机没有三份特征库和 `dexscreener.db`。影子干跑只能证明隔离和缺文件，不能代替现网新鲜样本上的五态验收。要在现场做只读干跑，最小输入是：一份脱敏的指标库（含 `decision_volume_z` 与 K 线）、`public_derivatives.db`、`news_events.db`、`data/lseg/lseg_macro.db`，以及每个 purpose 的只读账本副本。不要把这些生产文件复制进本 PR。

@@ -56,8 +56,8 @@ _ON_KEYS = (
     "BINANCE_SPOT_ORDERBOOK_GATE",
     "BINANCE_SPOT_POST_ONLY_LIMIT",
     "LIVE_BNB_POST_ONLY_LIMIT",
-    "BINANCE_SPOT_SOR_MAKER_FALLBACK",
     "DECISION_MACRO_GATE_ENABLED",
+    "BINANCE_SPOT_AUTO_FLATTEN_ON_OCO_FAIL",
 )
 
 
@@ -116,7 +116,7 @@ def profile_blocks(env: Mapping[str, str]) -> list[dict[str, str]]:
         blocks.append(
             _block(
                 "position_not_the_pending_baseline",
-                f"REGIME_V2_POSITION_PCT={position!r}; 24% remains pending, not a new Kelly fraction",
+                f"REGIME_V2_POSITION_PCT={position!r}; 24% is the live CLI fact, not a Kelly fraction",
                 source="profile",
             )
         )
@@ -140,6 +140,26 @@ def profile_blocks(env: Mapping[str, str]) -> list[dict[str, str]]:
     if env.get("DECISION_EXECUTION_LEDGER_FADE") == env.get("DECISION_EXECUTION_LEDGER_CLASSIC"):
         blocks.append(
             _block("purpose_ledger_shared", "fade and classic ledgers are the same path", source="profile")
+        )
+    if str(env.get("BINANCE_SPOT_REANCHOR_OCO_ON_FILL", "")).strip() not in {"0", "false", "no", "off"}:
+        blocks.append(
+            _block(
+                "reanchor_flag_claims_compliance",
+                "production reanchor is not once-from-fill-average",
+                source="profile",
+            )
+        )
+    if env.get("REGIME_V2_REANCHOR_STATUS") != "blocked_behavior_mismatch":
+        blocks.append(
+            _block(
+                "reanchor_status_missing",
+                str(env.get("REGIME_V2_REANCHOR_STATUS")),
+                source="profile",
+            )
+        )
+    if str(env.get("BINANCE_SPOT_SOR_MAKER_FALLBACK", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+        blocks.append(
+            _block("sor_not_in_t250", "BINANCE_SPOT_SOR_MAKER_FALLBACK", source="profile")
         )
     return blocks
 
@@ -891,7 +911,7 @@ def build_report(
     observations.append(
         _block(
             "position_pending_ruling",
-            "REGIME_V2_POSITION_PCT=0.24 is the 2026-11-12 baseline, not a new fraction",
+            "REGIME_V2_POSITION_PCT=0.24 is the live CLI fact, not a new Kelly fraction",
             source="profile",
         )
     )
