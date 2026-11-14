@@ -1,63 +1,84 @@
-# AGENTS.md / CLAUDE.md — Institutional Upgrade & Data Manifest (2026-11-10)
+# AGENTS.md / CLAUDE.md — 五态阶段章程（2026-11-14）
 
-> **致仓库内的 AI Agent（Claude Code / Cursor / Codex / OpenClaw）**：
-> 本文件是当前量化交易系统最新的**架构、数据库表结构与策略路由权威说明书**。在做任何代码修改、参数调整、回测或实盘诊断前，请务必先阅读本清单。
+> 本文件替换 11-10 说明书里「凯利底座已经下发现网、355 项测试即代表实盘五态」的写法，也替换 OCO 修复阶段的临时锁：不改策略、把 24% 当成不可评审的冻结、四个新开关永久不许点名、以及用 main 旧执行器哈希（`d8c31aca` / `f7e2e3c6` / `6686b214`）当现网门禁。那些哈希不是 11-14 生产字节。生产树没有本文件。11-11 work-canonical 副本不是全部现行规范。
 
-## 1. 核心架构升级总览（Milestones 1–24 已上线，355 项单元测试全通）
+## 阶段
 
-本系统已从单一技术指标反转升级为**跨资产机构级五态自适应量化引擎**：
+杨于 2026-11-14 授权从 OCO 修复阶段进入更新后的五态策略阶段，停止按旧逻辑继续开仓。本仓库改动只供审核。不部署、不合并、不打发布 tag、不下单、不启永续。
 
-1. **五态市场状态路由器 (`decision_engine/core/regime_strategy_router.py`)**
-   - 已挂载至主引擎 `decision_engine/core/engine.py` (`apply_five_state_regime_router`)。
-   - **状态 1 (`regime_1_positive_gamma_pinned`)**：常态正 Gamma 震荡（约占 55% 时间），运行 1h 布林下轨均值回归 (`tech_boll_fade_standard`)，全凯利最优固定底仓 **`18.5%`**（不追高加仓）。
-   - **状态 2 (`regime_2_short_squeeze_breakout`)**：CFTC 杠杆基金净空头拥挤 / 高空头矿企 / 币安极端负资金费率逼空，运行**三阶零本金风险 OCO 棘轮推仓 (`35.0% -> 70.0% -> 95.0%`)**。
-   - **状态 3 (`regime_3_cross_asset_bull_pullback`)**：`NVDA.O` / `SMH.O` 1h 领涨 (`>= +1.2%`) 或截面广度 `>= 68%` 的跨资产牛市，剔除截面后 35% 弱势币，并内置**防闷杀五看盘口过滤**（拒绝 `obi_top5 <= -0.25` 薄托单假突破与 `volume_z >= 3.8` 巨量派发陷阱），对前排龙头运行**三阶 OCO 棘轮推仓 (`30.0% -> 60.0% -> 85.0%`)**。
-   - **状态 4 (`regime_4_crowded_long_defensive`)**：散户多头拥挤或宏观高波冲击，现货缩至 **`5.0%`** 极深接针仓 + 强制开启 **`50%` 永续合约 Beta 空单对冲**。
-   - **状态 5 (`regime_5_crisis_liquidation_halt`)**：宏观黑天鹅 / `.VIX` / `.MOVE` / 日元风险逆转 (`JPY1MRR=`) 崩盘 / CME 期货贴水 (`BTCc2 < BTCc1`) / 连环清算瀑布，**100% 熔断拦截现货开多**（保留卖出通道）+ **`100%` 永续空单锁仓**。
+现网新开仓已由父级暂停：2026-11-14 11:16:32 HKT 创建 `LIVE_TRADING_DISABLED`，两个旧 emitter 于 11:16:39 退出，保护消费者继续。11:18 官方账户空仓、无挂单，仅 PEPE 0.40 尘。
 
-2. **城大 (CityU) 机构级跨资产 Alpha 引擎 (`decision_engine/core/cityu_institutional_alpha.py`)**
-   - 实时读取 CFTC COT 持仓 (`cot_regime`)、美股加密矿企空头比例 (`avg_miner_short_interest_pct`)、FINRA TRACE 可转债机构买盘占比 (`trace_conv_bond_buy_ratio`)、`NVDA.O`/`SMH.O` 1h 领先动量、美债 OIS 利差与 Orbis 银行脆弱度。
+## 安全基线（本 PR 不替换）
 
-3. **LSEG 宏观聪明钱预期走廊与 V2 跨资产熔断器 (`decision_engine/core/macro_circuit_breaker.py`)**
-   - 基于 56,933 条全球经济日历 (`macro_events`) 的 `[min_forecast, max_forecast]` 区间与 `predicted_surprise`：数据落入走廊内 **5 分钟极速解封**，超走廊黑天鹅执行 **90 分钟硬熔断**。
-   - V2 跨资产门控涵盖 `.VIX`、`.MOVE`、`SVOL.P`、`JPY1MRR=` 以及 CME `BTCc2 - BTCc1` 期限结构。
+| 文件 | main 字节 | 11-14 生产字节 |
+| --- | --- | --- |
+| `execution/executors/binance_spot.py` | `d8c31aca…` 186699 | `87ef5ed7…` 310144（PR220 head `aaf918326b82`，09:47 安装） |
+| `execution/executors/binance_spot_protect.py` | `6686b214…` 42031 | `70aecd69…` 46540 |
+| `execution/executors/binance_spot_gate.py` | `f7e2e3c6…` 28458 | `5c3022e0…` 52312 |
+| `execution/gateway.py` | `e99f6d6f…` | `06ee774e…` |
+| `execution/ledger.py` | `5e07b430…` | `6039fd02…` |
+| `execution/run.py` | `fc30c933…` | `ff44a21b…` |
+| `decision_engine/core/engine.py` | `bac2a059…` | `2b578762…`（生产多一次下单后的 beta 复检；main 没有） |
+| `decision_engine/core/live_buy_guards.py` | `6b3023ed…` | `a550474c…` |
+| `decision_engine/core/protection_halt.py` | `947465bc…` | `b3c02ee7…` |
 
-4. **公开衍生品、盘口微观结构与永续 Beta 对冲 (`decision_engine/core/perp_microstructure_and_beta_hedge.py`)**
-   - 融合币安永续大户/散户多空背离 (`whale_retail_divergence`)、现货 L2 盘口失衡 (`obi_top5`)、主动吃单比 (`taker_buy_ratio`)、跨所基准价差 (Coinbase/OKX/Bybit)、Deribit 期权 Gamma 墙与代币大额解锁排期。
+PR220 的 gate 重建值 `fa2fc3dd…` 不是生产 `5c3022e0`。不得用 PR220 或 main 覆盖生产执行器、gate、gateway、ledger、engine、guards、halt。PR218 与 PR220 都未合并。PR220 是 LIMITED-PASS：专项 3 项由失败变通过，execution suite 相对未打补丁生产基线仍是 58 失败/错误。
 
-5. **执行层与风控棘轮**
-   - `decision_engine/core/dynamic_oco_ratchet.py`：硬件级币安 OCO 止损上移（浮盈 `+1.2%` 移至保本线以上解锁二阶仓位，浮盈 `+2.2%` 锁利解锁三阶满仓）+ 75 分钟时间止损。
-   - `decision_engine/core/drawdown_and_kelly_budget.py`：策略组回撤熔断（Pod Drawdown Halt）与凯利风险预算。
-   - `execution/executors/binance_spot.py`：支持 `LIMIT_MAKER` 智能挂单路由，节省吃单费率与滑点。
+`decision_engine/core/regime_strategy_router.py` 生产与改动前 main 同为 `56a2df45`。本分支只在接受的买单上追加 `regime_classification`，不改分类、仓位或止盈公式。`decision_engine/run.py` 生产与改动前 main 同为 `a696ab8c`。本分支只增加 `--regime-v2-isolated-purpose`，不改默认的 `shadow_010` 隔离。
 
-## 2. 本地与服务器 SQLite 数据库清单（注意：`*.db` 在 `.gitignore` 中，换机需 `rsync` 同步）
+## OCO / kill 红线（保留）
 
-| 数据库相对路径 | 体量与行数 | 核心数据表（共 30 张表，约 923 万行） | 更新/构建脚本 |
-| :--- | :--- | :--- | :--- |
-| `data/lseg/lseg_macro.db` | ~171 MB (`836,474` 行) | `cross_asset_bars` (63 个 LSEG 跨资产 RIC + CBOE 波动率), `macro_events` (56,933 条 SmartEconomics 日历), `central_bank_events` (555 条央行日程) | `scripts/ingest_cityu_usb_all.py` / `scripts/fetch_cityu_lseg_incremental.py` |
-| `data/cityu/cityu_institutional.db` | ~613 MB (`8,397,225` 行) | `wrds_optionmetrics_vsurfd` (372万行期权曲面), `wrds_crsp_treasuries` (360万行美债), `wrds_13f_holdings` (46万行13F机构持仓), `wrds_trace_convertible_bonds`, `lseg_cftc_cot_positioning`, `lseg_short_interest_daily`, `orbis_bank_liquidity_risk` 等 19 张表 | `scripts/ingest_cityu_usb_all.py` |
-| `data/counterparty/public_derivatives.db` | 实时滚动更新 | `binance_perp_counterparty`, `binance_spot_microstructure`（`orderbook_imbalance_20` 仍是前 20 档；`obi_top5` 是排序后前 5 档 price×qty，且只带覆盖该 `lastUpdateId` 的深度事件时间）, `cross_exchange_spot_baseline`, `deribit_options_gamma`, `token_unlock_schedule`, `macro_net_liquidity`, `stablecoin_supply`, `onchain_holder_bot_summary`, `collector_fetch_errors` | `scripts/fetch_public_derivatives_and_counterparty.py --loop --interval 300 --db data/counterparty/public_derivatives.db` |
+- `LIVE_TRADING_DISABLED` 存在时不得启动 emitter。它只挡新买；`BINANCE_SPOT_BLOCK_SELL_ON_KILL=0`，保护性卖出不被杀开关本身挡住。
+- 原生 OCO 回读、逐 purpose 账本、急停继续有效。`BINANCE_SPOT_TRAILING_RATCHET=0`，`BINANCE_SPOT_MAX_HOLD_SEC=0`，`BINANCE_SPOT_REANCHOR_OCO_ON_FILL=0`。
+- 源码里上述开关以及 Kelly、EXPAND、永续、盘口、Maker、SOR 的默认都是未设置即关。历史 switches-off 行为不得靠改默认值放行。
+- 干跑不调用私有交易 API，不碰生产账本。验收必须 `--dry-run` 且 `--output-db` 在 `/tmp` 或 `/var/tmp`。`--output-db` 与 `--db` 不同时，原逻辑会把 purpose 改写成 `shadow_010`，从而不走进五态路由。验收脚本额外传 `--regime-v2-isolated-purpose`，只在 dry-run、输出库隔离、且 purpose 为 `live_bnb_boll_fade` 或 `live_bnb_boll_classic` 时保留原 purpose。不带该旗标的旧隔离行为不变。这个输出库不是消费者输入。
 
-## 3. 关键环境变量与开关
+## 策略入口与仓位（待裁定的保持原值）
 
-- `LSEG_MACRO_DB_PATH`：默认自动定位 `data/lseg/lseg_macro.db`。
-- `CITYU_INSTITUTIONAL_DB_PATH`：默认自动定位 `data/cityu/cityu_institutional.db`。
-- `PUBLIC_DERIVATIVES_DB_PATH`：默认自动定位 `data/counterparty/public_derivatives.db`。
-- `use_optimal_kelly_matrix`：信号行或配置开启后，自动按五态最优凯利底座 + 三阶 OCO 保本棘轮 (`18.5% / 95.0% / 85.0% / 5.0% / 0.0%`) 下发目标仓位。
+没有一份完整新规范定义独立入场模块。13:08 裁定保留已安装路由：状态 3 薄盘口与巨量是联合条件，巨量但鲸鱼缺失仍放行；状态 1 鲸鱼牛向 1.08、熊向区间 `0.45 < whale_div <= 0.72`、浅跌 `boll_z > -2.25` 拒绝。playbook 字符串不是另一个 `strategy_id`。入场仍是 `tech_boll_fade_v1` + `live_bnb_entry_zone`。只改名不能通过验收。
 
-## 4. 常用自检与验证命令
+2026-11-12 13:38 基准是账面的 24%（当时约 141.88 USDT，BOOK 591.18409897）。解除「24% 不动」的临时冻结没有指定新比例。`configs/live_regime_v2.env` 继续传 `--position-pct 0.24`，并标明 `pending_ruling`。不得自行改成 18.5%、20%、45%、35%、5%、95% 或三阶凯利。`USE_OPTIMAL_KELLY_MATRIX=0`。`EXPAND_REGIME_OCO_TP=0`（它只外扩状态 2/3，不会把状态 4 止盈收成 0.80）。状态 4 的 `tp_multiplier=0.80` 与 `require_perp_beta_hedge` 仍是盖章。0.80 未改写 `take_profit_price`。永续未授权：`ENABLE_PERP_SHORT_ENGINE=0`，`BINANCE_PERP_SHORT_LIVE_ENABLED=0`。盖章不是已对冲。
+
+缺分类特征时，路由仍会落到状态 1 标准剧本。这是现有代码，不是新政策。验收把这种买单标成 `state1_unconfirmed` 并阻断主通道。13:08 已允许的缺项（状态 3 缺 `obi`、缺 `volume_z`、巨量但鲸鱼缺失）不因此改成拒绝。
+
+## 显式接通的门禁
+
+`configs/live_regime_v2.env` 只在被启动脚本 source 时生效：
+
+| 开关 | 源码未设置 | 11-14 进程 | v2 配置 |
+| --- | --- | --- | --- |
+| Kelly / EXPAND / PERP / 白名单 / 逆波 | 关 | 0 | 0 |
+| TRAILING_RATCHET / MAX_HOLD_SEC / REANCHOR | 关 / 0 | 0 | 0 |
+| `BINANCE_SPOT_ORDERBOOK_GATE` | 关 | 未设置 | 1 |
+| `BINANCE_SPOT_POST_ONLY_LIMIT` 与 `LIVE_BNB_POST_ONLY_LIMIT` | 关 | 未设置 | 1 |
+| `BINANCE_SPOT_SOR_MAKER_FALLBACK` | 关 | 未设置 | 1 |
+| `DECISION_MACRO_GATE_ENABLED` + `DECISION_MACRO_DB` | 关 | 未设置 | 1，`data/lseg/lseg_macro.db` |
+| `PUBLIC_DERIVATIVES_DB_PATH` | 默认同名相对路径 | 未设置 | `data/counterparty/public_derivatives.db` |
+| `NEWS_EVENTS_DB_PATH` | 仓库根 `news_events.db` | 未设置 | `news_events.db` |
+| 账本 | 单数 `DECISION_EXECUTION_LEDGER` | 每 purpose 一个库 | 配置点名 fade 与 classic 两个路径；干跑改写到隔离目录 |
+
+`DECISION_MACRO_CITYU_V2_GATE`、`DECISION_MACRO_MICROSTRUCTURE_GATE`、`LIVE_BNB_PORTFOLIO_BETA_GATE` 没有新的点名授权，配置里保持关闭。
+
+## 特征新鲜度
+
+文件 mtime 不是新鲜度。
+
+- 对手盘、错位、Deribit：行内 `ts_ms`，窗口等于 `BINANCE_INDICATORS_FRESH_SEC`（默认 3600 秒）。盘口 OBI 用的是 `obi_top5_source_ts_ms`，不是表的 `ts_ms`。
+- 新闻：白名单行的 `fetched_at`，窗口 90 分钟。
+- LSEG 传染：`cross_asset_bars` 且 `interval='5min'` 的 `utc_ms`，窗口 30 分钟。
+- 11-14 11:20 HKT 证据包：永续 `ts_ms`、错位、Deribit 在 1 小时内；OBI 源时钟未入包；新闻 `max_time` 为空；LSEG 最新 bar 为 2026-11-09T10:00:00Z 且样本周期是 1h；解锁样本为空；城大 COT 库与 `volume_z` 指标库未入包。这些是阻断，不是绿。
+
+## 验收
 
 ```bash
-# 1. 运行全部 355 项单元测试
-python3 -m unittest discover -s decision_engine/tests -p "test_*.py"
-
-# 2. 公开衍生品与对手盘。默认单次；请求到的标的有缺失时退出码 2，锁被占用时退出码 3。
-#    --loop 单轮失败不退出。PEPE 的 USD-M 合约是 1000PEPEUSDT，不是 PEPEUSDT。
-#    行时间用交易所事件时间，不用本机刷新时间。不读私钥、不下单。
-#    运行时没有这份脚本时，先用 crawler 组件同步；systemd 模板不自动安装：
-#    deploy/public-derivatives-collector.service
-python3 scripts/fetch_public_derivatives_and_counterparty.py --loop --interval 300 --db data/counterparty/public_derivatives.db
-
-# 3. 查看全量 785MB 城大数据集实证归因报告
-cat docs/CITYU_FULL_DATASET_BACKTEST_2026-11-09.md
+python3 -m unittest decision_engine.tests.test_regime_v2_cutover
+bash scripts/regime_v2_kill_dry_run.sh \
+  --kill-file /tmp/regime-v2-kill/LIVE_TRADING_DISABLED \
+  --output-db /tmp/regime-v2-isolated/decision.db
 ```
+
+`cutover_allowed` 仅在没有阻断时为真。缺库、过期、无信号、未确认状态 1、或仓位等于未裁定凯利比例，都不得切主通道。
+
+## 仍缺的现场材料
+
+证据包没有：`data_adapter`、`bnb_spot_map`、`binance_indicators`、`volume_z_1h`、`cityu_institutional_alpha`、`macro_circuit_breaker`、`signal_bus`、`perp_microstructure_and_beta_hedge` 的生产哈希；没有整库，没有 `decision_log`，没有永续执行器（故意不打包）。城大 COT、1h `volume_z`、新闻行时钟、OBI 源时钟、解锁 `next_unlock_utc` 都不能从本包复原。状态 4 止盈 0.80 是否改写成交价、永续是否开启、独立入场模块是否另建、24% 之后的比例，都还要裁定。

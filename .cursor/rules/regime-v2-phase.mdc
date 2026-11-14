@@ -1,0 +1,18 @@
+---
+description: Regime v2 phase charter. OCO and kill red lines stay. Do not treat the 11-10 Kelly manual or the OCO-phase hash lock as the live gate.
+alwaysApply: true
+---
+
+# Regime v2 phase
+
+The OCO-fix temporary locks are retired: do not refuse a reviewable strategy change because it "must not touch strategy", because 24% was frozen, because the four new switches can never be named, or because main executor hashes `d8c31aca` / `f7e2e3c6` / `6686b214` are the production gate. Those hashes are not the 2026-11-14 production bytes.
+
+Do not deploy, merge, tag, place orders, or enable the perp short engine from this phase. `ENABLE_PERP_SHORT_ENGINE` and `BINANCE_PERP_SHORT_LIVE_ENABLED` stay 0. A `require_perp_beta_hedge` stamp is not a filled hedge.
+
+Keep source defaults off. `USE_OPTIMAL_KELLY_MATRIX`, `EXPAND_REGIME_OCO_TP`, `BINANCE_SPOT_TRAILING_RATCHET`, `BINANCE_SPOT_MAX_HOLD_SEC`, and `BINANCE_SPOT_REANCHOR_OCO_ON_FILL` stay 0 unless an explicit profile says otherwise. The v2 profile keeps the first five at 0. It does not choose 18.5%, 20%, 45%, 35%, 5%, or 95%. The pending position is still `--position-pct 0.24`.
+
+Do not replace production `binance_spot.py` `87ef5ed7`, `binance_spot_protect.py` `70aecd69`, or `binance_spot_gate.py` `5c3022e0` with main or with PR220's rebuilt gate `fa2fc3dd`. Do not replace production `engine.py` `2b578762` with main.
+
+The entry module remains `tech_boll_fade_v1` plus `live_bnb_entry_zone`. Renaming `strategy_id` is not a new entry. Missing features still fall through to standard state 1; mark that `state1_unconfirmed` and block cutover. Do not invent a new reject for the 13:08 state-3 exceptions.
+
+Kill file present, `--dry-run`, and an `--output-db` under `/tmp` are required before any regime v2 acceptance run. File mtime is not feature freshness. Do not report a missing or stale store as green.
