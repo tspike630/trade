@@ -11,7 +11,7 @@
 | POST | `/api/v3/orderList/oco` | `new_oco` |
 | GET / DELETE | `/api/v3/orderList` | `get_order_list` / `cancel_order_list` |
 
-没有 `openOrders`，没有 `cancelReplace`，也没有改数量的接口。下面不把未实现的接口写成能力。`DELETE /api/v3/order` 的回执被丢掉，随后的 `GET /api/v3/order` 才是状态（spot `_cancel_resting_entry` L5900–5968）。取消请求返回成功，不等于订单已终态。
+上表是生产封装实际调用的路径。官方现货 REST 另有 `GET /api/v3/openOrders`、`DELETE /api/v3/openOrders`、撤单再下单和改单；本封装没有这些方法。缺的是工具，不是「交易所没有这个接口」。查询只多一次观测，数据源注明为 Memory => Database，不能和撮合做成一次原子事实。`DELETE /api/v3/order` 的回执被丢掉，随后的 `GET /api/v3/order` 才被代码采纳（spot `_cancel_resting_entry` L5900–5968）。取消请求返回成功，不等于订单已终态。
 
 ## 已批准，本文件不再改
 
@@ -25,7 +25,7 @@
 
 ## 买单回查：什么才算数
 
-`GET /api/v3/order` 的 `status`。终态集合是 `FILLED`、`CANCELED`、`CANCELLED`、`EXPIRED`、`REJECTED`、`EXPIRED_IN_MATCH`（gate `_FINAL_ORDER_STATUS` L1207–1209）。`final_executed_qty` 只在这个集合里返回 `executedQty`；`NEW`、`PARTIALLY_FILLED`、`PENDING_NEW` 返回空（L1212–1228）。
+`GET /api/v3/order` 的 `status` 是这一份响应里的字段。代码把 `FILLED`、`CANCELED`、`CANCELLED`、`EXPIRED`、`REJECTED`、`EXPIRED_IN_MATCH` 当作可读取 `executedQty` 的集合（gate `_FINAL_ORDER_STATUS` L1207–1209）；`NEW`、`PARTIALLY_FILLED`、`PENDING_NEW` 在 `final_executed_qty` 里返回空（L1212–1228）。这是本地分类，不是跨请求的最终证明。订单查询和 `myTrades` 是两次调用，中间可以再成交，分页也可能停在半截。官方枚举把 `FILLED` 写成已完成，把部分成交的 `LIMIT IOC` 或 `MARKET` 写成可变为 `EXPIRED`；那仍是该次响应的描述。超时、空体或对不上的成交页保持未知。
 
 净数量只来自该 `orderId` 的 `myTrades`：各笔 `qty` 之和必须等于 `executedQty`，每笔都有 `commission` 和 `commissionAsset`。买单净数量 = `executedQty − 基础币手续费`。`commissionAsset` 等于该交易对基础币才扣；报价币或其他币不扣（gate `account_order_base` L1231–1310）。缺手续费字段是 `fee_unverified`，按 0 处理没有依据。
 
@@ -68,7 +68,7 @@ BNB 只有在它就是基础币时才扣。代码里没有单独的 BNB 抵扣�
 
 `AUTO_FLATTEN=1` 只走已经存在的失败路径，并且要同时满足：卖出数量来自已证明的净数量、这一张 flatten 客户号 `bnbfade-fl-` 回读为不存在、本次不是超时或空响应。尘埃和 `oco_partial` 现有代码本来就不进 flatten（L3343–3347）。flatten 提交再超时则停止，不第二张市场卖（L3527–3532）。
 
-客户端没有活动单总查询。因此「没有别的卖单」只能核对这张已登记的 flatten 客户号和账本里的退出订单，核对不到账本外的手工卖单。这项在补上官方活动单查询之前闭合不了。
+生产封装没有调用 `GET /api/v3/openOrders`。因此现在只能核对已登记的 flatten 客户号和账本里的退出订单。即便以后接上该接口，它也只改善观测，不能保证「查询到没有卖单」和「随后发出卖单」之间没有别人的单。
 
 ## 已确认成交能不能先挂一张，并盖住后续余量
 
@@ -76,7 +76,7 @@ BNB 只有在它就是基础币时才扣。代码里没有单独的 BNB 抵扣�
 
 把 OCO 数量写成原始买单全量也没有依据：未成交部分还不是持仓，现有客户端不会用账户余额去放大卖单。
 
-所以推荐路径是：余量 `GET` 进入终态、净数量和 `F` 都证明齐、并且属于「确定无 OCO」之后，首挂一张。在此之前不挂。这一段不是批准的持仓方式，也不是成功状态。每拍冻结新买（现有 `maker_cancel_unknown` 已挡）、重复 `DELETE`+`GET` 或只 `GET`、发告警。等待上限本设计不填秒数，由杨另批；没有这个上限，就不能把该状态当成可上线行为。超过上限、进程重启后仍是同一事件、或官方持续断联，都维持阻断上线。人工接管只是事件处理，不把账本写成 `oco_working`。断联期间没有零风险保证。
+在已批准约束下，只有一份回查被本地当成终态、净数量和 `F` 又能对上、并且属于「确定无 OCO」时，才首挂一张。在此之前不挂。这一段不是批准的持仓方式，也不是成功状态。本设计不填等待秒数。秒数也不能把未知窗口写成已解决。人工接管只是事件处理，不把账本写成 `oco_working`。断联期间没有零风险保证。
 
 现有注释写「部分成交当拍就撤，不把无保护等到 TTL」（spot L6058–6060）。实现在回查未知时停在 `maker_cancel_unknown` 且不挂 OCO（L5994）。本设计沿用「先撤再认终态」，同时把这段未收口定为上线阻断，而不是一条可接受规则。
 
@@ -89,12 +89,29 @@ BNB 只有在它就是基础币时才扣。代码里没有单独的 BNB 抵扣�
 | 其他可行。新增成交另挂第二张，只卖新增净数量。 | 两张列表都要能被现有回读认领。客户端今天按一个 `oco_list_client_id` 记账。 | 两张卖单叠加可能超过持仓。交易所是否拒绝同币第二张，本客户端没有证据。 | 突破「同币单笔单 OCO」。要另批。 |
 | 止损备选。距离和 50 bps、向下档位都与推荐相同，锚用 `min(F, 标记价)`。 | 沿用现有 `reanchor_oco_prices_to_fill` 的锚。 | 锚不是单独的真实均价。 | 不突破公式 B，也不突破 OCO 约束。 |
 
-推荐第一行。没有等待上限、并且活动单总查询仍缺失时，第一行也不能上线。上线阻断是结论，不是把无保护等待批成规则。
+止损锚仍待审，公式 B 不变。这一张表不是上线许可。上线结论只看下一节：未知窗口下保持停用，不靠等待秒数声称已经解决。
 
 现有止损距离：`g=(E−信号止损)/E`；`E` 不大于止损或止损非正时，`g` 用 `MIN_REANCHOR_STOP_GAP`。然后 `g=max(g, 0.005)`。`0.005` 是 protect L43 的源码常数。首挂止盈不用 L553–562 的旧止盈重算，只用公式 B。
 
+## 入场订单与最终裁定
+
+生产封装只接受 `MARKET`、`LIMIT`、`LIMIT_MAKER`（spot `_OrderType` L95，`_parse_order_type` L431–441）。`LIMIT` 固定带 `timeInForce=GTC`（`_order_pairs` L1457–1458）。`LIMIT_MAKER` 不带 `timeInForce`。其他类型返回 `invalid_order_type`。仓库里没有 IOC、FOK 参数。
+
+状态 1 在 `REGIME_V2_CONTRACT=1` 时把建议类型写成 `LIMIT_MAKER`（`regime_strategy_router.py` `_apply_v2_contract` L834–838）。入场区大单档仍写出 `MARKET`（`live_bnb_entry_zone.py` L904–907），中性档在 PostOnly 打开时写 `LIMIT_MAKER`，否则写 `LIMIT`（L630）。执行器若收到建议 `LIMIT_MAKER`，且信号上还不是显式 `LIMIT`，会改成 `LIMIT_MAKER`（spot `_apply_recommended_order_type` L404–421）。状态 4 的定案文字是只允许最严苛深跌 `LIMIT_MAKER`；契约现在直接关闭该路，类型为 `NONE`（L852–856），并没有发出市价单。
+
+官方现货 REST（`binance-spot-api-docs` `rest-api.md` New order，`enums.md`）写明：`LIMIT` 必须带 `timeInForce`，取值为 `GTC`、`IOC`、`FOK`；`LIMIT_MAKER` 的必填是 `quantity` 和 `price`，并写成挂出后若立即当 taker 成交则拒绝。文档没有写 `LIMIT_MAKER` 能否再带 `IOC` 或 `FOK`，这里不下结论。`EXPIRED` 的说明包含：`LIMIT FOK` 完全没成交、`LIMIT IOC` 或部分成交的 `MARKET`。`LIMIT_MAKER` 的默认回报类型是 `ACK`，不带成交明细。这些是文档描述，不是本仓库已经发出的订单。
+
+因此仓库里没有一条已接线的入场，能在保持 Maker 的同时避免活动余量。`LIMIT`/`LIMIT_MAKER` 会留在簿上。`MARKET`、以及文档里的 IOC/FOK，都要放弃 Maker，而且提交超时之后数量仍然未知。
+
+| 选项 | 内容 | 是否本次可执行 |
+| --- | --- | --- |
+| A | 保持 Maker、同币一张 OCO、不撤已查到的有效保护。未知窗口下保护改动保持停用。不新增等待秒数，也不用秒数声称风险已消除。 | 这是建议的裁定。停用，不写保护代码。 |
+| B | 文档里的 `LIMIT`+`IOC`/`FOK`，以及会部分成交后进入 `EXPIRED` 的 `MARKET`，只在官方说明中出现。要改状态 1 契约的 `LIMIT_MAKER`，以及状态 4「只允许深跌 `LIMIT_MAKER`」。改完仍有提交超时和两次查询对不上的未知。`LIMIT_MAKER` 与 IOC/FOK 是否兼容，文档未写。 | 不是仓库现有能力。先改 Maker 规则，才谈得到以后的实现审核。 |
+| C | 部分成交后再挂一张 OCO，或撤改已有有效保护。官方有撤单再下单和改单，本封装没有。 | 要另批安全契约。不是本次可执行选项。 |
+
 ## 最小改动边界（批准后才写）
 
+按上一节 A，本节不实施。下面只留给将来若另批、且不再把未知窗口当成可用保护时的范围。
 只动保护首挂和入场终态分类：终态证明齐才按 B 和所选止损锚 POST 一张；`oco_unknown` 与有效列表继续官方回读和销记；超时不卖；尘埃保持「不是完成退出」。不改决策路由，不改环境里的秒数，不修另外 49 失败 / 11 错误，不调用 `_cancel_working_oco` 去追新增成交。追踪棘轮保持关闭，避免那条现有撤列表路径。
 
 批准后要跑、本轮没跑的验收：
