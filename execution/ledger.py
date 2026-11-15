@@ -742,6 +742,11 @@ class ExecutionLedger:
             "exit_order_ids",
             "manual_action",
             "unprotected_qty",
+            "signal_entry_price",
+            "signal_take_profit_price",
+            "signal_stop_price",
+            "tp_multiplier",
+            "fill_tp_formula_b",
             *_OCO_READBACK_COLUMNS,
         ):
             if name not in have:
@@ -1366,6 +1371,11 @@ class ExecutionLedger:
         "residual_quote",
         "manual_action",
         "unprotected_qty",
+        "signal_entry_price",
+        "signal_take_profit_price",
+        "signal_stop_price",
+        "tp_multiplier",
+        "fill_tp_formula_b",
         *_OCO_READBACK_COLUMNS,
     )
 

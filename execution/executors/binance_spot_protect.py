@@ -589,6 +589,63 @@ def fill_average_price(placed: dict[str, Any] | None) -> str | None:
     return _decimal_text(quote / qty)
 
 
+FILL_TP_FORMULA_B_ENV = "BINANCE_SPOT_FILL_TP_FORMULA_B"
+_APPROVED_TP_MULTIPLIERS = (
+    Decimal("1"),
+    Decimal("1.35"),
+    Decimal("1.25"),
+    Decimal("0.85"),
+)
+
+
+def fill_tp_formula_b_enabled(environ: Any | None = None) -> bool:
+    """First-hang take-profit formula B. Unset stays off and does not move the stop."""
+    env = os.environ if environ is None else environ
+    raw = env.get(FILL_TP_FORMULA_B_ENV) if hasattr(env, "get") else None
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def approved_tp_multiplier(raw: object) -> Decimal | None:
+    """State take-profit multipliers already ruled. A size multiplier is not accepted."""
+    number = _to_decimal(raw)
+    if number is None:
+        return None
+    for allowed in _APPROVED_TP_MULTIPLIERS:
+        if number == allowed:
+            return allowed
+    return None
+
+
+def formula_b_take_profit(
+    *,
+    fill_average: object,
+    signal_entry: object,
+    signal_take_profit: object,
+    tp_multiplier: object,
+) -> str | None:
+    """``F * [1 + (P / E - 1) * m]``. Missing or unapproved inputs do not invent a price."""
+    fill = _to_decimal(fill_average)
+    entry = _to_decimal(signal_entry)
+    target = _to_decimal(signal_take_profit)
+    multiplier = approved_tp_multiplier(tp_multiplier)
+    if (
+        fill is None
+        or entry is None
+        or target is None
+        or multiplier is None
+        or fill <= 0
+        or entry <= 0
+        or target <= 0
+    ):
+        return None
+    price = fill * (Decimal("1") + (target / entry - Decimal("1")) * multiplier)
+    if not price.is_finite() or price <= 0:
+        return None
+    return _decimal_text(price)
+
+
 def build_spot_oco(
     *,
     symbol: str,

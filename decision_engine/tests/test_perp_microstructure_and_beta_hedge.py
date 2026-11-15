@@ -124,6 +124,11 @@ class PerpMicrostructureAndBetaHedgeTests(unittest.TestCase):
                         "symbol": "SOLUSDT",
                         "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
                         "status": "oco_working",
+                        "protection": "exchange_oco",
+                        "entry_order_id": "11",
+                        "oco_order_list_id": "21",
+                        "oco_above_order_id": "22",
+                        "oco_below_order_id": "23",
                         "quantity": "1.0",
                         "entry_price": "120.0",  # 12% of book * 1.45 beta = 0.174 beta_pct
                     }

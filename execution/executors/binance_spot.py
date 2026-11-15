@@ -1565,6 +1565,8 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     entry_ttl_sec,
     evaluate_orderbook_impact,
     fill_average_price,
+    fill_tp_formula_b_enabled,
+    formula_b_take_profit,
     flatten_client_order_id,
     MAX_HOLD_SEC_ENV,
     max_hold_sec,
@@ -4099,6 +4101,7 @@ class BinanceSpotAdapter:
                 consumer_allowed=False,
             )
         avg = fill_average_price(placed)
+        extras_ref = sig.get("extras") if isinstance(sig.get("extras"), dict) else {}
         arm: dict[str, Any] = {
             "decision_log_id": int(str(sig.get("decision_log_id")).strip()),
             "symbol": symbol,
@@ -4106,6 +4109,17 @@ class BinanceSpotAdapter:
             "entry_order_qty": order.get("quantity"),
             "entry_limit_price": order.get("price"),
             "entry_price": avg or order.get("price"),
+            "signal_entry_price": (
+                extras_ref.get("signal_entry_price")
+                or extras_ref.get("entry_price")
+                or extras_ref.get("price_usd")
+                or extras_ref.get("price")
+                or plan.get("entry_price")
+                or order.get("price")
+            ),
+            "signal_take_profit_price": plan["take_profit_price"],
+            "signal_stop_price": plan["stop_price"],
+            "tp_multiplier": extras_ref.get("tp_multiplier", sig.get("tp_multiplier")),
             "entry_order_id": order_id,
             "stop_price": plan["stop_price"],
             "take_profit_price": plan["take_profit_price"],
@@ -4114,8 +4128,7 @@ class BinanceSpotAdapter:
             "purpose": str(sig.get("purpose") or "").strip() or PURPOSE_LIVE_BNB_BOLL_FADE,
             "created_at_ms": str(int(self.clock_ms())),
         }
-        extras = sig.get("extras") if isinstance(sig.get("extras"), dict) else {}
-        self._apply_hold_passthrough(arm, extras)
+        self._apply_hold_passthrough(arm, extras_ref)
         return _result(
             ok=False,
             dry_run=False,
@@ -5791,8 +5804,14 @@ class BinanceSpotAdapter:
                     error="maker_fill_unconfirmed",
                     protection="maker_resting",
                 )
-            signal_entry = row.get("entry_limit_price") or row.get("entry_price")
+            signal_entry = row.get("signal_entry_price") or row.get("entry_limit_price") or row.get("entry_price")
             upd: dict[str, Any] = {"status": "open", "quantity": filled_qty}
+            if not str(row.get("signal_entry_price") or "").strip() and signal_entry not in (None, ""):
+                upd["signal_entry_price"] = signal_entry
+            if not str(row.get("signal_take_profit_price") or "").strip() and row.get("take_profit_price") not in (None, ""):
+                upd["signal_take_profit_price"] = row.get("take_profit_price")
+            if not str(row.get("signal_stop_price") or "").strip() and row.get("stop_price") not in (None, ""):
+                upd["signal_stop_price"] = row.get("stop_price")
             if avg_px:
                 upd["entry_price"] = avg_px
             save(upd)
@@ -5884,6 +5903,64 @@ class BinanceSpotAdapter:
             reason="entry_ttl_expired",
         )
 
+    def _bounded_entry_get(
+        self,
+        lookup: Any,
+        symbol: str,
+        entry_order_id: str,
+        key: str,
+        secret: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """One ``GET /api/v3/order`` after a cancel whose result is unknown.
+
+        ``NEW`` / ``PARTIALLY_FILLED`` stay open. A timeout, a mismatched
+        symbol or order id, a missing status, or ``-2011`` / ``-2013`` does
+        not become a fill. The caller must not cancel or sell on those results.
+        """
+        pairs = [
+            ("symbol", symbol),
+            ("orderId", entry_order_id),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            fresh = lookup(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AssertionError):
+                raise
+            if isinstance(exc, BinanceRequestError) and single_order_absent(exc):
+                return None, "entry_requery_absent"
+            if is_request_timeout(exc):
+                return None, "entry_requery_timeout"
+            return None, "entry_requery_failed"
+        if not isinstance(fresh, dict):
+            return None, "entry_requery_failed"
+        reported_symbol = str(fresh.get("symbol") or "").strip().upper()
+        if reported_symbol != symbol.upper():
+            return None, "entry_requery_symbol_mismatch"
+        reported_id = str(fresh.get("orderId") or "").strip()
+        if reported_id != str(entry_order_id).strip():
+            return None, "entry_requery_order_mismatch"
+        snapshot_uid = spot_account_uid(self.account_snapshot)
+        reported_uid = str(fresh.get("uid") or fresh.get("accountId") or "").strip()
+        if snapshot_uid and reported_uid and reported_uid != snapshot_uid:
+            return None, "entry_requery_account_mismatch"
+        status = str(fresh.get("status") or "").strip().upper()
+        if not status:
+            return None, "entry_requery_no_status"
+        if status in {"NEW", "PARTIALLY_FILLED", "PENDING_NEW"}:
+            return None, "maker_cancel_unknown"
+        if status not in {
+            "FILLED",
+            "CANCELED",
+            "CANCELLED",
+            "EXPIRED",
+            "REJECTED",
+            "EXPIRED_IN_MATCH",
+        }:
+            return None, "maker_cancel_unknown"
+        return fresh, ""
+
     def _cancel_resting_entry(
         self,
         row: dict[str, Any],
@@ -5926,13 +6003,29 @@ class BinanceSpotAdapter:
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, AssertionError):
                 raise
-            save({"last_error": "maker_cancel_unknown"})
-            return self._coverage(
+            # One official read. Do not DELETE again, sell, or submit an OCO
+            # from this handler. A missing order is not a fill.
+            fresh, reason = self._bounded_entry_get(
+                lookup, symbol, entry_order_id, key, secret
+            )
+            if fresh is None:
+                save({"last_error": reason or "maker_cancel_unknown"})
+                return self._coverage(
+                    row,
+                    book="maker_cancel_unknown",
+                    submitted=False,
+                    error=reason or "maker_cancel_unknown",
+                    protection="maker_resting",
+                )
+            filled_qty = self._verified_order_base(fresh, symbol=symbol, side="BUY")
+            return self._adopt_terminal_entry(
                 row,
-                book="maker_cancel_unknown",
-                submitted=False,
-                error="maker_cancel_unknown",
-                protection="maker_resting",
+                save,
+                fresh,
+                mark,
+                persist,
+                filled_qty,
+                fill_average_price(fresh),
             )
         try:
             fresh = lookup(sign_query(pairs, secret), api_key=key)
@@ -7125,6 +7218,74 @@ class BinanceSpotAdapter:
             outcome["oco_ratchet_count"] = next_seq
         return outcome
 
+    def _maybe_apply_fill_tp_formula_b(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        *,
+        mark: object,
+        filters: list[Any],
+    ) -> None:
+        """Rewrite only the first take-profit. The stop price is not an input.
+
+        Unset ``BINANCE_SPOT_FILL_TP_FORMULA_B`` leaves both prices alone.
+        A list id or client id means a submit already started, so the price
+        stays. A band rejection keeps the original take-profit and stop and
+        records ``blocked`` instead of selling or moving the stop.
+        """
+        if not fill_tp_formula_b_enabled():
+            return
+        if str(row.get("fill_tp_formula_b") or "") == "applied":
+            return
+        if str(row.get("oco_order_list_id") or "").strip() or str(row.get("oco_list_client_id") or "").strip():
+            return
+        signal_entry = row.get("signal_entry_price") or row.get("entry_limit_price")
+        signal_tp = row.get("signal_take_profit_price")
+        if signal_tp in (None, "") and not row.get("oco_reanchored"):
+            signal_tp = row.get("take_profit_price")
+        new_tp = formula_b_take_profit(
+            fill_average=row.get("entry_price"),
+            signal_entry=signal_entry,
+            signal_take_profit=signal_tp,
+            tp_multiplier=row.get("tp_multiplier"),
+        )
+        original_sl = row.get("stop_price")
+        if new_tp is None:
+            save({"fill_tp_formula_b": "skipped"})
+            return
+        blocked = protective_band_error(
+            stop_price=str(original_sl or ""),
+            take_profit_price=new_tp,
+            mark=mark,
+            filters=filters,
+        )
+        if blocked is None and row.get("entry_price") not in (None, ""):
+            blocked = protective_band_error(
+                stop_price=str(original_sl or ""),
+                take_profit_price=new_tp,
+                mark=row.get("entry_price"),
+                filters=filters,
+            )
+        if blocked is not None:
+            save(
+                {
+                    "fill_tp_formula_b": "blocked",
+                    "signal_entry_price": signal_entry,
+                    "signal_take_profit_price": signal_tp,
+                    "signal_stop_price": original_sl,
+                }
+            )
+            return
+        save(
+            {
+                "take_profit_price": new_tp,
+                "fill_tp_formula_b": "applied",
+                "signal_entry_price": signal_entry,
+                "signal_take_profit_price": signal_tp,
+                "signal_stop_price": original_sl,
+            }
+        )
+
     def _try_place_oco(
         self,
         row: dict[str, Any],
@@ -7155,6 +7316,7 @@ class BinanceSpotAdapter:
             return self._oco_failed(row, save, "oco_missing_lot_filter")
         if _to_decimal(mark) is None:
             return self._oco_failed(row, save, "mark_unavailable")
+        self._maybe_apply_fill_tp_formula_b(row, save, mark=mark, filters=filters)
         seq = int(row.get("oco_ratchet_count") or 0) if ratchet_seq is None else int(ratchet_seq)
         spec, spec_error = build_spot_oco(
             symbol=str(row.get("symbol") or ""),
