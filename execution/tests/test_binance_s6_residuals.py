@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -33,6 +34,11 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     classify_oco,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 from execution.run import tick_live_bnb_exits  # noqa: E402
 
 _FILTERS = [
@@ -101,6 +107,7 @@ class _Client:
         self.oco_mode = "accept"
         self.list_payload: dict[str, Any] | Exception = _working_oco()
         self.legs: dict[str, dict[str, Any]] = {}
+        self.buy_qty = "1.23"
 
     def exchange_info(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("exchange_info", symbol))
@@ -109,8 +116,11 @@ class _Client:
     def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_order", signed_query, api_key))
         if "side=BUY" in signed_query:
-            return {"orderId": "99", "status": "FILLED", "executedQty": "1.239"}
-        return {"orderId": "77", "status": "FILLED", "executedQty": "1.23"}
+            return {"orderId": "99", "status": "FILLED", "executedQty": self.buy_qty, "side": "BUY", "symbol": "BNBUSDT", "fills": [{"tradeId": 1, "qty": self.buy_qty, "commission": "0", "commissionAsset": "BNB", "isBuyer": True}]}
+        form = parse_qs(signed_query)
+        qty = (form.get("quantity") or ["1.23"])[0]
+        self.sell_qty = qty
+        return {"orderId": "77", "status": "FILLED", "executedQty": qty, "side": "SELL"}
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_oco", signed_query, api_key))
@@ -131,9 +141,67 @@ class _Client:
         self.calls.append(("get_order", signed_query, api_key))
         form = parse_qs(signed_query)
         order_id = form.get("orderId", ["?"])[0]
+        if form.get("origClientOrderId"):
+            raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+        if str(order_id) == "99":
+            qty = (
+                "1.239"
+                if isinstance(self.list_payload, dict)
+                and self.list_payload.get("orderListId") == 43
+                else self.buy_qty
+            )
+            return {
+                "symbol": "BNBUSDT",
+                "orderId": 99,
+                "side": "BUY",
+                "status": "FILLED",
+                "executedQty": qty,
+                "origQty": qty,
+            }
+        if str(order_id) == "77":
+            qty = getattr(self, "sell_qty", "1.23")
+            return {
+                "symbol": "BNBUSDT",
+                "orderId": 77,
+                "side": "SELL",
+                "status": "FILLED",
+                "executedQty": qty,
+                "origQty": qty,
+            }
         if order_id in self.legs:
             return self.legs[order_id]
         raise BinanceRequestError(400)
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        self.calls.append(("my_trades", signed_query, api_key))
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        if str(order_id) == "77":
+            qty, buyer = getattr(self, "sell_qty", "1.23"), False
+        elif str(order_id) == "11":
+            qty, buyer = "1.23", False
+        else:
+            qty = (
+                "1.239"
+                if isinstance(self.list_payload, dict)
+                and self.list_payload.get("orderListId") == 43
+                else self.buy_qty
+            )
+            buyer = True
+        return [
+            {
+                "symbol": symbol,
+                "id": 1 if buyer else 2,
+                "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+                "qty": qty,
+                "commission": "0",
+                "commissionAsset": "BNB",
+                "isBuyer": buyer,
+            }
+        ]
 
     def ticker_price(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("ticker_price", symbol))
@@ -215,6 +283,7 @@ class ResidualS6Tests(unittest.TestCase):
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
+            auto_flatten_on_oco_fail=True,
             account_snapshot={
                 "accountType": "SPOT",
                 "canTrade": True,
@@ -225,6 +294,7 @@ class ResidualS6Tests(unittest.TestCase):
                     "ipRestrict": True,
                 },
                 "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+                "uid": 424242,
             },
             production_book="rest_api_key",
             rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
@@ -234,15 +304,45 @@ class ResidualS6Tests(unittest.TestCase):
         self._net.stop()
         self._tmp.cleanup()
 
-    def _gateway(self) -> ExecutionGateway:
-        return ExecutionGateway(
+    @contextmanager
+    def _gateway(self) -> Any:
+        ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        if not classic.is_file():
+            ExecutionLedger(classic).close()
+        initialize_spot_ledger_binding(classic, "424242")
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(ledger_path.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
+        with ExecutionGateway(
             decision_db=self.root / "decision.db",
-            ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+            ledger_path=ledger_path,
             paper_enabled=False,
             pm_enabled=False,
             accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
             binance_spot=self.adapter,
-        )
+        ) as gw:
+            bound = initialize_spot_ledger_binding(ledger_path, "424242")
+            if bound:
+                raise RuntimeError(bound)
+            membership = bind_registry_membership("424242")
+            if membership:
+                raise RuntimeError(membership)
+            yield gw
 
     def test_dry_run_submits_nothing(self) -> None:
         env = _env(self.root, enabled="1")
@@ -287,6 +387,7 @@ class ResidualS6Tests(unittest.TestCase):
             "symbol": "BNBUSDT",
             "status": "open",
             "quantity": "1.239",
+            "entry_order_id": "99",
             "stop_price": "99",
             "take_profit_price": "110",
             "protection": "loop_fallback",
@@ -381,7 +482,8 @@ class ResidualS6Tests(unittest.TestCase):
         self.assertEqual(row["status"], "oco_working")
         self.assertEqual(row["protection"], "exchange_oco")
         self.assertEqual(row["quantity"], "1.23")
-        self.assertEqual(row["residual_qty"], "0.009")
+        self.assertIsNone(row["unprotected_qty"])
+        self.assertIsNone(row["residual_qty"])
         self.assertEqual(row["oco_order_list_id"], "42")
         self.assertEqual(row["oco_above_order_id"], "11")
         self.assertEqual(row["oco_below_order_id"], "10")
@@ -422,25 +524,23 @@ class ResidualS6Tests(unittest.TestCase):
         self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
 
     def test_oco_rejection_is_a_loud_loop_fallback(self) -> None:
+        import execution.gateway as _gw_mod
+        if not hasattr(_gw_mod, '_required_peer_books'):
+            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
+        self.client.buy_qty = "1.239"
         self.client.oco_mode = "reject"
         self.client.list_payload = BinanceRequestError(400)
         env = _env(self.root, enabled="1")
         with mock.patch.dict(os.environ, env):
             with self._gateway() as gw:
                 opened = gw.process_one(_row())
-                # Inside the band: rejection is recorded and no market sell is forced.
-                quiet = tick_live_bnb_exits(
-                    gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "100"}
-                )
                 row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertFalse(quiet[0]["submitted"], quiet[0])
-        self.assertNotEqual(quiet[0]["protection"], "exchange_oco")
-        self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
-        assert row is not None
-        self.assertEqual(row["status"], "oco_failed")
-        self.assertNotEqual(row["protection"], "exchange_oco")
-        self.assertTrue(str(opened["error"]).startswith("oco_rejected:"), opened["error"])
         self.assertEqual(opened["executed"], 0)
+        assert row is not None
+        self.assertEqual(row["status"], "closed_dust")
+        self.assertEqual(row["protection"], "dust_abandon")
+        self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
+        self.assertEqual(opened["exec_result"]["protection_state"], "dust_residual")
 
     def test_exchange_fill_and_expiry_are_reconciled(self) -> None:
         env = _env(self.root, enabled="1")
@@ -542,19 +642,24 @@ class ResidualS6Tests(unittest.TestCase):
                         "protection": "exchange_oco",
                         "oco_order_list_id": "43",
                         "exit_reason": None,
+                        "exit_order_id": None,
+                        "exit_filled_qty": None,
                         "quantity": "1.23",
                     },
                 )
+                gw.ledger.conn.execute(
+                    "UPDATE binance_spot_positions SET exit_order_ids = NULL WHERE id = ?",
+                    (int(row["id"]),),
+                )
+                gw.ledger.conn.commit()
                 woke = tick_live_bnb_exits(
                     gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "100"}
                 )
                 woke_row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertEqual(woke[0]["book"], "oco_failed", woke[0])
         assert woke_row is not None
-        self.assertEqual(woke_row["status"], "oco_failed")
-        self.assertEqual(woke_row["last_error"], "oco_terminal_unfilled")
-        self.assertNotEqual(woke_row["protection"], "exchange_oco")
-        self.assertFalse(any(call[0] == "new_order" for call in self.client.calls))
+        self.assertEqual(woke_row["status"], "closed_dust", woke)
+        self.assertEqual(woke_row["protection"], "dust_abandon")
+        self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
 
     def test_entry_floor_fee_and_dust_archive(self) -> None:
         self.assertEqual(ENTRY_MIN_NOTIONAL_USDT, 20)

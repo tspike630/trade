@@ -1319,6 +1319,11 @@ class ExecutionLedger:
                 "last_error",
                 "manual_action",
                 "unprotected_qty",
+                "signal_entry_price",
+                "signal_take_profit_price",
+                "signal_stop_price",
+                "tp_multiplier",
+                "fill_tp_formula_b",
                 *_OCO_READBACK_COLUMNS,
             )
             if key in spec and spec.get(key) not in (None, "")
@@ -1348,6 +1353,7 @@ class ExecutionLedger:
     _BINANCE_SPOT_MUTABLE = (
         "status",
         "quantity",
+        "entry_price",
         "stop_price",
         "take_profit_price",
         "oco_ratchet_count",

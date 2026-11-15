@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 import unittest
 
 from decision_engine.core.live_buy_guards import apply_live_buy_guards
@@ -113,9 +114,14 @@ class PerpMicrostructureAndBetaHedgeTests(unittest.TestCase):
         old_gate = os.environ.get("LIVE_BNB_PORTFOLIO_BETA_GATE")
         old_cap = os.environ.get("LIVE_BNB_MAX_PORTFOLIO_BETA")
         old_book = os.environ.get("BINANCE_SPOT_BOOK_USDT")
+        old_ttl = os.environ.get("LIVE_BNB_OCO_READBACK_TTL_SEC")
+        old_uid = os.environ.get("BINANCE_SPOT_REST_UID")
         os.environ["LIVE_BNB_PORTFOLIO_BETA_GATE"] = "1"
         os.environ["LIVE_BNB_MAX_PORTFOLIO_BETA"] = "0.25"
         os.environ["BINANCE_SPOT_BOOK_USDT"] = "1000"
+        os.environ.pop("LIVE_BNB_OCO_READBACK_TTL_SEC", None)
+        os.environ.pop("BINANCE_SPOT_REST_UID", None)
+        now_ms = int(time.time() * 1000)
         try:
             book = ProtectionBook.ready(
                 positions=[
@@ -125,12 +131,22 @@ class PerpMicrostructureAndBetaHedgeTests(unittest.TestCase):
                         "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
                         "status": "oco_working",
                         "protection": "exchange_oco",
-                        "entry_order_id": "11",
-                        "oco_order_list_id": "21",
-                        "oco_above_order_id": "22",
-                        "oco_below_order_id": "23",
+                        "entry_order_id": "1001",
+                        "oco_order_list_id": "2001",
+                        "oco_above_order_id": "2002",
+                        "oco_below_order_id": "2003",
                         "quantity": "1.0",
+                        "residual_qty": "0",
                         "entry_price": "120.0",  # 12% of book * 1.45 beta = 0.174 beta_pct
+                        "oco_readback_status": "verified",
+                        "oco_readback_account_uid": "rest_api_key",
+                        "oco_readback_symbol": "SOLUSDT",
+                        "oco_readback_entry_order_id": "1001",
+                        "oco_readback_list_id": "2001",
+                        "oco_readback_above_id": "2002",
+                        "oco_readback_below_id": "2003",
+                        "oco_readback_covered_qty": "1.0",
+                        "oco_readback_at_ms": str(now_ms),
                     }
                 ],
                 canonical=[],
@@ -184,6 +200,14 @@ class PerpMicrostructureAndBetaHedgeTests(unittest.TestCase):
                 os.environ.pop("BINANCE_SPOT_BOOK_USDT", None)
             else:
                 os.environ["BINANCE_SPOT_BOOK_USDT"] = old_book
+            if old_ttl is None:
+                os.environ.pop("LIVE_BNB_OCO_READBACK_TTL_SEC", None)
+            else:
+                os.environ["LIVE_BNB_OCO_READBACK_TTL_SEC"] = old_ttl
+            if old_uid is None:
+                os.environ.pop("BINANCE_SPOT_REST_UID", None)
+            else:
+                os.environ["BINANCE_SPOT_REST_UID"] = old_uid
 
 
 if __name__ == "__main__":

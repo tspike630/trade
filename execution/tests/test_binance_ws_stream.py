@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from decision_engine.core.bnb_kline_fetch import fetch_public_klines
 from execution.binance_ws_stream import (
@@ -88,8 +89,24 @@ class _LatencyTrackingClient:
             "status": "FILLED",
             "executedQty": "1.00",
             "cummulativeQuoteQty": "100.00",
-            "fills": [],
+            "fills": [{"tradeId": 1, "qty": "1.00", "commission": "0", "commissionAsset": "SOL", "isBuyer": True}],
         }
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["SOLUSDT"])[0]
+        order_id = (form.get("orderId") or ["77701"])[0]
+        return [{
+            "symbol": symbol,
+            "id": 1,
+            "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+            "qty": "1.00",
+            "commission": "0",
+            "commissionAsset": "SOL",
+            "isBuyer": True,
+        }]
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict:
         return {
@@ -257,6 +274,7 @@ class BinanceWsStreamTests(unittest.TestCase):
                 rest_expected={"account_type": "SPOT", "usdt_free": "500"},
                 orderbook_gate=True,
                 ws_cache=cache,
+                auto_flatten_on_oco_fail=True,
             )
             res = adapter.execute(sig)
             self.assertTrue(res["ok"], res.get("error"))

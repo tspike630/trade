@@ -52,8 +52,27 @@ if [[ ! -f "$KILL_FILE" ]]; then
   echo "REFUSE: kill file missing ($KILL_FILE); will not start a decision run" >&2
   exit 4
 fi
+ROOT_REAL="$(cd "$ROOT" && pwd -P)"
+OUT_DIR_RAW="$(dirname "$OUTPUT_DB")"
+if [[ -d "$OUT_DIR_RAW" ]]; then
+  OUT_REAL="$(cd "$OUT_DIR_RAW" && pwd -P)/$(basename "$OUTPUT_DB")"
+else
+  OUT_REAL="$OUTPUT_DB"
+fi
 case "$OUTPUT_DB" in
-  /tmp/*|/var/tmp/*) ;;
+  "$ROOT"/*|"$ROOT_REAL"/*)
+    echo "REFUSE: --output-db must not be inside repo root" >&2
+    exit 2
+    ;;
+esac
+case "$OUT_REAL" in
+  "$ROOT_REAL"/*)
+    echo "REFUSE: --output-db must not be inside repo root" >&2
+    exit 2
+    ;;
+esac
+case "$OUTPUT_DB" in
+  /tmp/*|/var/tmp/*|/private/tmp/*|/private/var/tmp/*|/var/folders/*|/private/var/folders/*) ;;
   *)
     echo "REFUSE: --output-db must be under /tmp or /var/tmp" >&2
     exit 2
@@ -122,7 +141,7 @@ python3 -m decision_engine.core.regime_v2_acceptance \
   --kill-file "$KILL_FILE" \
   --engine-exit-code "$engine_status" \
   --report "$REPORT" \
-  "${snapshot_args[@]}"
+  ${snapshot_args[@]+"${snapshot_args[@]}"}
 report_status=$?
 set -e
 
