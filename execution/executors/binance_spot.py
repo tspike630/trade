@@ -241,18 +241,24 @@ def public_exchange_error(raw: object) -> dict[str, Any] | None:
     return out
 
 
-# GET /api/v3/orderList only. -2018 is "Order list does not exist."
-# -2013 is GET /api/v3/order ("Order does not exist") for one leg.
-# -2011 is cancel ("Unknown order sent"). Neither means the list is gone.
+# GET /api/v3/orderList only. The official miss is HTTP 400
+# {"code":-2018,"msg":"Order list does not exist."}.
+# -2013 is GET /api/v3/order ("Order does not exist.") for one leg.
+# -2011 is cancel ("Unknown order sent."). Neither code is this miss.
+# A -2018 read after an unknown POST does not authorize another OCO.
 _ORDER_LIST_ABSENT_CODE = -2018
 _SINGLE_ORDER_ABSENT_CODES = frozenset({-2011, -2013})
+_UNKNOWN_OCO_READBACK_HOLD = "oco_unknown_readback_not_resubmit"
 
 
 def order_list_absent(exc: BinanceRequestError) -> bool:
-    """True only for a definitive miss on ``GET /api/v3/orderList``.
+    """True when the list read's code is ``-2018``.
 
-    A bare 400, 401, 418, 429, ``-1003``, ``-2015``, ``-2013``, or ``-2011``
-    is not absence. Those must not start a second OCO.
+    The confirmed miss is HTTP 400
+    ``{"code":-2018,"msg":"Order list does not exist."}``. HTTP 404 with the
+    same code is still this miss. Matching it does not authorize another OCO
+    after an unknown submit. A bare 400, 401, 418, 429, ``-1003``, ``-2015``,
+    ``-2013`` (``Order does not exist.``), or ``-2011`` is not this miss.
     """
     return exc.status in {400, 404} and exc.code == _ORDER_LIST_ABSENT_CODE
 
@@ -5377,7 +5383,9 @@ class BinanceSpotAdapter:
 
         ``persist`` runs before the OCO POST so a crash still has the client
         id to requery. Exchange coverage is recorded only after a working
-        list is observed. A timeout does not market-sell.
+        list is observed. A timeout does not market-sell. An ``oco_unknown``
+        row that then reads the official list miss stays unknown: that miss
+        does not POST again, sell, or rewrite the stop.
         """
         row = dict(position)
 
@@ -5610,6 +5618,19 @@ class BinanceSpotAdapter:
                         submitted=False,
                         error=stored,
                         protection=PROTECTION_PENDING,
+                    )
+                # Still inside the original band. An unknown submit plus an
+                # absent list read — including the confirmed HTTP 400
+                # {"code":-2018,"msg":"Order list does not exist."} — does not
+                # prove that POST was rejected or will stay invisible. Do not
+                # POST the same or a new listClientOrderId, sell, or rewrite prices.
+                if str(row.get("status") or "") == "oco_unknown":
+                    return self._coverage(
+                        row,
+                        book="oco_unknown",
+                        submitted=False,
+                        error=_UNKNOWN_OCO_READBACK_HOLD,
+                        protection=row.get("protection") or PROTECTION_PENDING,
                     )
                 retry_place = True
             if state in {"unfilled", "partial"}:

@@ -29,7 +29,9 @@ from execution.executors.binance_spot import (  # noqa: E402
     BinanceRequestError,
     BinanceSpotAdapter,
     floor_base_qty,
+    order_list_absent,
     protective_exit_reason,
+    single_order_absent,
     size_exit_quantity,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
@@ -996,28 +998,44 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
         self.assertNotIn("new_order", client.calls)
         self.assertIn("get_order_list", client.calls)
 
-    def test_unknown_submit_retries_once_when_the_list_is_absent(self) -> None:
+    def test_official_list_miss_is_not_a_single_order_miss(self) -> None:
+        # Confirmed GET /api/v3/orderList miss body. It does not authorize a resubmit.
+        miss = BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+        one_order = BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+        self.assertEqual(miss.status, 400)
+        self.assertEqual(miss.code, -2018)
+        self.assertEqual(miss.msg, "Order list does not exist.")
+        self.assertTrue(order_list_absent(miss))
+        self.assertFalse(single_order_absent(miss))
+        self.assertEqual(one_order.msg, "Order does not exist.")
+        self.assertFalse(order_list_absent(one_order))
+        self.assertTrue(single_order_absent(one_order))
+
+    def test_unknown_submit_official_list_miss_does_not_repost(self) -> None:
         class _Retry:
             def __init__(self) -> None:
-                self.calls: list[str] = []
-                self.placed = False
+                self.calls: list[tuple[str, str]] = []
 
             def exchange_info(self, symbol: str) -> dict[str, Any]:
                 return _INFO
 
             def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
-                self.calls.append("get_order_list")
-                if not self.placed:
-                    raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
-                return _working_oco()
+                self.calls.append(("get_order_list", signed_query))
+                raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
 
             def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
-                self.calls.append("new_oco")
-                self.placed = True
-                return _working_oco()
+                self.calls.append(("new_oco", signed_query))
+                raise AssertionError("official -2018 must not post another OCO")
 
             def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
-                raise AssertionError("retry must not buy or market-sell")
+                self.calls.append(("new_order", signed_query))
+                raise AssertionError("official -2018 must not buy or market-sell")
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+        def _kinds(calls: list[tuple[str, str]]) -> list[str]:
+            return [call[0] for call in calls]
 
         client = _Retry()
         adapter = self._adapter(client)
@@ -1032,6 +1050,7 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
             "take_profit_price": "110",
             "entry_order_id": "99",
             "oco_list_client_id": "bnbfade-ol-11",
+            "last_error": "oco_submit_timeout",
             "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
         }
         saved: dict[str, Any] = dict(row)
@@ -1047,12 +1066,70 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             first = adapter.maintain_held_position(dict(saved), "102", persist=persist)
             second = adapter.maintain_held_position(dict(saved), "102", persist=persist)
-        self.assertEqual(first["book"], "oco_working", first)
-        self.assertEqual(second["book"], "oco_working", second)
-        self.assertEqual(client.calls.count("new_oco"), 1)
-        self.assertEqual(saved.get("status"), "oco_working")
-        self.assertEqual(saved.get("oco_above_order_id"), "11")
-        self.assertEqual(saved.get("oco_below_order_id"), "10")
+        self.assertEqual(first["book"], "oco_unknown", first)
+        self.assertEqual(second["book"], "oco_unknown", second)
+        self.assertFalse(first["ok"], first)
+        self.assertFalse(first["submitted"], first)
+        self.assertEqual(first["error"], "oco_unknown_readback_not_resubmit")
+        self.assertEqual(second["error"], "oco_unknown_readback_not_resubmit")
+        self.assertNotIn("new_oco", _kinds(client.calls))
+        self.assertNotIn("new_order", _kinds(client.calls))
+        self.assertGreaterEqual(_kinds(client.calls).count("get_order_list"), 2)
+        for kind, query in client.calls:
+            if kind != "get_order_list":
+                continue
+            form = parse_qs(query)
+            self.assertEqual(form.get("origClientOrderId"), ["bnbfade-ol-11"])
+        self.assertEqual(saved.get("status"), "oco_unknown")
+        self.assertEqual(saved.get("protection"), "oco_pending")
+        self.assertEqual(saved.get("stop_price"), "99")
+        self.assertEqual(saved.get("take_profit_price"), "110")
+        self.assertEqual(saved.get("oco_list_client_id"), "bnbfade-ol-11")
+        self.assertEqual(saved.get("last_error"), "oco_submit_timeout")
+        self.assertNotIn("oco_above_order_id", saved)
+        self.assertNotIn("oco_below_order_id", saved)
+
+        fresh = _Retry()
+        restarted = self._adapter(fresh)
+        with mock.patch.dict(os.environ, env):
+            resumed = restarted.maintain_held_position(dict(saved), "102", persist=persist)
+            resumed_again = restarted.maintain_held_position(dict(saved), "102", persist=persist)
+        self.assertEqual(resumed["book"], "oco_unknown", resumed)
+        self.assertEqual(resumed_again["error"], "oco_unknown_readback_not_resubmit")
+        self.assertNotIn("new_oco", _kinds(fresh.calls))
+        self.assertNotIn("new_order", _kinds(fresh.calls))
+        self.assertEqual(saved.get("stop_price"), "99")
+        self.assertEqual(saved.get("take_profit_price"), "110")
+        self.assertEqual(saved.get("status"), "oco_unknown")
+
+        restarted.buy_blocks = [dict(saved)]
+        with mock.patch.dict(os.environ, env):
+            blocked = restarted.execute(
+                {
+                    "decision_log_id": 12,
+                    "strategy_id": "tech_boll_fade_v1",
+                    "action": "buy",
+                    "chain_id": "binance",
+                    "token_address": "BNBUSDT",
+                    "pair_address": "BNB/USDT",
+                    "size_pct": 0.05,
+                    "mode": "live_stub",
+                    "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                    "extras": {
+                        "binance_symbol": "BNBUSDT",
+                        "order_type": "MARKET",
+                        "quote_order_qty": "25",
+                        "price_usd": "102",
+                        "stop_price": "99",
+                        "take_profit_price": "110",
+                        "entry_reason": "large_trade_market",
+                    },
+                }
+            )
+        self.assertEqual(blocked["error"], "oco_failed_blocks_buy", blocked)
+        self.assertEqual(blocked["executed"], 0)
+        self.assertNotIn("new_oco", _kinds(fresh.calls))
+        self.assertNotIn("new_order", _kinds(fresh.calls))
 
     def test_missing_or_bad_mark_refuses_the_live_buy(self) -> None:
         class _NoTicker(_DashBook):
@@ -1149,6 +1226,15 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
             self.assertNotIn("new_oco", client.calls, exc)
             self.assertNotIn("new_order", client.calls, exc)
             self.assertNotIn("oco_list_absent", str(outcome.get("error")), exc)
+            self.assertNotEqual(outcome.get("error"), "oco_unknown_readback_not_resubmit", exc)
+            self.assertNotIn("stop_price", saved, exc)
+            self.assertNotIn("take_profit_price", saved, exc)
+            self.assertNotIn("status", saved, exc)
+            if isinstance(exc, BinanceRequestError) and exc.code == -2013:
+                self.assertEqual(outcome["book"], "oco_unknown", exc)
+                self.assertIn("-2013", str(outcome.get("error")), exc)
+                self.assertIn("Order does not exist.", str(outcome.get("error")), exc)
+                self.assertFalse(order_list_absent(exc), exc)
 
     def test_leg_not_found_does_not_drop_a_working_list(self) -> None:
         class _Legs:

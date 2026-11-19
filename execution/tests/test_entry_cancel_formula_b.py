@@ -1005,7 +1005,7 @@ class EntryCancelFormulaBTests(unittest.TestCase):
             )
             ledger.close()
 
-    def test_oco_unknown_absent_list_retries_same_client_id_once_without_moving_stop(self) -> None:
+    def test_oco_unknown_official_list_miss_does_not_repost_or_rewrite_prices(self) -> None:
         os.environ["BINANCE_SPOT_FILL_TP_FORMULA_B"] = "1"
         with tempfile.TemporaryDirectory(prefix="formula-b-absent-oco-") as tmp:
             ledger = ExecutionLedger(Path(tmp) / "ledger.db")
@@ -1028,7 +1028,8 @@ class EntryCancelFormulaBTests(unittest.TestCase):
 
             client = _TimeoutOnceOcoClient()
             adapter = self._adapter(client, auto_flatten_on_oco_fail=True)
-            # Tick 1: POST /orderList/oco times out, GET /orderList returns -2018 -> oco_unknown.
+            # Tick 1: POST /orderList/oco times out. GET /api/v3/orderList then
+            # returns the official miss HTTP 400 {"code":-2018,"msg":"Order list does not exist."}.
             t1 = adapter.maintain_held_position(
                 armed,
                 "101",
@@ -1044,25 +1045,58 @@ class EntryCancelFormulaBTests(unittest.TestCase):
             self.assertEqual(after_t1["take_profit_price"], "114.635")
             self.assertEqual(after_t1["stop_price"], "98")
 
-            # Tick 2: GET /orderList explicitly returns -2018 (absent) -> retries same listClientOrderId once.
+            # Tick 2: the same official -2018, still inside the band, must not POST again.
             t2 = adapter.maintain_held_position(
                 after_t1,
                 "101",
                 persist=lambda fields: ledger.update_binance_spot_position(pid, fields),
             )
-            self.assertTrue(t2["ok"], t2)
-            self.assertEqual(len(client.ocos), 2)
+            self.assertFalse(t2["ok"], t2)
+            self.assertFalse(t2["submitted"], t2)
+            self.assertEqual(t2["book"], "oco_unknown", t2)
+            self.assertEqual(t2["error"], "oco_unknown_readback_not_resubmit")
+            self.assertEqual(len(client.ocos), 1)
             self.assertEqual(client.sells, [])
-            q1 = parse_qs(client.ocos[0])
-            q2 = parse_qs(client.ocos[1])
-            self.assertEqual(q1["listClientOrderId"], ["bnbfade-ol-170003"])
-            self.assertEqual(q2["listClientOrderId"], ["bnbfade-ol-170003"])
-            self.assertEqual(q2["abovePrice"], ["114.63"])
-            self.assertEqual(q2["belowStopPrice"], ["98"])
+            only = parse_qs(client.ocos[0])
+            self.assertEqual(only["listClientOrderId"], ["bnbfade-ol-170003"])
+            self.assertEqual(only["abovePrice"], ["114.63"])
+            self.assertEqual(only["belowStopPrice"], ["98"])
             after_t2 = ledger.binance_spot_position_by_id(pid)
             assert after_t2 is not None
-            self.assertEqual(after_t2["status"], "oco_working")
+            self.assertEqual(after_t2["status"], "oco_unknown")
             self.assertEqual(after_t2["stop_price"], "98")
+            self.assertEqual(after_t2["take_profit_price"], "114.635")
+            self.assertEqual(after_t2["fill_tp_formula_b"], "applied")
+            self.assertEqual(after_t2["oco_list_client_id"], "bnbfade-ol-170003")
+            self.assertEqual(
+                buy_exposure_block(
+                    [after_t2],
+                    [],
+                    purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                    symbol="SOLUSDT",
+                ),
+                "oco_failed_blocks_buy",
+            )
+
+            # A new process with the same row still does not POST.
+            restarted_client = _TimeoutOnceOcoClient()
+            restarted = self._adapter(restarted_client, auto_flatten_on_oco_fail=True)
+            t3 = restarted.maintain_held_position(
+                after_t2,
+                "101",
+                persist=lambda fields: ledger.update_binance_spot_position(pid, fields),
+            )
+            self.assertEqual(t3["book"], "oco_unknown", t3)
+            self.assertEqual(t3["error"], "oco_unknown_readback_not_resubmit")
+            self.assertEqual(restarted_client.ocos, [])
+            self.assertEqual(restarted_client.sells, [])
+            after_restart = ledger.binance_spot_position_by_id(pid)
+            assert after_restart is not None
+            self.assertEqual(after_restart["status"], "oco_unknown")
+            self.assertEqual(after_restart["stop_price"], "98")
+            self.assertEqual(after_restart["take_profit_price"], "114.635")
+            self.assertEqual(after_restart["fill_tp_formula_b"], "applied")
+            self.assertEqual(after_restart["oco_list_client_id"], "bnbfade-ol-170003")
             ledger.close()
 
 
