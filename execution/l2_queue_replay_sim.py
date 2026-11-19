@@ -183,11 +183,22 @@ class L2QueueReplaySimulator:
         self._orders: dict[str, ReplayOrder] = {}
         self._order_seq = 0
 
-    def latest_wall_mid(self, symbol: str, *, tick_size: float | None = None) -> WallMidQuote | None:
+    def latest_wall_mid(
+        self,
+        symbol: str,
+        *,
+        tick_size: float | None = None,
+        max_wall_distance_bps: float | None = None,
+    ) -> WallMidQuote | None:
         snap = self._l2_books.get(symbol.strip().upper())
         if snap is None:
             return None
-        return compute_wall_mid_from_book(snap.bids, snap.asks, tick_size=tick_size)
+        return compute_wall_mid_from_book(
+            snap.bids,
+            snap.asks,
+            tick_size=tick_size,
+            max_wall_distance_bps=max_wall_distance_bps,
+        )
 
     def submit_order(
         self,
@@ -240,11 +251,16 @@ class L2QueueReplaySimulator:
         side: str,
         quantity: str | Decimal,
         tick_size: float | None = None,
+        max_wall_distance_bps: float | None = None,
         submit_ts_ms: int | None = None,
         ttl_ms: int | None = None,
         order_id: str | None = None,
     ) -> ReplayOrder:
-        quote = self.latest_wall_mid(symbol, tick_size=tick_size)
+        quote = self.latest_wall_mid(
+            symbol,
+            tick_size=tick_size,
+            max_wall_distance_bps=max_wall_distance_bps,
+        )
         if quote is None:
             raise RuntimeError(f"wall_mid_book_unavailable:{symbol}")
         clean_side = str(side or "").strip().upper()

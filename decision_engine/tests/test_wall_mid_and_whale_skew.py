@@ -10,6 +10,7 @@ from decision_engine.core.wall_mid_pricing import (
     compute_wall_mid_from_book,
     extract_wall_mid_from_row,
 )
+from execution.l2_queue_replay_sim import L2QueueReplaySimulator
 
 
 class WallMidAndWhaleSkewTests(unittest.TestCase):
@@ -132,7 +133,9 @@ class WallMidAndWhaleSkewTests(unittest.TestCase):
         self.assertAlmostEqual(quote.maker_buy_price, 99.81, places=4)
 
     def test_book_helper_has_no_freshness_clock(self) -> None:
-        self.assertNotIn("now_ms", inspect.signature(compute_wall_mid_from_book).parameters)
+        sig = inspect.signature(compute_wall_mid_from_book)
+        self.assertNotIn("now_ms", sig.parameters)
+        self.assertIsNone(sig.parameters["max_wall_distance_bps"].default)
         stale = compute_wall_mid_from_book(
             [
                 {"price": 100.0, "qty": 1.0, "ts_ms": 0},
@@ -150,6 +153,141 @@ class WallMidAndWhaleSkewTests(unittest.TestCase):
             tick_size=0.01,
         )
         self.assertEqual(stale, fresh)
+
+    def test_max_wall_distance_bps_default_off_and_four_microstructure_regimes(self) -> None:
+        # 1) SOLUSDT archetype: uniform thick top levels (~$95k-$120k), distant whale wall at -13 ticks (74.68)
+        sol_bids = [(round(74.81 - k * 0.01, 2), 1300.0) for k in range(13)] + [(74.68, 3000.0)]
+        sol_asks = [(round(74.82 + k * 0.01, 2), 800.0) for k in range(13)] + [(74.95, 2500.0)]
+
+        q_off = compute_wall_mid_from_book(sol_bids, sol_asks, tick_size=0.01)
+        assert q_off is not None
+        self.assertAlmostEqual(q_off.maker_buy_price, 74.69, places=4)
+        self.assertAlmostEqual(q_off.maker_sell_price, 74.94, places=4)
+
+        # With 8.0 bps cap (max 5 ticks on 74.81), distant -13t wall is ignored and healthy L1 falls back to best_bid/ask
+        q_sol_cap = compute_wall_mid_from_book(
+            sol_bids, sol_asks, tick_size=0.01, max_wall_distance_bps=8.0
+        )
+        assert q_sol_cap is not None
+        self.assertFalse(q_sol_cap.used_true_bid_wall)
+        self.assertFalse(q_sol_cap.used_true_ask_wall)
+        self.assertAlmostEqual(q_sol_cap.maker_buy_price, 74.81, places=4)
+        self.assertAlmostEqual(q_sol_cap.maker_sell_price, 74.82, places=4)
+
+        # When a true >=2x wall sits within the near band (-4 ticks = 74.77), quotes 1 tick ahead at 74.78 (-3 ticks)
+        sol_near_bids = [
+            (74.81, 1000.0),
+            (74.80, 1000.0),
+            (74.79, 1000.0),
+            (74.78, 1000.0),
+            (74.77, 2600.0),
+            (74.68, 3500.0),
+        ]
+        q_sol_near = compute_wall_mid_from_book(
+            sol_near_bids, sol_asks, tick_size=0.01, max_wall_distance_bps=8.0
+        )
+        assert q_sol_near is not None
+        self.assertTrue(q_sol_near.used_true_bid_wall)
+        self.assertAlmostEqual(q_sol_near.bid_wall_price, 74.77, places=4)
+        self.assertAlmostEqual(q_sol_near.maker_buy_price, 74.78, places=4)
+
+        # 2) FETUSDT archetype: ultra-thin $5.26 L1 spoof (40.7 FET @ 0.1293), real depth @ 0.1292, distant wall @ 0.1289
+        fet_bids = [
+            (0.1293, 40.7),
+            (0.1292, 152866.0),
+            (0.1291, 177088.5),
+            (0.1290, 114353.8),
+            (0.1289, 360000.0),
+            (0.1288, 149869.1),
+        ]
+        fet_asks = [
+            (0.1294, 30.0),
+            (0.1295, 140000.0),
+            (0.1296, 150000.0),
+            (0.1297, 130000.0),
+            (0.1298, 340000.0),
+            (0.1299, 145000.0),
+        ]
+        for cap_val in (5.0, 8.0):
+            q_fet = compute_wall_mid_from_book(
+                fet_bids, fet_asks, tick_size=0.0001, max_wall_distance_bps=cap_val
+            )
+            assert q_fet is not None
+            # 1-tick floor steps behind the thin L1 spoof onto 0.1292 / 0.1295 instead of retreating 3 ticks
+            self.assertAlmostEqual(q_fet.maker_buy_price, 0.1292, places=6)
+            self.assertAlmostEqual(q_fet.maker_sell_price, 0.1295, places=6)
+
+        # 3) PEPEUSDT coarse-tick archetype: 1 tick = ~24.9 bps > 8.0 bps, true >=2x whale wall at -2 ticks (4.00e-6)
+        pepe_bids = [
+            (0.00000402, 30_000_000_000.0),
+            (0.00000401, 28_000_000_000.0),
+            (0.00000400, 75_000_000_000.0),
+            (0.00000399, 25_000_000_000.0),
+        ]
+        pepe_asks = [
+            (0.00000403, 30_000_000_000.0),
+            (0.00000404, 28_000_000_000.0),
+            (0.00000405, 75_000_000_000.0),
+            (0.00000406, 25_000_000_000.0),
+        ]
+        q_pepe = compute_wall_mid_from_book(
+            pepe_bids, pepe_asks, tick_size=1e-8, max_wall_distance_bps=8.0
+        )
+        assert q_pepe is not None
+        self.assertTrue(q_pepe.used_true_bid_wall)
+        self.assertAlmostEqual(q_pepe.maker_buy_price, 0.00000401, places=8)
+        self.assertAlmostEqual(q_pepe.maker_sell_price, 0.00000404, places=8)
+
+        # 4) BTCUSDT wide-spread penny-ahead archetype: L1 wall (63941.99) + 3-tick spread (ask=63942.02)
+        btc_bids = [(63941.99, 10.0), (63941.50, 0.02), (63940.97, 0.01)]
+        btc_asks = [(63942.02, 1.0), (63942.50, 0.02), (63943.00, 0.02)]
+        q_btc = compute_wall_mid_from_book(
+            btc_bids, btc_asks, tick_size=0.01, max_wall_distance_bps=8.0
+        )
+        assert q_btc is not None
+        self.assertAlmostEqual(q_btc.maker_buy_price, 63942.00, places=4)
+
+        # 5) Row extraction & L2QueueReplaySimulator passthrough
+        row_capped = extract_wall_mid_from_row(
+            {
+                "bid_wall_price": 74.68,
+                "ask_wall_price": 74.95,
+                "best_bid": 74.81,
+                "best_ask": 74.82,
+                "tick_size": 0.01,
+                "max_wall_distance_bps": 8.0,
+            }
+        )
+        assert row_capped is not None
+        self.assertAlmostEqual(row_capped.maker_buy_price, 74.76, places=4)
+
+        sim = L2QueueReplaySimulator(gateway_latency_ms=10)
+        sim.step_raw_event(
+            {
+                "stream": "solusdt@depth20@100ms",
+                "data": {
+                    "E": 1_000,
+                    "s": "SOLUSDT",
+                    "bids": [[f"{p:.2f}", f"{q:.2f}"] for p, q in sol_bids],
+                    "asks": [[f"{p:.2f}", f"{q:.2f}"] for p, q in sol_asks],
+                },
+            }
+        )
+        o_uncapped = sim.submit_wall_mid_maker_order(
+            symbol="SOLUSDT", side="BUY", quantity="1.0", tick_size=0.01, submit_ts_ms=1_000
+        )
+        o_capped = sim.submit_wall_mid_maker_order(
+            symbol="SOLUSDT",
+            side="BUY",
+            quantity="1.0",
+            tick_size=0.01,
+            max_wall_distance_bps=8.0,
+            submit_ts_ms=1_000,
+        )
+        assert o_uncapped.limit_price is not None
+        assert o_capped.limit_price is not None
+        self.assertAlmostEqual(float(o_uncapped.limit_price), 74.69, places=4)
+        self.assertAlmostEqual(float(o_capped.limit_price), 74.81, places=4)
 
 
 if __name__ == "__main__":
