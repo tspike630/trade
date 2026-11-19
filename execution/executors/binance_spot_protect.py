@@ -344,6 +344,8 @@ def dust_archive_fields(
         "exit_reason": "dust_abandon",
         "residual_qty": quantity,
         "residual_quote": quote,
+        "unprotected_qty": quantity,
+        "manual_action": "residual_below_min_is_not_a_complete_exit",
         "last_error": f"dust_untradable:{detail}:{source}",
     }
 
@@ -599,12 +601,12 @@ _APPROVED_TP_MULTIPLIERS = (
 
 
 def fill_tp_formula_b_enabled(environ: Any | None = None) -> bool:
-    """First-hang take-profit formula B. Unset stays off and does not move the stop."""
+    """First-hang take-profit formula B. Only literal ``1`` turns it on."""
     env = os.environ if environ is None else environ
     raw = env.get(FILL_TP_FORMULA_B_ENV) if hasattr(env, "get") else None
     if raw is None:
         return False
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    return str(raw).strip() == "1"
 
 
 def approved_tp_multiplier(raw: object) -> Decimal | None:

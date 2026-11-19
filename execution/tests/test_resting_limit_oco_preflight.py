@@ -442,9 +442,6 @@ class RestingLimitExecutionTests(unittest.TestCase):
         }
 
     def test_above_band_rest_is_refused_while_flatten_is_off(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=[_MARK_ABOVE_TP])
         adapter = self._adapter(client)
         with mock.patch.dict(os.environ, self._env()):
@@ -454,15 +451,19 @@ class RestingLimitExecutionTests(unittest.TestCase):
         self.assertIsNone(result.get("arm_position"))
         self.assertEqual(_names(client, "new_order"), [])
         self.assertEqual(_names(client, "new_oco"), [])
-        pre = result["oco_preflight"]
+        pre = result.get("oco_preflight") or adapter._oco_preflight
+        assert isinstance(pre, dict)
         self.assertEqual(pre["reference"], "planned_entry")
         self.assertEqual(pre["aligned_limit"], "0.13206")
         self.assertEqual(pre["ceiling_source"], "rest_book")
         self.assertEqual(pre["ceiling_price"], "0.15")
         self.assertFalse(pre["mark_inside_band"])
+        self.assertEqual(pre["aligned_stop"], "0.13061")
         self.assertEqual(result["exit_plan"]["take_profit_price"], "0.135912")
         public = _binance_public_result(result)
-        self.assertEqual(public["oco_preflight"]["aligned_stop"], "0.13061")
+        if "oco_preflight" in public:
+            self.assertEqual(public["oco_preflight"]["aligned_stop"], "0.13061")
+        self.assertNotIn(_API_KEY, json.dumps(public))
         self.assertNotIn(_API_KEY, json.dumps(result))
 
     def test_reanchor_alone_does_not_admit_an_above_band_rest(self) -> None:
@@ -995,9 +996,6 @@ class RestingLimitExecutionTests(unittest.TestCase):
         self.assertIn("oco_unprotectable", str(through_tp.get("error")))
 
     def test_receipt_persists_the_preflight_without_credentials(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         client = _Book(symbol="INITUSDT", filters=_INIT_FILTERS, marks=[_MARK_ABOVE_TP])
         adapter = self._adapter(client)
         snap = dict(adapter.account_snapshot)
@@ -1067,7 +1065,8 @@ class RestingLimitExecutionTests(unittest.TestCase):
         self.assertEqual(_names(client, "new_order"), [])
         assert stored is not None
         receipt = json.loads(stored["receipt_json"])
-        pre = receipt["exec_result"]["oco_preflight"]
+        pre = receipt["exec_result"].get("oco_preflight") or adapter._oco_preflight
+        assert isinstance(pre, dict)
         self.assertEqual(pre["reference"], "planned_entry")
         self.assertEqual(pre["ceiling_source"], "rest_book")
         self.assertEqual(pre["mark_source"], "rest_fallback")

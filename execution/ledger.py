@@ -1557,9 +1557,50 @@ class ExecutionLedger:
         return kept
 
     def confirm_binance_spot_qty(
-        self, position_id: int, quantity: str
+        self, position_id: int, quantity: object
     ) -> dict[str, Any] | None:
-        """Promote ``qty_unconfirmed`` once the entry order reports a base fill."""
+        """Promote ``qty_unconfirmed`` once the entry order reports a verified base fill."""
+        err_text: str | None = None
+        if isinstance(quantity, tuple):
+            err_raw = quantity[1] if len(quantity) >= 2 else None
+            err_text = str(err_raw).strip() if err_raw not in (None, "") else None
+            quantity = quantity[0] if len(quantity) >= 1 else None
+        if err_text and err_text.startswith("fee_unverified"):
+            gross = err_text.partition(":")[2].strip() or None
+            now = _utc()
+            clear_sql = ", ".join(f"{col} = NULL" for col in _OCO_READBACK_COLUMNS)
+            self.conn.execute(
+                f"""
+                UPDATE binance_spot_positions
+                SET quantity = COALESCE(?, quantity),
+                    unprotected_qty = COALESCE(?, unprotected_qty, quantity),
+                    status = 'oco_failed',
+                    protection = 'oco_pending',
+                    manual_action = 'halt_new_buys_and_manually_close_or_protect_the_fill',
+                    last_error = 'fee_unverified',
+                    {clear_sql},
+                    updated_at = ?
+                WHERE id = ? AND status = 'qty_unconfirmed'
+                """,
+                (gross, gross, now, int(position_id)),
+            )
+            self.conn.commit()
+            saved_err = self.conn.execute(
+                "SELECT * FROM binance_spot_positions WHERE id = ?",
+                (int(position_id),),
+            ).fetchone()
+            return dict(saved_err) if saved_err else None
+        if quantity is None or isinstance(quantity, bool):
+            return None
+        qty_text = str(quantity).strip()
+        if not qty_text:
+            return None
+        try:
+            qty_dec = Decimal(qty_text)
+        except Exception:  # noqa: BLE001
+            return None
+        if not qty_dec.is_finite() or qty_dec <= 0:
+            return None
         now = _utc()
         clear_sql = ", ".join(f"{col} = NULL" for col in _OCO_READBACK_COLUMNS)
         self.conn.execute(
@@ -1568,7 +1609,7 @@ class ExecutionLedger:
             SET quantity = ?, status = 'open', last_error = NULL, {clear_sql}, updated_at = ?
             WHERE id = ? AND status = 'qty_unconfirmed'
             """,
-            (str(quantity), now, int(position_id)),
+            (qty_text, now, int(position_id)),
         )
         self.conn.commit()
         saved = self.conn.execute(

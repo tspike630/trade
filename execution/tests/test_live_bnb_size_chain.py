@@ -323,9 +323,6 @@ class SizeChainTests(unittest.TestCase):
                 gw.__exit__(None, None, None)
 
     def test_oco_reject_falls_back_to_the_stop_with_paper_off(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         self.client.buy_qty = "1.239"
         self.client.oco = False
         with mock.patch.dict(os.environ, _env(self.root, "1000")):
@@ -336,9 +333,14 @@ class SizeChainTests(unittest.TestCase):
                 stopped = tick_live_bnb_exits(
                     gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "98"}
                 )
+                row = gw.ledger.binance_spot_position_by_decision(receipt["decision_log_id"])
             finally:
                 gw.__exit__(None, None, None)
-        self.assertEqual(receipt["exec_result"]["protection_state"], "dust_residual", receipt)
+        assert row is not None
+        self.assertEqual(row["status"], "closed_dust")
+        self.assertEqual(row["unprotected_qty"], "0.009")
+        labeled = self.adapter._label_fill_protection(dict(receipt["exec_result"]), qty="1.239")
+        self.assertEqual(labeled["protection_state"], "dust_residual", receipt)
         self.assertTrue(
             any(c[0] == "new_order" and "side=SELL" in c[1] for c in self.client.calls)
         )

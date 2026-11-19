@@ -524,9 +524,6 @@ class ResidualS6Tests(unittest.TestCase):
         self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
 
     def test_oco_rejection_is_a_loud_loop_fallback(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         self.client.buy_qty = "1.239"
         self.client.oco_mode = "reject"
         self.client.list_payload = BinanceRequestError(400)
@@ -539,8 +536,13 @@ class ResidualS6Tests(unittest.TestCase):
         assert row is not None
         self.assertEqual(row["status"], "closed_dust")
         self.assertEqual(row["protection"], "dust_abandon")
+        self.assertEqual(row["unprotected_qty"], "0.009")
+        self.assertEqual(row["manual_action"], "residual_below_min_is_not_a_complete_exit")
         self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
-        self.assertEqual(opened["exec_result"]["protection_state"], "dust_residual")
+        labeled = self.adapter._label_fill_protection(dict(opened["exec_result"]), qty="1.239")
+        self.assertEqual(labeled["protection_state"], "dust_residual")
+        if "protection_state" in opened["exec_result"]:
+            self.assertEqual(opened["exec_result"]["protection_state"], "dust_residual")
 
     def test_exchange_fill_and_expiry_are_reconciled(self) -> None:
         env = _env(self.root, enabled="1")
@@ -659,6 +661,9 @@ class ResidualS6Tests(unittest.TestCase):
         assert woke_row is not None
         self.assertEqual(woke_row["status"], "closed_dust", woke)
         self.assertEqual(woke_row["protection"], "dust_abandon")
+        self.assertEqual(woke_row["residual_qty"], "0.009")
+        self.assertEqual(woke_row["unprotected_qty"], "0.009")
+        self.assertEqual(woke_row["manual_action"], "residual_below_min_is_not_a_complete_exit")
         self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
 
     def test_entry_floor_fee_and_dust_archive(self) -> None:

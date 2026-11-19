@@ -865,11 +865,204 @@ class EntryCancelFormulaBTests(unittest.TestCase):
             stored = ledger.binance_spot_position_by_id(pid)
             assert stored is not None
             self.assertEqual(stored["status"], "closed_dust")
+            self.assertEqual(stored["residual_qty"], "0.05")
+            self.assertEqual(stored["unprotected_qty"], "0.05")
+            self.assertEqual(
+                stored["manual_action"],
+                "residual_below_min_is_not_a_complete_exit",
+            )
             blocks = ledger.list_binance_spot_buy_blocks(PURPOSE_LIVE_BNB_BOLL_FADE)
             self.assertEqual(
                 buy_exposure_block(blocks, [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="BTCUSDT"),
                 "unprotected_position_blocks_buy",
             )
+            ledger.close()
+
+    def test_formula_b_flag_accepts_only_literal_one(self) -> None:
+        for raw in ("", "0", "2", "1.0", "nope", "true", "TRUE", "yes", "on"):
+            self.assertFalse(
+                fill_tp_formula_b_enabled({"BINANCE_SPOT_FILL_TP_FORMULA_B": raw}),
+                raw,
+            )
+        self.assertTrue(fill_tp_formula_b_enabled({"BINANCE_SPOT_FILL_TP_FORMULA_B": "1"}))
+        self.assertTrue(fill_tp_formula_b_enabled({"BINANCE_SPOT_FILL_TP_FORMULA_B": " 1 "}))
+
+    def test_oco_leg_residual_dust_persists_unprotected_qty_and_manual_action(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="formula-b-remdust-") as tmp:
+            ledger = ExecutionLedger(Path(tmp) / "ledger.db")
+            armed = ledger.arm_binance_spot_position(
+                {
+                    "decision_log_id": 170091,
+                    "symbol": "SOLUSDT",
+                    "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                    "entry_order_id": "91001",
+                    "status": "oco_partial",
+                    "protection": "exchange_oco",
+                    "quantity": "10.005",
+                    "unprotected_qty": "0.005",
+                    "manual_action": "residual_below_min_is_not_a_complete_exit",
+                    "entry_price": "100",
+                    "stop_price": "98",
+                    "take_profit_price": "110",
+                }
+            )
+            pid = int(armed["id"])
+            armed = ledger.update_binance_spot_position(
+                pid,
+                {
+                    "residual_qty": "0.005",
+                    "oco_order_list_id": "77",
+                    "oco_list_client_id": "bnbfade-ol-170091",
+                    "oco_above_order_id": "501",
+                    "oco_below_order_id": "502",
+                },
+            ) or armed
+            entry_filled = {
+                "symbol": "SOLUSDT",
+                "orderId": 91001,
+                "side": "BUY",
+                "status": "FILLED",
+                "executedQty": "10.005",
+                "cummulativeQuoteQty": "1000.5",
+            }
+            done_list = {
+                "orderListId": 77,
+                "listClientOrderId": "bnbfade-ol-170091",
+                "listOrderStatus": "ALL_DONE",
+                "listStatusType": "ALL_DONE",
+                "symbol": "SOLUSDT",
+                "orders": [
+                    {"symbol": "SOLUSDT", "orderId": 501, "clientOrderId": "bnbfade-tp-170091"},
+                    {"symbol": "SOLUSDT", "orderId": 502, "clientOrderId": "bnbfade-sl-170091"},
+                ],
+                "orderReports": [
+                    {
+                        "orderId": 501,
+                        "clientOrderId": "bnbfade-tp-170091",
+                        "symbol": "SOLUSDT",
+                        "type": "LIMIT_MAKER",
+                        "side": "SELL",
+                        "status": "FILLED",
+                        "price": "110",
+                        "origQty": "10",
+                        "executedQty": "10",
+                    },
+                    {
+                        "orderId": 502,
+                        "clientOrderId": "bnbfade-sl-170091",
+                        "symbol": "SOLUSDT",
+                        "type": "STOP_LOSS_LIMIT",
+                        "side": "SELL",
+                        "status": "EXPIRED",
+                        "price": "97.99",
+                        "stopPrice": "98",
+                        "origQty": "10",
+                        "executedQty": "0",
+                    },
+                ],
+            }
+
+            class _ResidualClient(_Client):
+                def my_trades(self, signed_query: str, *, api_key: str) -> list:
+                    form = parse_qs(signed_query)
+                    if form.get("fromId"):
+                        return []
+                    oid = (form.get("orderId") or [""])[0]
+                    if oid == "91001":
+                        return _trades([("10.005", "0", "USDT")], order_id=91001)
+                    if oid == "501":
+                        return [
+                            {
+                                "id": 10,
+                                "symbol": "SOLUSDT",
+                                "orderId": 501,
+                                "qty": "10",
+                                "commission": "0",
+                                "commissionAsset": "USDT",
+                                "isBuyer": False,
+                            }
+                        ]
+                    return []
+
+            rc = _ResidualClient([entry_filled], [])
+            rc.last_oco_resp = done_list
+            adapter = self._adapter(rc, auto_flatten_on_oco_fail=True)
+            out = adapter.maintain_held_position(
+                armed,
+                "110",
+                persist=lambda fields: ledger.update_binance_spot_position(pid, fields),
+            )
+            self.assertEqual(out["book"], "closed_dust", out)
+            self.assertEqual(rc.sells, [])
+            stored = ledger.binance_spot_position_by_id(pid)
+            assert stored is not None
+            self.assertEqual(stored["status"], "closed_dust")
+            self.assertEqual(stored["unprotected_qty"], "0.005")
+            self.assertEqual(stored["residual_qty"], "0.005")
+            self.assertEqual(
+                stored["manual_action"],
+                "residual_below_min_is_not_a_complete_exit",
+            )
+            ledger.close()
+
+    def test_oco_unknown_absent_list_retries_same_client_id_once_without_moving_stop(self) -> None:
+        os.environ["BINANCE_SPOT_FILL_TP_FORMULA_B"] = "1"
+        with tempfile.TemporaryDirectory(prefix="formula-b-absent-oco-") as tmp:
+            ledger = ExecutionLedger(Path(tmp) / "ledger.db")
+            armed = ledger.arm_binance_spot_position(
+                _position(status="open", entry_price="101", quantity="10")
+            )
+            pid = int(armed["id"])
+
+            class _TimeoutOnceOcoClient(_Client):
+                def __init__(self) -> None:
+                    super().__init__([], _trades([("10", "0", "USDT")]))
+                    self.fail_first_oco = True
+
+                def new_oco(self, signed_query: str, *, api_key: str) -> dict:
+                    if self.fail_first_oco:
+                        self.ocos.append(signed_query)
+                        self.fail_first_oco = False
+                        raise TimeoutError("oco post timed out")
+                    return super().new_oco(signed_query, api_key=api_key)
+
+            client = _TimeoutOnceOcoClient()
+            adapter = self._adapter(client, auto_flatten_on_oco_fail=True)
+            # Tick 1: POST /orderList/oco times out, GET /orderList returns -2018 -> oco_unknown.
+            t1 = adapter.maintain_held_position(
+                armed,
+                "101",
+                persist=lambda fields: ledger.update_binance_spot_position(pid, fields),
+            )
+            self.assertEqual(t1["book"], "oco_unknown", t1)
+            self.assertEqual(len(client.ocos), 1)
+            self.assertEqual(client.sells, [])
+            after_t1 = ledger.binance_spot_position_by_id(pid)
+            assert after_t1 is not None
+            self.assertEqual(after_t1["oco_list_client_id"], "bnbfade-ol-170003")
+            self.assertEqual(after_t1["fill_tp_formula_b"], "applied")
+            self.assertEqual(after_t1["take_profit_price"], "114.635")
+            self.assertEqual(after_t1["stop_price"], "98")
+
+            # Tick 2: GET /orderList explicitly returns -2018 (absent) -> retries same listClientOrderId once.
+            t2 = adapter.maintain_held_position(
+                after_t1,
+                "101",
+                persist=lambda fields: ledger.update_binance_spot_position(pid, fields),
+            )
+            self.assertTrue(t2["ok"], t2)
+            self.assertEqual(len(client.ocos), 2)
+            self.assertEqual(client.sells, [])
+            q1 = parse_qs(client.ocos[0])
+            q2 = parse_qs(client.ocos[1])
+            self.assertEqual(q1["listClientOrderId"], ["bnbfade-ol-170003"])
+            self.assertEqual(q2["listClientOrderId"], ["bnbfade-ol-170003"])
+            self.assertEqual(q2["abovePrice"], ["114.63"])
+            self.assertEqual(q2["belowStopPrice"], ["98"])
+            after_t2 = ledger.binance_spot_position_by_id(pid)
+            assert after_t2 is not None
+            self.assertEqual(after_t2["status"], "oco_working")
+            self.assertEqual(after_t2["stop_price"], "98")
             ledger.close()
 
 

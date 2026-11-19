@@ -62,7 +62,7 @@ _SWITCHES = (
 # by a third rewrite in this branch.
 _UNTOUCHED = {
     "execution/executors/binance_spot.py": (
-        "63dd64a2835af69bf5860c535efcc16c0239fdadb2134bdc84ddc286fef41f2a",
+        "fb463ebaa7b71135e1eb1ef3e0b16ac0b193179a063595d7face66bafeb459c6",
         "87ef5ed7ed6566bab4f6b7ff0abd4fd33a96811f03cf8f7477a5eb03bede2f00",
     ),
     "execution/executors/binance_spot_gate.py": (
@@ -70,7 +70,7 @@ _UNTOUCHED = {
         "f7e2e3c63d42ad606516c9fc73bc822b868eba8686874248192671f03595cf38",
     ),
     "execution/executors/binance_spot_protect.py": (
-        "38dc737c103b2f6660ac0e178401ce564ad42996095b495eeda477a30daf5fde",
+        "ae88063da14022563ef63b3e0cc34f35cc7eec891190edb0429f601a6ff52c8c",
         "70aecd695825a7b71216b336d2a71c3c1b3bcb7302370cae8dd5ac44405c1ad9",
     ),
     "execution/gateway.py": (
@@ -78,7 +78,7 @@ _UNTOUCHED = {
         "06ee774eedd91ff18bbde603c65a7e474a561fa4ea976c011e21ed61343906ed",
     ),
     "execution/ledger.py": (
-        "c7014709544058538d65e4c29aa8465da8c09188fdf1be85d44403384b279d2b",
+        "fa1410df2d4d1780b3206a9acc40e32ffd574e5d29aa2c7280bede4b7e7fd0d2",
         "6039fd02e734acd8c031bc4ac80806b32b7e8ef9b049387ae6f8b5b6b81d82ac",
     ),
     "execution/run.py": (

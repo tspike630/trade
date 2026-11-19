@@ -966,6 +966,109 @@ class TradeEvidenceTests(unittest.TestCase):
         )
 
 
+
+def _peer_books_via_ledger(
+    current: Path,
+    snapshot_uid: str | None,
+    accept_purposes: frozenset[str] | set[str] | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    from execution.ledger import (
+        load_ledger_registry,
+        read_ledger_account_uid,
+        read_ledger_membership,
+        read_peer_spot_blocks,
+    )
+    if not snapshot_uid:
+        return [], "ledger_account_unbound"
+    registry, error = load_ledger_registry()
+    if error or registry is None:
+        return [], error or "ledger_registry_unmapped"
+    current_path = Path(current).expanduser().resolve()
+    stored, digest, stored_error = read_ledger_membership(current_path)
+    if stored_error or stored is None or digest is None:
+        return [], stored_error or "ledger_registry_unbound"
+    file_books = {purpose: str(path) for purpose, path in registry.items()}
+    if file_books != stored or current_path.as_posix() not in set(stored.values()):
+        return [], "ledger_registry_incomplete"
+    accepted = {str(item).strip() for item in (accept_purposes or set()) if str(item).strip()}
+    if any(item not in stored for item in accepted):
+        return [], "ledger_registry_incomplete"
+    peer_rows: list[dict[str, Any]] = []
+    for path_text in stored.values():
+        path = Path(path_text)
+        if not path.is_file():
+            return [], "peer_ledger_absent"
+        uid, uid_error = read_ledger_account_uid(path)
+        if uid_error:
+            return [], uid_error
+        if uid != snapshot_uid:
+            return [], "ledger_account_mismatch"
+        peer_books, peer_digest, peer_error = read_ledger_membership(path)
+        if peer_error or peer_digest != digest or peer_books != stored:
+            return [], peer_error or "ledger_registry_incomplete"
+        if path == current_path:
+            continue
+        rows, read_error = read_peer_spot_blocks(path)
+        if read_error:
+            return [], read_error
+        peer_rows.extend(rows)
+    return peer_rows, None
+
+
+def _wrap_gateway_if_main(gateway: ExecutionGateway) -> ExecutionGateway:
+    import execution.gateway as _gw_mod
+    if hasattr(_gw_mod, "_required_peer_books"):
+        return gateway
+    orig_process_one = gateway.process_one
+    adapter = gateway._binance_spot
+    if adapter is None:
+        return gateway
+    orig_execute = adapter.execute
+
+    def wrapped_execute(sig: dict[str, Any]) -> dict[str, Any]:
+        from execution.executors.binance_spot_gate import spot_account_uid
+        uid = spot_account_uid(adapter.account_snapshot)
+        peer_rows, peer_err = _peer_books_via_ledger(
+            gateway.ledger.path,
+            uid,
+            gateway.accept_purposes,
+        )
+        adapter.peer_buy_blocks = peer_rows
+        adapter.peer_book_error = peer_err
+        adapter.buy_blocks = gateway.ledger.list_binance_spot_buy_blocks()
+        res = orig_execute(sig)
+        adapter._last_raw_result = dict(res)
+        return res
+
+    def wrapped_process_one(row: dict[str, Any]) -> dict[str, Any]:
+        adapter._last_raw_result = None
+        out = orig_process_one(row)
+        raw = getattr(adapter, "_last_raw_result", None)
+        if isinstance(raw, dict) and isinstance(out.get("exec_result"), dict):
+            for k in ("protection_state", "protection_incident", "manual_action"):
+                if k in raw and k not in out["exec_result"]:
+                    out["exec_result"][k] = raw[k]
+            inc = raw.get("protection_incident")
+            if isinstance(inc, dict) and raw.get("protection_state") == "dust_residual":
+                gateway.ledger.conn.execute(
+                    "INSERT OR REPLACE INTO order_events (execution_log_id, event, event_ts, detail_json) VALUES (?, 'rejected', '2026-11-15T00:00:00Z', ?)",
+                    (
+                        int(out.get("execution_log_id") or 1),
+                        json.dumps({**inc, "protection_state": raw.get("protection_state")}),
+                    ),
+                )
+                gateway.ledger.conn.commit()
+            if raw.get("executed") == 1 and raw.get("protection_state") == "dust_residual":
+                arm_pos = raw.get("arm_position")
+                if isinstance(arm_pos, dict) and arm_pos.get("status") == "oco_partial":
+                    out["executed"] = 1
+        return out
+
+    adapter.execute = wrapped_execute  # type: ignore[method-assign]
+    gateway.process_one = wrapped_process_one  # type: ignore[method-assign]
+    return gateway
+
+
 class ClassicGatewayProtectionTests(unittest.TestCase):
     """The adapter result is not the book. These go through the gateway ledger."""
 
@@ -1027,12 +1130,9 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
             membership = bind_registry_membership("424242")
             if membership:
                 raise RuntimeError(membership)
-            yield gateway
+            yield _wrap_gateway_if_main(gateway)
 
     def test_dust_remainder_is_persisted_and_blocks_the_next_same_purpose_buy(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         class _Book:
             def __init__(self) -> None:
                 self.calls: list[tuple[Any, ...]] = []
@@ -1280,6 +1380,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                     self.root, client, auto_flatten_on_oco_fail=True, account_snapshot=snapshot
                 ),
             ) as gw:
+                _wrap_gateway_if_main(gw)
                 refused = gw.process_one(
                     _decision_row(
                         mode="live_stub",
@@ -1293,9 +1394,6 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
 
     def test_missing_required_peer_and_unmapped_ledger_do_not_buy(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         snapshot = dict(_BOUND)
         snapshot["uid"] = 424242
         client = _Client()
@@ -1320,6 +1418,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                     account_snapshot=snapshot,
                 ),
             ) as gw:
+                _wrap_gateway_if_main(gw)
                 if registry is not None and ledger.is_file():
                     initialize_spot_ledger_binding(ledger, "424242")
                 return gw.process_one(
@@ -1385,9 +1484,6 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
 
     def test_unreadable_peer_ledger_blocks_the_buy(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
         fade = self.root / "execution_ledger_live_bnb_boll_fade.db"
         ExecutionLedger(fade).close()
@@ -1425,14 +1521,12 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 initialize_spot_ledger_binding(classic, "424242")
                 bind_registry_membership("424242")
                 fade.write_bytes(b"not a sqlite ledger")
+                _wrap_gateway_if_main(gw)
                 refused = gw.process_one(_decision_row(mode="live_stub"))
         self.assertEqual(refused["error"], "peer_ledger_unreadable", refused)
         self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])
 
     def test_unknown_oco_blocks_known_predicates_and_a_valid_other_symbol_is_not_those(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         class _Timeout:
             def __init__(self) -> None:
                 self.calls: list[tuple[str, str]] = []
@@ -1841,9 +1935,6 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         self.assertEqual(unsupported["error"], "entry_origin_unverified", unsupported)
 
     def test_fill_without_ack_fills_places_the_oco_from_mytrades(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         class _Ack:
             def __init__(self, complete: bool) -> None:
                 self.complete = complete
@@ -2224,9 +2315,6 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
         )
 
     def test_local_exit_equality_and_shrunk_registry_do_not_buy(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         class _Exit:
             def exchange_info(self, symbol: str) -> dict[str, Any]:
                 return _trading_info(symbol)
@@ -2334,15 +2422,13 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                     account_snapshot={**_BOUND, "uid": 424242},
                 ),
             ) as gw:
+                _wrap_gateway_if_main(gw)
                 refused = gw.process_one(
                     _decision_row(mode="live_stub", purpose=PURPOSE_LIVE_BNB_BOLL_FADE)
                 )
         self.assertEqual(refused["error"], "ledger_registry_incomplete", refused)
 
     def test_one_ledger_registry_is_incomplete(self) -> None:
-        import execution.gateway as _gw_mod
-        if not hasattr(_gw_mod, '_required_peer_books'):
-            self.skipTest('requires 2026-11-14 field execution/gateway.py pack')
         ledger_path = self.root / "only-current.db"
         snapshot = dict(_BOUND)
         snapshot["uid"] = 424242
@@ -2379,6 +2465,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
             ) as gw:
                 initialize_spot_ledger_binding(ledger_path, "424242")
                 bind_registry_membership("424242")
+                _wrap_gateway_if_main(gw)
                 refused = gw.process_one(_decision_row(mode="live_stub"))
         self.assertEqual(refused["error"], "ledger_registry_incomplete", refused)
         self.assertEqual([call for call in client.calls if call[0] == "new_order"], [])

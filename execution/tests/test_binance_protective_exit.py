@@ -463,9 +463,6 @@ class ProtectiveExitTests(unittest.TestCase):
         self.assertEqual(self.client.calls, [])
 
     def test_unconfirmed_fill_and_bad_precision_do_not_sell(self) -> None:
-        import execution.run as _run_mod
-        if not hasattr(_run_mod, 'effective_poll_interval_sec'):
-            self.skipTest('requires 2026-11-14 field execution/run.py pack')
         self.client = _Client()
         self.client.trades.clear()
         self.client.new_order = _buy_without_qty(self.client)  # type: ignore[method-assign]
@@ -531,9 +528,6 @@ class ProtectiveExitTests(unittest.TestCase):
         self.assertNotEqual(floor_base_qty("1.239", "0.01"), "1.24")
 
     def test_missing_fill_qty_is_read_from_the_entry_order_then_sold(self) -> None:
-        import execution.run as _run_mod
-        if not hasattr(_run_mod, 'effective_poll_interval_sec'):
-            self.skipTest('requires 2026-11-14 field execution/run.py pack')
         self.client = _Client()
 
         def new_order(signed_query: str, *, api_key: str) -> dict[str, Any]:
@@ -589,10 +583,12 @@ class ProtectiveExitTests(unittest.TestCase):
                 )
                 row = gw.ledger.binance_spot_position_by_decision(11)
         self.assertEqual(exits[0]["position_status"], "closed_dust", exits[0])
+        assert row is not None
         self.assertEqual(row["protection"], "dust_abandon")
         self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
-        assert row is not None
         self.assertEqual(row["status"], "closed_dust")
+        self.assertEqual(row["unprotected_qty"], "0.009")
+        self.assertEqual(row["manual_action"], "residual_below_min_is_not_a_complete_exit")
         self.assertIn("orderId=99", next(call[1] for call in self.client.calls if call[0] == "get_order"))
         self.assertEqual(_sell_forms(self.client)[0]["side"], ["SELL"])
 
@@ -894,6 +890,56 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
         self.assertIsNone(filled.get("arm_position"))
         self.assertFalse(any(call[0] == "new_order" for call in client.calls))
         self.assertFalse(any(call[0] == "new_oco" for call in client.calls))
+
+        # With auto-flatten enabled (and sell blocked on kill during flatten),
+        # a fill average below stop_price (48.02 < 48.02605) refuses OCO and blocks next buy.
+        slipped_client = _DashBook(mark="48.10")
+        slipped_client.my_trades = lambda signed_query, *, api_key: [  # type: ignore[attr-defined]
+            {"id": 1, "symbol": "DASHUSDT", "orderId": 2953042815, "qty": "1.082", "commission": "0", "commissionAsset": "USDT", "isBuyer": True}
+        ]
+        slipped_adapter = self._adapter(slipped_client)
+        slipped_adapter.auto_flatten_on_oco_fail = True
+        kill_file = self.root / "temp-kill"
+        kill_file.write_text("halt\n", encoding="utf-8")
+        slipped_adapter.kill_switch_path = kill_file
+        with mock.patch.dict(os.environ, {**env, "BINANCE_SPOT_BLOCK_SELL_ON_KILL": "1"}):
+            slipped = slipped_adapter._buy_with_native_oco(
+                self._dash_buy(),
+                plan={"stop_price": "48.02605", "take_profit_price": "48.2895", "entry_price": "48.10"},
+                gates={"kill_switch_active": True, "kill_switch": "LIVE_TRADING_DISABLED", "live_enabled": True, "block_sell_on_kill": True},
+                intent=None,
+                pairs=[("symbol", "DASHUSDT"), ("side", "BUY"), ("type", "MARKET")],
+                order_id="2953042815",
+                filled="1.082",
+                sellable="1.082",
+                info=_DASH_INFO,
+                symbol="DASHUSDT",
+                placed={"orderId": "2953042815", "status": "FILLED", "executedQty": "1.082", "cummulativeQuoteQty": "51.957640", "symbol": "DASHUSDT"},
+            )
+        kill_file.unlink()
+        slipped_adapter.kill_switch_path = self.root / "absent-kill"
+        self.assertIn("oco_unprotectable:oco_price_restriction", str(slipped["error"]))
+        self.assertEqual(slipped["arm_position"]["status"], "oco_failed")
+        self.assertEqual(slipped["arm_position"]["stop_price"], "48.02605")
+        self.assertEqual(slipped["arm_position"]["take_profit_price"], "48.2895")
+        self.assertFalse(any(call[0] == "new_oco" for call in slipped_client.calls))
+        slipped_adapter.buy_blocks = [slipped["arm_position"]]
+        with mock.patch.dict(os.environ, env):
+            blocked = slipped_adapter.execute(
+                {
+                    **self._dash_buy(),
+                    "decision_log_id": 148593,
+                    "token_address": "ETHUSDT",
+                    "extras": {
+                        **self._dash_buy()["extras"],
+                        "binance_symbol": "ETHUSDT",
+                        "price_usd": "100",
+                        "stop_price": "90",
+                        "take_profit_price": "120",
+                    },
+                }
+            )
+        self.assertEqual(blocked["error"], "oco_failed_blocks_buy")
 
     def test_absent_list_code_is_not_a_working_oco_and_does_not_repost(self) -> None:
         class _Query:

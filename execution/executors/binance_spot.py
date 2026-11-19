@@ -7589,13 +7589,15 @@ class BinanceSpotAdapter:
             "oco_below_order_id": recon.get("below_order_id"),
             "last_error": None,
         }
+        res_now = _to_decimal(row.get("residual_qty"))
+        if res_now is not None and res_now > Decimal("0.00000001"):
+            return None
         held = _to_decimal(row.get("quantity"))
         if held is not None:
             remainder = held - executed
-            if remainder <= Decimal("0.00000001"):
-                fields["residual_qty"] = "0"
-            else:
-                fields["residual_qty"] = _decimal_text(remainder)
+            if remainder > Decimal("0.00000001"):
+                return None
+            fields["residual_qty"] = "0"
         return fields
 
     def _reconcile_oco(self, row: dict[str, Any]) -> dict[str, Any]:
