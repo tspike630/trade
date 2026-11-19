@@ -2318,6 +2318,7 @@ class BinanceSpotAdapter:
         prior = str(row.get("last_error") or "")
         if prior in {
             "oco_submit_timeout",
+            "oco_cancel_unconfirmed",
             "native_oco_unverified",
             "oco_unknown_readback_not_resubmit",
             "oco_readback_not_protective",
@@ -2330,7 +2331,9 @@ class BinanceSpotAdapter:
             "oco_leg_requery_failed",
         }:
             return True
-        return prior.startswith(("oco_list_absent:", "oco_requery_", "binance_http_error:"))
+        if prior.startswith(("oco_list_absent:", "oco_requery_")):
+            return True
+        return prior.startswith("binance_http_error:") and self._list_identity(row)
 
     def _claim_gate(self, row: dict[str, Any], status: str) -> bool:
         """Only a held row must prove the HTTP 200 before protection is restored.
@@ -5653,20 +5656,7 @@ class BinanceSpotAdapter:
                             conflict or "oco_readback_not_protective",
                         )
                 if native_oco_verified(_recon_payload(recon))[0] is None:
-                    save(
-                        {
-                            "status": "oco_unknown",
-                            "protection": PROTECTION_PENDING,
-                            "last_error": "native_oco_unverified",
-                        }
-                    )
-                    return self._coverage(
-                        row,
-                        book="oco_unknown",
-                        submitted=False,
-                        error="native_oco_unverified",
-                        protection=PROTECTION_PENDING,
-                    )
+                    return self._persist_readback_hold(row, save, "native_oco_unverified")
                 close_state = self._account_oco_execution(row, recon, save)
                 mapped = self._coverage_from_account(row, recon, close_state)
                 if mapped is not None:
@@ -5678,7 +5668,7 @@ class BinanceSpotAdapter:
                     residual_qty=row.get("residual_qty"),
                     submitted=False,
                 )
-                if status == "oco_unknown" and str(row.get("status") or "") == "oco_working":
+                if self._claim_gate(row, status) and str(row.get("status") or "") == "oco_working":
                     save({"manual_action": None, "unprotected_qty": None})
                 hold_limit_sec = self._effective_max_hold_sec(row)
                 if hold_limit_sec > 0:
@@ -5777,6 +5767,17 @@ class BinanceSpotAdapter:
                     str(recon.get("error") or "oco_requery_missing"),
                 )
             if state == "absent":
+                if status == "open" and not self._list_identity(row) and fill_tp_formula_b_enabled():
+                    info_fb, err_fb = self._load_symbol_info(row, self._gates())
+                    if not err_fb and isinstance(info_fb, dict):
+                        filters_fb = _symbol_filters(info_fb, str(row.get("symbol") or ""))
+                        if filters_fb:
+                            self._maybe_apply_fill_tp_formula_b(
+                                row,
+                                save,
+                                mark=mark,
+                                filters=filters_fb,
+                            )
                 allowed, band = self._repost_band(row, mark)
                 if not allowed:
                     prior = str(row.get("last_error") or "")
@@ -7478,7 +7479,8 @@ class BinanceSpotAdapter:
         if cancel_err or canceled is None:
             return None
         classified = classify_oco(canceled, held_qty=str(row.get("quantity") or ""))
-        if self._account_oco_execution(row, classified, save) == "closed":
+        close_state = self._account_oco_execution(row, classified, save)
+        if close_state == "closed":
             save(
                 {
                     "status": "oco_filled",
@@ -7497,18 +7499,28 @@ class BinanceSpotAdapter:
                 error=None,
                 reason=classified.get("exit_reason"),
             )
-        if classified.get("state") not in {"unfilled", "partial", "absent"}:
-            save({"last_error": "oco_cancel_unconfirmed"})
-            return self._coverage(
-                row,
-                book="oco_unknown",
-                submitted=False,
-                error="oco_cancel_unconfirmed",
-                protection=PROTECTION_PENDING,
-            )
+        if close_state == "closed_dust":
+            mapped = self._coverage_from_account(row, classified, close_state)
+            if mapped is not None:
+                return mapped
+        if close_state in {"unverified", "unproved"} or classified.get("state") not in {
+            "unfilled",
+            "partial",
+        }:
+            return self._persist_readback_hold(row, save, "oco_cancel_unconfirmed")
         prev_stop = str(row.get("stop_price") or "")
         next_seq = int(row.get("oco_ratchet_count") or 0) + 1
         upd_fields: dict[str, Any] = {
+            "status": "open",
+            "protection": PROTECTION_PENDING,
+            "oco_order_list_id": "",
+            "oco_list_client_id": "",
+            "oco_list_status": "",
+            "oco_above_order_id": "",
+            "oco_below_order_id": "",
+            "oco_above_client_id": "",
+            "oco_below_client_id": "",
+            "last_error": None,
             "stop_price": new_stop,
             "oco_ratchet_count": next_seq,
             "oco_ratchet_reason": ratchet_reason,
@@ -7517,6 +7529,20 @@ class BinanceSpotAdapter:
             upd_fields["initial_stop_price"] = prev_stop
         save(upd_fields)
         outcome = self._try_place_oco(row, mark, save, ratchet_seq=next_seq)
+        if (
+            self._auto_flatten_enabled()
+            and isinstance(outcome, dict)
+            and outcome.get("book") == "oco_failed"
+            and str(row.get("status") or "") not in {"closed_dust", "oco_partial"}
+        ):
+            outcome = self._auto_flatten_naked_position(
+                row,
+                info=info,
+                mark=mark,
+                oco_error=str(outcome.get("error") or "oco_failed"),
+                save=save,
+                exchange_error=outcome.get("exchange_error"),
+            )
         if isinstance(outcome, dict):
             outcome["oco_ratcheted"] = True
             outcome["oco_ratchet_reason"] = ratchet_reason
@@ -7712,20 +7738,7 @@ class BinanceSpotAdapter:
             if claimed is not None:
                 return claimed
             if is_request_timeout(exc) or not isinstance(exc, BinanceRequestError):
-                save(
-                    {
-                        "status": "oco_unknown",
-                        "protection": PROTECTION_PENDING,
-                        "last_error": "oco_submit_timeout",
-                    }
-                )
-                return self._coverage(
-                    row,
-                    book="oco_unknown",
-                    submitted=False,
-                    error="oco_submit_timeout",
-                    protection=PROTECTION_PENDING,
-                )
+                return self._persist_readback_hold(row, save, "oco_submit_timeout")
             err_str, exch_err = _exchange_failure(exc, key, secret)
             return self._oco_failed(
                 row,
@@ -7753,33 +7766,9 @@ class BinanceSpotAdapter:
             # A single miss after an unproven 200 is not a rejected list and
             # is not a market sell. The same client id stays for a later read.
             if str(found.get("state") or "") == "absent":
-                save(
-                    {
-                        "status": "oco_unknown",
-                        "protection": PROTECTION_PENDING,
-                        "last_error": _UNKNOWN_OCO_READBACK_HOLD,
-                    }
-                )
-                return self._coverage(
-                    row,
-                    book="oco_unknown",
-                    submitted=False,
-                    error=_UNKNOWN_OCO_READBACK_HOLD,
-                    protection=PROTECTION_PENDING,
-                )
-            save(
-                {
-                    "status": "oco_unknown",
-                    "protection": PROTECTION_PENDING,
-                    "last_error": verify_error or "native_oco_unverified",
-                }
-            )
-            return self._coverage(
-                row,
-                book="oco_unknown",
-                submitted=False,
-                error=verify_error or "native_oco_unverified",
-                protection=PROTECTION_PENDING,
+                return self._persist_readback_hold(row, save, _UNKNOWN_OCO_READBACK_HOLD)
+            return self._persist_readback_hold(
+                row, save, verify_error or "native_oco_unverified"
             )
         classified = classify_oco(placed, held_qty=str(spec["quantity"]))
         if isinstance(placed, dict):
@@ -7864,7 +7853,7 @@ class BinanceSpotAdapter:
             latest = self._reconcile_oco(row)
             seen += 1
         if (
-            seen >= 1
+            seen == _SAME_LIST_REREAD_BUDGET
             and str(latest.get("state") or "") == "absent"
             and str(latest.get("error") or "") == "oco_list_absent:-2018"
         ):
@@ -7899,6 +7888,15 @@ class BinanceSpotAdapter:
         gates = self._gates()
         if not gates.get("live_enabled"):
             return {"state": "requery_failed", "error": "binance_spot_live_disabled"}
+        symbol = str(row.get("symbol") or "")
+        list_client = row.get("oco_list_client_id")
+        list_order = row.get("oco_order_list_id")
+        if (
+            str(row.get("status") or "") == "open"
+            and list_order in (None, "")
+            and list_client in (None, "")
+        ):
+            return {"state": "absent", "error": "oco_requery_missing"}
         client = self._order_list_reader()
         query = getattr(client, "get_order_list", None) if client is not None else None
         if not callable(query):
@@ -7906,9 +7904,6 @@ class BinanceSpotAdapter:
         key, secret = self._credentials()
         if not key or not secret:
             return {"state": "requery_failed", "error": "missing_api_credentials"}
-        symbol = str(row.get("symbol") or "")
-        list_client = row.get("oco_list_client_id")
-        list_order = row.get("oco_order_list_id")
         if list_order not in (None, ""):
             ident = ("orderListId", str(list_order))
         elif list_client not in (None, ""):
@@ -8161,6 +8156,8 @@ class BinanceSpotAdapter:
         residual_qty: object = None,
         order: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
+        if self._identity_conflict(row, found):
+            return None
         state = str(found.get("state") or "")
         if state in {"filled", "partial"}:
             close_state = self._account_oco_execution(row, found, save)
