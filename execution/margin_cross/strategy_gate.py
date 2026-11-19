@@ -267,7 +267,7 @@ def evaluate_approved_regime_intent(
 
     if requested_action == "OPEN_SHORT":
         return _evaluate_short_regime(plain_row, symbol=symbol, routed_regime=routed.regime, reject_reason=routed.reject_reason)
-    return _evaluate_long_regime(plain_row, routed=routed, environ=environ)
+    return _evaluate_long_regime(plain_row, symbol=symbol, routed=routed, environ=environ)
 
 
 def _evaluate_short_regime(
@@ -398,10 +398,10 @@ def _evaluate_short_regime(
 def _evaluate_long_regime(
     row: dict[str, Any],
     *,
+    symbol: str = "BTCUSDT",
     routed: Any,
     environ: Mapping[str, str] | None = None,
 ) -> StrategyGateDecision:
-    del row
     if not routed.allow_buy:
         return StrategyGateDecision(
             False,
@@ -443,6 +443,16 @@ def _evaluate_long_regime(
                 Decimal(1),
                 ("state2_entry_module_not_live",),
             )
+        tbr_s2 = _dec_or_none(row, "taker_buy_ratio") or _dec_or_none(row, "spot_taker_buy_ratio")
+        obi_s2 = _dec_or_none(row, "obi_top5") or _dec_or_none(row, "spot_obi_top5")
+        if tbr_s2 is None or tbr_s2 < Decimal("0.48"):
+            return StrategyGateDecision(
+                False, routed.regime, "", "OPEN_LONG", Decimal(0), Decimal(1), ("state2_taker_buy_below_min",),
+            )
+        if obi_s2 is None or obi_s2 < Decimal("-0.05"):
+            return StrategyGateDecision(
+                False, routed.regime, "", "OPEN_LONG", Decimal(0), Decimal(1), ("state2_obi_top5_below_min",),
+            )
         return StrategyGateDecision(
             True,
             routed.regime,
@@ -462,6 +472,30 @@ def _evaluate_long_regime(
                 Decimal(0),
                 Decimal(1),
                 ("state4_long_closed_on_margin",),
+            )
+        if get_conviction_tier(symbol) == "SPECULATIVE":
+            return StrategyGateDecision(
+                False, routed.regime, "", "OPEN_LONG", Decimal(0), Decimal(1), ("state4_speculative_symbol_rejected",),
+            )
+        bz_s4 = _dec_or_none(row, "boll_z") or _dec_or_none(row, "boll_z_1h")
+        if bz_s4 is None or bz_s4 > Decimal("-2.20"):
+            return StrategyGateDecision(
+                False, routed.regime, "", "OPEN_LONG", Decimal(0), Decimal(1), ("state4_boll_z_not_deep_enough",),
+            )
+        alpha_s4 = _dec_or_none(row, "alpha")
+        if alpha_s4 is not None and alpha_s4 > Decimal("0.15"):
+            return StrategyGateDecision(
+                False, routed.regime, "", "OPEN_LONG", Decimal(0), Decimal(1), ("state4_dip_not_deep_enough",),
+            )
+        tbr_s4 = _dec_or_none(row, "taker_buy_ratio") or _dec_or_none(row, "spot_taker_buy_ratio")
+        obi_s4 = _dec_or_none(row, "obi_top5") or _dec_or_none(row, "spot_obi_top5")
+        if tbr_s4 is None or tbr_s4 < Decimal("0.38"):
+            return StrategyGateDecision(
+                False, routed.regime, "", "OPEN_LONG", Decimal(0), Decimal(1), ("state4_taker_buy_below_min",),
+            )
+        if obi_s4 is None or obi_s4 < Decimal("-0.15"):
+            return StrategyGateDecision(
+                False, routed.regime, "", "OPEN_LONG", Decimal(0), Decimal(1), ("state4_obi_top5_below_min",),
             )
         return StrategyGateDecision(
             True,

@@ -482,9 +482,17 @@ class StrategySizingAndFreshnessTest(unittest.TestCase):
                 environ={},
             ).allowed
         )
+        self.assertFalse(
+            evaluate_approved_regime_intent(
+                {**_state4_short_market_row(), "boll_z": -1.50},
+                symbol="BTCUSDT",
+                requested_action="OPEN_LONG",
+                environ={ENABLE_STATE4_LONG_ENV: "1"},
+            ).allowed
+        )
         self.assertTrue(
             evaluate_approved_regime_intent(
-                _state4_short_market_row(),
+                {**_state4_short_market_row(), "boll_z": -2.40, "alpha": 0.10, "obi_top5": -0.10, "taker_buy_ratio": 0.42},
                 symbol="BTCUSDT",
                 requested_action="OPEN_LONG",
                 environ={ENABLE_STATE4_LONG_ENV: "1"},
