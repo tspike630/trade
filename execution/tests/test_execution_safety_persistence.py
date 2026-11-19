@@ -39,6 +39,7 @@ from execution.executors.binance_spot_protect import PROTECTION_EXCHANGE  # noqa
 from decision_engine.core.regime_strategy_router import evaluate_five_state_regime  # noqa: E402
 from decision_engine.core.data_adapter import IndicatorDataAdapter  # noqa: E402
 from decision_engine.core.engine import DecisionEngine  # noqa: E402
+from decision_engine.tests.quiet_macro import write_quiet_macro  # noqa: E402
 from decision_engine.core.risk_manager import RiskManager  # noqa: E402
 from decision_engine.core.signal_bus import SignalBus  # noqa: E402
 from decision_engine.strategies import get_strategy  # noqa: E402
@@ -1027,6 +1028,7 @@ class PersistenceSafetyTests(unittest.TestCase):
                 bus,
                 [get_strategy("tech_boll_fade_v1")],
                 risk=RiskManager(cooldown_sec=0),
+                macro_db=write_quiet_macro(db.with_name("quiet_macro.db"), now_ms),
             ).tick()
         finally:
             bus.close()

@@ -21,6 +21,7 @@ import decision_engine  # noqa: F401
 from decision_engine import config as de_config
 from decision_engine.core.data_adapter import IndicatorDataAdapter
 from decision_engine.core.engine import DecisionEngine
+from decision_engine.tests.quiet_macro import write_quiet_macro
 from decision_engine.core.news_shock_gate import load_news_snapshot
 from decision_engine.core.regime_strategy_router import (
     REGIME_3_CROSS_ASSET_BULL_PULLBACK,
@@ -163,6 +164,7 @@ class PublishedSignalTests(unittest.TestCase):
                     bus,
                     [get_strategy("tech_boll_fade_v1")],
                     risk=RiskManager(cooldown_sec=0),
+                    macro_db=write_quiet_macro(db.with_name("quiet_macro.db")),
                 ).tick()
             finally:
                 bus.close()

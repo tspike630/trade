@@ -27,6 +27,22 @@ _HIGH_IMPACT = re.compile(
     r"\b(FOMC|Powell|Interest Rate|Policy Statement|Press Conference|Lagarde|Ueda|Minutes|Nonfarm|CPI)\b",
     re.IGNORECASE,
 )
+# A policy-decision release, not a speech that merely mentions monetary policy.
+_POLICY_DECISION = re.compile(
+    r"(?:"
+    r"announces (?:its |a )?(?:rate|policy) decision\b"
+    r"|announces decision of its\b"
+    r"|concludes (?:two-day |its )?policy meeting, announces\b"
+    r"|publication of the monetary policy decisions\b"
+    r"|publication of the account of the (?:ecb )?monetary policy meeting\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_high_impact_event(name: str) -> bool:
+    text = name or ""
+    return _HIGH_IMPACT.search(text) is not None or _POLICY_DECISION.search(text) is not None
 
 _ECON_FILES = (
     "lesg_crypto__Economic Events.xlsx",
@@ -244,10 +260,20 @@ def build_acceptance_db(source_dir: Path, out_path: Path) -> dict[str, int]:
                 kind TEXT NOT NULL,
                 clock_status TEXT NOT NULL,
                 observation_period TEXT,
+                release_date_hkt TEXT,
                 release_local_hkt TEXT,
                 utc_ts TEXT,
                 relevance TEXT,
                 sources TEXT NOT NULL
+            );
+            CREATE TABLE coverage_scope (
+                country TEXT,
+                event_class TEXT,
+                resolved_n INTEGER,
+                unresolved_n INTEGER,
+                first_utc TEXT,
+                last_utc TEXT,
+                note TEXT
             );
             CREATE TABLE source_file (
                 name TEXT PRIMARY KEY,
@@ -285,22 +311,25 @@ def build_acceptance_db(source_dir: Path, out_path: Path) -> dict[str, int]:
                 sample = item["sample"]
                 assert isinstance(sample, dict)
                 period = sample.get("Period", "") if kind == "economic" else ""
+                sources = item["sources"]
+                assert isinstance(sources, tuple)
                 conn.execute(
                     """
                     INSERT INTO release_event (
                         event_key, kind, clock_status, observation_period,
-                        release_local_hkt, utc_ts, relevance, sources
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        release_date_hkt, release_local_hkt, utc_ts, relevance, sources
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         key,
                         kind,
                         status,
                         period,
+                        str(identity[-1])[:10],
                         local_hkt,
                         utc_ts or None,
                         item["relevance"],
-                        ",".join(item["sources"]),  # type: ignore[arg-type]
+                        ",".join(sources),
                     ),
                 )
                 if status != "release" or utc_ms is None:
@@ -341,10 +370,38 @@ def build_acceptance_db(source_dir: Path, out_path: Path) -> dict[str, int]:
                             utc_ts,
                             utc_ms,
                             local_hkt,
-                            1 if _HIGH_IMPACT.search(name) else 0,
+                            1 if is_high_impact_event(name) else 0,
                         ),
                     )
                     counts["central_bank"] += 1
+        note = (
+            "Proven only in the open gap between two consecutive resolved clocks "
+            "of the same country and class. Not a continuous calendar."
+        )
+        conn.execute(
+            """
+            INSERT INTO coverage_scope (
+                country, event_class, resolved_n, unresolved_n, first_utc, last_utc, note
+            )
+            SELECT country, 'rel3', COUNT(*), 0, MIN(utc_ts), MAX(utc_ts), ?
+            FROM macro_events
+            WHERE relevance = 3
+            GROUP BY country
+            """,
+            (note,),
+        )
+        conn.execute(
+            """
+            INSERT INTO coverage_scope (
+                country, event_class, resolved_n, unresolved_n, first_utc, last_utc, note
+            )
+            SELECT country, 'cb_high', COUNT(*), 0, MIN(utc_ts), MAX(utc_ts), ?
+            FROM central_bank_events
+            WHERE is_high_impact = 1
+            GROUP BY country
+            """,
+            (note,),
+        )
         conn.commit()
     finally:
         conn.close()

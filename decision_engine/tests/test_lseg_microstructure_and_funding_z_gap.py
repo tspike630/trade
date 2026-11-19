@@ -146,7 +146,8 @@ class TestLsegMicrostructureAndFundingZGap(unittest.TestCase):
                 purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
                 environ={"DECISION_MACRO_SURPRISE_DYNAMIC": "1"},
             )
-            self.assertIsNone(status.halt_reason)
+            self.assertNotEqual(status.halt_reason, "macro_rel3_blackout")
+            self.assertEqual(status.detail, "release_coverage_unproven:United States:rel3")
 
     def test_lseg_dealer_spread_and_quote_imbalance_microstructure_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -71,7 +71,7 @@ class PublicReleaseCalendarTests(unittest.TestCase):
         at_minutes = evaluate_macro_gate(self.db, now_ms=minutes)
         self.assertEqual(at_minutes.halt_reason, "central_bank_blackout")
         after_minutes = evaluate_macro_gate(self.db, now_ms=minutes + 50 * 60_000)
-        self.assertIsNone(after_minutes.halt_reason)
+        self.assertEqual(after_minutes.detail, "release_coverage_unproven:United States:cb_high")
 
         statement = evaluate_macro_gate(self.db, now_ms=_ms("2026-10-28T18:00:00Z"))
         self.assertEqual(statement.halt_reason, "central_bank_blackout")
@@ -79,12 +79,11 @@ class PublicReleaseCalendarTests(unittest.TestCase):
     def test_after_the_last_sourced_release_day_still_locks(self) -> None:
         status = evaluate_macro_gate(self.db, now_ms=_ms("2027-12-16T16:00:00Z"))
         self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
-        self.assertEqual(status.detail, "release_calendar_not_covering_query_day")
+        self.assertEqual(status.detail, "release_coverage_unproven:United States:cb_high")
 
-    def test_a_later_release_does_not_cover_an_empty_day(self) -> None:
+    def test_a_gap_between_consecutive_sourced_clocks_can_clear(self) -> None:
         status = evaluate_macro_gate(self.db, now_ms=_ms("2026-11-12T16:00:00Z"))
-        self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
-        self.assertEqual(status.detail, "release_calendar_not_covering_query_day")
+        self.assertIsNone(status.halt_reason)
 
     def test_builder_refuses_the_cityu_snapshot_when_present(self) -> None:
         import hashlib

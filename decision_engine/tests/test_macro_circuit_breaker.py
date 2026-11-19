@@ -184,8 +184,23 @@ class MacroCircuitBreakerTests(unittest.TestCase):
         self.assertTrue(str(default_path).endswith("data/lseg/lseg_macro.db"))
 
         status = evaluate_macro_gate(None, now_ms=1_700_000_000_000)
-        self.assertFalse(status.configured)
-        self.assertIsNone(status.halt_reason)
+        self.assertTrue(status.configured)
+        self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+        self.assertEqual(status.detail, "path_unwired")
+        paper = evaluate_macro_gate(
+            None,
+            now_ms=1_700_000_000_000,
+            purpose=PURPOSE_RACE_TECH_BOLL_FADE,
+        )
+        self.assertFalse(paper.configured)
+        self.assertIsNone(paper.halt_reason)
+        self.assertEqual(
+            resolve_macro_db_path(
+                {"DECISION_MACRO_DB": "/tmp/kept.db", "DECISION_MACRO_GATE_ENABLED": "0"},
+                live_required=True,
+            ),
+            Path("/tmp/kept.db"),
+        )
 
     def test_calendar_blackout_windows_cb_rel3_and_rel2_auction(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -228,10 +243,11 @@ class MacroCircuitBreakerTests(unittest.TestCase):
                 evaluate_macro_gate(db, now_ms=fomc_ms + 40 * 60_000).halt_reason,
                 "central_bank_blackout",
             )
-            # 50 min after FOMC -> clear
-            self.assertIsNone(
-                evaluate_macro_gate(db, now_ms=fomc_ms + 50 * 60_000).halt_reason
-            )
+            # 50 min after the only FOMC clock is outside the window, and one
+            # clock does not prove the rest of the day.
+            after_fomc = evaluate_macro_gate(db, now_ms=fomc_ms + 50 * 60_000)
+            self.assertEqual(after_fomc.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(after_fomc.detail, "release_coverage_unproven:United States:cb_high")
 
             # 5 min after US CPI (Rel=3) -> blocked
             st_cpi = evaluate_macro_gate(db, now_ms=cpi_ms + 5 * 60_000)
@@ -249,10 +265,11 @@ class MacroCircuitBreakerTests(unittest.TestCase):
             st_auc = evaluate_macro_gate(db, now_ms=auc_ms + 10 * 60_000)
             self.assertEqual(st_auc.halt_reason, "macro_rel2_auction_blackout")
 
-            # Minor Rel=2 ('Wholesale Invt') -> clear by default, blocked if DECISION_MACRO_BLOCK_ALL_REL2=1
-            self.assertIsNone(
-                evaluate_macro_gate(db, now_ms=minor_r2_ms).halt_reason
-            )
+            # Minor Rel=2 is not an auction blackout. This fixture has no
+            # second clock, so the instant is unproven rather than clear.
+            minor = evaluate_macro_gate(db, now_ms=minor_r2_ms)
+            self.assertNotEqual(minor.halt_reason, "macro_rel2_auction_blackout")
+            self.assertEqual(minor.detail, "release_coverage_unproven:United States:cb_high")
             self.assertEqual(
                 evaluate_macro_gate(
                     db,
@@ -368,7 +385,7 @@ class MacroCircuitBreakerTests(unittest.TestCase):
                 ):
                     payload = engine.tick()
                 self.assertEqual(payload["emitted"], 0)
-                self.assertEqual(payload["macro_halt"], "macro_status_unknown")
+                self.assertEqual(payload["macro_halt"], "macro_lseg_stale_or_missing")
             finally:
                 bus.close()
                 adapter.close()
@@ -504,6 +521,81 @@ class MacroCircuitBreakerTests(unittest.TestCase):
                 "macro_rel3_blackout",
             )
 
+    def test_live_purpose_stays_closed_when_the_gate_is_disabled_or_unwired(self) -> None:
+        disabled = evaluate_macro_gate(
+            None,
+            now_ms=1_700_000_000_000,
+            environ={"DECISION_MACRO_GATE_ENABLED": "0", "DECISION_MACRO_DB": "/tmp/kept.db"},
+        )
+        self.assertEqual(disabled.halt_reason, "macro_lseg_stale_or_missing")
+        self.assertEqual(disabled.detail, "db_missing")
+        bare = evaluate_macro_gate(
+            None,
+            now_ms=1_700_000_000_000,
+            environ={"DECISION_MACRO_GATE_ENABLED": "0"},
+        )
+        self.assertEqual(bare.detail, "gate_disabled")
+        dry = evaluate_macro_gate(
+            None,
+            now_ms=1_700_000_000_000,
+            environ={"REGIME_V2_OUTPUT_MODE": "dry_run"},
+        )
+        self.assertEqual(dry.detail, "path_unwired")
+        paper = evaluate_macro_gate(
+            None,
+            now_ms=1_700_000_000_000,
+            purpose=PURPOSE_RACE_TECH_BOLL_FADE,
+            environ={"DECISION_MACRO_GATE_ENABLED": "0"},
+        )
+        self.assertIsNone(paper.halt_reason)
+
+    def test_low_relevance_same_day_does_not_cover_a_missing_us_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "japan.db"
+            _create_macro_db(db)
+            stamp = _utc_ms("2026-11-10T13:30:00Z")
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-10', '2026-11-10 21:30:00', '2026-11-10T13:30:00Z', ?, 'Japan', 0, 'Low relevance print')
+                """,
+                (stamp,),
+            )
+            conn.commit()
+            conn.close()
+            status = evaluate_macro_gate(db, now_ms=stamp)
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(status.detail, "release_coverage_unproven:no_gate_class")
+
+    def test_clear_requires_a_gap_between_two_clocks_of_the_same_class(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bracket.db"
+            _create_macro_db(db)
+            first = _utc_ms("2026-11-10T13:30:00Z")
+            second = _utc_ms("2026-11-13T13:30:00Z")
+            conn = sqlite3.connect(db)
+            conn.executemany(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES (?, ?, ?, ?, 'United States', 3, ?)
+                """,
+                [
+                    ("2026-11-10", "2026-11-10 21:30:00", "2026-11-10T13:30:00Z", first, "CPI"),
+                    ("2026-11-13", "2026-11-13 21:30:00", "2026-11-13T13:30:00Z", second, "PPI"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            between = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-12T16:00:00Z"))
+            self.assertIsNone(between.halt_reason)
+            before = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-09T16:00:00Z"))
+            self.assertEqual(before.detail, "release_coverage_unproven:United States:rel3")
+            at_cpi = evaluate_macro_gate(db, now_ms=first)
+            self.assertEqual(at_cpi.halt_reason, "macro_rel3_blackout")
+
     def test_date_only_reference_date_is_not_an_intraday_blackout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "period.db"
@@ -570,8 +662,8 @@ class MacroCircuitBreakerTests(unittest.TestCase):
             conn.commit()
             conn.close()
             morning = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-10T09:00:00Z"))
-            self.assertIsNone(morning.halt_reason)
-            self.assertTrue(morning.configured)
+            self.assertEqual(morning.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(morning.detail, "release_coverage_unproven:United States:rel3")
 
     def test_release_calendar_that_ended_on_a_previous_utc_day_does_not_clear(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -591,7 +683,7 @@ class MacroCircuitBreakerTests(unittest.TestCase):
             conn.close()
             status = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-10T13:30:00Z"))
             self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
-            self.assertEqual(status.detail, "release_calendar_not_covering_query_day")
+            self.assertEqual(status.detail, "release_coverage_unproven:United States:rel3")
 
     def test_real_lseg_macro_db_upcoming_events_if_present(self) -> None:
         """The CityU snapshot stores reference dates, not the official release clocks.

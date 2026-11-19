@@ -27,9 +27,11 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
@@ -124,16 +126,36 @@ def _env_bool(env: Mapping[str, str], key: str) -> bool:
     return str(raw).strip().lower() in _TRUE
 
 
-def resolve_macro_db_path(environ: Mapping[str, str] | None = None) -> Path | None:
-    """Return configured LSEG macro SQLite path, or ``None`` when disabled."""
+def resolve_macro_db_path(
+    environ: Mapping[str, str] | None = None,
+    *,
+    live_required: bool = False,
+) -> Path | None:
+    """Return the configured LSEG macro SQLite path.
+
+    ``DECISION_MACRO_GATE_ENABLED=0`` still unwires a non-live caller. A live
+    caller keeps an explicit path, and a missing path stays ``None`` so the
+    live gate can fail closed instead of skipping.
+    """
     env = os.environ if environ is None else environ
     gate_flag = str(env.get("DECISION_MACRO_GATE_ENABLED") or "").strip().lower()
-    if gate_flag in {"0", "false", "no", "off"}:
-        return None
+    explicit: Path | None = None
     for key in _MACRO_DB_ENV:
         raw = env.get(key)
         if raw is not None and str(raw).strip():
-            return Path(str(raw).strip()).expanduser()
+            explicit = Path(str(raw).strip()).expanduser()
+            break
+    if live_required:
+        if explicit is not None:
+            return explicit
+        if gate_flag in {"1", "true", "yes", "on"}:
+            repo_root = Path(__file__).resolve().parents[2]
+            return repo_root / "data" / "lseg" / "lseg_macro.db"
+        return None
+    if gate_flag in {"0", "false", "no", "off"}:
+        return None
+    if explicit is not None:
+        return explicit
     if gate_flag in {"1", "true", "yes", "on"}:
         repo_root = Path(__file__).resolve().parents[2]
         return repo_root / "data" / "lseg" / "lseg_macro.db"
@@ -453,36 +475,128 @@ def _evaluate_dynamic_surprise(
     return None, None, False
 
 
-def _release_calendar_gap(conn: sqlite3.Connection, now_ms: int) -> str | None:
-    """Return why this UTC day has no release clock, or None when it has one.
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
 
-    A date-only ``local_time_hkt`` is not a release. A clock with no ``utc_ms``
-    has no timezone. A release on a later day does not cover this day: one
-    future row is not continuous coverage.
+
+def _hkt_date_ms(day: str) -> int | None:
+    try:
+        parsed = datetime.strptime(day[:10], "%Y-%m-%d").replace(tzinfo=ZoneInfo("Asia/Hong_Kong"))
+    except ValueError:
+        return None
+    return int(parsed.timestamp() * 1000)
+
+
+def _unresolved_release_block(conn: sqlite3.Connection, now_ms: int) -> str | None:
+    """A missing or conflicting clock on a release date blocks that Hong Kong day.
+
+    The date alone is not a clock. It only says a row exists whose time was
+    not resolved, so the day cannot be cleared.
+    """
+    if not _table_exists(conn, "release_event"):
+        return None
+    columns = _table_cols(conn, "release_event")
+    if "release_date_hkt" not in columns or "clock_status" not in columns:
+        return None
+    rows = conn.execute(
+        """
+        SELECT clock_status, release_date_hkt, COUNT(*)
+        FROM release_event
+        WHERE clock_status IN ('absent', 'conflict')
+          AND release_date_hkt IS NOT NULL
+          AND release_date_hkt != ''
+        GROUP BY clock_status, release_date_hkt
+        """
+    ).fetchall()
+    lead = DEFAULT_CB_BEFORE_MIN * 60_000
+    tail = 86_400_000 + DEFAULT_CB_AFTER_MIN * 60_000
+    hits: list[tuple[str, str, int]] = []
+    for status, day, count in rows:
+        start = _hkt_date_ms(str(day))
+        if start is None:
+            continue
+        if start - lead <= now_ms < start + tail:
+            hits.append((str(status), str(day)[:10], int(count)))
+    if not hits:
+        return None
+    hits.sort(key=lambda item: (item[1], item[0]))
+    status, day, count = hits[0]
+    return f"release_clock_unresolved:{status}:{day}:n={count}"
+
+
+def _gate_class_clocks(conn: sqlite3.Connection) -> dict[tuple[str, str], list[int]]:
+    grouped: dict[tuple[str, str], list[int]] = {}
+    rel3 = conn.execute(
+        """
+        SELECT country, utc_ms FROM macro_events
+        WHERE relevance = 3 AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
+        """
+    ).fetchall()
+    for country, stamp in rel3:
+        grouped.setdefault((str(country), "rel3"), []).append(int(stamp))
+    banks = conn.execute(
+        """
+        SELECT country, utc_ms FROM central_bank_events
+        WHERE is_high_impact = 1 AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
+        """
+    ).fetchall()
+    for country, stamp in banks:
+        grouped.setdefault((str(country), "cb_high"), []).append(int(stamp))
+    for key in grouped:
+        grouped[key] = sorted(set(grouped[key]))
+    return grouped
+
+
+def _inside_proven_gap(stamps: list[int], now_ms: int, *, tail_ms: int, lead_ms: int) -> bool:
+    for earlier, later in zip(stamps, stamps[1:]):
+        if earlier + tail_ms < now_ms < later - lead_ms:
+            return True
+    return False
+
+
+def _release_calendar_gap(
+    conn: sqlite3.Connection,
+    now_ms: int,
+    *,
+    rel3_after_ms: int,
+    cb_after_ms: int,
+    before_ms: int,
+) -> str | None:
+    """Return why this instant is not a proven clear, or None when it is.
+
+    One clocked row does not cover a day, a country, or a later date. A
+    country and class are proven only in the open gap between two of that
+    class's own resolved clocks. A low-relevance row is not one of those clocks.
     """
     release_n = 0
     unzoned_n = 0
-    day_start = now_ms - (now_ms % 86_400_000)
-    day_end = day_start + 86_400_000
-    on_day = 0
     for table in ("macro_events", "central_bank_events"):
         row = conn.execute(
             f"""
             SELECT
                 SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms >= ? AND utc_ms < ? THEN 1 ELSE 0 END)
+                SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NULL THEN 1 ELSE 0 END)
             FROM {table}
-            """,
-            (day_start, day_end),
+            """
         ).fetchone()
         release_n += int(row[0] or 0)
         unzoned_n += int(row[1] or 0)
-        on_day += int(row[2] or 0)
     if release_n == 0:
         return "release_clock_unzoned" if unzoned_n else "release_clock_absent"
-    if on_day == 0:
-        return "release_calendar_not_covering_query_day"
+    unresolved = _unresolved_release_block(conn, now_ms)
+    if unresolved is not None:
+        return unresolved
+    classes = _gate_class_clocks(conn)
+    if not classes:
+        return "release_coverage_unproven:no_gate_class"
+    for (country, kind), stamps in sorted(classes.items()):
+        tail = cb_after_ms if kind == "cb_high" else rel3_after_ms
+        if not _inside_proven_gap(stamps, now_ms, tail_ms=tail, lead_ms=before_ms):
+            return f"release_coverage_unproven:{country}:{kind}"
     return None
 
 
@@ -505,15 +619,22 @@ def evaluate_macro_gate(
         and str(env_check.get("REGIME_V2_STALE_DATA_POLICY", "")).strip().lower() == "fail_closed"
         and (purpose in LIVE_BNB_SPOT_PURPOSES or _env_bool(env_check, "DECISION_MACRO_GATE_ALL_PURPOSES"))
     )
+    env = os.environ if environ is None else environ
+    all_purposes = str(env.get("DECISION_MACRO_GATE_ALL_PURPOSES") or "").strip() == "1"
+    live_gate = purpose in LIVE_BNB_SPOT_PURPOSES or all_purposes
+    gate_flag = str(env.get("DECISION_MACRO_GATE_ENABLED") or "").strip().lower()
+    if path is None and live_gate:
+        path = resolve_macro_db_path(env, live_required=True)
+        if path is None:
+            detail = "gate_disabled" if gate_flag in {"0", "false", "no", "off"} else "path_unwired"
+            return MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail=detail)
     if path is None:
         if v2_fail_closed:
             return MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail="path_unwired")
         return MacroGateStatus.unwired()
-    if v2_fail_closed and not Path(path).expanduser().is_file():
+    if not Path(path).expanduser().is_file() and (live_gate or v2_fail_closed):
         return MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail="db_missing")
-    env = os.environ if environ is None else environ
-    all_purposes = str(env.get("DECISION_MACRO_GATE_ALL_PURPOSES") or "").strip() == "1"
-    if not all_purposes and purpose not in LIVE_BNB_SPOT_PURPOSES:
+    if not live_gate:
         return MacroGateStatus.unwired()
 
     try:
@@ -618,7 +739,13 @@ def evaluate_macro_gate(
         if ca_reason is not None:
             return MacroGateStatus.halted(ca_reason, ca_detail)
 
-        gap = _release_calendar_gap(conn, now_ms)
+        gap = _release_calendar_gap(
+            conn,
+            now_ms,
+            rel3_after_ms=r3_after_ms,
+            cb_after_ms=cb_after_ms,
+            before_ms=cb_before_ms,
+        )
         if gap is not None:
             return MacroGateStatus.halted("macro_lseg_stale_or_missing", gap)
         return MacroGateStatus.clear()

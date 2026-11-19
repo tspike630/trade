@@ -18,6 +18,7 @@ from pathlib import Path
 import decision_engine  # noqa: F401
 from decision_engine.core.data_adapter import IndicatorDataAdapter
 from decision_engine.core.engine import DecisionEngine
+from decision_engine.tests.quiet_macro import write_quiet_macro
 from decision_engine.core.live_bnb_turnover import min_quote_volume_usdt, top_buys_per_tick
 from decision_engine.core.protection_halt import ProtectionBook
 from decision_engine.core.risk_manager import RiskManager
@@ -205,7 +206,7 @@ class ProductionGateTests(unittest.TestCase):
                     risk=RiskManager(cooldown_sec=0),
                     hot_limit=20,
                     protection_book=_book(purpose),
-                    macro_db=None,
+                    macro_db=write_quiet_macro(db.with_name("quiet_macro.db")),
                 )
                 payload = engine.tick()
                 symbols = [str(item.get("token_address") or "") for item in bus.emitted]

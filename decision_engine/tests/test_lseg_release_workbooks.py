@@ -21,6 +21,7 @@ from scripts.import_lseg_release_workbooks import (
     SNAPSHOT_SHA256,
     _merge,
     build_acceptance_db,
+    is_high_impact_event,
 )
 
 _DEFAULT_SOURCES = Path("/tmp/lseg-release-sources-t351/xlsx")
@@ -66,6 +67,29 @@ class ReleaseMergeTests(unittest.TestCase):
         )
         self.assertEqual(filled[0]["status"], "release")
         self.assertEqual(filled[0]["local_time"], "2026-11-10T21:30:00")
+
+    def test_policy_decision_wording_is_high_impact_and_a_speech_is_not(self) -> None:
+        self.assertTrue(is_high_impact_event(
+            "Bank of Japan concludes policy meeting, announces rate decision"
+        ))
+        self.assertTrue(is_high_impact_event(
+            "Bank of Japan concludes two-day policy meeting, announces policy decision"
+        ))
+        self.assertTrue(is_high_impact_event(
+            "Bank of Japan announces decision of its two-day policy meeting"
+        ))
+        self.assertTrue(is_high_impact_event(
+            "ECB’s publication of the monetary policy decisions"
+        ))
+        self.assertFalse(is_high_impact_event(
+            "Lecture on Monetary Policy Tightening by ECB chief economist Philip Lane"
+        ))
+        self.assertFalse(is_high_impact_event(
+            "Federal Reserve Vice Chair participates in Approach to Monetary Policy Decision-Making conversation"
+        ))
+        self.assertFalse(is_high_impact_event(
+            "European Central Bank Executive Board member gives a student roundtable"
+        ))
 
 
 class WorkbookAcceptanceTests(unittest.TestCase):
@@ -147,19 +171,29 @@ class WorkbookAcceptanceTests(unittest.TestCase):
         self.assertEqual(at_cpi.halt_reason, "macro_rel3_blackout")
         self.assertIn("Core CPI", at_cpi.detail or "")
         after_cpi = evaluate_macro_gate(self.db, now_ms=cpi_ms + 35 * 60_000)
-        self.assertIsNone(after_cpi.halt_reason)
+        self.assertEqual(after_cpi.halt_reason, "macro_lseg_stale_or_missing")
+        self.assertTrue(
+            (after_cpi.detail or "").startswith("release_clock_unresolved:")
+            or (after_cpi.detail or "").startswith("release_coverage_unproven:")
+        )
         morning = evaluate_macro_gate(self.db, now_ms=_ms("2026-11-10T09:00:00Z"))
-        self.assertIsNone(morning.halt_reason)
+        self.assertEqual(morning.halt_reason, "macro_lseg_stale_or_missing")
 
         fomc_ms = _ms("2026-11-18T19:00:00Z")
         at_fomc = evaluate_macro_gate(self.db, now_ms=fomc_ms)
         self.assertEqual(at_fomc.halt_reason, "central_bank_blackout")
         after_fomc = evaluate_macro_gate(self.db, now_ms=fomc_ms + 50 * 60_000)
-        self.assertIsNone(after_fomc.halt_reason)
+        self.assertEqual(after_fomc.halt_reason, "macro_lseg_stale_or_missing")
+        boj = evaluate_macro_gate(self.db, now_ms=_ms("2024-12-19T02:30:00Z"))
+        self.assertEqual(boj.halt_reason, "central_bank_blackout")
+        self.assertIn("announces rate", (boj.detail or "").lower())
+        ecb = evaluate_macro_gate(self.db, now_ms=_ms("2026-06-11T12:15:00Z"))
+        self.assertEqual(ecb.halt_reason, "central_bank_blackout")
+        self.assertIn("monetary policy decisions", (ecb.detail or "").lower())
 
         gap = evaluate_macro_gate(self.db, now_ms=_ms("2023-11-12T16:00:00Z"))
         self.assertEqual(gap.halt_reason, "macro_lseg_stale_or_missing")
-        self.assertEqual(gap.detail, "release_calendar_not_covering_query_day")
+        self.assertEqual(gap.detail, "release_clock_unresolved:absent:2023-11-12:n=4")
         built = __import__("hashlib").sha256(self.db.read_bytes()).hexdigest()
         self.assertNotEqual(built, SNAPSHOT_SHA256)
 
@@ -225,5 +259,5 @@ class WorkbookAcceptanceTests(unittest.TestCase):
             adapter.close()
         self.assertEqual(inside["macro_halt"], "macro_rel3_blackout")
         self.assertEqual(inside["emitted"], 0)
-        self.assertNotIn("macro_halt", outside)
-        self.assertEqual(outside["emitted"], 1)
+        self.assertEqual(outside["macro_halt"], "macro_lseg_stale_or_missing")
+        self.assertEqual(outside["emitted"], 0)
