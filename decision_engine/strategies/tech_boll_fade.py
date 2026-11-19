@@ -114,6 +114,7 @@ class TechBollFadeStrategy(BaseStrategy):
         """
         self._pending.clear()
         self.rejected = {}
+        purpose = str(data.get("purpose") or "")
         hot = data.get("hot_tokens") or []
         if multi_horizon_regime_enabled() and isinstance(hot, list) and hot:
             hot, _xs_ctx = stamp_cross_sectional_metrics(hot)
@@ -206,6 +207,8 @@ class TechBollFadeStrategy(BaseStrategy):
                 "beta_vs_btc": symbol_beta_vs_btc(sym_str),
                 "risk_parity_scalar": vol_sized.risk_parity_scalar,
             }
+            if purpose:
+                lift_extra["purpose"] = purpose
             bz_val = resolve_boll_z(row)
             if bz_val is not None:
                 lift_extra["boll_z"] = bz_val

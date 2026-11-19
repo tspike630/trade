@@ -62,7 +62,8 @@ _SWITCHES = (
 # by a third rewrite in this branch.
 _UNTOUCHED = {
     "execution/executors/binance_spot.py": (
-        "fb463ebaa7b71135e1eb1ef3e0b16ac0b193179a063595d7face66bafeb459c6",
+        # t310 adds order_post_attempted. Production pack stays the second hash.
+        "6a02fcde777a64e8349c2238c230a4ade2107cdcd337c86022975aa577cacfc9",
         "87ef5ed7ed6566bab4f6b7ff0abd4fd33a96811f03cf8f7477a5eb03bede2f00",
     ),
     "execution/executors/binance_spot_gate.py": (
@@ -74,7 +75,8 @@ _UNTOUCHED = {
         "70aecd695825a7b71216b336d2a71c3c1b3bcb7302370cae8dd5ac44405c1ad9",
     ),
     "execution/gateway.py": (
-        "e99f6d6f290d02a96328c8e4ecf287b16df4539a7bbd5ff2299d9cb129f8466c",
+        # t310 binds and settles the reservation around the existing buy path.
+        "9ec2ba768fbd203ff9094c99217b52e4496da81e82a4b04e36d5e1afb925a48f",
         "06ee774eedd91ff18bbde603c65a7e474a561fa4ea976c011e21ed61343906ed",
     ),
     "execution/ledger.py": (

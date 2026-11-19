@@ -1311,10 +1311,16 @@ def enforce_regime_v2_sizing_and_caps(
         open_beta_sum += pos_pct * symbol_beta_vs_btc(sym)
     position_cluster_counts = Counter(cluster_counts)
     position_exposure_pct = open_exposure_pct
+    caller_live = eq_view.source == "signed_snapshot"
     for held in held_reservations:
         held_sym = str(held.get("symbol") or "").strip().upper()
-        if held_sym and held_sym not in open_symbols:
+        held_mode = str(held.get("mode") or "live")
+        same_book = held_mode == ("live" if caller_live else "dry_run")
+        if held_sym:
             open_symbols.add(held_sym)
+        if held_sym and same_book and held_sym not in {
+            str(pos.get("symbol") or "").strip().upper() for pos in open_positions
+        }:
             held_cluster = str(held.get("cluster_key") or "")
             if held_cluster:
                 cluster_counts[held_cluster] += 1
@@ -1322,12 +1328,9 @@ def enforce_regime_v2_sizing_and_caps(
             if held_pct is not None and held_pct > 0:
                 open_exposure_pct += held_pct
                 open_beta_sum += held_pct * symbol_beta_vs_btc(held_sym)
-            cur_count_extra = 1
+            held["_counts_as_open"] = 1
         else:
-            cur_count_extra = 0
-        if held_sym in {str(pos.get("symbol") or "").strip().upper() for pos in open_positions}:
-            cur_count_extra = 0
-        held["_counts_as_open"] = cur_count_extra
+            held["_counts_as_open"] = 0
 
     dropped: Counter[str] = Counter()
     accepted_ids: set[int] = set()
