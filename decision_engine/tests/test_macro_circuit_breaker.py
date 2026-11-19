@@ -33,6 +33,70 @@ from decision_engine.core.signal_bus import (
 from decision_engine.strategies.base_strategy import BaseStrategy
 
 
+# Same order as ``resolve_macro_db_path`` / ``_MACRO_DB_ENV``.
+_LSEG_PATH_ENVS = ("DECISION_MACRO_DB", "LSEG_MACRO_DB_PATH")
+_LSEG_ACCEPTANCE_ENV = "LSEG_MACRO_ACCEPTANCE"
+_LSEG_REQUIRED_TABLES = ("macro_events", "central_bank_events")
+
+
+def _default_lseg_macro_db() -> Path:
+    return Path(__file__).resolve().parents[2] / "data" / "lseg" / "lseg_macro.db"
+
+
+def _truthy(raw: object) -> bool:
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def inspect_lseg_macro_target(environ: dict[str, str] | None = None) -> dict[str, object]:
+    """Classify the database the real-file test may open.
+
+    An explicit ``DECISION_MACRO_DB`` or ``LSEG_MACRO_DB_PATH`` is mandatory.
+    The default checkout path stays optional unless ``LSEG_MACRO_ACCEPTANCE``
+    is set. A present file that is unreadable or has no calendar tables is
+    never a skip.
+    """
+    env = os.environ if environ is None else environ
+    source = "default"
+    path = _default_lseg_macro_db()
+    for key in _LSEG_PATH_ENVS:
+        raw = env.get(key)
+        if raw is not None and str(raw).strip():
+            source = key
+            path = Path(str(raw).strip()).expanduser()
+            break
+    explicit = source != "default"
+    required = _truthy(env.get(_LSEG_ACCEPTANCE_ENV))
+    if not path.is_file():
+        kind = "missing" if explicit or required else "absent_optional"
+        return {"kind": kind, "path": path, "source": source}
+    try:
+        conn = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return {"kind": "unreadable", "path": path, "source": source}
+    try:
+        try:
+            names = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        except sqlite3.Error:
+            return {"kind": "unreadable", "path": path, "source": source}
+        missing = [name for name in _LSEG_REQUIRED_TABLES if name not in names]
+        if missing:
+            return {"kind": "schema", "path": path, "source": source, "missing": missing}
+        counts = {
+            name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
+            for name in _LSEG_REQUIRED_TABLES
+        }
+    finally:
+        conn.close()
+    if any(count <= 0 for count in counts.values()):
+        return {"kind": "empty", "path": path, "source": source, "counts": counts}
+    return {"kind": "ready", "path": path, "source": source, "counts": counts}
+
+
 def _utc_ms(iso_str: str) -> int:
     text = iso_str[:-1] + "+00:00" if iso_str.endswith("Z") else iso_str
     return int(datetime.fromisoformat(text).astimezone(timezone.utc).timestamp() * 1000)
@@ -338,10 +402,108 @@ class MacroCircuitBreakerTests(unittest.TestCase):
                 "central_bank_blackout",
             )
 
+    def _open_real_lseg_or_skip(self) -> Path:
+        """Open the reader-selected file. Fixtures do not call this."""
+        target = inspect_lseg_macro_target()
+        kind = str(target["kind"])
+        path = target["path"]
+        source = target["source"]
+        if kind == "absent_optional":
+            self.skipTest(
+                "optional checkout has no data/lseg/lseg_macro.db; "
+                "this is not an acceptance run. Set LSEG_MACRO_ACCEPTANCE=1 "
+                "or DECISION_MACRO_DB / LSEG_MACRO_DB_PATH to require the real file"
+            )
+        if kind != "ready":
+            self.fail(f"lseg macro db {kind} source={source} path={path} detail={target}")
+        opened = target["path"]
+        assert isinstance(opened, Path)
+        return opened
+
+    def test_explicit_lseg_path_matches_reader_and_bad_files_fail(self) -> None:
+        both = resolve_macro_db_path(
+            {
+                "DECISION_MACRO_DB": "/tmp/decision-lseg.db",
+                "LSEG_MACRO_DB_PATH": "/tmp/other-lseg.db",
+            }
+        )
+        chosen = inspect_lseg_macro_target(
+            {
+                "DECISION_MACRO_DB": "/tmp/decision-lseg.db",
+                "LSEG_MACRO_DB_PATH": "/tmp/other-lseg.db",
+            }
+        )
+        self.assertEqual(both, Path("/tmp/decision-lseg.db"))
+        self.assertEqual(chosen["path"], Path("/tmp/decision-lseg.db"))
+        self.assertEqual(chosen["kind"], "missing")
+        self.assertEqual(chosen["source"], "DECISION_MACRO_DB")
+
+        fallback = inspect_lseg_macro_target(
+            {"LSEG_MACRO_DB_PATH": "/tmp/only-lseg-path.db"}
+        )
+        self.assertEqual(fallback["source"], "LSEG_MACRO_DB_PATH")
+        self.assertEqual(fallback["kind"], "missing")
+
+        required = inspect_lseg_macro_target({_LSEG_ACCEPTANCE_ENV: "1"})
+        self.assertEqual(required["kind"], "missing")
+        self.assertEqual(required["path"], _default_lseg_macro_db())
+
+        optional = inspect_lseg_macro_target({})
+        self.assertEqual(optional["kind"], "absent_optional")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            empty = root / "empty.db"
+            sqlite3.connect(empty).close()
+            self.assertEqual(
+                inspect_lseg_macro_target({"DECISION_MACRO_DB": str(empty)})["kind"],
+                "schema",
+            )
+            blank = root / "blank.db"
+            _create_macro_db(blank)
+            self.assertEqual(
+                inspect_lseg_macro_target({"DECISION_MACRO_DB": str(blank)})["kind"],
+                "empty",
+            )
+            garbage = root / "garbage.db"
+            garbage.write_bytes(b"this is not sqlite")
+            self.assertEqual(
+                inspect_lseg_macro_target({"LSEG_MACRO_DB_PATH": str(garbage)})["kind"],
+                "unreadable",
+            )
+            ready = root / "fixture.db"
+            _create_macro_db(ready)
+            cpi_ms = _utc_ms("2026-11-10T13:30:00Z")
+            fomc_ms = _utc_ms("2026-11-18T19:00:00Z")
+            conn = sqlite3.connect(ready)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-10', '2026-11-10 21:30:00', '2026-11-10T13:30:00Z', ?, 'United States', 3, 'Core CPI fixture')
+                """,
+                (cpi_ms,),
+            )
+            conn.execute(
+                """
+                INSERT INTO central_bank_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, event_name, is_high_impact
+                ) VALUES ('2026-11-19', '2026-11-19 03:00:00', '2026-11-18T19:00:00Z', ?, 'United States', 'FOMC fixture', 1)
+                """,
+                (fomc_ms,),
+            )
+            conn.commit()
+            conn.close()
+            seen = inspect_lseg_macro_target({"DECISION_MACRO_DB": str(ready)})
+            self.assertEqual(seen["kind"], "ready")
+            self.assertEqual(seen["source"], "DECISION_MACRO_DB")
+            self.assertEqual(
+                evaluate_macro_gate(ready, now_ms=cpi_ms).halt_reason,
+                "macro_rel3_blackout",
+            )
+
     def test_real_lseg_macro_db_upcoming_events_if_present(self) -> None:
-        real_db = Path(__file__).resolve().parents[2] / "data" / "lseg" / "lseg_macro.db"
-        if not real_db.is_file():
-            self.skipTest("data/lseg/lseg_macro.db not built in this environment")
+        real_db = self._open_real_lseg_or_skip()
         # 2026-11-10T13:30:00Z = US Oct Core CPI (Relevance=3)
         cpi_ms = _utc_ms("2026-11-10T13:30:00Z")
         st_cpi = evaluate_macro_gate(real_db, now_ms=cpi_ms)
