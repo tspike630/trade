@@ -340,7 +340,9 @@ class BinanceCrossMarginHttpClient:
             raise MarginTransportTimeout(method_label) from exc
 
         if status >= 400:
-            raise self._decode_error(status, body)
+            err = self._decode_error(status, body)
+            err.method = method_label
+            raise err
         if not body:
             return {}
         try:
@@ -962,7 +964,12 @@ def fetch_live_cross_margin_snapshot(
     except MarginTransportTimeout as exc:
         return None, f"live_snapshot_timeout:{exc.method}"
     except MarginExchangeError as exc:
-        return None, f"live_snapshot_exchange_error:{exc.code}"
+        # One snapshot read. A terminal borrow code is not retried and does not borrow.
+        call = str(getattr(exc, "method", "") or "")
+        reason = f"live_snapshot_exchange_error:{exc.code}"
+        if call:
+            reason = f"{reason}:{call}"
+        return None, reason
 
     if restrictions.get("enableReading") is not True:
         return None, "api_reading_disabled"

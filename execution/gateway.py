@@ -1177,6 +1177,8 @@ class ExecutionGateway:
             return None
         payload = dict(extras)
         payload.setdefault("strategy_id", sig.get("strategy_id"))
+        if sig.get("decision_log_id") is not None:
+            payload.setdefault("decision_log_id", sig.get("decision_log_id"))
         request = route_request_from_signal(payload)
         if request["account_domain"] == "binance_spot" and not request["submit_margin"]:
             return None

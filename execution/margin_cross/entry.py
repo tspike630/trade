@@ -36,13 +36,17 @@ from execution.margin_cross.http_client import (
 from execution.margin_cross.policy import (
     APPROVED_DRY_RUN_MODE,
     LIVE_EXECUTION_MODE,
+    TERMINAL_BORROW_REJECT_CODES,
     kill_switch_active,
     live_gate_reasons,
     load_approved_risk_config,
     parameters_approved_by_env,
 )
 from execution.margin_cross.proposal import unapproved_threshold_proposal
-from execution.margin_cross.strategy_gate import build_approved_position_plan
+from execution.margin_cross.strategy_gate import (
+    ApprovedPositionPlan,
+    build_approved_position_plan,
+)
 from execution.margin_cross.track import CrossMarginTrack
 
 
@@ -128,11 +132,86 @@ def run_short_cycle(ledger_path: str) -> dict[str, object]:
     }
 
 
+def stable_decision_intent_id(decision_log_id: object) -> str | None:
+    """One id per decision row. The same row always binds the same intent."""
+    if isinstance(decision_log_id, bool) or decision_log_id in (None, ""):
+        return None
+    text = str(decision_log_id).strip()
+    if not text.isdigit():
+        return None
+    number = int(text)
+    if number <= 0:
+        return None
+    return f"dl-{number}"
+
+
+def bind_document_intent_id(doc: dict[str, Any]) -> dict[str, Any]:
+    """Keep an explicit intent id. Otherwise bind the decision row, or leave it absent."""
+    out = dict(doc)
+    current = out.get("intent_id")
+    if isinstance(current, str) and current.strip():
+        out["intent_id"] = current.strip()
+        return out
+    bound = stable_decision_intent_id(out.get("decision_log_id"))
+    if bound:
+        out["intent_id"] = bound
+    else:
+        out.pop("intent_id", None)
+    return out
+
+
+def _refused_plan(reason: str) -> ApprovedPositionPlan:
+    return ApprovedPositionPlan(
+        allowed=False,
+        reasons=(reason,),
+        regime="blocked",
+        strategy_id="",
+        net_asset_quote=Decimal(0),
+        effective_leverage_after=Decimal(0),
+        target_notional_quote=Decimal(0),
+        quantity=Decimal(0),
+        intent=None,
+        contract=None,
+    )
+
+
+def _snapshot_failure_payload(action: str, reason: str) -> dict[str, Any]:
+    """Name the snapshot sub-call. A terminal borrow code is not a retry."""
+    payload: dict[str, Any] = {
+        "mode": LIVE_EXECUTION_MODE,
+        "action": action,
+        "ok": False,
+        "reason": reason,
+        "borrow_retried": False,
+    }
+    parts = str(reason).split(":")
+    if len(parts) >= 2 and parts[0] == "live_snapshot_exchange_error":
+        try:
+            code = int(parts[1])
+        except ValueError:
+            code = None
+        else:
+            payload["exchange_code"] = code
+            if code in TERMINAL_BORROW_REJECT_CODES:
+                payload["terminal_borrow_reject"] = True
+        if len(parts) >= 3 and parts[2]:
+            payload["snapshot_call"] = parts[2]
+    return payload
+
+
 def _plan_from_signal_doc(
     doc: dict[str, Any],
     snapshot_raw: dict[str, Any],
     now_ms: int,
 ):
+    doc = bind_document_intent_id(doc)
+    missing = [
+        key
+        for key in ("intent_id", "action", "take_profit_price", "stop_price", "stop_limit_price")
+        if doc.get(key) in (None, "")
+    ]
+    if missing:
+        return _refused_plan("order_fields_missing:" + ",".join(missing))
     symbol = str(doc["symbol"])
     base_asset = str(doc["base_asset"])
     quote_asset = str(doc.get("quote_asset") or "USDT")
@@ -301,6 +380,7 @@ def open_live_document(
 
     if not doc:
         return 2, None, "live cross-margin preflight/open requires --signal-json PATH\n"
+    doc = bind_document_intent_id(doc)
     symbol = str(doc["symbol"])
     base_asset = str(doc["base_asset"])
     quote_asset = str(doc.get("quote_asset") or "USDT")
@@ -317,11 +397,7 @@ def open_live_document(
         observed_at_ms=now_ms,
     )
     if snap_err or snapshot_raw is None:
-        return (
-            1,
-            {"mode": LIVE_EXECUTION_MODE, "action": action, "ok": False, "reason": snap_err},
-            "",
-        )
+        return 1, _snapshot_failure_payload(action, str(snap_err or "snapshot_missing")), ""
 
     existing_row = (
         track.ledger.intent_row(str(doc.get("intent_id") or ""))

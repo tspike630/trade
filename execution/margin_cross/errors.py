@@ -24,11 +24,13 @@ class MarginExchangeError(Exception):
         message: str,
         *,
         http_status: int | None = None,
+        method: str = "",
     ) -> None:
         super().__init__(f"{code} {message}")
         self.code = code
         self.message = message
         self.http_status = http_status
+        self.method = method
 
     @property
     def is_indeterminate(self) -> bool:

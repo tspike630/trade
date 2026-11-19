@@ -51,6 +51,7 @@ def _offline_approval_ok(signal: dict[str, Any]) -> bool:
 
 _LIVE_DOCUMENT_KEYS = (
     "intent_id",
+    "decision_log_id",
     "symbol",
     "base_asset",
     "quote_asset",
@@ -178,7 +179,7 @@ def dispatch_account_route(
         called = isinstance(result, dict)
         reason = _live_failure_reason(payload, result if called else None, err)
         opened = code == 0 and called and result.get("phase_ok") is True
-        return {
+        routed = {
             "ok": opened,
             "reason": None if opened else reason,
             "venue": "binance_cross_margin",
@@ -188,6 +189,16 @@ def dispatch_account_route(
             "open": result if called else None,
             "live_code": code,
         }
+        if isinstance(payload, dict):
+            for key in (
+                "snapshot_call",
+                "exchange_code",
+                "terminal_borrow_reject",
+                "borrow_retried",
+            ):
+                if key in payload:
+                    routed[key] = payload[key]
+        return routed
 
     if execution_mode == "offline_fixture":
         if not _offline_approval_ok(signal):

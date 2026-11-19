@@ -48,6 +48,7 @@ def route_request_from_signal(signal: dict[str, Any]) -> dict[str, Any]:
         "offline_approval": signal.get("offline_approval"),
         "interest_on_borrow": signal.get("interest_on_borrow"),
         "intent_id": signal.get("intent_id"),
+        "decision_log_id": signal.get("decision_log_id"),
         "symbol": signal.get("symbol"),
         "base_asset": signal.get("base_asset"),
         "quote_asset": signal.get("quote_asset"),

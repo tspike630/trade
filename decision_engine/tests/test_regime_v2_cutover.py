@@ -88,6 +88,8 @@ _UNTOUCHED = {
         "1a10d32e136a6b008ef086c5cf622d993125bde88b8fd4f7b75bb1d927725c75",
         # Cross-margin purpose is routed, and spot arms do not claim those rows.
         "7c6d1ab54cccdea18c16455c8d1a06008c7c7d95d779be66d80e6bc3c24108c3",
+        # The consumer copies decision_log_id so a missing intent id can be bound.
+        "f7599040e024699a00c56107d8bae1bfc567103fe601f3d743986d2c5da887d7",
     ),
     "execution/ledger.py": (
         "fa1410df2d4d1780b3206a9acc40e32ffd574e5d29aa2c7280bede4b7e7fd0d2",
