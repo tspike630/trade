@@ -26,9 +26,11 @@ That purpose never writes the indicator db. live_candidate admission is unchange
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
+from typing import Any
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -310,6 +312,52 @@ def _entry_ih_min_hours(
     return None
 
 
+def load_explicit_account_route(
+    path: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return a caller-supplied route, or None when no path was given.
+
+    A path that cannot be read, or that is not a non-empty object, is an
+    error. This does not add a domain, a topology, or an approval.
+    """
+    if path is None or str(path).strip() == "":
+        return None, None
+    file = Path(path).expanduser()
+    try:
+        raw = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"account route config unreadable: {exc}"
+    if not isinstance(raw, dict) or not raw:
+        return None, "account route config must be a non-empty object"
+    return dict(raw), None
+
+
+def build_production_engine(
+    adapter: IndicatorDataAdapter,
+    bus: SignalBus,
+    strategies: list,
+    *,
+    risk: RiskManager,
+    hot_limit: int | None,
+    token_cooldown: TokenCooldown,
+    entry_ih_min_hours: float | None,
+    account_route: dict[str, Any] | None = None,
+    macro_db: str | Path | None = None,
+) -> DecisionEngine:
+    """Same construction ``main`` uses. ``account_route`` stays None unless given."""
+    return DecisionEngine(
+        adapter,
+        bus,
+        strategies,
+        risk=risk,
+        hot_limit=hot_limit,
+        token_cooldown=token_cooldown,
+        entry_ih_min_hours=entry_ih_min_hours,
+        account_route=account_route,
+        macro_db=macro_db,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Decision engine Step 1 (dry-run signals; no execution)"
@@ -420,6 +468,14 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=de_config.JEV_POSITION_PCT,
         help=f"JEV buy size_pct (default {de_config.JEV_POSITION_PCT})",
+    )
+    parser.add_argument(
+        "--account-route-json",
+        default=None,
+        help=(
+            "Optional JSON object copied onto buys as the account route. "
+            "Unset leaves the spot path. This flag does not supply defaults."
+        ),
     )
     parser.add_argument(
         "--entry-ih-min-hours",
@@ -542,7 +598,11 @@ def main(argv: list[str] | None = None) -> int:
     log.info("token_cooldown_min=%s", token_cooldown.cooldown_min)
     bus = SignalBus(out_db, dry_run=dry_run, purpose=purpose)
     try:
-        engine = DecisionEngine(
+        account_route, route_error = load_explicit_account_route(args.account_route_json)
+        if route_error:
+            log.error("%s", route_error)
+            return 2
+        engine = build_production_engine(
             adapter,
             bus,
             strategies,
@@ -550,6 +610,7 @@ def main(argv: list[str] | None = None) -> int:
             hot_limit=hot_limit,
             token_cooldown=token_cooldown,
             entry_ih_min_hours=entry_ih_min_hours,
+            account_route=account_route,
         )
         results = engine.run(
             once=args.once,

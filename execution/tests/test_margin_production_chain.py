@@ -19,9 +19,11 @@ from typing import Any
 import decision_engine  # noqa: F401
 from decision_engine import config as de_config
 from decision_engine.core.data_adapter import IndicatorDataAdapter
-from decision_engine.core.engine import DecisionEngine
+from decision_engine.core.engine import scan_limit_for_purpose
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import PURPOSE_LIVE_BNB_BOLL_FADE, SignalBus
+from decision_engine.core.token_cooldown import TokenCooldown
+from decision_engine.run import build_production_engine
 from decision_engine.strategies import get_strategy
 from decision_engine.tests.quiet_macro import write_quiet_macro
 from execution.executors.binance_spot_gate import REPLAY_FLOOR_DECISION_ID
@@ -58,8 +60,10 @@ class MarginProductionChainTests(unittest.TestCase):
                 "CROSS_MARGIN_PARAMETERS_APPROVED",
                 "CROSS_MARGIN_LIVE_ENABLED",
                 "CROSS_MARGIN_APPROVED_CONFIG_JSON",
+                "BINANCE_SPOT_PRODUCTION_BOOK",
             )
         }
+        os.environ.pop("BINANCE_SPOT_PRODUCTION_BOOK", None)
         os.environ.pop("CROSS_MARGIN_PARAMETERS_APPROVED", None)
         os.environ.pop("CROSS_MARGIN_LIVE_ENABLED", None)
         os.environ.pop("CROSS_MARGIN_APPROVED_CONFIG_JSON", None)
@@ -81,7 +85,14 @@ class MarginProductionChainTests(unittest.TestCase):
             paper_enabled=False,
         )
 
-    def _insert(self, decision: Path, row_id: int, extras: dict[str, Any]) -> None:
+    def _insert(
+        self,
+        decision: Path,
+        row_id: int,
+        extras: dict[str, Any],
+        *,
+        mode: str = "dry_run",
+    ) -> None:
         raw = {
             "pair_address": "BTCUSDT",
             "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
@@ -101,12 +112,13 @@ class MarginProductionChainTests(unittest.TestCase):
             """
             INSERT INTO decision_log VALUES (
                 ?, '2026-11-19T00:00:00Z', ?, 'buy', 'binance', 'BTCUSDT',
-                0.1, 'probe', 1, 'dry_run', ?, ?
+                0.1, 'probe', 1, ?, ?, ?
             )
             """,
             (
                 row_id,
                 str(extras.get("strategy_id") or "probe"),
+                mode,
                 PURPOSE_LIVE_BNB_BOLL_FADE,
                 json.dumps(raw),
             ),
@@ -215,6 +227,67 @@ class MarginProductionChainTests(unittest.TestCase):
         for item in stats.receipts:
             self.assertFalse(item["exec_result"]["spot_called"])
 
+    def test_live_stub_without_an_adapter_keeps_the_spot_skip(self) -> None:
+        case = short_case()
+        decision = self.root / "live-rows.db"
+        floor = REPLAY_FLOOR_DECISION_ID
+        offline = {
+            "account_domain": "binance_cross_margin",
+            "spot_book_full": False,
+            "strategy_id": OFFLINE_FIXTURE_STRATEGY_ID,
+            "execution_mode": "offline_fixture",
+            "intent": case["intent"],
+            "snapshot": case["snapshot"],
+            "contract": case["contract"],
+            "gate": case["gate"],
+            "interest_on_borrow": "0.0001",
+            "offline_approval": _offline_approval(),
+            "margin_ledger_path": str(self.root / "live-margin.db"),
+        }
+        planned = {
+            "account_domain": "binance_cross_margin",
+            "spot_book_full": True,
+            "strategy_id": "regime5_crisis_contagion_short",
+            "execution_mode": "approved_dry_run",
+            "symbol": "BTCUSDT",
+            "base_asset": "BTC",
+            "requested_action": "OPEN_SHORT",
+            "now_ms": 1_700_000_000_000,
+            "offline_approval": _offline_approval(),
+            "margin_ledger_path": str(self.root / "plan-margin.db"),
+        }
+        explicit_spot = {"account_domain": "binance_spot"}
+        self._insert(decision, floor + 1, {}, mode="live_stub")
+        self._insert(decision, floor + 2, offline, mode="live_stub")
+        self._insert(decision, floor + 3, planned, mode="live_stub")
+        self._insert(decision, floor + 4, explicit_spot, mode="live_stub")
+        gateway = ExecutionGateway(
+            decision_db=str(decision),
+            ledger_path=str(self.root / "live-exec.db"),
+            accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
+            paper_enabled=False,
+        )
+        stats = gateway.process_pending()
+        self.assertEqual(len(stats.receipts), 4)
+        plain, opened, refused, spot = stats.receipts
+        self.assertEqual(plain["executor"], "binance_spot")
+        self.assertEqual(plain["receipt"]["status"], "gate_skip")
+        self.assertEqual(plain["receipt"]["gate_reason"], "protection_tool_absent")
+        self.assertEqual(opened["executor"], "cross_margin_track")
+        self.assertEqual(opened["receipt"]["status"], "cross_margin_opened")
+        self.assertEqual(_borrow_count(opened), 1)
+        self.assertNotEqual(opened["receipt"]["status"], "gate_skip")
+        self.assertFalse(refused["exec_result"]["margin_called"])
+        self.assertEqual(refused["exec_result"]["reason"], "parameters_not_approved")
+        self.assertEqual(
+            refused["exec_result"]["entry"],
+            "execution.margin_cross.strategy_gate.build_approved_position_plan",
+        )
+        self.assertEqual(_borrow_count(refused), 0)
+        self.assertEqual(spot["executor"], "binance_spot")
+        self.assertEqual(spot["receipt"]["status"], "gate_skip")
+        self.assertEqual(spot["receipt"]["gate_reason"], "protection_tool_absent")
+
     def _tick_and_consume(self, *, account_route: dict[str, Any] | None):
         now_ms = int(time.time() * 1000)
         decision = self.root / ("routed.db" if account_route else "plain.db")
@@ -232,13 +305,16 @@ class MarginProductionChainTests(unittest.TestCase):
                 (REPLAY_FLOOR_DECISION_ID,),
             )
             bus._rw.commit()
-            payload = DecisionEngine(
+            payload = build_production_engine(
                 adapter_db,
                 bus,
                 [get_strategy("tech_boll_fade_v1")],
                 risk=RiskManager(cooldown_sec=0),
-                macro_db=write_quiet_macro(decision.with_name(f"{decision.stem}-macro.db")),
+                hot_limit=scan_limit_for_purpose(PURPOSE_LIVE_BNB_BOLL_FADE, None),
+                token_cooldown=TokenCooldown(0),
+                entry_ih_min_hours=None,
                 account_route=account_route,
+                macro_db=write_quiet_macro(decision.with_name(f"{decision.stem}-macro.db")),
             ).tick()
         finally:
             bus.close()

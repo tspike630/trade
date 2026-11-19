@@ -84,6 +84,8 @@ _UNTOUCHED = {
         "9ec2ba768fbd203ff9094c99217b52e4496da81e82a4b04e36d5e1afb925a48f",
         "06ee774eedd91ff18bbde603c65a7e474a561fa4ea976c011e21ed61343906ed",
         "172dfbdd84f13312c63f5b27f7d2be4a0ccb04f0aad9baf2364ccce99ae8fb90",
+        # Explicit route is checked before the spot gate skip. Another rewrite fails.
+        "1a10d32e136a6b008ef086c5cf622d993125bde88b8fd4f7b75bb1d927725c75",
     ),
     "execution/ledger.py": (
         "fa1410df2d4d1780b3206a9acc40e32ffd574e5d29aa2c7280bede4b7e7fd0d2",

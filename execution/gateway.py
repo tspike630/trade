@@ -1296,6 +1296,29 @@ class ExecutionGateway:
         if not ok:
             receipt_body["status"] = "validation_failed"
             receipt_body["note"] = "validation_failed; not executed"
+        elif is_live_bnb_spot_purpose(sig.get("purpose")) and (
+            routed := self._explicit_account_result(sig, receipt_body)
+        ) is not None:
+            # An explicit account route is not a spot live row. The spot
+            # protection skip below stays in place when this returns None.
+            return self._finalize(
+                execution_log_id=exec_id,
+                sig=sig,
+                strategy_id=strategy_id,
+                action=action,
+                size_pct_f=size_pct_f,
+                ok=ok,
+                errors=errors,
+                executed=int(routed["executed"]),
+                executor=str(routed["executor"]),
+                exec_error=routed["error"],
+                risk_reasons=None,
+                submitted=False,
+                exec_result=routed["exec_result"],
+                pm_result=None,
+                receipt_body=receipt_body,
+                order_status=str(routed["order_status"]),
+            )
         elif (
             is_live_bnb_spot_purpose(sig.get("purpose"))
             and mode != "dry_run"
@@ -1343,26 +1366,6 @@ class ExecutionGateway:
                     evaluation.get("reason"),
                 )
         elif is_live_bnb_spot_purpose(sig.get("purpose")):
-            routed = self._explicit_account_result(sig, receipt_body)
-            if routed is not None:
-                return self._finalize(
-                    execution_log_id=exec_id,
-                    sig=sig,
-                    strategy_id=strategy_id,
-                    action=action,
-                    size_pct_f=size_pct_f,
-                    ok=ok,
-                    errors=errors,
-                    executed=int(routed["executed"]),
-                    executor=str(routed["executor"]),
-                    exec_error=routed["error"],
-                    risk_reasons=None,
-                    submitted=False,
-                    exec_result=routed["exec_result"],
-                    pm_result=None,
-                    receipt_body=receipt_body,
-                    order_status=str(routed["order_status"]),
-                )
             # CEX arm: not a paper fill, and not LiveExecutor. The adapter
             # itself keeps live newOrder behind the kill switch. A protected
             # open on this arm blocks only the same symbol. The other arm's
