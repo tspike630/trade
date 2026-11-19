@@ -7,6 +7,7 @@ an order, or flatten a position. ``unknown`` is not released here.
 from __future__ import annotations
 
 import os
+import secrets
 import time
 from typing import Any, Mapping
 
@@ -21,6 +22,38 @@ from decision_engine.core.regime_v2_reservation import (
 from execution.ledger import _stored_qty_positive, _stored_qty_zero
 
 _FLAT_STATUSES = frozenset({"closed", "oco_filled", "closed_canceled"})
+# Binance codes whose documented meaning is that the new order was rejected
+# and not created. HTTP status alone is not one of these.
+_DEFINITE_NEW_ORDER_REJECT_CODES = frozenset({-1013, -1015, -1111, -1121, -2010})
+# Execution result unknown even when the transport status is 400.
+_UNKNOWN_EXECUTION_CODES = frozenset({-1000, -1001, -1006, -1007, -1008})
+
+
+def position_is_definite_flat(row: Mapping[str, Any], reservation: Mapping[str, Any]) -> bool:
+    """Flat only when status, zero quantity, and zero residual are all present.
+
+    A missing quantity, a non-zero quantity, or a missing residual is not proof.
+    """
+    status = str(row.get("status") or "")
+    if status not in _FLAT_STATUSES:
+        return False
+    if row.get("quantity") in (None, "") or row.get("residual_qty") in (None, ""):
+        return False
+    if not _stored_qty_zero(row.get("quantity")) or not _stored_qty_zero(row.get("residual_qty")):
+        return False
+    symbol = str(row.get("symbol") or "").strip().upper()
+    reserved_symbol = str(reservation.get("symbol") or "").strip().upper()
+    if not symbol or symbol != reserved_symbol:
+        return False
+    purpose = str(row.get("purpose") or "").strip()
+    reserved_purpose = str(reservation.get("purpose") or "").strip()
+    if not purpose or purpose != reserved_purpose:
+        return False
+    decision_id = str(row.get("decision_log_id") or "").strip()
+    reserved_decision = str(reservation.get("decision_log_id") or "").strip()
+    if not decision_id or (reserved_decision and decision_id != reserved_decision):
+        return False
+    return True
 
 
 def position_occupies_slot(row: Mapping[str, Any]) -> bool:
@@ -91,6 +124,7 @@ def bind_reservation_before_submit(sig: Mapping[str, Any]) -> str | None:
         return "reservation_mode_unconfirmed"
     if row_mode != "live" or not permitted:
         return "live_order_not_permitted"
+    token = secrets.token_hex(16)
     ok, reason = confirm_reservation(
         path,
         key,
@@ -99,9 +133,12 @@ def bind_reservation_before_submit(sig: Mapping[str, Any]) -> str | None:
         symbol=symbol,
         purpose=purpose,
         decision_log_id=decision_id,
+        submit_owner=token,
     )
     if not ok:
         return reason or "reservation_store_error"
+    if isinstance(sig, dict):
+        sig["_reservation_submit_owner"] = token
     return None
 
 
@@ -113,9 +150,12 @@ def _proven_exchange_rejection(result: Mapping[str, Any]) -> bool:
     err = result.get("exchange_error")
     if not isinstance(err, dict):
         return False
-    status = err.get("status")
     code = err.get("code")
-    return status == 400 and isinstance(code, int) and not isinstance(code, bool)
+    if isinstance(code, bool) or not isinstance(code, int):
+        return False
+    if code in _UNKNOWN_EXECUTION_CODES or code not in _DEFINITE_NEW_ORDER_REJECT_CODES:
+        return False
+    return err.get("status") == 400
 
 
 def _result_occupies(result: Mapping[str, Any]) -> bool:
@@ -151,6 +191,7 @@ def settle_reservation_after_execute(
         return "reservation_mode_mismatch"
     if mode == "live_stub" and row_mode != "live":
         return "reservation_mode_mismatch"
+    owner = str(sig.get("_reservation_submit_owner") or "").strip() or None
     if result is not None and _result_occupies(result):
         ok, reason = confirm_reservation(
             path,
@@ -160,6 +201,7 @@ def settle_reservation_after_execute(
             symbol=symbol,
             purpose=purpose,
             decision_log_id=decision_id or None,
+            submit_owner=owner,
         )
         return None if ok else (reason or "reservation_store_error")
     posted = result is not None and bool(result.get("order_post_attempted"))
@@ -172,9 +214,10 @@ def settle_reservation_after_execute(
             symbol=symbol,
             purpose=purpose,
             decision_log_id=decision_id or None,
+            submit_owner=owner,
         )
         return None if ok else (reason or "reservation_store_error")
-    reason = (
+    reason_name = (
         "exchange_rejected"
         if result is not None and _proven_exchange_rejection(result)
         else "definite_no_fill"
@@ -183,10 +226,11 @@ def settle_reservation_after_execute(
         path,
         key,
         now_ms=_now(),
-        reason=reason,
+        reason=reason_name,
         symbol=symbol,
         purpose=purpose,
         decision_log_id=decision_id or None,
+        submit_owner=owner,
     )
     if released:
         return None
@@ -210,7 +254,9 @@ def settle_reservation_for_position(row: Mapping[str, Any]) -> str | None:
     key = str(found.get("signal_key") or "")
     symbol = str(found.get("symbol") or row.get("symbol") or "")
     purpose = str(found.get("purpose") or row.get("purpose") or "")
-    if position_occupies_slot(row):
+    if not position_is_definite_flat(row, found):
+        if str(found.get("status") or "") == "released":
+            return None
         ok, reason = confirm_reservation(
             path,
             key,

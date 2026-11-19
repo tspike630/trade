@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import unittest
 
 from decision_engine.core.regime_v2_policy import enforce_regime_v2_sizing_and_caps
@@ -25,6 +26,8 @@ from execution.executors.binance_spot import (
     BinanceSpotAdapter,
 )
 from execution.gateway import ExecutionGateway
+from execution.ledger import ExecutionLedger
+from execution.reservation_lifecycle import bind_reservation_before_submit
 
 
 def _reserve(path: str, *, decision_id: int, symbol: str, permitted: bool) -> str:
@@ -126,6 +129,8 @@ class ScriptedSpot:
     def __init__(self, result: dict[str, object], maintain_status: str = "open") -> None:
         self.result = result
         self.maintain_status = maintain_status
+        self.flat_quantity: object = "0"
+        self.flat_residual: object = "0"
         self.calls: list[dict[str, object]] = []
 
     def execute(self, sig: dict[str, object]) -> dict[str, object]:
@@ -145,8 +150,8 @@ class ScriptedSpot:
             persist(
                 {
                     "status": self.maintain_status,
-                    "quantity": None if self.maintain_status == "closed" else row.get("quantity"),
-                    "residual_qty": None,
+                    "quantity": self.flat_quantity if self.maintain_status == "closed" else row.get("quantity"),
+                    "residual_qty": self.flat_residual if self.maintain_status == "closed" else None,
                 }
             )
         return {"book": self.maintain_status, "submitted": False}
@@ -176,6 +181,25 @@ def _held_result(decision_id: int, symbol: str) -> dict[str, object]:
             "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
         },
     }
+
+
+def _bind_race(path: str, key: str, decision_id: int, symbol: str, out_path: str) -> None:
+    os.environ["REGIME_V2_RESERVATION_DB"] = path
+    err = bind_reservation_before_submit(
+        {
+            "decision_log_id": decision_id,
+            "mode": "live_stub",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+            "token_address": symbol,
+            "action": "buy",
+            "extras": {
+                "binance_symbol": symbol,
+                "reservation_key": key,
+                "live_order_permitted": True,
+            },
+        }
+    )
+    Path(out_path).write_text("ok" if err is None else str(err), encoding="utf-8")
 
 
 def _consume_held(root: str, decision_id: int, symbol: str, key: str) -> None:
@@ -366,6 +390,7 @@ class ReservationLifecycleTests(unittest.TestCase):
         key = _reserve(self.db, decision_id=147843, symbol="BTCUSDT", permitted=True)
         row = _row(decision_id=147843, symbol="BTCUSDT", key=key, mode="live_stub", permitted=True)
         _write_decision(self.root / "decision.db", row)
+        ExecutionLedger(self.root / "ledger.db").close()
         ctx = multiprocessing.get_context("spawn")
         first = ctx.Process(target=_consume_held, args=(str(self.root), 147843, "BTCUSDT", key))
         second = ctx.Process(target=_consume_held, args=(str(self.root), 147843, "BTCUSDT", key))
@@ -406,3 +431,153 @@ class ReservationLifecycleTests(unittest.TestCase):
         dry_rows = [row for row in active_reservations(self.db) if row["mode"] == "dry_run"]
         self.assertEqual(len(dry_rows), 2)
         self.assertEqual(live_rows, [])
+
+    def test_http_400_unknown_execution_code_stays_occupied(self) -> None:
+        key = _reserve(self.db, decision_id=147850, symbol="BTCUSDT", permitted=True)
+        row = _row(
+            decision_id=147850, symbol="BTCUSDT", key=key, mode="live_stub", permitted=True
+        )
+        with self._gateway(ScriptedSpot({
+            "ok": False,
+            "dry_run": False,
+            "executed": 0,
+            "submitted": False,
+            "order_post_attempted": True,
+            "error": "binance_http_error:400:-1007:Timeout waiting for response from backend server",
+            "symbol": "BTCUSDT",
+            "exchange_error": {"status": 400, "code": -1007, "msg": "Timeout waiting for response from backend server. Send status unknown; execution status unknown."},
+            "exchange_order_id": None,
+            "consumer_allowed": False,
+        })) as gateway:
+            gateway.process_one(row)
+        stored = get_reservation(self.db, key)
+        self.assertEqual(stored["status"], "unknown")
+        self.assertIsNone(stored["released_at_ms"])
+
+    def test_submit_right_is_once_and_crash_does_not_post_again(self) -> None:
+        key = _reserve(self.db, decision_id=147851, symbol="ETHUSDT", permitted=True)
+        sig = {
+            "decision_log_id": 147851,
+            "mode": "live_stub",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+            "token_address": "ETHUSDT",
+            "action": "buy",
+            "extras": {
+                "binance_symbol": "ETHUSDT",
+                "reservation_key": key,
+                "live_order_permitted": True,
+            },
+        }
+        results: list[str | None] = []
+
+        def _once() -> None:
+            err = bind_reservation_before_submit(dict(sig))
+            results.append(err)
+
+        threads = [threading.Thread(target=_once) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(results.count(None), 1)
+        self.assertIn("reservation_submit_not_owned", results)
+        self.assertEqual(get_reservation(self.db, key)["status"], "submit_pending")
+
+        calls: list[int] = []
+
+        class _CrashAfterPost:
+            def execute(self, signal: dict[str, object]) -> dict[str, object]:
+                calls.append(1)
+                raise RuntimeError("crash_after_post")
+
+            def refresh_filled_qty(self, row: dict[str, object]) -> None:
+                return None
+
+            def maintain_held_position(self, row: dict[str, object], mark: object, persist: object = None) -> dict[str, object]:
+                return {"book": "open", "submitted": False}
+
+        fresh_key = _reserve(self.db, decision_id=147852, symbol="SOLUSDT", permitted=True)
+        fresh = _row(
+            decision_id=147852, symbol="SOLUSDT", key=fresh_key, mode="live_stub", permitted=True
+        )
+        with self._gateway(_CrashAfterPost()) as gateway:
+            crashed = gateway.process_one(fresh)
+            self.assertIn("crash_after_post", str(crashed.get("error")))
+            self.assertEqual(get_reservation(self.db, fresh_key)["status"], "submit_pending")
+            gateway.ledger.conn.execute(
+                """
+                UPDATE execution_log
+                SET status = 'claimed', status_updated_at = '2000-01-01T00:00:00+00:00'
+                WHERE decision_log_id = ?
+                """,
+                (147852,),
+            )
+            gateway.ledger.conn.commit()
+            gateway.process_one(dict(fresh))
+        self.assertEqual(calls, [1])
+        self.assertEqual(get_reservation(self.db, fresh_key)["status"], "submit_pending")
+        self.assertIsNone(get_reservation(self.db, fresh_key)["released_at_ms"])
+
+        race_key = _reserve(self.db, decision_id=147854, symbol="BNBUSDT", permitted=True)
+        ctx = multiprocessing.get_context("spawn")
+        first_out = str(self.root / "race-a.txt")
+        second_out = str(self.root / "race-b.txt")
+        first = ctx.Process(
+            target=_bind_race,
+            args=(self.db, race_key, 147854, "BNBUSDT", first_out),
+        )
+        second = ctx.Process(
+            target=_bind_race,
+            args=(self.db, race_key, 147854, "BNBUSDT", second_out),
+        )
+        first.start()
+        second.start()
+        first.join(15)
+        second.join(15)
+        self.assertEqual(first.exitcode, 0)
+        self.assertEqual(second.exitcode, 0)
+        outcomes = {
+            Path(first_out).read_text(encoding="utf-8"),
+            Path(second_out).read_text(encoding="utf-8"),
+        }
+        self.assertEqual(outcomes, {"ok", "reservation_submit_not_owned"})
+        self.assertEqual(get_reservation(self.db, race_key)["status"], "submit_pending")
+
+    def test_nonzero_qty_without_residual_is_not_a_flat_close(self) -> None:
+        key = _reserve(self.db, decision_id=147853, symbol="BTCUSDT", permitted=True)
+        row = _row(decision_id=147853, symbol="BTCUSDT", key=key, mode="live_stub", permitted=True)
+        _write_decision(self.root / "decision.db", row)
+        posted = {
+            "ok": False,
+            "dry_run": False,
+            "executed": 0,
+            "submitted": False,
+            "order_post_attempted": True,
+            "error": "binance_http_error:400:-1007:Timeout",
+            "symbol": "BTCUSDT",
+            "exchange_error": {"status": 400, "code": -1007, "msg": "execution status unknown"},
+            "consumer_allowed": False,
+        }
+        adapter = ScriptedSpot(posted, maintain_status="closed")
+        adapter.flat_quantity = "1"
+        adapter.flat_residual = None
+        with self._gateway(adapter) as gateway:
+            gateway.process_one(row)
+            self.assertEqual(get_reservation(self.db, key)["status"], "unknown")
+            gateway.ledger.arm_binance_spot_position({
+                "decision_log_id": 147853,
+                "symbol": "BTCUSDT",
+                "quantity": "1",
+                "stop_price": "90",
+                "take_profit_price": "110",
+                "entry_price": "100",
+                "entry_order_id": "99",
+                "status": "open",
+                "protection": "native_oco",
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+            })
+            gateway.tick_binance_protective_exits(marks={"BTCUSDT": "100"})
+        stored = get_reservation(self.db, key)
+        self.assertIsNone(stored["released_at_ms"])
+        self.assertNotEqual(stored["release_reason"], "flat_close")
+        self.assertIn(stored["status"], {"unknown", "held", "submit_pending"})

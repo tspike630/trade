@@ -71,37 +71,47 @@ def _connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(str(target), timeout=5.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS regime_v2_reservation (
-            signal_key TEXT PRIMARY KEY,
-            purpose TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            cluster_key TEXT NOT NULL,
-            regime TEXT NOT NULL,
-            size_pct TEXT NOT NULL,
-            created_at_ms INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            released_at_ms INTEGER
-        )
-        """
-    )
-    present = {str(row[1]) for row in conn.execute("PRAGMA table_info(regime_v2_reservation)")}
-    if "mode" not in present:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
         conn.execute(
-            "ALTER TABLE regime_v2_reservation ADD COLUMN mode TEXT NOT NULL DEFAULT 'live'"
+            """
+            CREATE TABLE IF NOT EXISTS regime_v2_reservation (
+                signal_key TEXT PRIMARY KEY,
+                purpose TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                cluster_key TEXT NOT NULL,
+                regime TEXT NOT NULL,
+                size_pct TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                released_at_ms INTEGER
+            )
+            """
         )
-    if "live_order_permitted" not in present:
-        conn.execute(
-            "ALTER TABLE regime_v2_reservation "
-            "ADD COLUMN live_order_permitted INTEGER NOT NULL DEFAULT 0"
+        present = {str(row[1]) for row in conn.execute("PRAGMA table_info(regime_v2_reservation)")}
+        additions = (
+            ("mode", "ALTER TABLE regime_v2_reservation ADD COLUMN mode TEXT NOT NULL DEFAULT 'live'"),
+            (
+                "live_order_permitted",
+                "ALTER TABLE regime_v2_reservation ADD COLUMN live_order_permitted INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("decision_log_id", "ALTER TABLE regime_v2_reservation ADD COLUMN decision_log_id TEXT"),
+            ("release_reason", "ALTER TABLE regime_v2_reservation ADD COLUMN release_reason TEXT"),
+            ("updated_at_ms", "ALTER TABLE regime_v2_reservation ADD COLUMN updated_at_ms INTEGER"),
+            ("submit_owner", "ALTER TABLE regime_v2_reservation ADD COLUMN submit_owner TEXT"),
         )
-    if "decision_log_id" not in present:
-        conn.execute("ALTER TABLE regime_v2_reservation ADD COLUMN decision_log_id TEXT")
-    if "release_reason" not in present:
-        conn.execute("ALTER TABLE regime_v2_reservation ADD COLUMN release_reason TEXT")
-    if "updated_at_ms" not in present:
-        conn.execute("ALTER TABLE regime_v2_reservation ADD COLUMN updated_at_ms INTEGER")
+        for name, ddl in additions:
+            if name in present:
+                continue
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     return conn
 
 
@@ -246,8 +256,13 @@ def confirm_reservation(
     symbol: str,
     purpose: str,
     decision_log_id: str | None,
+    submit_owner: str | None = None,
 ) -> tuple[bool, str | None]:
-    """Move an occupying row forward. Never releases. Identity mismatch writes nothing."""
+    """Move an occupying row forward. Never releases. Identity mismatch writes nothing.
+
+    ``submit_pending`` is won only by an update from ``reserved``. A second
+    confirm does not own the submit right.
+    """
     if phase not in _CONFIRM_PHASES:
         return False, "reservation_phase_invalid"
     conn = _connect(path)
@@ -269,28 +284,49 @@ def confirm_reservation(
         if status == "released" or row["released_at_ms"] is not None:
             conn.execute("COMMIT")
             return False, "reservation_released"
-        if phase == "submit_pending" and int(row["live_order_permitted"] or 0) != 1:
+        if phase == "submit_pending":
+            if int(row["live_order_permitted"] or 0) != 1 or str(row["mode"] or "") != "live":
+                conn.execute("COMMIT")
+                return False, "live_order_not_permitted"
+            if not submit_owner:
+                conn.execute("COMMIT")
+                return False, "reservation_submit_owner_missing"
+            if status != "reserved":
+                conn.execute("COMMIT")
+                return False, "reservation_submit_not_owned"
+            cur = conn.execute(
+                """
+                UPDATE regime_v2_reservation
+                SET status = 'submit_pending', submit_owner = ?, updated_at_ms = ?,
+                    decision_log_id = COALESCE(decision_log_id, ?)
+                WHERE signal_key = ? AND status = 'reserved' AND released_at_ms IS NULL
+                  AND mode = 'live' AND live_order_permitted = 1
+                """,
+                (submit_owner, int(now_ms), decision_log_id, signal_key),
+            )
             conn.execute("COMMIT")
-            return False, "live_order_not_permitted"
-        if str(row["mode"] or "") == "dry_run" and phase == "submit_pending":
-            conn.execute("COMMIT")
-            return False, "live_order_not_permitted"
-        stored_decision = str(row["decision_log_id"] or "").strip()
-        next_status = status
-        if status == "unknown" and phase == "submit_pending":
-            next_status = "unknown"
+            if cur.rowcount != 1:
+                return False, "reservation_submit_not_owned"
+            return True, None
+        if status == "submit_pending":
+            owner = str(row["submit_owner"] or "")
+            if not submit_owner or submit_owner != owner:
+                conn.execute("COMMIT")
+                return False, "reservation_submit_owner_mismatch"
         elif status == "held" and phase in {"submit_pending", "unknown"}:
-            next_status = "held"
-        else:
-            next_status = phase
+            conn.execute("COMMIT")
+            return True, None
+        elif status == phase:
+            conn.execute("COMMIT")
+            return True, None
         conn.execute(
             """
             UPDATE regime_v2_reservation
             SET status = ?, updated_at_ms = ?,
                 decision_log_id = COALESCE(decision_log_id, ?)
-            WHERE signal_key = ? AND released_at_ms IS NULL
+            WHERE signal_key = ? AND released_at_ms IS NULL AND status = ?
             """,
-            (next_status, int(now_ms), decision_log_id, signal_key),
+            (phase, int(now_ms), decision_log_id, signal_key, status),
         )
         conn.execute("COMMIT")
         return True, None
@@ -313,6 +349,7 @@ def release_reservation(
     symbol: str | None = None,
     purpose: str | None = None,
     decision_log_id: str | None = None,
+    submit_owner: str | None = None,
 ) -> bool:
     """Release only from a status that this reason is allowed to close.
 
@@ -344,6 +381,11 @@ def release_reservation(
         if status == "unknown" or status not in allowed:
             conn.execute("COMMIT")
             return False
+        if status == "submit_pending":
+            owner = str(row["submit_owner"] or "")
+            if not owner or submit_owner != owner:
+                conn.execute("COMMIT")
+                return False
         conn.execute(
             """
             UPDATE regime_v2_reservation
