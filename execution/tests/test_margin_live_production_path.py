@@ -5,8 +5,10 @@ The only stand-in is the HTTP opener. Sockets stay blocked.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
+import io
 import json
 import os
 import socket
@@ -27,6 +29,8 @@ from decision_engine.strategies import get_strategy
 from decision_engine.tests.quiet_macro import write_quiet_macro
 from execution.executors.binance_spot_gate import REPLAY_FLOOR_DECISION_ID
 from execution.gateway import ExecutionGateway
+from execution.margin_cross.api_semantics import make_client_id
+from execution.run import main as execution_main
 from execution.margin_cross import http_client as hc
 from execution.margin_cross.policy import (
     APPROVAL_HMAC_KEY_ENV,
@@ -73,6 +77,9 @@ _ENV_KEYS = (
     "BINANCE_API_KEY",
     "BINANCE_API_SECRET",
     "BINANCE_SPOT_PRODUCTION_BOOK",
+    "CROSS_MARGIN_LEDGER_PATH",
+    "PUBLIC_DERIVATIVES_DB_PATH",
+    "NEWS_EVENTS_DB_PATH",
 )
 
 
@@ -226,6 +233,18 @@ class LiveProductionPathTests(unittest.TestCase):
             paper_enabled=False,
         )
 
+    def _post_paths(self) -> list[str]:
+        return [path for method, path, _params in self.transport.requests if method == "POST"]
+
+    def _run_once(self, argv: list[str]) -> dict[str, Any]:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = execution_main(argv)
+        self.assertEqual(code, 0, buf.getvalue())
+        lines = [line for line in buf.getvalue().splitlines() if line.startswith("{")]
+        self.assertTrue(lines, buf.getvalue())
+        return json.loads(lines[-1])
+
     def _consume(self, extras: dict[str, Any]) -> dict[str, Any]:
         row_id = REPLAY_FLOOR_DECISION_ID + 20
         self._row(row_id, extras)
@@ -258,9 +277,10 @@ class LiveProductionPathTests(unittest.TestCase):
         loaded, error = load_explicit_account_route(str(path))
         self.assertIsNone(error)
         self.assertNotIn("offline_approval", loaded or {})
-        decision = self.host.root / "routed-live.db"
+        decision = self.host.root / "dexscreener.db"
         book = self.host.root / "routed-live-book.db"
         self.host._seed(decision, book, now_ms)
+        os.environ["CROSS_MARGIN_LEDGER_PATH"] = str(self.host.root / "live-margin.db")
         os.environ["PUBLIC_DERIVATIVES_DB_PATH"] = str(book)
         os.environ["NEWS_EVENTS_DB_PATH"] = str(self.host.root / "missing-news.db")
         adapter = IndicatorDataAdapter(decision)
@@ -293,55 +313,65 @@ class LiveProductionPathTests(unittest.TestCase):
         conn.close()
         self.assertEqual(raw["extras"]["execution_mode"], "live")
         self.assertNotIn("offline_approval", raw["extras"])
-        gateway = ExecutionGateway(
-            decision_db=str(decision),
-            ledger_path=str(self.host.root / "routed-exec.db"),
-            accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
-            paper_enabled=False,
-        )
-        with patch("execution.margin_cross.entry.time.time", return_value=now_ms / 1000.0):
-            first = gateway.process_pending()
-        self.assertEqual(first.processed, 1)
-        receipt = first.receipts[0]
+        argv = [
+            "--once",
+            "--json",
+            "--db",
+            str(decision),
+            "--ledger",
+            str(self.host.root / "fade-ledger.db"),
+            "--accept-purpose",
+            PURPOSE_LIVE_BNB_BOLL_FADE,
+        ]
+        first = self._run_once(argv)
+        self.assertEqual(first["processed"], 1)
+        receipt = first["sample"][0]
         self.assertEqual(receipt["executor"], "cross_margin_track")
         self.assertEqual(receipt["exec_result"]["entry"], "execution.margin_cross.entry.open_live_document")
-        self.assertTrue(receipt["exec_result"]["margin_called"], receipt["exec_result"])
         self.assertTrue(receipt["exec_result"]["ok"], receipt["exec_result"])
         self.assertEqual(receipt["exec_result"]["open"]["state"], "protected")
-        posts = [item for item in self.transport.requests if item[0] == "POST"]
-        self.assertEqual(
-            [path for _method, path, _params in posts],
-            [
-                "/sapi/v1/margin/borrow-repay",
-                "/sapi/v1/margin/order",
-                "/sapi/v1/margin/order/oco",
-            ],
+        self.assertEqual(self._post_paths(), [
+            "/sapi/v1/margin/borrow-repay",
+            "/sapi/v1/margin/order",
+            "/sapi/v1/margin/order/oco",
+        ])
+        second = self._run_once(argv)
+        self.assertEqual(self._post_paths(), [
+            "/sapi/v1/margin/borrow-repay",
+            "/sapi/v1/margin/order",
+            "/sapi/v1/margin/order/oco",
+        ])
+        self.assertEqual(second["processed"], 0)
+        self.transport.fail_order_list = True
+        unknown = self._run_once(argv)
+        self.assertEqual(self._post_paths(), [
+            "/sapi/v1/margin/borrow-repay",
+            "/sapi/v1/margin/order",
+            "/sapi/v1/margin/order/oco",
+        ])
+        self.assertEqual(unknown["margin_maintenance"][0]["result"]["reason"], "oco_query_failed")
+        self.transport.fail_order_list = False
+        transport_mod.NOW_MS = int(time.time() * 1000)
+        self.transport.fill_oco_take_profit(
+            make_client_id("live-prod-short-1", "oco-list"),
+            match_exact_liability=True,
         )
-        extras = dict(raw["extras"])
-        extras["strategy_id"] = "regime5_crisis_contagion_short"
-        conn = sqlite3.connect(decision)
-        conn.execute(
-            """
-            INSERT INTO decision_log (
-                id, ts, strategy_id, action, chain_id, token_address, size_pct,
-                reason, risk_passed, mode, purpose, raw_json
-            ) VALUES (?, '2026-11-19T00:00:00Z', ?, 'buy', 'binance', 'BTCUSDT', 0.1, 'probe', 1, 'live_stub', ?, ?)
-            """,
-            (
-                REPLAY_FLOOR_DECISION_ID + 2,
-                "regime5_crisis_contagion_short",
-                PURPOSE_LIVE_BNB_BOLL_FADE,
-                json.dumps({"pair_address": "BTCUSDT", "purpose": PURPOSE_LIVE_BNB_BOLL_FADE, "extras": extras}),
-            ),
-        )
-        conn.commit()
-        conn.close()
-        with patch("execution.margin_cross.entry.time.time", return_value=now_ms / 1000.0):
-            second = gateway.process_pending()
-        again = [item for item in self.transport.requests if item[0] == "POST"]
-        self.assertEqual(len(again), 3)
-        self.assertTrue(second.receipts[0]["exec_result"]["margin_called"])
-        self.assertEqual(second.receipts[0]["exec_result"]["open"]["state"], "protected")
+        closed = self._run_once(argv)
+        repay = [
+            params.get("type")
+            for method, path, params in self.transport.requests
+            if method == "POST" and path == "/sapi/v1/margin/borrow-repay"
+        ]
+        self.assertEqual(repay, ["BORROW", "REPAY"])
+        self.assertEqual(closed["margin_maintenance"][0]["result"]["state"], "clean_flat")
+        again = self._run_once(argv)
+        repay_again = [
+            params.get("type")
+            for method, path, params in self.transport.requests
+            if method == "POST" and path == "/sapi/v1/margin/borrow-repay"
+        ]
+        self.assertEqual(repay_again, ["BORROW", "REPAY"])
+        self.assertEqual(again["margin_maintenance"], [])
 
     def test_live_rejections_do_not_post_or_fall_back_to_spot(self) -> None:
         now_ms = self.now_ms

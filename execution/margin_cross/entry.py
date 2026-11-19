@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from decimal import Decimal
 import json
+import os
 from pathlib import Path
 import socket
 import sys
@@ -404,6 +405,119 @@ def open_live_document(
     opened = track.open_position(plan.intent, snapshot_raw, plan.contract, gate)
     code = 0 if opened.phase_ok else 1
     return code, {"mode": LIVE_EXECUTION_MODE, "action": "open", "result": opened.as_dict()}, ""
+
+
+_MAINTAIN_SKIP_STATES = frozenset(
+    {
+        "clean_flat",
+        "not_flat",
+        "protection_failed_flattened",
+        "entry_rejected_unwound",
+        "risk_dropped_unwound",
+        "emergency_unwound",
+        "locked",
+        "borrow_rejected",
+        "entry_rejected",
+        "otoco_not_submitted",
+        "live_network_disabled",
+    }
+)
+
+
+def maintain_live_margin(ledger_path: str | None = None) -> list[dict[str, Any]]:
+    """One client and one track for an explicit ledger.
+
+    Unset ``CROSS_MARGIN_LEDGER_PATH`` does nothing. A missing approval,
+    credential, or live switch returns one refusal and does not open a socket
+    through the default transport until those gates pass. An unknown OCO read
+    is returned as-is and is not followed by another order.
+    """
+    path = (ledger_path or os.environ.get("CROSS_MARGIN_LEDGER_PATH") or "").strip()
+    if not path:
+        return []
+    now_ms = int(time.time() * 1000)
+    reasons = live_gate_reasons(
+        allow_live_network=True,
+        for_protective_or_repay=True,
+        now_ms=now_ms,
+    )
+    if reasons:
+        return [
+            {
+                "ok": False,
+                "reason": reasons[0],
+                "margin_called": False,
+                "entry": "execution.margin_cross.entry.maintain_live_margin",
+            }
+        ]
+    pinned_cfg, cfg_errs = load_approved_risk_config(now_ms=now_ms)
+    if pinned_cfg is None or cfg_errs:
+        return [
+            {
+                "ok": False,
+                "reason": cfg_errs[0] if cfg_errs else "approved_config_missing",
+                "margin_called": False,
+                "entry": "execution.margin_cross.entry.maintain_live_margin",
+            }
+        ]
+    api_key, api_secret = resolve_api_credentials()
+    if not api_key or not api_secret:
+        return [
+            {
+                "ok": False,
+                "reason": "missing_api_credentials",
+                "margin_called": False,
+                "entry": "execution.margin_cross.entry.maintain_live_margin",
+            }
+        ]
+    client = BinanceCrossMarginHttpClient(
+        api_key=api_key,
+        api_secret=api_secret,
+        account_uid=pinned_cfg.approved_account_uid,
+        clock_ms=lambda: now_ms,
+        approved_config=pinned_cfg,
+    )
+    track = CrossMarginTrack(
+        path,
+        client,
+        allow_live_network=True,
+        approved_config=pinned_cfg,
+        now_ms=now_ms,
+    )
+    kill_on, _name = kill_switch_active(None)
+    gate = {
+        "emergency_stop": kill_on,
+        "now_ms": now_ms,
+        "execution_mode": LIVE_EXECUTION_MODE,
+    }
+    out: list[dict[str, Any]] = []
+    for row in track.ledger.list_intents():
+        state = str(row["state"])
+        if state in _MAINTAIN_SKIP_STATES:
+            continue
+        intent_id = str(row["intent_id"])
+        closed = track.complete_exit(intent_id, gate)
+        if closed.reason == "protection_not_placed":
+            stored = json.loads(str(row["payload_json"]))
+            opened = track.open_position(
+                stored["intent"], stored["snapshot"], stored["contract"], gate
+            )
+            out.append(
+                {
+                    "action": "maintain_open",
+                    "entry": "execution.margin_cross.entry.maintain_live_margin",
+                    "result": opened.as_dict(),
+                }
+            )
+            continue
+        out.append(
+            {
+                "action": "maintain_exit",
+                "entry": "execution.margin_cross.entry.maintain_live_margin",
+                "result": closed.as_dict(),
+            }
+        )
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:

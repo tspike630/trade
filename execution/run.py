@@ -47,6 +47,7 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
 )
 from execution.live_bnb_dispatch import live_bnb_paper_env_block  # noqa: E402
 from execution.gateway import ExecutionGateway, _env_bool  # noqa: E402
+from execution.margin_cross.entry import maintain_live_margin  # noqa: E402
 from execution.ledger import resolve_ledger_path  # noqa: E402
 
 log = get_logger("execution.run")
@@ -422,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def tick(since_id: int | None) -> dict:
             stats = gw.process_pending(since_id=since_id, limit=args.limit)
+            margin_maintenance = maintain_live_margin()
             tick_actions: list = []
             if paper_tick:
                 paper = gw._get_paper()
@@ -444,6 +446,7 @@ def main(argv: list[str] | None = None) -> int:
                     sorted(accept_purposes) if accept_purposes is not None else None
                 ),
                 "paper_tick_closed": tick_actions,
+                "margin_maintenance": margin_maintenance,
                 "protective_exits": [
                     {
                         "symbol": item.get("symbol"),

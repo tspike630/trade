@@ -94,6 +94,8 @@ _UNTOUCHED = {
     "execution/run.py": (
         "fc30c933d19820a120d3896d8174fb8f54be118399736843540eede2e2500e94",
         "ff44a21b317788a8a04a25e77633641e2f33d32fa2e79795bef473e9c7f637ed",
+        # Explicit margin ledger maintenance on the production tick. Another rewrite fails.
+        "a5410a8e34ad415ed8d19eb05cf2b5e69327b1d99a626aecb762e20281da5728",
     ),
     "decision_engine/core/engine.py": (
         # The third hash stamps a caller-supplied account route. Default is none.

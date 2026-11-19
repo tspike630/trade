@@ -171,6 +171,17 @@ class _InMemoryMarginTransport:
         self.seq += 1
         return self.seq
 
+    def _event_ms(self, params: dict[str, str]) -> int:
+        """Exchange event time follows the signed request clock.
+
+        A stale module constant is not an exchange timestamp. Interest that
+        accrued before the borrow started stays a real conflict.
+        """
+        raw = params.get("timestamp")
+        if isinstance(raw, str) and raw.isdigit():
+            return int(raw)
+        return NOW_MS
+
     def _verify_signed(self, req: Any, raw_query: str) -> dict[str, str]:
         headers_lower = {str(k).lower(): str(v) for k, v in req.header_items()}
         if self.cred_id not in headers_lower.values():
@@ -337,7 +348,7 @@ class _InMemoryMarginTransport:
                         "interest": api_amount(self.interest_on_borrow),
                         "principal": api_amount(amt),
                         "status": "CONFIRMED",
-                        "timestamp": NOW_MS,
+                        "timestamp": self._event_ms(params),
                         "txId": tx_id,
                         "type": "MANUAL",
                     }
@@ -346,7 +357,7 @@ class _InMemoryMarginTransport:
                     self.interest_rows.append(
                         {
                             "txId": self._next_id(),
-                            "interestAccruedTime": NOW_MS,
+                            "interestAccruedTime": self._event_ms(params),
                             "asset": params["asset"],
                             "rawAsset": params["asset"],
                             "principal": api_amount(amt),
@@ -371,7 +382,7 @@ class _InMemoryMarginTransport:
                         "interest": api_amount(pay_int),
                         "principal": api_amount(pay_prin),
                         "status": "CONFIRMED",
-                        "timestamp": NOW_MS,
+                        "timestamp": self._event_ms(params),
                         "txId": tx_id,
                         "type": "MANUAL",
                     }
@@ -481,6 +492,8 @@ class _InMemoryMarginTransport:
             self.oco_lists[list_cid] = listed
             return {k: v for k, v in listed.items() if not k.startswith("_")}
         if method == "GET" and path == "/sapi/v1/margin/orderList":
+            if getattr(self, "fail_order_list", False):
+                raise TimeoutError("order list unknown")
             if "symbol" in params:
                 raise AssertionError("Cross Margin GET /sapi/v1/margin/orderList forbids symbol")
             listed = self.oco_lists[params["origClientOrderId"]]
