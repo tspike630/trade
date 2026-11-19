@@ -20,6 +20,33 @@ from execution.margin_cross.strategy_gate import build_approved_position_plan
 
 SpotSubmit = Callable[[dict[str, Any]], dict[str, Any]]
 
+# Names the offline fixture must supply. Values stay on the fixture.
+_OFFLINE_APPROVAL_KEYS = (
+    "approval_scope",
+    "max_leverage",
+    "effective_leverage",
+    "total_liability_net",
+    "single_borrow_net",
+    "borrowable_pool",
+    "entry_margin_level",
+    "warn_margin_level",
+    "emergency_margin_level",
+    "base_position_pct",
+    "min_notional",
+    "snapshot_max_age_ms",
+    "interest_horizon_hours",
+    "enable_state2_long",
+    "enable_state4_long",
+    "fill_tp_formula_b",
+)
+
+
+def _offline_approval_ok(signal: dict[str, Any]) -> bool:
+    approval = signal.get("offline_approval")
+    if not isinstance(approval, dict) or approval.get("parameters_approved") is not True:
+        return False
+    return all(approval.get(key) not in (None, "") for key in _OFFLINE_APPROVAL_KEYS)
+
 
 def _refuse(reason: str) -> dict[str, Any]:
     return {
@@ -93,13 +120,15 @@ def dispatch_account_route(
             return _refuse("strategy_payload_mismatch")
 
     if execution_mode == "offline_fixture":
+        if not _offline_approval_ok(signal):
+            return _refuse("parameters_not_approved")
         opened = open_offline_routed(ledger_path, signal)
         return {
             "ok": bool(opened.get("ok")),
             "reason": opened.get("reason"),
             "venue": "binance_cross_margin",
             "spot_called": False,
-            "margin_called": True,
+            "margin_called": bool(opened.get("margin_called")),
             "entry": opened.get("entry"),
             "open": opened.get("open"),
             "writes": opened.get("writes"),

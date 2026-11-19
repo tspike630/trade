@@ -17,6 +17,29 @@ from execution.margin_cross.policy import SUPPORTED_SHORT_STRATEGIES
 from execution.margin_cross.risk import OFFLINE_FIXTURE_STRATEGY_ID
 
 
+def _offline_approval() -> dict[str, object]:
+    """Caller-supplied numbers. The route module does not fill these in."""
+    return {
+        "parameters_approved": True,
+        "approval_scope": "binance_cross_margin_only",
+        "max_leverage": "3",
+        "effective_leverage": "1.60",
+        "total_liability_net": "0.60",
+        "single_borrow_net": "0.55",
+        "borrowable_pool": "0.50",
+        "entry_margin_level": "2.50",
+        "warn_margin_level": "2.00",
+        "emergency_margin_level": "1.60",
+        "base_position_pct": "1.00",
+        "min_notional": "20",
+        "snapshot_max_age_ms": 5000,
+        "interest_horizon_hours": "2",
+        "enable_state2_long": 1,
+        "enable_state4_long": 1,
+        "fill_tp_formula_b": 1,
+    }
+
+
 class AccountDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self._dir = tempfile.TemporaryDirectory()
@@ -66,6 +89,7 @@ class AccountDispatchTests(unittest.TestCase):
             "contract": case["contract"],
             "gate": case["gate"],
             "client": case["client"],
+            "offline_approval": _offline_approval(),
         }
         request = route_request_from_signal(signal)
         first = dispatch_account_route(request, ledger_path=self.ledger, spot_submit=lambda _sig: {})
@@ -176,3 +200,71 @@ class AccountDispatchTests(unittest.TestCase):
             denied["entry"],
             "execution.margin_cross.strategy_gate.build_approved_position_plan",
         )
+
+    def test_illegal_domain_is_refused_and_does_not_fall_back_to_spot(self) -> None:
+        seen: list[str] = []
+        request = route_request_from_signal(
+            {"account_domain": "binance_margin", "symbol": "BTCUSDT"}
+        )
+        self.assertEqual(request["account_domain"], "binance_margin")
+        result = dispatch_account_route(
+            request,
+            ledger_path=self.ledger,
+            spot_submit=lambda _sig: seen.append("spot") or {"ok": True},
+        )
+        self.assertEqual(result["reason"], "account_domain_invalid")
+        self.assertFalse(result["spot_called"])
+        self.assertFalse(result["margin_called"])
+        self.assertEqual(seen, [])
+
+    def test_missing_offline_approval_does_not_call_the_track(self) -> None:
+        case = short_case()
+        result = dispatch_account_route(
+            route_request_from_signal(
+                {
+                    "account_domain": "binance_cross_margin",
+                    "spot_book_full": False,
+                    "strategy_id": OFFLINE_FIXTURE_STRATEGY_ID,
+                    "execution_mode": "offline_fixture",
+                    "intent": case["intent"],
+                    "snapshot": case["snapshot"],
+                    "contract": case["contract"],
+                    "gate": case["gate"],
+                    "client": case["client"],
+                }
+            ),
+            ledger_path=self.ledger,
+            spot_submit=lambda _sig: {"spot": True},
+        )
+        self.assertEqual(result["reason"], "parameters_not_approved")
+        self.assertFalse(result["margin_called"])
+        self.assertFalse(result["spot_called"])
+        self.assertEqual(case["client"].write_log, [])
+
+    def test_phase_failure_is_not_reported_as_an_open(self) -> None:
+        case = short_case()
+        intent = dict(case["intent"])
+        intent["intent_id"] = ""
+        result = dispatch_account_route(
+            route_request_from_signal(
+                {
+                    "account_domain": "binance_cross_margin",
+                    "spot_book_full": False,
+                    "strategy_id": OFFLINE_FIXTURE_STRATEGY_ID,
+                    "execution_mode": "offline_fixture",
+                    "intent": intent,
+                    "snapshot": case["snapshot"],
+                    "contract": case["contract"],
+                    "gate": case["gate"],
+                    "client": case["client"],
+                    "offline_approval": _offline_approval(),
+                }
+            ),
+            ledger_path=self.ledger,
+            spot_submit=lambda _sig: {"spot": True},
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["margin_called"])
+        self.assertFalse(result["spot_called"])
+        self.assertFalse(result["open"]["phase_ok"])
+        self.assertEqual(result["reason"], "intent_id_invalid")

@@ -22,19 +22,29 @@ def preserve_explicit_account_domain(signal: dict[str, Any]) -> dict[str, Any]:
 
 
 def route_request_from_signal(signal: dict[str, Any]) -> dict[str, Any]:
-    """Build the execution request from fields the signal already carries."""
-    kept = preserve_explicit_account_domain(dict(signal))
-    domain = kept.get("account_domain") or "binance_spot"
+    """Build the execution request from fields the signal already carries.
+
+    A missing domain stays on spot. A present domain that is not spot or
+    cross-margin is kept so the dispatcher can refuse it. It is not rewritten
+    to spot.
+    """
+    raw_domain = signal.get("account_domain", None)
+    spot_book_full = signal.get("spot_book_full", None)
+    if not isinstance(spot_book_full, bool):
+        spot_book_full = None
+    domain = "binance_spot" if raw_domain in (None, "") else raw_domain
     return {
         "account_domain": domain,
-        "spot_book_full": kept.get("spot_book_full"),
-        "strategy_id": kept.get("strategy_id"),
-        "execution_mode": kept.get("execution_mode"),
-        "submit_spot": kept.get("submit_spot") is True,
-        "submit_margin": kept.get("submit_margin") is True,
-        "intent": kept.get("intent"),
-        "snapshot": kept.get("snapshot"),
-        "contract": kept.get("contract"),
-        "gate": kept.get("gate"),
-        "client": kept.get("client"),
+        "spot_book_full": spot_book_full,
+        "strategy_id": signal.get("strategy_id"),
+        "execution_mode": signal.get("execution_mode"),
+        "submit_spot": signal.get("submit_spot") is True,
+        "submit_margin": signal.get("submit_margin") is True,
+        "intent": signal.get("intent"),
+        "snapshot": signal.get("snapshot"),
+        "contract": signal.get("contract"),
+        "gate": signal.get("gate"),
+        "client": signal.get("client"),
+        "offline_approval": signal.get("offline_approval"),
+        "interest_on_borrow": signal.get("interest_on_borrow"),
     }

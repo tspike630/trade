@@ -84,15 +84,19 @@ def open_offline_routed(ledger_path: str, signal: dict[str, Any]) -> dict[str, A
             "entry": "execution.margin_cross.entry.open_offline_routed",
             "margin_called": False,
         }
+    if client is None:
+        interest = signal.get("interest_on_borrow", "0")
+        client = client_from_snapshot(snapshot, Decimal(str(interest)))
     track = CrossMarginTrack(ledger_path, client)
     opened = track.open_position(intent, snapshot, contract, gate if isinstance(gate, dict) else {})
     writes: list[str] = []
     write_log = getattr(client, "write_log", None)
     if isinstance(write_log, list):
         writes = [str(name) for name, _payload in write_log]
+    phase_ok = bool(opened.phase_ok)
     return {
-        "ok": True,
-        "reason": None,
+        "ok": phase_ok,
+        "reason": None if phase_ok else opened.reason,
         "entry": "execution.margin_cross.entry.open_offline_routed",
         "margin_called": True,
         "open": opened.as_dict(),

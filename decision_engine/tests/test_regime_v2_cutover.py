@@ -80,8 +80,10 @@ _UNTOUCHED = {
     ),
     "execution/gateway.py": (
         # t310 binds and settles the reservation around the existing buy path.
+        # The third hash is the explicit account-route branch. Another rewrite fails.
         "9ec2ba768fbd203ff9094c99217b52e4496da81e82a4b04e36d5e1afb925a48f",
         "06ee774eedd91ff18bbde603c65a7e474a561fa4ea976c011e21ed61343906ed",
+        "172dfbdd84f13312c63f5b27f7d2be4a0ccb04f0aad9baf2364ccce99ae8fb90",
     ),
     "execution/ledger.py": (
         "fa1410df2d4d1780b3206a9acc40e32ffd574e5d29aa2c7280bede4b7e7fd0d2",
@@ -92,8 +94,10 @@ _UNTOUCHED = {
         "ff44a21b317788a8a04a25e77633641e2f33d32fa2e79795bef473e9c7f637ed",
     ),
     "decision_engine/core/engine.py": (
+        # The third hash stamps a caller-supplied account route. Default is none.
         "bac2a0590190973af9059eae5c035804b27390b277d833d10663d9e03b4cfb08",
         "2b5787626f42bb5c40542e39164445688f1bbda0afa3727a9fd7e20d959bd7b3",
+        "45c0ef177289b7a3f9d8fe207f2be300773511d68bc2ee1ee3791deef2f397ae",
     ),
     "decision_engine/core/live_buy_guards.py": (
         "6b3023ed5bdcbb2fdd4b4372ea0d360b147be96ac68016b4d7631fc671991da7",

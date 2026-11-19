@@ -61,6 +61,28 @@ from decision_engine.strategies.base_strategy import BaseStrategy
 
 log = get_logger("decision_engine.engine")
 
+
+def _stamp_explicit_account_route(
+    signals: list[dict[str, Any]],
+    route: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Copy a caller-supplied account route onto buys that are about to publish.
+
+    ``route`` is None unless the engine was constructed with one. This does
+    not invent a domain, a topology, or an approval.
+    """
+    if not route:
+        return signals
+    stamped: list[dict[str, Any]] = []
+    for sig in signals:
+        if str(sig.get("action") or "").lower() != "buy":
+            stamped.append(sig)
+            continue
+        out = dict(sig)
+        out.update(route)
+        stamped.append(out)
+    return stamped
+
 # Binance spot scan and factor feed. Entry rules stay on the strategy.
 LIVE_BNB_SPOT_PURPOSES = frozenset(
     {
@@ -101,6 +123,7 @@ class DecisionEngine:
         protection_book: ProtectionBook | None = None,
         protection_ledger: str | Path | None = None,
         macro_db: str | Path | None = None,
+        account_route: dict[str, Any] | None = None,
     ):
         self.adapter = adapter
         self.bus = bus
@@ -123,6 +146,12 @@ class DecisionEngine:
             )
         self._macro_db: Path | None = (
             Path(macro_db).expanduser() if macro_db is not None else None
+        )
+        # None leaves every published buy on its existing spot path.
+        self._account_route = (
+            {key: value for key, value in account_route.items() if key != "client"}
+            if account_route
+            else None
         )
         self._protection_unwired_logged = False
         self.tick_count = 0
@@ -294,6 +323,7 @@ class DecisionEngine:
                 news_snapshot=news_snapshot,
             )
             passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
+        passed = _stamp_explicit_account_route(passed, self._account_route)
         emitted = self.bus.publish_many(passed)
         eff_macro_halt = guard_report.get("macro_halt") or macro_halt
         perp_short_report = (

@@ -61,6 +61,8 @@ from execution.live_bnb_dispatch import (
     dispatch_live_bnb,
     parent_queue_view,
 )
+from decision_engine.core.execution_account_route import route_request_from_signal
+from execution.account_dispatch import dispatch_account_route
 from execution.reservation_lifecycle import (
     bind_reservation_before_submit,
     settle_reservation_after_execute,
@@ -1148,6 +1150,65 @@ class ExecutionGateway:
         }
         exec_result["held_position"] = receipt_body["held_position"]
 
+    def _explicit_account_result(
+        self,
+        sig: dict[str, Any],
+        receipt_body: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Route one explicit account domain. Missing domain stays on spot.
+
+        Cross-margin reaches ``CrossMarginTrack.open_position`` only for an
+        offline fixture whose caller supplied an approval object and a ledger
+        path. Any other explicit domain is refused and does not call the spot
+        adapter.
+        """
+        extras = sig.get("extras") if isinstance(sig.get("extras"), dict) else {}
+        raw_domain = extras.get("account_domain", None)
+        if raw_domain in (None, "") and extras.get("submit_margin") is not True:
+            return None
+        payload = dict(extras)
+        payload.setdefault("strategy_id", sig.get("strategy_id"))
+        request = route_request_from_signal(payload)
+        if request["account_domain"] == "binance_spot" and not request["submit_margin"]:
+            return None
+        ledger = extras.get("margin_ledger_path")
+        if request["account_domain"] == "binance_cross_margin" and (
+            not isinstance(ledger, str) or not str(ledger).strip()
+        ):
+            result: dict[str, Any] = {
+                "ok": False,
+                "reason": "margin_ledger_unspecified",
+                "venue": None,
+                "spot_called": False,
+                "margin_called": False,
+                "entry": None,
+            }
+        else:
+            result = dispatch_account_route(
+                request,
+                ledger_path=str(ledger or ""),
+                spot_submit=lambda _ignored: {"ok": False, "error": "spot_not_used"},
+            )
+        opened = bool(result.get("ok")) and bool(result.get("margin_called"))
+        error = None if opened else str(result.get("reason") or "cross_margin_refused")
+        receipt_body["status"] = "cross_margin_opened" if opened else "cross_margin_refused"
+        receipt_body["note"] = (
+            "offline cross-margin open_position"
+            if opened
+            else "account route refused; spot adapter not called"
+        )
+        receipt_body["step"] = "account_route"
+        receipt_body["exec_result"] = result
+        if error:
+            receipt_body["error"] = error
+        return {
+            "executor": "cross_margin_track" if result.get("margin_called") else "account_route",
+            "executed": 1 if opened else 0,
+            "error": error,
+            "order_status": "executed" if opened else "rejected",
+            "exec_result": result,
+        }
+
     def process_one(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         sig: dict[str, Any] | None = None
         try:
@@ -1282,6 +1343,26 @@ class ExecutionGateway:
                     evaluation.get("reason"),
                 )
         elif is_live_bnb_spot_purpose(sig.get("purpose")):
+            routed = self._explicit_account_result(sig, receipt_body)
+            if routed is not None:
+                return self._finalize(
+                    execution_log_id=exec_id,
+                    sig=sig,
+                    strategy_id=strategy_id,
+                    action=action,
+                    size_pct_f=size_pct_f,
+                    ok=ok,
+                    errors=errors,
+                    executed=int(routed["executed"]),
+                    executor=str(routed["executor"]),
+                    exec_error=routed["error"],
+                    risk_reasons=None,
+                    submitted=False,
+                    exec_result=routed["exec_result"],
+                    pm_result=None,
+                    receipt_body=receipt_body,
+                    order_status=str(routed["order_status"]),
+                )
             # CEX arm: not a paper fill, and not LiveExecutor. The adapter
             # itself keeps live newOrder behind the kill switch. A protected
             # open on this arm blocks only the same symbol. The other arm's
