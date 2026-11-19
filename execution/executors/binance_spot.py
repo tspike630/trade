@@ -251,6 +251,9 @@ _ORDER_LIST_ABSENT_MSG = "Order list does not exist."
 _SINGLE_ORDER_ABSENT_CODES = frozenset({-2011, -2013})
 _UNKNOWN_OCO_READBACK_HOLD = "oco_unknown_readback_not_resubmit"
 _LIST_MISS_HOLD_STATUSES = frozenset({"oco_unknown", "oco_working", "oco_partial"})
+# One extra GET of the same list after a confirmed -2018, then stop.
+# 418/429 and every other read failure do not get that extra call.
+_SAME_LIST_REREAD_BUDGET = 2
 
 
 def order_list_absent(exc: BinanceRequestError) -> bool:
@@ -2368,14 +2371,16 @@ class BinanceSpotAdapter:
             stored = prior
         else:
             stored = error or prior or "oco_readback_not_protective"
-        save(
-            {
-                "status": "oco_unknown",
-                "protection": PROTECTION_PENDING,
-                "last_error": stored,
-                "manual_action": "halt_new_buys_and_manually_close_or_protect_the_fill",
-            }
-        )
+        held_qty = str(row.get("quantity") or "").strip()
+        fields: dict[str, Any] = {
+            "status": "oco_unknown",
+            "protection": PROTECTION_PENDING,
+            "last_error": stored,
+            "manual_action": "halt_new_buys_and_manually_close_or_protect_the_fill",
+        }
+        if held_qty and held_qty not in {"0", "0.0", "0.00"}:
+            fields["unprotected_qty"] = held_qty
+        save(fields)
         return self._coverage(
             row,
             book="oco_unknown",
@@ -5633,7 +5638,10 @@ class BinanceSpotAdapter:
             PROTECTION_PENDING,
             PROTECTION_EXCHANGE,
         }:
-            recon = self._reconcile_oco(row)
+            if status == "oco_unknown" and self._list_identity(row):
+                recon = self._reread_same_list(row)
+            else:
+                recon = self._reconcile_oco(row)
             state = str(recon.get("state") or "")
             if state in {"working", "partial_working"}:
                 if self._claim_gate(row, status):
@@ -5671,7 +5679,7 @@ class BinanceSpotAdapter:
                     submitted=False,
                 )
                 if status == "oco_unknown" and str(row.get("status") or "") == "oco_working":
-                    save({"manual_action": None})
+                    save({"manual_action": None, "unprotected_qty": None})
                 hold_limit_sec = self._effective_max_hold_sec(row)
                 if hold_limit_sec > 0:
                     created_ms = _row_epoch_ms(row)
@@ -7835,6 +7843,57 @@ class BinanceSpotAdapter:
                 return None
             fields["residual_qty"] = "0"
         return fields
+
+    def _reread_same_list(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Read this row's list at most twice, then stop.
+
+        The second ``GET /api/v3/orderList`` uses the same stored id and runs
+        only after the confirmed HTTP 400 / -2018 miss. A timeout, 404, -2013,
+        418, 429, or 5xx stops after the first read. One ``open_orders`` read
+        may follow two confirmed misses. It does not POST, sell, or restore
+        protection; only a later matching list body can do that.
+        """
+        seen = 0
+        latest = self._reconcile_oco(row)
+        seen += 1
+        while (
+            seen < _SAME_LIST_REREAD_BUDGET
+            and str(latest.get("state") or "") == "absent"
+            and str(latest.get("error") or "") == "oco_list_absent:-2018"
+        ):
+            latest = self._reconcile_oco(row)
+            seen += 1
+        if (
+            seen >= 1
+            and str(latest.get("state") or "") == "absent"
+            and str(latest.get("error") or "") == "oco_list_absent:-2018"
+        ):
+            self._read_open_orders_once(row)
+        return latest
+
+    def _read_open_orders_once(self, row: dict[str, Any]) -> None:
+        """One signed open-order read. Any failure, including 418 or 429, stops."""
+        client = self._order_list_reader()
+        query = getattr(client, "open_orders", None) if client is not None else None
+        if not callable(query):
+            return
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            return
+        key, secret = self._credentials()
+        if not key or not secret:
+            return
+        pairs = [
+            ("symbol", symbol),
+            ("recvWindow", RECV_WINDOW_MS),
+            ("timestamp", str(int(self.clock_ms()))),
+        ]
+        try:
+            query(sign_query(pairs, secret), api_key=key)
+        except Exception as exc:  # noqa: BLE001 — one look, then the hold stands
+            if isinstance(exc, AssertionError):
+                raise
+            return
 
     def _reconcile_oco(self, row: dict[str, Any]) -> dict[str, Any]:
         gates = self._gates()
