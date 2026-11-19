@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import tempfile
@@ -97,6 +98,14 @@ def inspect_lseg_macro_target(environ: dict[str, str] | None = None) -> dict[str
     return {"kind": "ready", "path": path, "source": source, "counts": counts}
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _utc_ms(iso_str: str) -> int:
     text = iso_str[:-1] + "+00:00" if iso_str.endswith("Z") else iso_str
     return int(datetime.fromisoformat(text).astimezone(timezone.utc).timestamp() * 1000)
@@ -187,6 +196,7 @@ class MacroCircuitBreakerTests(unittest.TestCase):
         self.assertTrue(status.configured)
         self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
         self.assertEqual(status.detail, "path_unwired")
+        self.assertEqual(status.cross_asset_status, "cross_asset_unwired")
         paper = evaluate_macro_gate(
             None,
             now_ms=1_700_000_000_000,
@@ -300,15 +310,24 @@ class MacroCircuitBreakerTests(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            # Fresh at t0 + 2 min -> blocks with cross_asset_nq_dump
+            # Fresh at t0 + 2 min -> blocks with cross_asset_nq_dump.
+            # The check ran; stale is not this state.
             st = evaluate_macro_gate(db, now_ms=t0 + 2 * 60_000)
             self.assertEqual(st.halt_reason, "cross_asset_nq_dump")
+            self.assertEqual(st.cross_asset_status, "cross_asset_triggered")
+            self.assertEqual(st.cross_asset_trigger, "cross_asset_nq_dump")
+            self.assertEqual(st.cross_asset_source, "calendar_path")
+            self.assertLessEqual(st.cross_asset_age_ms, 30 * 60_000)
 
             # Stale bars do not themselves block. This fixture has no release
             # clock, so the gate still refuses to call the window clear.
             st_stale = evaluate_macro_gate(db, now_ms=t0 + 45 * 60_000)
             self.assertEqual(st_stale.halt_reason, "macro_lseg_stale_or_missing")
             self.assertEqual(st_stale.detail, "release_clock_absent")
+            self.assertEqual(st_stale.cross_asset_status, "cross_asset_stale")
+            self.assertIsNone(st_stale.cross_asset_trigger)
+            self.assertGreater(st_stale.cross_asset_age_ms, 30 * 60_000)
+            self.assertEqual(st_stale.cross_asset_max_age_ms, 30 * 60_000)
 
     def test_engine_and_guards_drop_buys_keep_sells_and_fail_closed_on_missing_db(self) -> None:
         buy_sig = {
@@ -704,6 +723,237 @@ class MacroCircuitBreakerTests(unittest.TestCase):
             self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing", iso)
             self.assertEqual(status.detail, "release_clock_absent", iso)
             self.assertIsNone(status.error, iso)
+
+    def test_cross_asset_path_stays_independent_and_visible_during_a_blackout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calendar = root / "calendar.db"
+            bars = root / "bars.db"
+            other = root / "other.db"
+            _create_macro_db(calendar)
+            _create_macro_db(bars)
+            _create_macro_db(other)
+            conn = sqlite3.connect(calendar)
+            conn.execute("DROP TABLE cross_asset_bars")
+            cpi_ms = _utc_ms("2026-11-10T13:30:00Z")
+            later_ms = _utc_ms("2026-12-10T13:30:00Z")
+            conn.executemany(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES (?, ?, ?, ?, 'United States', 3, 'CPI')
+                """,
+                [
+                    ("2026-11-10", "2026-11-10 21:30:00", "2026-11-10T13:30:00Z", cpi_ms),
+                    ("2026-12-10", "2026-12-10 21:30:00", "2026-12-10T13:30:00Z", later_ms),
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-12', '2026-11-12 21:30:00', '2026-11-12T13:30:00Z', ?, 'Belgium', 3, 'CPI')
+                """,
+                (_utc_ms("2026-11-12T13:30:00Z"),),
+            )
+            conn.execute(
+                """
+                CREATE TABLE release_event (
+                    clock_status TEXT,
+                    release_date_hkt TEXT
+                )
+                """
+            )
+            conn.commit()
+            conn.close()
+            quiet_ms = _utc_ms("2026-11-20T16:00:00Z")
+            bar_conn = sqlite3.connect(bars)
+            for origin in (cpi_ms, quiet_ms):
+                for offset, close in ((15, 20000.0), (10, 19980.0), (5, 19960.0), (0, 19940.0)):
+                    stamp = origin - offset * 60_000
+                    bar_conn.execute(
+                        """
+                        INSERT INTO cross_asset_bars (ric, interval, utc_ts, utc_ms, close)
+                        VALUES ('NQc1', '5min', 'ignored-local-label', ?, ?)
+                        """,
+                        (stamp, close),
+                    )
+            bar_conn.execute(
+                """
+                INSERT INTO cross_asset_bars (ric, interval, utc_ts, utc_ms, close)
+                VALUES ('NQc1', '5min', '2099-01-01T00:00:00Z', ?, 1.0)
+                """,
+                (quiet_ms + 86_400_000,),
+            )
+            bar_conn.commit()
+            bar_conn.close()
+            other_conn = sqlite3.connect(other)
+            other_conn.execute("DELETE FROM cross_asset_bars")
+            other_conn.commit()
+            other_conn.close()
+
+            inside = evaluate_macro_gate(
+                calendar,
+                now_ms=cpi_ms,
+                environ={"DECISION_MACRO_CROSS_ASSET_DB": str(bars)},
+            )
+            self.assertEqual(inside.halt_reason, "macro_rel3_blackout")
+            self.assertEqual(inside.cross_asset_status, "cross_asset_triggered")
+            self.assertEqual(inside.cross_asset_trigger, "cross_asset_nq_dump")
+            self.assertEqual(inside.cross_asset_source, "DECISION_MACRO_CROSS_ASSET_DB")
+            self.assertEqual(inside.cross_asset_path, str(bars))
+
+            between = evaluate_macro_gate(
+                calendar,
+                now_ms=quiet_ms,
+                environ={"DECISION_MACRO_CROSS_ASSET_DB": str(bars)},
+            )
+            self.assertEqual(between.halt_reason, "cross_asset_nq_dump")
+            self.assertEqual(between.cross_asset_status, "cross_asset_triggered")
+            self.assertEqual(between.cross_asset_latest_utc_ms, quiet_ms)
+            self.assertEqual(between.cross_asset_age_ms, 0)
+
+            same_file = evaluate_macro_gate(calendar, now_ms=cpi_ms, environ={})
+            self.assertEqual(same_file.halt_reason, "macro_rel3_blackout")
+            self.assertEqual(same_file.cross_asset_status, "cross_asset_table_missing")
+            self.assertEqual(same_file.cross_asset_source, "calendar_path")
+            self.assertIsNone(same_file.cross_asset_trigger)
+
+            preferred = evaluate_macro_gate(
+                calendar,
+                now_ms=quiet_ms,
+                environ={
+                    "DECISION_MACRO_CROSS_ASSET_DB": str(other),
+                    "LSEG_CROSS_ASSET_DB_PATH": str(bars),
+                },
+            )
+            self.assertEqual(preferred.cross_asset_source, "DECISION_MACRO_CROSS_ASSET_DB")
+            self.assertEqual(preferred.cross_asset_status, "cross_asset_no_utc")
+            self.assertNotEqual(preferred.halt_reason, "cross_asset_nq_dump")
+
+            fallback = evaluate_macro_gate(
+                calendar,
+                now_ms=quiet_ms,
+                environ={"LSEG_CROSS_ASSET_DB_PATH": str(bars)},
+            )
+            self.assertEqual(fallback.cross_asset_source, "LSEG_CROSS_ASSET_DB_PATH")
+            self.assertEqual(fallback.halt_reason, "cross_asset_nq_dump")
+
+            absent = sqlite3.connect(calendar)
+            absent.execute(
+                "INSERT INTO release_event (clock_status, release_date_hkt) VALUES ('absent', '2026-11-20')"
+            )
+            absent.commit()
+            absent.close()
+            locked = evaluate_macro_gate(
+                calendar,
+                now_ms=quiet_ms,
+                environ={"DECISION_MACRO_CROSS_ASSET_DB": str(other)},
+            )
+            self.assertEqual(locked.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(locked.detail, "release_clock_unresolved:absent:2026-11-20:n=1")
+            self.assertEqual(locked.cross_asset_status, "cross_asset_no_utc")
+
+            missing_cross = root / "no-such-bars.db"
+            missing = evaluate_macro_gate(
+                calendar,
+                now_ms=cpi_ms,
+                environ={"DECISION_MACRO_CROSS_ASSET_DB": str(missing_cross)},
+            )
+            self.assertEqual(missing.halt_reason, "macro_rel3_blackout")
+            self.assertEqual(missing.cross_asset_status, "cross_asset_source_missing")
+            self.assertFalse(missing_cross.exists())
+
+            garbage = root / "not-a-db.txt"
+            garbage.write_text("not sqlite", encoding="utf-8")
+            unreadable = evaluate_macro_gate(
+                calendar,
+                now_ms=cpi_ms,
+                environ={"DECISION_MACRO_CROSS_ASSET_DB": str(garbage)},
+            )
+            self.assertEqual(unreadable.halt_reason, "macro_rel3_blackout")
+            self.assertEqual(unreadable.cross_asset_status, "cross_asset_source_unreadable")
+
+            edged = quiet_ms - 30 * 60_000
+            edge_conn = sqlite3.connect(bars)
+            edge_conn.execute("DELETE FROM cross_asset_bars")
+            for offset, close in ((15, 20000.0), (10, 19980.0), (5, 19960.0), (0, 19940.0)):
+                edge_conn.execute(
+                    "INSERT INTO cross_asset_bars (ric, interval, utc_ts, utc_ms, close) VALUES ('NQc1', '5min', 'label', ?, ?)",
+                    (edged - offset * 60_000, close),
+                )
+            edge_conn.commit()
+            edge_conn.close()
+            at_edge = evaluate_macro_gate(
+                calendar,
+                now_ms=edged + 30 * 60_000,
+                environ={"DECISION_MACRO_CROSS_ASSET_DB": str(bars)},
+            )
+            self.assertEqual(at_edge.cross_asset_age_ms, 30 * 60_000)
+            self.assertEqual(at_edge.halt_reason, "cross_asset_nq_dump")
+            past_edge = evaluate_macro_gate(
+                calendar,
+                now_ms=edged + 30 * 60_000 + 1,
+                environ={"DECISION_MACRO_CROSS_ASSET_DB": str(bars)},
+            )
+            self.assertEqual(past_edge.cross_asset_status, "cross_asset_stale")
+            self.assertNotEqual(past_edge.halt_reason, "cross_asset_nq_dump")
+
+    def test_one_country_inside_its_gap_does_not_clear_another_country(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "countries.db"
+            _create_macro_db(db)
+            conn = sqlite3.connect(db)
+            rows = [
+                ("2026-11-10", "2026-11-10 21:30:00", "2026-11-10T13:30:00Z", _utc_ms("2026-11-10T13:30:00Z"), "United States"),
+                ("2026-12-10", "2026-12-10 21:30:00", "2026-12-10T13:30:00Z", _utc_ms("2026-12-10T13:30:00Z"), "United States"),
+                ("2026-11-12", "2026-11-12 21:30:00", "2026-11-12T13:30:00Z", _utc_ms("2026-11-12T13:30:00Z"), "Belgium"),
+            ]
+            conn.executemany(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES (?, ?, ?, ?, ?, 3, 'CPI')
+                """,
+                [(a, b, c, d, country) for a, b, c, d, country in rows],
+            )
+            conn.commit()
+            conn.close()
+            now = _utc_ms("2026-11-20T16:00:00Z")
+            status = evaluate_macro_gate(db, now_ms=now)
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(status.detail, "release_coverage_unproven:Belgium:rel3")
+            self.assertEqual(status.cross_asset_status, "cross_asset_no_utc")
+
+    def test_real_overlay_calendar_keeps_the_old_cross_asset_file(self) -> None:
+        calendar = os.environ.get("LSEG_RELEASE_OVERLAY_DB", "").strip()
+        cross = os.environ.get("LSEG_CROSS_ASSET_SNAPSHOT_DB", "").strip()
+        if not calendar or not cross:
+            self.skipTest("real overlay and snapshot are not in this process")
+        calendar_path = Path(calendar)
+        cross_path = Path(cross)
+        if not calendar_path.is_file() or not cross_path.is_file():
+            self.skipTest("real overlay and snapshot are not in this process")
+        before = (_sha256(calendar_path), _sha256(cross_path))
+        env = {"DECISION_MACRO_CROSS_ASSET_DB": str(cross_path)}
+        cpi = evaluate_macro_gate(calendar_path, now_ms=_utc_ms("2026-11-10T13:30:00Z"), environ=env)
+        after_cpi = evaluate_macro_gate(calendar_path, now_ms=_utc_ms("2026-11-10T14:05:00Z"), environ=env)
+        fomc = evaluate_macro_gate(calendar_path, now_ms=_utc_ms("2026-11-18T19:00:00Z"), environ=env)
+        after_fomc = evaluate_macro_gate(calendar_path, now_ms=_utc_ms("2026-11-18T19:50:00Z"), environ=env)
+        alone = evaluate_macro_gate(calendar_path, now_ms=_utc_ms("2026-11-10T14:05:00Z"), environ={})
+        self.assertEqual(cpi.halt_reason, "macro_rel3_blackout")
+        self.assertEqual(cpi.cross_asset_status, "cross_asset_stale")
+        self.assertEqual(cpi.cross_asset_source, "DECISION_MACRO_CROSS_ASSET_DB")
+        self.assertEqual(cpi.cross_asset_path, str(cross_path))
+        self.assertEqual(after_cpi.detail, "release_clock_unresolved:absent:2026-11-10:n=7")
+        self.assertEqual(after_cpi.cross_asset_status, "cross_asset_stale")
+        self.assertEqual(fomc.halt_reason, "central_bank_blackout")
+        self.assertEqual(fomc.cross_asset_status, "cross_asset_stale")
+        self.assertEqual(after_fomc.detail, "release_coverage_unproven:Belgium:rel3")
+        self.assertEqual(alone.detail, "release_clock_unresolved:absent:2026-11-10:n=7")
+        self.assertEqual(alone.cross_asset_status, "cross_asset_table_missing")
+        self.assertEqual(alone.cross_asset_source, "calendar_path")
+        self.assertEqual(before, (_sha256(calendar_path), _sha256(cross_path)))
 
 
 if __name__ == "__main__":
