@@ -375,7 +375,7 @@ def _evaluate_dynamic_surprise(
         SELECT {', '.join(select_cols)}
         FROM macro_events
         WHERE relevance = 3
-          AND local_time_hkt != ''
+          AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
           AND utc_ms BETWEEN ? AND ?
         ORDER BY ABS(utc_ms - ?) ASC
         """,
@@ -453,6 +453,39 @@ def _evaluate_dynamic_surprise(
     return None, None, False
 
 
+def _release_calendar_gap(conn: sqlite3.Connection, now_ms: int) -> str | None:
+    """Return why this UTC day has no release clock, or None when it has one.
+
+    ``local_time_hkt`` with no clock is the ECOCAL reference date. A clock
+    with no ``utc_ms`` has no timezone. Neither one can clear an intraday
+    window. A release clock on this UTC day, or later, can.
+    """
+    release_n = 0
+    unzoned_n = 0
+    max_ms: int | None = None
+    for table in ("macro_events", "central_bank_events"):
+        row = conn.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL THEN 1 ELSE 0 END),
+                MAX(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL THEN utc_ms END),
+                SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NULL THEN 1 ELSE 0 END)
+            FROM {table}
+            """
+        ).fetchone()
+        release_n += int(row[0] or 0)
+        if row[1] is not None:
+            stamp = int(row[1])
+            max_ms = stamp if max_ms is None else max(max_ms, stamp)
+        unzoned_n += int(row[2] or 0)
+    if release_n == 0:
+        return "release_clock_unzoned" if unzoned_n else "release_clock_absent"
+    day_start = now_ms - (now_ms % 86_400_000)
+    if max_ms is None or max_ms < day_start:
+        return "release_calendar_not_covering_query_day"
+    return None
+
+
 def evaluate_macro_gate(
     path: str | Path | None,
     *,
@@ -503,7 +536,7 @@ def evaluate_macro_gate(
             SELECT country, event_name, utc_ts
             FROM central_bank_events
             WHERE is_high_impact = 1
-              AND local_time_hkt != ''
+              AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
               AND utc_ms BETWEEN ? AND ?
             ORDER BY ABS(utc_ms - ?) ASC
             LIMIT 1
@@ -534,7 +567,7 @@ def evaluate_macro_gate(
                 SELECT country, indicator_name, utc_ts
                 FROM macro_events
                 WHERE relevance = 3
-                  AND local_time_hkt != ''
+                  AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
                   AND utc_ms BETWEEN ? AND ?
                 ORDER BY ABS(utc_ms - ?) ASC
                 LIMIT 1
@@ -555,7 +588,7 @@ def evaluate_macro_gate(
                 SELECT country, indicator_name, utc_ts
                 FROM macro_events
                 WHERE relevance = 2
-                  AND local_time_hkt != ''
+                  AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
                   AND utc_ms BETWEEN ? AND ?
                 ORDER BY ABS(utc_ms - ?) ASC
                 LIMIT 1
@@ -568,7 +601,7 @@ def evaluate_macro_gate(
                 SELECT country, indicator_name, utc_ts
                 FROM macro_events
                 WHERE relevance = 2
-                  AND local_time_hkt != ''
+                  AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
                   AND (indicator_name LIKE '%Auc%' OR indicator_name LIKE '%PMI%' OR indicator_name LIKE '%Jobless%')
                   AND utc_ms BETWEEN ? AND ?
                 ORDER BY ABS(utc_ms - ?) ASC
@@ -585,6 +618,9 @@ def evaluate_macro_gate(
         if ca_reason is not None:
             return MacroGateStatus.halted(ca_reason, ca_detail)
 
+        gap = _release_calendar_gap(conn, now_ms)
+        if gap is not None:
+            return MacroGateStatus.halted("macro_lseg_stale_or_missing", gap)
         return MacroGateStatus.clear()
     except sqlite3.Error as exc:
         return MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}")

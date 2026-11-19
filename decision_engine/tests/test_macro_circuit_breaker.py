@@ -287,9 +287,11 @@ class MacroCircuitBreakerTests(unittest.TestCase):
             st = evaluate_macro_gate(db, now_ms=t0 + 2 * 60_000)
             self.assertEqual(st.halt_reason, "cross_asset_nq_dump")
 
-            # Stale at t0 + 45 min (> 30m) -> does not block on old bars
+            # Stale bars do not themselves block. This fixture has no release
+            # clock, so the gate still refuses to call the window clear.
             st_stale = evaluate_macro_gate(db, now_ms=t0 + 45 * 60_000)
-            self.assertIsNone(st_stale.halt_reason)
+            self.assertEqual(st_stale.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(st_stale.detail, "release_clock_absent")
 
     def test_engine_and_guards_drop_buys_keep_sells_and_fail_closed_on_missing_db(self) -> None:
         buy_sig = {
@@ -502,17 +504,114 @@ class MacroCircuitBreakerTests(unittest.TestCase):
                 "macro_rel3_blackout",
             )
 
-    def test_real_lseg_macro_db_upcoming_events_if_present(self) -> None:
-        real_db = self._open_real_lseg_or_skip()
-        # 2026-11-10T13:30:00Z = US Oct Core CPI (Relevance=3)
-        cpi_ms = _utc_ms("2026-11-10T13:30:00Z")
-        st_cpi = evaluate_macro_gate(real_db, now_ms=cpi_ms)
-        self.assertEqual(st_cpi.halt_reason, "macro_rel3_blackout")
+    def test_date_only_reference_date_is_not_an_intraday_blackout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "period.db"
+            _create_macro_db(db)
+            period_ms = _utc_ms("2026-10-31T00:00:00Z")
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-10-31', '2026-10-31', '2026-10-31T00:00:00Z', ?, 'United States', 3, 'CPI period')
+                """,
+                (period_ms,),
+            )
+            conn.execute(
+                """
+                INSERT INTO central_bank_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, event_name, is_high_impact
+                ) VALUES ('2026-10-28', '2026-10-28', '2026-10-28T00:00:00Z', ?, 'United States', 'Fed funds period', 1)
+                """,
+                (_utc_ms("2026-10-28T00:00:00Z"),),
+            )
+            conn.commit()
+            conn.close()
+            status = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-10T13:30:00Z"))
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(status.detail, "release_clock_absent")
+            self.assertIsNone(status.error)
+            near_period = evaluate_macro_gate(db, now_ms=period_ms + 5 * 60_000)
+            self.assertEqual(near_period.detail, "release_clock_absent")
 
-        # 2026-11-18T19:00:00Z = FOMC Minutes (High-impact CB)
-        fomc_ms = _utc_ms("2026-11-18T19:00:00Z")
-        st_fomc = evaluate_macro_gate(real_db, now_ms=fomc_ms)
-        self.assertEqual(st_fomc.halt_reason, "central_bank_blackout")
+    def test_clock_without_utc_is_not_a_zoned_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "unzoned.db"
+            _create_macro_db(db)
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-10', '21:30:00', NULL, NULL, 'United States', 3, 'CPI clock without zone')
+                """
+            )
+            conn.commit()
+            conn.close()
+            status = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-10T13:30:00Z"))
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(status.detail, "release_clock_unzoned")
+
+    def test_empty_window_stays_clear_when_a_later_release_clock_covers_the_day(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "later.db"
+            _create_macro_db(db)
+            later_ms = _utc_ms("2026-11-10T13:30:00Z")
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-10', '2026-11-10 21:30:00', '2026-11-10T13:30:00Z', ?, 'United States', 3, 'CPI release')
+                """,
+                (later_ms,),
+            )
+            conn.commit()
+            conn.close()
+            morning = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-10T09:00:00Z"))
+            self.assertIsNone(morning.halt_reason)
+            self.assertTrue(morning.configured)
+
+    def test_release_calendar_that_ended_on_a_previous_utc_day_does_not_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "ended.db"
+            _create_macro_db(db)
+            yesterday_ms = _utc_ms("2026-11-09T13:30:00Z")
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-09', '2026-11-09 21:30:00', '2026-11-09T13:30:00Z', ?, 'United States', 3, 'CPI release')
+                """,
+                (yesterday_ms,),
+            )
+            conn.commit()
+            conn.close()
+            status = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-10T13:30:00Z"))
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(status.detail, "release_calendar_not_covering_query_day")
+
+    def test_real_lseg_macro_db_upcoming_events_if_present(self) -> None:
+        """The CityU snapshot stores reference dates, not the official release clocks.
+
+        BLS scheduled the October 2026 CPI for 2026-11-10 08:30 Eastern, which is
+        13:30 UTC. The Fed released the October 27-28 minutes at 2026-11-18
+        14:00 EST, which is 19:00 UTC. This file's ``date`` column is a
+        date-only UTC midnight, so those instants must not come back clear and
+        must not come back as a blackout built from the period end.
+        """
+        real_db = self._open_real_lseg_or_skip()
+        probes = (
+            "2026-11-10T13:30:00Z",
+            "2026-11-18T19:00:00Z",
+        )
+        for iso in probes:
+            status = evaluate_macro_gate(real_db, now_ms=_utc_ms(iso))
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing", iso)
+            self.assertEqual(status.detail, "release_clock_absent", iso)
+            self.assertIsNone(status.error, iso)
 
 
 if __name__ == "__main__":

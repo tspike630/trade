@@ -263,6 +263,9 @@ def ingest_lseg_macro_db(conn: sqlite3.Connection) -> dict[str, int]:
                 if len(r) < 6:
                     continue
                 row_d = dict(zip(hdr, r + [""] * len(hdr)))
+                # ECOCAL ``date`` is the reference date exported by SmartEconomics.
+                # A date-only cell is not a release clock and is not Hong Kong time.
+                # The reader ignores it for intraday blackouts.
                 dt_str = (row_d.get("date") or "").strip()
                 parsed = _parse_utc_ms(dt_str)
                 if parsed is None:
