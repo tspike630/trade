@@ -132,7 +132,32 @@ class _Exchange:
         if self.list_mode == "timeout":
             raise TimeoutError("list timed out")
         if self.list_mode == "working_unverified_ack":
-            return _working(5002, 11, 12, "bnbfade-ol-44")
+            return {
+                "symbol": "BNBUSDT",
+                "orderListId": 5001,
+                "listClientOrderId": "bnbfade-ol-44",
+                "listOrderStatus": "EXECUTING",
+                "listStatusType": "EXEC_STARTED",
+                "orders": [{"orderId": 6001}, {"orderId": 6002}],
+                "orderReports": [
+                    {
+                        "symbol": "BNBUSDT",
+                        "orderId": 6001,
+                        "type": "LIMIT_MAKER",
+                        "status": "NEW",
+                        "origQty": "1.00",
+                        "executedQty": "0",
+                    },
+                    {
+                        "symbol": "BNBUSDT",
+                        "orderId": 6002,
+                        "type": "STOP_LOSS_LIMIT",
+                        "status": "NEW",
+                        "origQty": "1.00",
+                        "executedQty": "0",
+                    },
+                ],
+            }
         return _working(5001, 6001, 6002, "bnbfade-ol-42")
 
     def cancel_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
@@ -455,14 +480,33 @@ class PersistenceSafetyTests(unittest.TestCase):
         naked = self._held(ledger, 45)
         nid = int(naked["id"])
         ledger.update_binance_spot_position(nid, {"status": "open", "protection": "oco_pending"})
-        flat = adapter.maintain_held_position(
+        posts_before = len(client.ocos)
+        held = adapter.maintain_held_position(
             dict(ledger.binance_spot_position_by_id(nid) or {}),
             "100",
             persist=lambda fields: ledger.update_binance_spot_position(nid, fields),
         )
-        self.assertEqual(flat["book"], "closed")
-        self.assertEqual(len(client.sells), 1)
-        self.assertIn("oco_failed_auto_flattened", str(flat.get("error")))
+        stored = ledger.binance_spot_position_by_id(nid)
+        assert stored is not None
+        self.assertEqual(held["book"], "oco_unknown", held)
+        self.assertEqual(held["error"], "oco_list_absent:-2018")
+        self.assertEqual(client.sells, [])
+        self.assertEqual(stored["status"], "oco_unknown")
+        self.assertEqual(stored["stop_price"], "96")
+        self.assertEqual(stored["take_profit_price"], "104")
+        self.assertEqual(len(client.ocos), posts_before)
+        client.list_mode = "working"
+        claimed = adapter.maintain_held_position(
+            dict(stored),
+            "100",
+            persist=lambda fields: ledger.update_binance_spot_position(nid, fields),
+        )
+        claimed_row = ledger.binance_spot_position_by_id(nid)
+        assert claimed_row is not None
+        self.assertEqual(claimed["book"], "oco_unknown", claimed)
+        self.assertEqual(claimed_row["status"], "oco_unknown")
+        self.assertEqual(len(client.ocos), posts_before)
+        self.assertEqual(client.sells, [])
 
     def test_resting_maker_reserves_partial_qty_and_ttl_is_terminal(self) -> None:
         client = _Exchange()
@@ -1222,7 +1266,18 @@ class PersistenceSafetyTests(unittest.TestCase):
         client.list_mode = "absent"
         client.oco_mode = "reject"
         client.sell_ack = {"orderId": 78, "status": "NEW", "executedQty": "0.00", "origQty": "1.50"}
-        ledger.update_binance_spot_position(pid, {"status": "open", "protection": "oco_pending"})
+        ledger.update_binance_spot_position(
+            pid,
+            {
+                "status": "open",
+                "protection": "oco_pending",
+                "oco_order_list_id": None,
+                "oco_list_client_id": None,
+                "oco_above_order_id": None,
+                "oco_below_order_id": None,
+                "last_error": None,
+            },
+        )
         self._tick(ledger, adapter, "100")
         self._tick(ledger, adapter, "100")
         stored = ledger.binance_spot_position_by_id(pid)
@@ -1243,7 +1298,18 @@ class PersistenceSafetyTests(unittest.TestCase):
             "executedQty": "0.40",
             "origQty": "1.50",
         }
-        ledger.update_binance_spot_position(pid, {"status": "open", "protection": "oco_pending"})
+        ledger.update_binance_spot_position(
+            pid,
+            {
+                "status": "open",
+                "protection": "oco_pending",
+                "oco_order_list_id": None,
+                "oco_list_client_id": None,
+                "oco_above_order_id": None,
+                "oco_below_order_id": None,
+                "last_error": None,
+            },
+        )
         self._tick(ledger, adapter, "100")
         self._tick(ledger, adapter, "100")
         stored = ledger.binance_spot_position_by_id(pid)
