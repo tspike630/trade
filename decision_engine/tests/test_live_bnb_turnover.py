@@ -20,6 +20,7 @@ from pathlib import Path
 import decision_engine  # noqa: F401 — crawler/ on path for logging_setup
 from decision_engine.core.data_adapter import IndicatorDataAdapter
 from decision_engine.core.engine import DecisionEngine
+from decision_engine.tests.quiet_macro import write_quiet_macro
 from decision_engine.core import live_bnb_turnover as turnover_gate
 from decision_engine.core.live_bnb_turnover import (
     ENV_MIN_QUOTE_VOLUME,
@@ -389,6 +390,7 @@ class EngineTurnoverTests(TurnoverContractTests):
                 adapter,
                 bus,
                 strategies or [get_strategy("tech_boll_fade_v1")],
+                macro_db=write_quiet_macro(db.with_name("quiet_macro.db")),
                 **kwargs,
             )
             payload = engine.tick()

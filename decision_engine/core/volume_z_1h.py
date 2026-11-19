@@ -450,6 +450,8 @@ def attach_stored_volume_z(
         if not _stored_matches_source(conn, symbol, saved, now_ms=now_ms):
             continue
         candidate[VOLUME_Z_KEY] = _finite(saved["volume_z"])
+        if saved.get("source_close_time_ms") is not None:
+            candidate["volume_z_source_close_ms"] = int(saved["source_close_time_ms"])
     return rows
 
 

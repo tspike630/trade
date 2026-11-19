@@ -39,7 +39,7 @@ PR220 的 gate 重建值 `fa2fc3dd…` 不是生产 `5c3022e0`。不得用 PR220
 | 定案 | 草案配置 | 现有代码 | 结论 |
 | --- | --- | --- | --- |
 | 24% × 入场档 × 状态乘数 | `REGIME_V2_POSITION_PCT=0.24` 只被干跑脚本当成 `--position-pct` | fade 臂：`live_bnb_entry_zone.py` 大单乘数 1.0（L912）、中性 0.5（L643、L961）。路由在乘数 ≠ 1 时再乘状态乘数（生产路由 L639–640） | 比例相乘这条路径存在。实时权益不在决策路由里读。执行侧用 `BINANCE_SPOT_BOOK_USDT`，启动脚本另把 `BINANCE_SPOT_REST_USDT_FREE` 设成同一个数。两套口径不唯一，本草案不私选 |
-| 板块簇和总敞口 | `LIVE_BNB_CLUSTER_CAP_ENABLED=0` | `portfolio_clusters.py` 只在旗标打开时按簇计口数，不是名义总敞口。默认阈值未按定案给定 | 不打开，避免猜上限 |
+| 板块簇和总敞口 | `LIVE_BNB_CLUSTER_CAP_ENABLED` 不因本裁定改写 | `portfolio_clusters.py` 仍只在自己的旗标打开时计口数。五态上限在 `REGIME_V2_*` | t307（2026-11-19 17:31 HKT）批准 f06cfb1c 提交值：并发 3（状态 4 为 1）、总敞口 0.72（状态 4 为 0.30）、每簇 1、单名 0.30，替代此前 2 / 0.70。同组保留提交值：beta 0.85 / 状态 4 0.35，底仓 0.24，仓位乘数 1 / 1.20 / 1.15 / 0.30 / 0，止盈乘数 1 / 1.35 / 1.25 / 0.85。不是部署、合并或撤急停授权 |
 | 同币单笔单 OCO、跨 purpose 同币互斥 | 不改执行器 | `live_buy_guards.py` 在账本可读时挡住同一标的的第二笔买。PR218 的跨臂互斥在生产执行器里，本 PR 不改那些文件 | 保持，不在本草案里重写 |
 | 180 秒 OCO 回读后才允许异币 | 不新设旗标 | `binance_spot_gate.py` 默认回读 TTL 180 秒。回读通过后是否允许下一笔异币，本 PR 没有再证 | 阻断：不能把 TTL 常数说成已经实现「顺风横向开仓」 |
 | 永续关闭 | 两个永续旗标 = 0。契约打开时 `require_perp_beta_hedge` 改为 False | 永续引擎只在 `ENABLE_PERP_SHORT_ENGINE` 打开时读这个标签。Beta 上限函数不读它，因此标签本身不放宽 beta。现网该引擎为 0 | 标签不再当成已对冲。执行器未改 |
@@ -115,3 +115,10 @@ bash scripts/regime_v2_kill_dry_run.sh \
 ## 仍未切正式服务
 
 本机没有三份特征库和 `dexscreener.db`。影子干跑只能证明隔离和缺文件，不能代替现网新鲜样本上的五态验收。要在现场做只读干跑，最小输入是：一份脱敏的指标库（含 `decision_volume_z` 与 K 线）、`public_derivatives.db`、`news_events.db`、`data/lseg/lseg_macro.db`，以及每个 purpose 的只读账本副本。不要把这些生产文件复制进本 PR。
+
+## Phase-2 Ruled Strategy & Freshness Gates (`REGIME_V2_CONTRACT=1`)
+
+- **State 2 Squeeze Entry (`live_squeeze_limit_maker_gated`)**: Unified on `tech_boll_fade_v1` (`funding_z <= -1.80` or `funding_rate <= -0.0003` or squeeze cascade or COT squeeze with `whale_retail_divergence >= 1.35`), requiring `taker_buy_ratio >= 0.48`, `obi_top5 >= -0.05`, `trade_size_ratio >= 0.85`, `oi_change_1h > -5%`, `alpha in [0.08, 0.55]`, `odds >= 1.50`, and passive `LIMIT_MAKER` (`1.20x` size, `1.35x` TP stamp; legacy `state2_entry_module_not_live` remains when disabled).
+- **State 4 Deep-Dip Entry (`live_deep_dip_limit_maker_gated`)**: Restricted to Tier S/A whitelist symbols with `boll_z <= -2.20`, `alpha <= 0.15`, `taker_buy_ratio >= 0.38`, `obi_top5 >= -0.15`, `trade_size_ratio >= 0.85`, `odds >= 3.00`, and passive `LIMIT_MAKER` (`0.30x` size, `0.85x` TP stamp).
+- **Real-Time Equity & Concurrency/Exposure Caps**: Reads authenticated `BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH` (`<= 300s`, non-MCP UID) for `live_equity_usdt * 0.24 * entry_tier * state_multiplier` (`>= 20 USDT`). t307 (2026-11-19 17:31 HKT) approved the f06cfb1c submitted caps and replaced the earlier 2 / 0.70 proposal: `<= 3` concurrent positions (`<= 1` in State 4), `<= 1` per sector cluster, `<= 30%` single exposure, `<= 72%` total exposure (`<= 30%` in State 4). Beta `<= 0.85` (`<= 0.35` in State 4), the 24% base, size multipliers `1 / 1.20 / 1.15 / 0.30 / 0`, and TP multipliers `1 / 1.35 / 1.25 / 0.85` stay as submitted in that same group. This is not a deploy, merge, or kill-switch authorization. The free-USDT buffer remains `98%`.
+- **9-Datasource Fail-Closed Clocks (`REGIME_V2_STALE_DATA_POLICY=fail_closed`)**: Record-timestamp freshness enforced across account snapshot (`300s`), spot indicators & turnover (`3600s`), 5m entry kline (`900s`), 1h `volume_z` (`3600s` inclusive), `obi_top5_source_ts_ms` (`3600s`), perp/dislocation/Deribit (`3600s`), whitelist news `fetched_at` (`90m`), LSEG 5m bars (`90m` when open), and CFTC COT `due_cftc_asof`.

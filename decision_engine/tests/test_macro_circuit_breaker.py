@@ -33,6 +33,70 @@ from decision_engine.core.signal_bus import (
 from decision_engine.strategies.base_strategy import BaseStrategy
 
 
+# Same order as ``resolve_macro_db_path`` / ``_MACRO_DB_ENV``.
+_LSEG_PATH_ENVS = ("DECISION_MACRO_DB", "LSEG_MACRO_DB_PATH")
+_LSEG_ACCEPTANCE_ENV = "LSEG_MACRO_ACCEPTANCE"
+_LSEG_REQUIRED_TABLES = ("macro_events", "central_bank_events")
+
+
+def _default_lseg_macro_db() -> Path:
+    return Path(__file__).resolve().parents[2] / "data" / "lseg" / "lseg_macro.db"
+
+
+def _truthy(raw: object) -> bool:
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def inspect_lseg_macro_target(environ: dict[str, str] | None = None) -> dict[str, object]:
+    """Classify the database the real-file test may open.
+
+    An explicit ``DECISION_MACRO_DB`` or ``LSEG_MACRO_DB_PATH`` is mandatory.
+    The default checkout path stays optional unless ``LSEG_MACRO_ACCEPTANCE``
+    is set. A present file that is unreadable or has no calendar tables is
+    never a skip.
+    """
+    env = os.environ if environ is None else environ
+    source = "default"
+    path = _default_lseg_macro_db()
+    for key in _LSEG_PATH_ENVS:
+        raw = env.get(key)
+        if raw is not None and str(raw).strip():
+            source = key
+            path = Path(str(raw).strip()).expanduser()
+            break
+    explicit = source != "default"
+    required = _truthy(env.get(_LSEG_ACCEPTANCE_ENV))
+    if not path.is_file():
+        kind = "missing" if explicit or required else "absent_optional"
+        return {"kind": kind, "path": path, "source": source}
+    try:
+        conn = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return {"kind": "unreadable", "path": path, "source": source}
+    try:
+        try:
+            names = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        except sqlite3.Error:
+            return {"kind": "unreadable", "path": path, "source": source}
+        missing = [name for name in _LSEG_REQUIRED_TABLES if name not in names]
+        if missing:
+            return {"kind": "schema", "path": path, "source": source, "missing": missing}
+        counts = {
+            name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
+            for name in _LSEG_REQUIRED_TABLES
+        }
+    finally:
+        conn.close()
+    if any(count <= 0 for count in counts.values()):
+        return {"kind": "empty", "path": path, "source": source, "counts": counts}
+    return {"kind": "ready", "path": path, "source": source, "counts": counts}
+
+
 def _utc_ms(iso_str: str) -> int:
     text = iso_str[:-1] + "+00:00" if iso_str.endswith("Z") else iso_str
     return int(datetime.fromisoformat(text).astimezone(timezone.utc).timestamp() * 1000)
@@ -120,8 +184,23 @@ class MacroCircuitBreakerTests(unittest.TestCase):
         self.assertTrue(str(default_path).endswith("data/lseg/lseg_macro.db"))
 
         status = evaluate_macro_gate(None, now_ms=1_700_000_000_000)
-        self.assertFalse(status.configured)
-        self.assertIsNone(status.halt_reason)
+        self.assertTrue(status.configured)
+        self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+        self.assertEqual(status.detail, "path_unwired")
+        paper = evaluate_macro_gate(
+            None,
+            now_ms=1_700_000_000_000,
+            purpose=PURPOSE_RACE_TECH_BOLL_FADE,
+        )
+        self.assertFalse(paper.configured)
+        self.assertIsNone(paper.halt_reason)
+        self.assertEqual(
+            resolve_macro_db_path(
+                {"DECISION_MACRO_DB": "/tmp/kept.db", "DECISION_MACRO_GATE_ENABLED": "0"},
+                live_required=True,
+            ),
+            Path("/tmp/kept.db"),
+        )
 
     def test_calendar_blackout_windows_cb_rel3_and_rel2_auction(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -164,10 +243,11 @@ class MacroCircuitBreakerTests(unittest.TestCase):
                 evaluate_macro_gate(db, now_ms=fomc_ms + 40 * 60_000).halt_reason,
                 "central_bank_blackout",
             )
-            # 50 min after FOMC -> clear
-            self.assertIsNone(
-                evaluate_macro_gate(db, now_ms=fomc_ms + 50 * 60_000).halt_reason
-            )
+            # 50 min after the only FOMC clock is outside the window, and one
+            # clock does not prove the rest of the day.
+            after_fomc = evaluate_macro_gate(db, now_ms=fomc_ms + 50 * 60_000)
+            self.assertEqual(after_fomc.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(after_fomc.detail, "release_coverage_unproven:United States:cb_high")
 
             # 5 min after US CPI (Rel=3) -> blocked
             st_cpi = evaluate_macro_gate(db, now_ms=cpi_ms + 5 * 60_000)
@@ -185,10 +265,11 @@ class MacroCircuitBreakerTests(unittest.TestCase):
             st_auc = evaluate_macro_gate(db, now_ms=auc_ms + 10 * 60_000)
             self.assertEqual(st_auc.halt_reason, "macro_rel2_auction_blackout")
 
-            # Minor Rel=2 ('Wholesale Invt') -> clear by default, blocked if DECISION_MACRO_BLOCK_ALL_REL2=1
-            self.assertIsNone(
-                evaluate_macro_gate(db, now_ms=minor_r2_ms).halt_reason
-            )
+            # Minor Rel=2 is not an auction blackout. This fixture has no
+            # second clock, so the instant is unproven rather than clear.
+            minor = evaluate_macro_gate(db, now_ms=minor_r2_ms)
+            self.assertNotEqual(minor.halt_reason, "macro_rel2_auction_blackout")
+            self.assertEqual(minor.detail, "release_coverage_unproven:United States:cb_high")
             self.assertEqual(
                 evaluate_macro_gate(
                     db,
@@ -223,9 +304,11 @@ class MacroCircuitBreakerTests(unittest.TestCase):
             st = evaluate_macro_gate(db, now_ms=t0 + 2 * 60_000)
             self.assertEqual(st.halt_reason, "cross_asset_nq_dump")
 
-            # Stale at t0 + 45 min (> 30m) -> does not block on old bars
+            # Stale bars do not themselves block. This fixture has no release
+            # clock, so the gate still refuses to call the window clear.
             st_stale = evaluate_macro_gate(db, now_ms=t0 + 45 * 60_000)
-            self.assertIsNone(st_stale.halt_reason)
+            self.assertEqual(st_stale.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(st_stale.detail, "release_clock_absent")
 
     def test_engine_and_guards_drop_buys_keep_sells_and_fail_closed_on_missing_db(self) -> None:
         buy_sig = {
@@ -302,7 +385,7 @@ class MacroCircuitBreakerTests(unittest.TestCase):
                 ):
                     payload = engine.tick()
                 self.assertEqual(payload["emitted"], 0)
-                self.assertEqual(payload["macro_halt"], "macro_status_unknown")
+                self.assertEqual(payload["macro_halt"], "macro_lseg_stale_or_missing")
             finally:
                 bus.close()
                 adapter.close()
@@ -338,19 +421,289 @@ class MacroCircuitBreakerTests(unittest.TestCase):
                 "central_bank_blackout",
             )
 
-    def test_real_lseg_macro_db_upcoming_events_if_present(self) -> None:
-        real_db = Path(__file__).resolve().parents[2] / "data" / "lseg" / "lseg_macro.db"
-        if not real_db.is_file():
-            self.skipTest("data/lseg/lseg_macro.db not built in this environment")
-        # 2026-11-10T13:30:00Z = US Oct Core CPI (Relevance=3)
-        cpi_ms = _utc_ms("2026-11-10T13:30:00Z")
-        st_cpi = evaluate_macro_gate(real_db, now_ms=cpi_ms)
-        self.assertEqual(st_cpi.halt_reason, "macro_rel3_blackout")
+    def _open_real_lseg_or_skip(self) -> Path:
+        """Open the reader-selected file. Fixtures do not call this."""
+        target = inspect_lseg_macro_target()
+        kind = str(target["kind"])
+        path = target["path"]
+        source = target["source"]
+        if kind == "absent_optional":
+            self.skipTest(
+                "optional checkout has no data/lseg/lseg_macro.db; "
+                "this is not an acceptance run. Set LSEG_MACRO_ACCEPTANCE=1 "
+                "or DECISION_MACRO_DB / LSEG_MACRO_DB_PATH to require the real file"
+            )
+        if kind != "ready":
+            self.fail(f"lseg macro db {kind} source={source} path={path} detail={target}")
+        opened = target["path"]
+        assert isinstance(opened, Path)
+        return opened
 
-        # 2026-11-18T19:00:00Z = FOMC Minutes (High-impact CB)
-        fomc_ms = _utc_ms("2026-11-18T19:00:00Z")
-        st_fomc = evaluate_macro_gate(real_db, now_ms=fomc_ms)
-        self.assertEqual(st_fomc.halt_reason, "central_bank_blackout")
+    def test_explicit_lseg_path_matches_reader_and_bad_files_fail(self) -> None:
+        both = resolve_macro_db_path(
+            {
+                "DECISION_MACRO_DB": "/tmp/decision-lseg.db",
+                "LSEG_MACRO_DB_PATH": "/tmp/other-lseg.db",
+            }
+        )
+        chosen = inspect_lseg_macro_target(
+            {
+                "DECISION_MACRO_DB": "/tmp/decision-lseg.db",
+                "LSEG_MACRO_DB_PATH": "/tmp/other-lseg.db",
+            }
+        )
+        self.assertEqual(both, Path("/tmp/decision-lseg.db"))
+        self.assertEqual(chosen["path"], Path("/tmp/decision-lseg.db"))
+        self.assertEqual(chosen["kind"], "missing")
+        self.assertEqual(chosen["source"], "DECISION_MACRO_DB")
+
+        fallback = inspect_lseg_macro_target(
+            {"LSEG_MACRO_DB_PATH": "/tmp/only-lseg-path.db"}
+        )
+        self.assertEqual(fallback["source"], "LSEG_MACRO_DB_PATH")
+        self.assertEqual(fallback["kind"], "missing")
+
+        required = inspect_lseg_macro_target({_LSEG_ACCEPTANCE_ENV: "1"})
+        self.assertEqual(required["kind"], "missing")
+        self.assertEqual(required["path"], _default_lseg_macro_db())
+
+        optional = inspect_lseg_macro_target({})
+        self.assertEqual(optional["kind"], "absent_optional")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            empty = root / "empty.db"
+            sqlite3.connect(empty).close()
+            self.assertEqual(
+                inspect_lseg_macro_target({"DECISION_MACRO_DB": str(empty)})["kind"],
+                "schema",
+            )
+            blank = root / "blank.db"
+            _create_macro_db(blank)
+            self.assertEqual(
+                inspect_lseg_macro_target({"DECISION_MACRO_DB": str(blank)})["kind"],
+                "empty",
+            )
+            garbage = root / "garbage.db"
+            garbage.write_bytes(b"this is not sqlite")
+            self.assertEqual(
+                inspect_lseg_macro_target({"LSEG_MACRO_DB_PATH": str(garbage)})["kind"],
+                "unreadable",
+            )
+            ready = root / "fixture.db"
+            _create_macro_db(ready)
+            cpi_ms = _utc_ms("2026-11-10T13:30:00Z")
+            fomc_ms = _utc_ms("2026-11-18T19:00:00Z")
+            conn = sqlite3.connect(ready)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-10', '2026-11-10 21:30:00', '2026-11-10T13:30:00Z', ?, 'United States', 3, 'Core CPI fixture')
+                """,
+                (cpi_ms,),
+            )
+            conn.execute(
+                """
+                INSERT INTO central_bank_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, event_name, is_high_impact
+                ) VALUES ('2026-11-19', '2026-11-19 03:00:00', '2026-11-18T19:00:00Z', ?, 'United States', 'FOMC fixture', 1)
+                """,
+                (fomc_ms,),
+            )
+            conn.commit()
+            conn.close()
+            seen = inspect_lseg_macro_target({"DECISION_MACRO_DB": str(ready)})
+            self.assertEqual(seen["kind"], "ready")
+            self.assertEqual(seen["source"], "DECISION_MACRO_DB")
+            self.assertEqual(
+                evaluate_macro_gate(ready, now_ms=cpi_ms).halt_reason,
+                "macro_rel3_blackout",
+            )
+
+    def test_live_purpose_stays_closed_when_the_gate_is_disabled_or_unwired(self) -> None:
+        disabled = evaluate_macro_gate(
+            None,
+            now_ms=1_700_000_000_000,
+            environ={"DECISION_MACRO_GATE_ENABLED": "0", "DECISION_MACRO_DB": "/tmp/kept.db"},
+        )
+        self.assertEqual(disabled.halt_reason, "macro_lseg_stale_or_missing")
+        self.assertEqual(disabled.detail, "db_missing")
+        bare = evaluate_macro_gate(
+            None,
+            now_ms=1_700_000_000_000,
+            environ={"DECISION_MACRO_GATE_ENABLED": "0"},
+        )
+        self.assertEqual(bare.detail, "gate_disabled")
+        dry = evaluate_macro_gate(
+            None,
+            now_ms=1_700_000_000_000,
+            environ={"REGIME_V2_OUTPUT_MODE": "dry_run"},
+        )
+        self.assertEqual(dry.detail, "path_unwired")
+        paper = evaluate_macro_gate(
+            None,
+            now_ms=1_700_000_000_000,
+            purpose=PURPOSE_RACE_TECH_BOLL_FADE,
+            environ={"DECISION_MACRO_GATE_ENABLED": "0"},
+        )
+        self.assertIsNone(paper.halt_reason)
+
+    def test_low_relevance_same_day_does_not_cover_a_missing_us_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "japan.db"
+            _create_macro_db(db)
+            stamp = _utc_ms("2026-11-10T13:30:00Z")
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-10', '2026-11-10 21:30:00', '2026-11-10T13:30:00Z', ?, 'Japan', 0, 'Low relevance print')
+                """,
+                (stamp,),
+            )
+            conn.commit()
+            conn.close()
+            status = evaluate_macro_gate(db, now_ms=stamp)
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(status.detail, "release_coverage_unproven:no_gate_class")
+
+    def test_clear_requires_a_gap_between_two_clocks_of_the_same_class(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bracket.db"
+            _create_macro_db(db)
+            first = _utc_ms("2026-11-10T13:30:00Z")
+            second = _utc_ms("2026-11-13T13:30:00Z")
+            conn = sqlite3.connect(db)
+            conn.executemany(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES (?, ?, ?, ?, 'United States', 3, ?)
+                """,
+                [
+                    ("2026-11-10", "2026-11-10 21:30:00", "2026-11-10T13:30:00Z", first, "CPI"),
+                    ("2026-11-13", "2026-11-13 21:30:00", "2026-11-13T13:30:00Z", second, "PPI"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            between = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-12T16:00:00Z"))
+            self.assertIsNone(between.halt_reason)
+            before = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-09T16:00:00Z"))
+            self.assertEqual(before.detail, "release_coverage_unproven:United States:rel3")
+            at_cpi = evaluate_macro_gate(db, now_ms=first)
+            self.assertEqual(at_cpi.halt_reason, "macro_rel3_blackout")
+
+    def test_date_only_reference_date_is_not_an_intraday_blackout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "period.db"
+            _create_macro_db(db)
+            period_ms = _utc_ms("2026-10-31T00:00:00Z")
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-10-31', '2026-10-31', '2026-10-31T00:00:00Z', ?, 'United States', 3, 'CPI period')
+                """,
+                (period_ms,),
+            )
+            conn.execute(
+                """
+                INSERT INTO central_bank_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, event_name, is_high_impact
+                ) VALUES ('2026-10-28', '2026-10-28', '2026-10-28T00:00:00Z', ?, 'United States', 'Fed funds period', 1)
+                """,
+                (_utc_ms("2026-10-28T00:00:00Z"),),
+            )
+            conn.commit()
+            conn.close()
+            status = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-10T13:30:00Z"))
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(status.detail, "release_clock_absent")
+            self.assertIsNone(status.error)
+            near_period = evaluate_macro_gate(db, now_ms=period_ms + 5 * 60_000)
+            self.assertEqual(near_period.detail, "release_clock_absent")
+
+    def test_clock_without_utc_is_not_a_zoned_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "unzoned.db"
+            _create_macro_db(db)
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-10', '21:30:00', NULL, NULL, 'United States', 3, 'CPI clock without zone')
+                """
+            )
+            conn.commit()
+            conn.close()
+            status = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-10T13:30:00Z"))
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(status.detail, "release_clock_unzoned")
+
+    def test_empty_window_stays_clear_when_a_later_release_clock_covers_the_day(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "later.db"
+            _create_macro_db(db)
+            later_ms = _utc_ms("2026-11-10T13:30:00Z")
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-10', '2026-11-10 21:30:00', '2026-11-10T13:30:00Z', ?, 'United States', 3, 'CPI release')
+                """,
+                (later_ms,),
+            )
+            conn.commit()
+            conn.close()
+            morning = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-10T09:00:00Z"))
+            self.assertEqual(morning.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(morning.detail, "release_coverage_unproven:United States:rel3")
+
+    def test_release_calendar_that_ended_on_a_previous_utc_day_does_not_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "ended.db"
+            _create_macro_db(db)
+            yesterday_ms = _utc_ms("2026-11-09T13:30:00Z")
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                INSERT INTO macro_events (
+                    local_date_hkt, local_time_hkt, utc_ts, utc_ms, country, relevance, indicator_name
+                ) VALUES ('2026-11-09', '2026-11-09 21:30:00', '2026-11-09T13:30:00Z', ?, 'United States', 3, 'CPI release')
+                """,
+                (yesterday_ms,),
+            )
+            conn.commit()
+            conn.close()
+            status = evaluate_macro_gate(db, now_ms=_utc_ms("2026-11-10T13:30:00Z"))
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+            self.assertEqual(status.detail, "release_coverage_unproven:United States:rel3")
+
+    def test_real_lseg_macro_db_upcoming_events_if_present(self) -> None:
+        """The CityU snapshot stores reference dates, not the official release clocks.
+
+        BLS scheduled the October 2026 CPI for 2026-11-10 08:30 Eastern, which is
+        13:30 UTC. The Fed released the October 27-28 minutes at 2026-11-18
+        14:00 EST, which is 19:00 UTC. This file's ``date`` column is a
+        date-only UTC midnight, so those instants must not come back clear and
+        must not come back as a blackout built from the period end.
+        """
+        real_db = self._open_real_lseg_or_skip()
+        probes = (
+            "2026-11-10T13:30:00Z",
+            "2026-11-18T19:00:00Z",
+        )
+        for iso in probes:
+            status = evaluate_macro_gate(real_db, now_ms=_utc_ms(iso))
+            self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing", iso)
+            self.assertEqual(status.detail, "release_clock_absent", iso)
+            self.assertIsNone(status.error, iso)
 
 
 if __name__ == "__main__":

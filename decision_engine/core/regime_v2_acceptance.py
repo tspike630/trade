@@ -58,6 +58,22 @@ _ON_KEYS = (
     "LIVE_BNB_POST_ONLY_LIMIT",
     "DECISION_MACRO_GATE_ENABLED",
     "BINANCE_SPOT_AUTO_FLATTEN_ON_OCO_FAIL",
+    "LIVE_BNB_CLUSTER_CAP_ENABLED",
+    "LIVE_BNB_PORTFOLIO_BETA_GATE",
+)
+_RULED_PROFILE_VALUES = (
+    ("REGIME_V2_STATE2_ENTRY_STATUS", "live_squeeze_limit_maker_gated"),
+    ("REGIME_V2_STATE4_ENTRY_STATUS", "live_deep_dip_limit_maker_gated"),
+    ("REGIME_V2_STALE_DATA_POLICY", "fail_closed"),
+    ("REGIME_V2_EQUITY_SOURCE", "signed_account_snapshot"),
+    ("REGIME_V2_ACCOUNT_SNAPSHOT_MAX_AGE_SEC", "300"),
+    ("REGIME_V2_ENTRY_KLINE_5M_MAX_AGE_SEC", "900"),
+    ("REGIME_V2_MAX_CONCURRENT_POSITIONS", "3"),
+    ("REGIME_V2_STATE4_MAX_CONCURRENT_POSITIONS", "1"),
+    ("REGIME_V2_MAX_PER_CLUSTER", "1"),
+    ("REGIME_V2_MAX_SINGLE_EXPOSURE_PCT", "0.30"),
+    ("REGIME_V2_MAX_TOTAL_EXPOSURE_PCT", "0.72"),
+    ("REGIME_V2_STATE4_MAX_TOTAL_EXPOSURE_PCT", "0.30"),
 )
 
 
@@ -120,10 +136,16 @@ def profile_blocks(env: Mapping[str, str]) -> list[dict[str, str]]:
                 source="profile",
             )
         )
+    for key, expected_val in _RULED_PROFILE_VALUES:
+        if str(env.get(key, "")).strip() != expected_val:
+            blocks.append(
+                _block("profile_ruled_value_mismatch", f"{key}={env.get(key)!r}", source="profile")
+            )
     for key, relative in (
         ("PUBLIC_DERIVATIVES_DB_PATH", "data/counterparty/public_derivatives.db"),
         ("NEWS_EVENTS_DB_PATH", "news_events.db"),
         ("DECISION_MACRO_DB", "data/lseg/lseg_macro.db"),
+        ("CITYU_INSTITUTIONAL_DB_PATH", "data/institutional/cityu_institutional.db"),
     ):
         if str(env.get(key, "")).strip() != relative:
             blocks.append(
@@ -610,9 +632,13 @@ def local_store_blocks(env: Mapping[str, str], *, root: Path) -> list[dict[str, 
         ("PUBLIC_DERIVATIVES_DB_PATH", "public_derivatives_missing"),
         ("NEWS_EVENTS_DB_PATH", "news_events_missing"),
         ("DECISION_MACRO_DB", "lseg_macro_missing"),
+        ("CITYU_INSTITUTIONAL_DB_PATH", "cityu_institutional_missing"),
     )
     for key, code in specs:
         relative = str(env.get(key, "")).strip()
+        if not relative:
+            blocks.append(_block(code, key, source="local"))
+            continue
         path = Path(relative)
         if not path.is_absolute():
             path = root / path
@@ -623,8 +649,10 @@ def local_store_blocks(env: Mapping[str, str], *, root: Path) -> list[dict[str, 
             blocks.extend(_sqlite_clock_blocks(path, now_ms=now_ms, fresh_ms=fresh_ms))
         elif key == "NEWS_EVENTS_DB_PATH":
             blocks.extend(_news_clock_blocks(path, now_ms=now_ms))
-        else:
+        elif key == "DECISION_MACRO_DB":
             blocks.extend(_lseg_clock_blocks(path, now_ms=now_ms))
+        else:
+            blocks.extend(_cityu_cot_blocks(path, now_ms=now_ms))
     for key in ("DECISION_EXECUTION_LEDGER_FADE", "DECISION_EXECUTION_LEDGER_CLASSIC"):
         relative = str(env.get(key, "")).strip()
         path = root / relative if relative and not Path(relative).is_absolute() else Path(relative)
@@ -716,6 +744,29 @@ def _news_clock_blocks(path: Path, *, now_ms: int) -> list[dict[str, str]]:
     return [] if found is None else [found]
 
 
+def _cityu_cot_blocks(path: Path, *, now_ms: int) -> list[dict[str, str]]:
+    conn = _connect(path)
+    if conn is None:
+        return [_block("cityu_institutional_unreadable", str(path), source="local")]
+    try:
+        tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+        if "lseg_cftc_cot_positioning" not in tables:
+            return [_block("cot_table_missing", str(path), source="local")]
+        due_iso = due_cftc_asof(datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)).isoformat()
+        row = conn.execute(
+            "SELECT MAX(substr(date, 1, 10)) AS max_d FROM lseg_cftc_cot_positioning WHERE symbol = 'BTC' AND substr(date, 1, 10) <= ?",
+            (due_iso,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        return [_block("cityu_institutional_unreadable", exc.__class__.__name__, source="local")]
+    finally:
+        conn.close()
+    max_d = "" if row is None or not row["max_d"] else str(row["max_d"]).strip()
+    if max_d != due_iso:
+        return [_block("cot_publication_not_current", f"max_date={max_d or 'absent'} due={due_iso}", source="local")]
+    return []
+
+
 def _lseg_clock_blocks(path: Path, *, now_ms: int) -> list[dict[str, str]]:
     conn = _connect(path)
     if conn is None:
@@ -802,6 +853,16 @@ def signal_blocks(signal: Mapping[str, Any], *, kelly_off: bool) -> list[dict[st
                 break
     if str(signal.get("action") or "").lower() == "buy" and not signal.get("recommended_order_type"):
         blocks.append(_block("order_type_absent", playbook or strategy_id, source="signal"))
+    if str(signal.get("action") or "").lower() == "buy":
+        sz_val = signal.get("size_pct")
+        if isinstance(sz_val, (int, float)) and not isinstance(sz_val, bool) and float(sz_val) > 0.30 + 1e-9:
+            blocks.append(_block("single_exposure_above_cap", f"size_pct={sz_val}", source="signal"))
+        regime_name = str(signal.get("market_regime") or "")
+        if regime_name in {"short_squeeze_breakout", "crowded_long_defensive"}:
+            if str(signal.get("recommended_order_type") or "") != "LIMIT_MAKER":
+                blocks.append(_block("s2_s4_requires_limit_maker", regime_name, source="signal"))
+        if signal.get("equity_source") == "dry_run_override":
+            blocks.append(_block("dry_run_equity_override_not_live", "REGIME_V2_DRY_RUN_EQUITY_USDT", source="signal"))
     return blocks
 
 

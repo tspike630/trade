@@ -1,0 +1,22 @@
+source_url: https://www.bls.gov/schedule/news_release/empsit.htm
+fetched_at_utc: 2026-11-19T13:20:00Z
+kind: bls_release_table
+indicator: Employment Situation
+relevance: 3
+
+| Reference Month | Release Date | Release Time |
+| --- | --- | --- |
+| October 2026 | Nov. 06, 2026 | 08:30 AM |
+| November 2026 | Dec. 04, 2026 | 08:30 AM |
+| December 2026 | Jan. 08, 2027 | 08:30 AM |
+| January 2027 | Feb. 05, 2027 | 08:30 AM |
+| February 2027 | Mar. 05, 2027 | 08:30 AM |
+| March 2027 | Apr. 02, 2027 | 08:30 AM |
+| April 2027 | May 07, 2027 | 08:30 AM |
+| May 2027 | Jun. 04, 2027 | 08:30 AM |
+| June 2027 | Jul. 02, 2027 | 08:30 AM |
+| July 2027 | Aug. 06, 2027 | 08:30 AM |
+| August 2027 | Sep. 03, 2027 | 08:30 AM |
+| September 2027 | Oct. 08, 2027 | 08:30 AM |
+| October 2027 | Nov. 05, 2027 | 08:30 AM |
+| November 2027 | Dec. 03, 2027 | 08:30 AM |

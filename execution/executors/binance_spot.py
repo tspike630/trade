@@ -4469,6 +4469,7 @@ class BinanceSpotAdapter:
         )
 
     def execute(self, sig: dict[str, Any]) -> dict[str, Any]:
+        self._order_post_attempted = False
         self._size_plan = None
         self._entry_mark = None
         self._orderbook_metrics = None
@@ -5189,6 +5190,7 @@ class BinanceSpotAdapter:
                     )
                 )
         signed = sign_query(pairs, secret)
+        self._order_post_attempted = True
         try:
             placed = client.new_order(signed, api_key=key)
         except Exception as exc:  # noqa: BLE001 — rejection is final; do not post again
@@ -8486,6 +8488,7 @@ class BinanceSpotAdapter:
         return outcome
 
     def _finish(self, result: dict[str, Any]) -> dict[str, Any]:
+        result["order_post_attempted"] = bool(getattr(self, "_order_post_attempted", False))
         plan = getattr(self, "_size_plan", None)
         if isinstance(plan, dict):
             result["size_plan"] = {

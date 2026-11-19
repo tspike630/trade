@@ -14,6 +14,7 @@ native OCO can read them. This module does not place that order.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from logging_setup import get_logger
@@ -33,6 +34,7 @@ from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
 )
+from decision_engine.core.regime_v2_policy import resolve_boll_z, v2_contract_active
 from decision_engine.core.stop_gap import stop_distance_reason
 from decision_engine.strategies.base_strategy import BaseStrategy
 from decision_engine.strategies.entry_sizing import buy_size_fields
@@ -112,6 +114,7 @@ class TechBollFadeStrategy(BaseStrategy):
         """
         self._pending.clear()
         self.rejected = {}
+        purpose = str(data.get("purpose") or "")
         hot = data.get("hot_tokens") or []
         if multi_horizon_regime_enabled() and isinstance(hot, list) and hot:
             hot, _xs_ctx = stamp_cross_sectional_metrics(hot)
@@ -148,7 +151,11 @@ class TechBollFadeStrategy(BaseStrategy):
                         decision.alpha,
                     )
                 continue
-            sized = buy_size_fields(row, floor_pct=self.position_pct)
+            if v2_contract_active():
+                v2_pct = _finite(os.environ.get("REGIME_V2_POSITION_PCT")) or self.position_pct
+                sized = {"size_pct": float(v2_pct), "size_tier": "regime_v2_base", "entry_r3": 0, "size_blockers": ()}
+            else:
+                sized = buy_size_fields(row, floor_pct=self.position_pct)
             tier_multiplier = float(decision.position_size_multiplier or 1.0)
             entry_ref = (
                 decision.limit_price
@@ -186,7 +193,7 @@ class TechBollFadeStrategy(BaseStrategy):
             # After the lift. A quote that still cannot clear 20 USDT is not
             # written. A missing book fails open. Paper never reaches here.
             skip, book_warn = live_buy_notional_skip(size_pct)
-            if book_warn is not None and not book_warned:
+            if book_warn is not None and not book_warned and not v2_contract_active():
                 log.warning("%s", book_warn)
                 book_warned = True
             if skip:
@@ -200,6 +207,13 @@ class TechBollFadeStrategy(BaseStrategy):
                 "beta_vs_btc": symbol_beta_vs_btc(sym_str),
                 "risk_parity_scalar": vol_sized.risk_parity_scalar,
             }
+            if purpose:
+                lift_extra["purpose"] = purpose
+            bz_val = resolve_boll_z(row)
+            if bz_val is not None:
+                lift_extra["boll_z"] = bz_val
+            if row.get("entry_kline_5m_close_ms") is not None:
+                lift_extra["entry_kline_5m_close_ms"] = row["entry_kline_5m_close_ms"]
             if vol_sized.stop_distance_pct is not None:
                 lift_extra["stop_distance_pct"] = vol_sized.stop_distance_pct
             if decision.funding_rate is not None:
