@@ -1,0 +1,5 @@
+source_url: https://www.federalreserve.gov/monetarypolicy/fomcpresconf20261028.htm
+fetched_at_utc: 2026-11-19T13:20:00Z
+kind: fed_statement
+
+FOMC Meeting Statement: PDF | HTML (Released October 28, 2026 at 2:00 p.m.)

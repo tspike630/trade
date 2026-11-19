@@ -1,0 +1,11 @@
+source_url: https://www.bls.gov/schedule/2026/11_sched_list.htm
+fetched_at_utc: 2026-11-19T13:20:00Z
+kind: bls_timezone_note
+
+| Date | Time | Release |
+| --- | --- | --- |
+| Friday, November 06, 2026 | 08:30 AM | Employment Situation for October 2026 |
+| Tuesday, November 10, 2026 | 08:30 AM | Consumer Price Index for October 2026 |
+| Friday, November 13, 2026 | 08:30 AM | Producer Price Index for October 2026 |
+
+NOTE: All times on calendar are Eastern Time.
