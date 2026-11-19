@@ -66,6 +66,40 @@ def _install_network_guard() -> None:
     socket.socket = GuardedSocket  # type: ignore[misc]
 
 
+def open_offline_routed(ledger_path: str, signal: dict[str, Any]) -> dict[str, Any]:
+    """Open one offline position through ``CrossMarginTrack``.
+
+    The caller has already chosen the account domain. This does not read
+    production environment switches and does not open a socket.
+    """
+    client = signal.get("client")
+    intent = signal.get("intent")
+    snapshot = signal.get("snapshot")
+    contract = signal.get("contract")
+    gate = signal.get("gate")
+    if not isinstance(intent, dict) or not isinstance(snapshot, dict) or not isinstance(contract, dict):
+        return {
+            "ok": False,
+            "reason": "offline_payload_missing",
+            "entry": "execution.margin_cross.entry.open_offline_routed",
+            "margin_called": False,
+        }
+    track = CrossMarginTrack(ledger_path, client)
+    opened = track.open_position(intent, snapshot, contract, gate if isinstance(gate, dict) else {})
+    writes: list[str] = []
+    write_log = getattr(client, "write_log", None)
+    if isinstance(write_log, list):
+        writes = [str(name) for name, _payload in write_log]
+    return {
+        "ok": True,
+        "reason": None,
+        "entry": "execution.margin_cross.entry.open_offline_routed",
+        "margin_called": True,
+        "open": opened.as_dict(),
+        "writes": writes,
+    }
+
+
 def run_short_cycle(ledger_path: str) -> dict[str, object]:
     case = short_case()
     track = CrossMarginTrack(ledger_path, case["client"])

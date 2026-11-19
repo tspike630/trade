@@ -175,17 +175,33 @@ def bind_reservation_before_submit(sig: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _text_implies_existing_order(msg: object) -> bool:
+    """Duplicate or already-present wording is not proof that no order exists."""
+    if not isinstance(msg, str):
+        return False
+    lowered = msg.strip().casefold()
+    if not lowered:
+        return False
+    return any(marker in lowered for marker in _UNPROVEN_2010_MARKERS)
+
+
 def _code_2010_proves_no_order(msg: object) -> bool:
     """True only for an exact -2010 text that does not imply an existing order."""
+    if _text_implies_existing_order(msg):
+        return False
     if not isinstance(msg, str):
         return False
     text = msg.strip()
     if not text:
         return False
-    lowered = text.casefold()
-    if any(marker in lowered for marker in _UNPROVEN_2010_MARKERS):
-        return False
     return text in _DEFINITE_2010_NO_ORDER_MESSAGES
+
+
+def _explicit_reject_text(msg: object) -> bool:
+    """A non-empty rejection sentence that does not say an order already exists."""
+    if _text_implies_existing_order(msg):
+        return False
+    return isinstance(msg, str) and bool(msg.strip())
 
 
 def _proven_exchange_rejection(result: Mapping[str, Any]) -> bool:
@@ -202,6 +218,8 @@ def _proven_exchange_rejection(result: Mapping[str, Any]) -> bool:
     if code in _UNKNOWN_EXECUTION_CODES:
         return False
     if err.get("status") != 400:
+        return False
+    if not _explicit_reject_text(err.get("msg")):
         return False
     if code in _DEFINITE_NEW_ORDER_REJECT_CODES:
         return True

@@ -542,6 +542,39 @@ class ReservationLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(get_reservation(self.db, text_code)["status"], "unknown")
 
+    def test_code_1013_duplicate_sentence_stays_occupied_and_is_not_posted_again(self) -> None:
+        key = self._reject_through_gateway(
+            decision_id=147880,
+            symbol="BTCUSDT",
+            exchange_error={"status": 400, "code": -1013, "msg": "Duplicate order sent."},
+            pending=False,
+        )
+        stored = get_reservation(self.db, key)
+        self.assertEqual(stored["status"], "unknown")
+        self.assertIsNone(stored["released_at_ms"])
+        row = _row(
+            decision_id=147880,
+            symbol="BTCUSDT",
+            key=key,
+            mode="live_stub",
+            permitted=True,
+        )
+        _write_decision(self.root / "decision.db", row)
+        adapter = ScriptedSpot(
+            {
+                "ok": False,
+                "submitted": False,
+                "order_post_attempted": True,
+                "exchange_error": {"status": 400, "code": -1013, "msg": "Duplicate order sent."},
+            }
+        )
+        with self._gateway(adapter) as gateway:
+            gateway.process_one(row)
+        self.assertEqual(adapter.calls, [])
+        again = get_reservation(self.db, key)
+        self.assertEqual(again["status"], "unknown")
+        self.assertIsNone(again["released_at_ms"])
+
     def test_http_400_unknown_execution_code_stays_occupied(self) -> None:
         key = _reserve(self.db, decision_id=147850, symbol="BTCUSDT", permitted=True)
         row = _row(

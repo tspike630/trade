@@ -62,10 +62,12 @@ _SWITCHES = (
 # by a third rewrite in this branch.
 _UNTOUCHED = {
     "execution/executors/binance_spot.py": (
-        # Audit candidate keeps both historical pins. It does not add the
-        # merged executor hash, so a third combined file still fails this test.
+        # PR223 protection bytes, PR221 reservation bytes, production pack,
+        # and the reviewed union of the PR223 executor plus the three
+        # order_post_attempted lines. A different third rewrite still fails.
         "1a5c3ffdd2b7b376408e3c66773328a9a092b44f450ef19e15c94ac27ebc596c",
         "6a02fcde777a64e8349c2238c230a4ade2107cdcd337c86022975aa577cacfc9",
+        "ff8124f906841d2d28238af662a6dc292c82dfeb5a410720a282eb97db97fa76",
         "87ef5ed7ed6566bab4f6b7ff0abd4fd33a96811f03cf8f7477a5eb03bede2f00",
     ),
     "execution/executors/binance_spot_gate.py": (
