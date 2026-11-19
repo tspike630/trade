@@ -1054,7 +1054,7 @@ class EntryCancelFormulaBTests(unittest.TestCase):
             self.assertFalse(t2["ok"], t2)
             self.assertFalse(t2["submitted"], t2)
             self.assertEqual(t2["book"], "oco_unknown", t2)
-            self.assertEqual(t2["error"], "oco_unknown_readback_not_resubmit")
+            self.assertEqual(t2["error"], "oco_list_absent:-2018")
             self.assertEqual(len(client.ocos), 1)
             self.assertEqual(client.sells, [])
             only = parse_qs(client.ocos[0])
@@ -1087,7 +1087,7 @@ class EntryCancelFormulaBTests(unittest.TestCase):
                 persist=lambda fields: ledger.update_binance_spot_position(pid, fields),
             )
             self.assertEqual(t3["book"], "oco_unknown", t3)
-            self.assertEqual(t3["error"], "oco_unknown_readback_not_resubmit")
+            self.assertEqual(t3["error"], "oco_list_absent:-2018")
             self.assertEqual(restarted_client.ocos, [])
             self.assertEqual(restarted_client.sells, [])
             after_restart = ledger.binance_spot_position_by_id(pid)

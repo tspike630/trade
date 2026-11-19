@@ -310,7 +310,7 @@ class OfficialOcoFillRequeryTests(unittest.TestCase):
         self.assertNotEqual(done[0]["position_status"], "oco_filled", done[0])
         self.assertEqual(done[0]["error"], "oco_requery_transport", done[0])
         assert row is not None
-        self.assertEqual(row["status"], "oco_working")
+        self.assertEqual(row["status"], "oco_unknown")
         self.assertEqual(row["oco_list_status"], "EXECUTING")
         self.assertEqual(row["last_error"], "oco_requery_transport")
         self.assertIsNone(row["exit_filled_qty"])

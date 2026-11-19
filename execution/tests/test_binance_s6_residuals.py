@@ -706,7 +706,16 @@ class ResidualS6Tests(unittest.TestCase):
                 self.assertEqual(buy["quoteOrderQty"], ["25"])
                 gw.ledger.update_binance_spot_position(
                     int(gw.ledger.binance_spot_position_by_decision(6)["id"]),  # type: ignore[index]
-                    {"quantity": "0.004", "status": "open", "protection": "loop_fallback"},
+                    {
+                        "quantity": "0.004",
+                        "status": "open",
+                        "protection": "loop_fallback",
+                        "oco_order_list_id": None,
+                        "oco_list_client_id": None,
+                        "oco_above_order_id": None,
+                        "oco_below_order_id": None,
+                        "last_error": None,
+                    },
                 )
                 dusted = tick_live_bnb_exits(
                     gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "100"}

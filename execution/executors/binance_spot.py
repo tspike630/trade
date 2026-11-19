@@ -2297,6 +2297,159 @@ class BinanceSpotAdapter:
         band = self._held_band_error(row, mark)
         return band is None, band
 
+    def _decoded_oco_rejection(self, row: dict[str, Any]) -> bool:
+        """A POST the exchange decoded and refused. That path stays as it is."""
+        return str(row.get("last_error") or "").startswith("oco_rejected:")
+
+    def _list_identity(self, row: dict[str, Any]) -> bool:
+        return bool(
+            str(row.get("oco_list_client_id") or "").strip()
+            or str(row.get("oco_order_list_id") or "").strip()
+        )
+
+    def _unconfirmed_submit_marker(self, row: dict[str, Any]) -> bool:
+        """An error that says a submit or a list read was not confirmed.
+
+        No list id is invented from this text. The row is held for a person.
+        """
+        prior = str(row.get("last_error") or "")
+        if prior in {
+            "oco_submit_timeout",
+            "native_oco_unverified",
+            "oco_unknown_readback_not_resubmit",
+            "oco_readback_not_protective",
+            "oco_readback_symbol_mismatch",
+            "oco_readback_list_mismatch",
+            "oco_requery_missing",
+            "oco_requery_transport",
+            "oco_requery_failed",
+            "oco_requery_unsupported",
+            "oco_leg_requery_failed",
+        }:
+            return True
+        return prior.startswith(("oco_list_absent:", "oco_requery_", "binance_http_error:"))
+
+    def _claim_gate(self, row: dict[str, Any], status: str) -> bool:
+        """Only a held row must prove the HTTP 200 before protection is restored.
+
+        An already working or partial row keeps its existing refresh, ratchet,
+        and verified terminal settlement.
+        """
+        return status == "oco_unknown" or (
+            status in {"open", "oco_failed"} and self._readback_hold_row(row, status)
+        )
+
+    def _readback_hold_row(self, row: dict[str, Any], status: str) -> bool:
+        """Rows whose exchange protection is not confirmed, so a new buy waits.
+
+        A decoded ``oco_rejected:`` POST is not this set. An ``open`` row that
+        has never stored a list id and has none of these errors is still the
+        first OCO placement.
+        """
+        if status in _LIST_MISS_HOLD_STATUSES:
+            return True
+        if status not in {"open", "oco_failed"} or self._decoded_oco_rejection(row):
+            return False
+        return self._list_identity(row) or self._unconfirmed_submit_marker(row)
+
+    def _persist_readback_hold(
+        self,
+        row: dict[str, Any],
+        save: Callable[[dict[str, Any]], None],
+        error: str,
+    ) -> dict[str, Any]:
+        """Persist the real read reason and block new buys of this purpose.
+
+        Prices, quantity, and list ids stay. This does not POST or sell, and
+        it does not create an exchange OCO.
+        """
+        prior = str(row.get("last_error") or "")
+        if prior.startswith("oco_rejected:") or prior.startswith("oco_unprotectable:"):
+            stored = prior
+        else:
+            stored = error or prior or "oco_readback_not_protective"
+        save(
+            {
+                "status": "oco_unknown",
+                "protection": PROTECTION_PENDING,
+                "last_error": stored,
+                "manual_action": "halt_new_buys_and_manually_close_or_protect_the_fill",
+            }
+        )
+        return self._coverage(
+            row,
+            book="oco_unknown",
+            submitted=False,
+            error=stored,
+            protection=PROTECTION_PENDING,
+        )
+
+    def _list_payload(self, recon: dict[str, Any]) -> dict[str, Any]:
+        raw = recon.get("raw_payload")
+        return raw if isinstance(raw, dict) else {}
+
+    def _identity_conflict(self, row: dict[str, Any], recon: dict[str, Any]) -> str | None:
+        """A body that names a different symbol, list, or leg. Missing fields do not conflict."""
+        raw = self._list_payload(recon)
+        reported = str(raw.get("symbol") or "").strip().upper()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if reported and symbol and reported != symbol:
+            return "oco_readback_symbol_mismatch"
+        stored_list = str(row.get("oco_order_list_id") or "").strip()
+        got_list = str(recon.get("order_list_id") or "").strip()
+        if stored_list and got_list and stored_list != got_list:
+            return "oco_readback_list_mismatch"
+        stored_client = str(row.get("oco_list_client_id") or "").strip()
+        got_client = str(raw.get("listClientOrderId") or "").strip()
+        if stored_client and got_client and stored_client != got_client:
+            return "oco_readback_list_mismatch"
+        for stored_key, got_key in (
+            ("oco_above_order_id", "above_order_id"),
+            ("oco_below_order_id", "below_order_id"),
+        ):
+            stored = str(row.get(stored_key) or "").strip()
+            got = str(recon.get(got_key) or "").strip()
+            if stored and got and stored != got:
+                return "oco_readback_list_mismatch"
+        return None
+
+    def _protective_claim(self, row: dict[str, Any], recon: dict[str, Any]) -> bool:
+        """True when this HTTP 200 is the same live list and both legs cover the hold.
+
+        A body with no symbol, a different id, or legs that do not cover the
+        quantity does not clear the readback block. The list payload has no
+        account uid; the query is the adapter's signed key, and the symbol
+        plus list identity are what this body can prove.
+        """
+        if self._identity_conflict(row, recon):
+            return False
+        raw = self._list_payload(recon)
+        if not str(raw.get("symbol") or "").strip():
+            return False
+        stored_list = str(row.get("oco_order_list_id") or "").strip()
+        stored_client = str(row.get("oco_list_client_id") or "").strip()
+        got_list = str(recon.get("order_list_id") or "").strip()
+        got_client = str(raw.get("listClientOrderId") or "").strip()
+        if stored_list and got_list != stored_list:
+            return False
+        if stored_client and got_client != stored_client:
+            return False
+        if not stored_list and not stored_client:
+            return False
+        held = _to_decimal(row.get("quantity"))
+        above = str(recon.get("above_order_id") or "").strip()
+        below = str(recon.get("below_order_id") or "").strip()
+        if held is None or held <= 0 or not got_list or not above or not below:
+            return False
+        return oco_readback_covers(
+            raw,
+            symbol=str(row.get("symbol") or ""),
+            held_net=held,
+            list_id=got_list,
+            above_id=above,
+            below_id=below,
+        )
+
     def _held_band_error(self, row: dict[str, Any], mark: object) -> str | None:
         """Whether this held row can still host the original stop and take-profit."""
         if _to_decimal(mark) is None:
@@ -5483,6 +5636,14 @@ class BinanceSpotAdapter:
             recon = self._reconcile_oco(row)
             state = str(recon.get("state") or "")
             if state in {"working", "partial_working"}:
+                if self._claim_gate(row, status):
+                    conflict = self._identity_conflict(row, recon)
+                    if conflict or not self._protective_claim(row, recon):
+                        return self._persist_readback_hold(
+                            row,
+                            save,
+                            conflict or "oco_readback_not_protective",
+                        )
                 if native_oco_verified(_recon_payload(recon))[0] is None:
                     save(
                         {
@@ -5509,6 +5670,8 @@ class BinanceSpotAdapter:
                     residual_qty=row.get("residual_qty"),
                     submitted=False,
                 )
+                if status == "oco_unknown" and str(row.get("status") or "") == "oco_working":
+                    save({"manual_action": None})
                 hold_limit_sec = self._effective_max_hold_sec(row)
                 if hold_limit_sec > 0:
                     created_ms = _row_epoch_ms(row)
@@ -5538,6 +5701,16 @@ class BinanceSpotAdapter:
                     error="oco_lot_residual" if uncovered else None,
                 )
             if state == "filled":
+                if self._claim_gate(row, status):
+                    conflict = self._identity_conflict(row, recon)
+                    raw_list = self._list_payload(recon)
+                    reports = raw_list.get("orderReports") if isinstance(raw_list.get("orderReports"), list) else None
+                    if conflict or not reports:
+                        return self._persist_readback_hold(
+                            row,
+                            save,
+                            conflict or "oco_readback_not_protective",
+                        )
                 fields = self._official_oco_fill_fields(row, recon)
                 if fields is not None:
                     save(fields)
@@ -5557,6 +5730,8 @@ class BinanceSpotAdapter:
                 state = "partial"
             if state == "requery_failed":
                 error = str(recon.get("error") or "oco_requery_failed")
+                if self._readback_hold_row(row, status):
+                    return self._persist_readback_hold(row, save, error)
                 prior = str(row.get("last_error") or "")
                 clear_ev = (
                     {col: None for col in OCO_READBACK_COLUMNS}
@@ -5584,27 +5759,14 @@ class BinanceSpotAdapter:
                     error=error,
                     protection=row.get("protection") or PROTECTION_PENDING,
                 )
-            if state == "absent" and status in _LIST_MISS_HOLD_STATUSES:
-                # An absent read, including confirmed HTTP 400
-                # {"code":-2018,"msg":"Order list does not exist."}, is not
-                # proof the tracked list is gone. In or out of the band, this
-                # pass stops after that one read: no replacement POST, no
-                # market sell, and no stop or take-profit rewrite. A later
-                # HTTP 200 takes the working path above and claims that list.
-                if status != "oco_unknown":
-                    save(
-                        {
-                            "status": "oco_unknown",
-                            "protection": PROTECTION_PENDING,
-                            "last_error": _UNKNOWN_OCO_READBACK_HOLD,
-                        }
-                    )
-                return self._coverage(
+            if state == "absent" and self._readback_hold_row(row, status):
+                # One read, then stop. The stored error keeps the real reason:
+                # confirmed HTTP 400 / -2018, or oco_requery_missing when this
+                # row has no list id. It does not POST or sell.
+                return self._persist_readback_hold(
                     row,
-                    book="oco_unknown",
-                    submitted=False,
-                    error=_UNKNOWN_OCO_READBACK_HOLD,
-                    protection=row.get("protection") or PROTECTION_PENDING,
+                    save,
+                    str(recon.get("error") or "oco_requery_missing"),
                 )
             if state == "absent":
                 allowed, band = self._repost_band(row, mark)
@@ -5651,6 +5813,15 @@ class BinanceSpotAdapter:
                     )
                 retry_place = True
             if state in {"unfilled", "partial"}:
+                raw_list = self._list_payload(recon)
+                reports = raw_list.get("orderReports") if isinstance(raw_list.get("orderReports"), list) else None
+                conflict = self._identity_conflict(row, recon)
+                if self._claim_gate(row, status) and (conflict or not reports):
+                    return self._persist_readback_hold(
+                        row,
+                        save,
+                        conflict or "oco_readback_not_protective",
+                    )
                 close_state = self._account_oco_execution(row, recon, save)
                 mapped = self._coverage_from_account(row, recon, close_state)
                 if mapped is not None:
@@ -5716,6 +5887,12 @@ class BinanceSpotAdapter:
                     protection=PROTECTION_PENDING,
                 )
             elif state and state != "absent":
+                if self._readback_hold_row(row, status):
+                    return self._persist_readback_hold(
+                        row,
+                        save,
+                        str(recon.get("error") or "oco_requery_failed"),
+                    )
                 save({"last_error": recon.get("error") or "oco_requery_failed"})
                 return self._coverage(
                     row,
@@ -5725,6 +5902,12 @@ class BinanceSpotAdapter:
                     protection=PROTECTION_PENDING,
                 )
 
+        if self._readback_hold_row(row, str(row.get("status") or status)):
+            return self._persist_readback_hold(
+                row,
+                save,
+                str(row.get("last_error") or "oco_readback_not_protective"),
+            )
         if retry_place or str(row.get("status") or "") in {"open", "oco_failed"}:
             placed = self._try_place_oco(row, mark, save)
             if placed is not None:
