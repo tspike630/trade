@@ -77,9 +77,12 @@ class PublicReleaseCalendarTests(unittest.TestCase):
         self.assertEqual(statement.halt_reason, "central_bank_blackout")
 
     def test_after_the_last_sourced_release_day_still_locks(self) -> None:
-        # 88415f4 treats a later release clock as coverage. The lock is the
-        # day after this file's last sourced clock, not an empty day inside it.
         status = evaluate_macro_gate(self.db, now_ms=_ms("2027-12-16T16:00:00Z"))
+        self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
+        self.assertEqual(status.detail, "release_calendar_not_covering_query_day")
+
+    def test_a_later_release_does_not_cover_an_empty_day(self) -> None:
+        status = evaluate_macro_gate(self.db, now_ms=_ms("2026-11-12T16:00:00Z"))
         self.assertEqual(status.halt_reason, "macro_lseg_stale_or_missing")
         self.assertEqual(status.detail, "release_calendar_not_covering_query_day")
 

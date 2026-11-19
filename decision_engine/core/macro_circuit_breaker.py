@@ -456,32 +456,32 @@ def _evaluate_dynamic_surprise(
 def _release_calendar_gap(conn: sqlite3.Connection, now_ms: int) -> str | None:
     """Return why this UTC day has no release clock, or None when it has one.
 
-    ``local_time_hkt`` with no clock is the ECOCAL reference date. A clock
-    with no ``utc_ms`` has no timezone. Neither one can clear an intraday
-    window. A release clock on this UTC day, or later, can.
+    A date-only ``local_time_hkt`` is not a release. A clock with no ``utc_ms``
+    has no timezone. A release on a later day does not cover this day: one
+    future row is not continuous coverage.
     """
     release_n = 0
     unzoned_n = 0
-    max_ms: int | None = None
+    day_start = now_ms - (now_ms % 86_400_000)
+    day_end = day_start + 86_400_000
+    on_day = 0
     for table in ("macro_events", "central_bank_events"):
         row = conn.execute(
             f"""
             SELECT
                 SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL THEN 1 ELSE 0 END),
-                MAX(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL THEN utc_ms END),
-                SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NULL THEN 1 ELSE 0 END)
+                SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms >= ? AND utc_ms < ? THEN 1 ELSE 0 END)
             FROM {table}
-            """
+            """,
+            (day_start, day_end),
         ).fetchone()
         release_n += int(row[0] or 0)
-        if row[1] is not None:
-            stamp = int(row[1])
-            max_ms = stamp if max_ms is None else max(max_ms, stamp)
-        unzoned_n += int(row[2] or 0)
+        unzoned_n += int(row[1] or 0)
+        on_day += int(row[2] or 0)
     if release_n == 0:
         return "release_clock_unzoned" if unzoned_n else "release_clock_absent"
-    day_start = now_ms - (now_ms % 86_400_000)
-    if max_ms is None or max_ms < day_start:
+    if on_day == 0:
         return "release_calendar_not_covering_query_day"
     return None
 
