@@ -62,7 +62,7 @@ _SWITCHES = (
 # by a third rewrite in this branch.
 _UNTOUCHED = {
     "execution/executors/binance_spot.py": (
-        "fb463ebaa7b71135e1eb1ef3e0b16ac0b193179a063595d7face66bafeb459c6",
+        "f24ca6135432a063cc94604739041b18700af2659f2d511a14ddbbcbe263a149",
         "87ef5ed7ed6566bab4f6b7ff0abd4fd33a96811f03cf8f7477a5eb03bede2f00",
     ),
     "execution/executors/binance_spot_gate.py": (
