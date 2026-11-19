@@ -1,11 +1,12 @@
-"""Explicit cross-margin risk contract.
+"""Explicit cross-margin risk contract with zero threshold defaults.
 
 Missing, non-finite, stale, or mismatched inputs fail closed.
-By default ``CROSS_MARGIN_PARAMETERS_APPROVED`` is off, so ``parameters_approved``
-must be false and only offline fixture verification can run. When operator
-approval is explicitly enabled via ``CROSS_MARGIN_PARAMETERS_APPROVED=1``,
-``parameters_approved=True`` is validated against the ruled risk ceilings in
-``execution.margin_cross.policy``.
+- When ``parameters_approved`` is ``False``, execution is strictly restricted to
+  ``offline_fixture`` mode with ``FIXTURE_UNAPPROVED_NOT_A_STRATEGY``; optional
+  approved-tier fields remain ``None`` (never filled with policy defaults).
+- When ``parameters_approved`` is ``True``, EVERY risk ceiling and margin-level
+  threshold on the contract is mandatory (missing -> rejected), and is cross-checked
+  against the explicit zero-default ``ApprovedRiskConfig``.
 """
 
 from __future__ import annotations
@@ -18,21 +19,14 @@ from execution.margin_cross.money import on_grid, parse_decimal
 from execution.margin_cross.policy import (
     ALLOWED_MARGIN_LEVEL_STATUSES,
     APPROVED_CONTRACT_LABEL,
-    APPROVED_CROSS_MARGIN_STRATEGIES,
     APPROVED_DRY_RUN_MODE,
-    EMERGENCY_MARGIN_LEVEL,
     EMERGENCY_MARGIN_LEVEL_STATUSES,
+    HARD_CLASSIC_CROSS_LEVERAGE_CEILING,
     LIVE_EXECUTION_MODE,
-    MAX_ACCOUNT_LEVERAGE,
-    MAX_ALLOWED_INTEREST_HORIZON_HOURS,
-    MAX_ALLOWED_SNAPSHOT_AGE_MS,
-    MAX_BORROWABLE_POOL_RATIO,
-    MAX_EFFECTIVE_LEVERAGE,
-    MAX_TOTAL_LIABILITY_NET_RATIO,
     MCP_FORBIDDEN_UID,
-    MIN_ENTRY_MARGIN_LEVEL,
-    MIN_ORDER_NOTIONAL_USDT,
-    WARN_MARGIN_LEVEL,
+    SUPPORTED_REGIME_STRATEGIES,
+    ApprovedRiskConfig,
+    load_approved_risk_config,
     live_enabled_by_env,
     parameters_approved_by_env,
 )
@@ -104,9 +98,12 @@ class Contract:
     max_base_over_liability: Decimal
     strategy_id: str
     borrow_step: Decimal
-    max_effective_leverage: Decimal = MAX_EFFECTIVE_LEVERAGE
-    warn_margin_level: Decimal = WARN_MARGIN_LEVEL
-    emergency_margin_level: Decimal = EMERGENCY_MARGIN_LEVEL
+    max_effective_leverage: Decimal | None = None
+    warn_margin_level: Decimal | None = None
+    emergency_margin_level: Decimal | None = None
+    max_total_liability_net_ratio: Decimal | None = None
+    max_borrowable_pool_ratio: Decimal | None = None
+    min_order_notional_usdt: Decimal | None = None
     formula_b_enabled: bool = False
 
 
@@ -190,17 +187,22 @@ def _dec(
     return number
 
 
-def _opt_dec(
+def _fixture_optional_or_approved_required_dec(
     raw: Mapping[str, object],
     field: str,
-    default: Decimal,
-    reasons: list[str],
     *,
-    positive: bool = True,
-) -> Decimal:
-    if field not in raw or raw.get(field) is None:
-        return default
-    return _dec(raw, field, reasons, positive=positive)
+    required: bool,
+    reasons: list[str],
+) -> Decimal | None:
+    """No fallback threshold numbers: required when approved; ``None`` only if absent in fixture."""
+    if field not in raw:
+        if required:
+            reasons.append(f"{field}_missing")
+        return None
+    if raw.get(field) is None:
+        reasons.append(f"{field}_invalid")
+        return None
+    return _dec(raw, field, reasons, positive=True)
 
 
 def _dec_map(
@@ -213,23 +215,14 @@ def _dec_map(
         return parsed
     for key, item in value.items():
         if not isinstance(key, str) or key.strip() == "":
-            reasons.append(f"{field}_invalid")
+            reasons.append(f"{field}_key_invalid")
             continue
         number, problem = parse_decimal(item, f"{field}.{key}")
         if problem or number is None or number < 0:
-            reasons.append(problem or f"{field}_invalid")
+            reasons.append(problem or f"{field}.{key}_invalid")
             continue
         parsed[key] = number
     return parsed
-
-
-def parse_filters(raw: Mapping[str, object], reasons: list[str]) -> Filters:
-    return Filters(
-        tick_size=_dec(raw, "tick_size", reasons, positive=True),
-        step_size=_dec(raw, "step_size", reasons, positive=True),
-        min_qty=_dec(raw, "min_qty", reasons, positive=True),
-        min_notional=_dec(raw, "min_notional", reasons, positive=True),
-    )
 
 
 def _assets(raw: Mapping[str, object], reasons: list[str]) -> dict[str, AssetRow]:
@@ -270,13 +263,22 @@ def _assets(raw: Mapping[str, object], reasons: list[str]) -> dict[str, AssetRow
 def parse_snapshot(raw: Mapping[str, object]) -> tuple[Snapshot | None, list[str]]:
     reasons: list[str] = []
     filters_raw = raw.get("filters")
-    filters = parse_filters(filters_raw if isinstance(filters_raw, Mapping) else {}, reasons)
-    status_raw = raw.get("margin_level_status", "EXCESSIVE")
-    if not isinstance(status_raw, str) or status_raw.strip().upper() not in _ALL_MARGIN_STATUSES:
-        reasons.append("margin_level_status_invalid")
-        margin_status = "EXCESSIVE"
+    if not isinstance(filters_raw, Mapping):
+        reasons.append("filters_invalid")
+        filters = Filters(Decimal(0), Decimal(0), Decimal(0), Decimal(0))
     else:
-        margin_status = status_raw.strip().upper()
+        filters = Filters(
+            tick_size=_dec(filters_raw, "tick_size", reasons, positive=True),
+            step_size=_dec(filters_raw, "step_size", reasons, positive=True),
+            min_qty=_dec(filters_raw, "min_qty", reasons, positive=True),
+            min_notional=_dec(filters_raw, "min_notional", reasons, positive=True),
+        )
+    raw_status = raw.get("margin_level_status", "EXCESSIVE")
+    if not isinstance(raw_status, str) or raw_status.strip().upper() not in _ALL_MARGIN_STATUSES:
+        reasons.append("margin_level_status_invalid")
+        status_norm = ""
+    else:
+        status_norm = raw_status.strip().upper()
     snapshot = Snapshot(
         uid=_text(raw, "uid", reasons),
         margin_mode=_text(raw, "margin_mode", reasons),
@@ -291,15 +293,15 @@ def parse_snapshot(raw: Mapping[str, object]) -> tuple[Snapshot | None, list[str
         max_borrowable=_dec_map(raw, "max_borrowable", reasons),
         borrow_limit=_dec_map(raw, "borrow_limit", reasons),
         hourly_interest_rate=_dec_map(raw, "hourly_interest_rate", reasons),
-        bid_qty=_dec(raw, "bid_qty", reasons, positive=True),
-        ask_qty=_dec(raw, "ask_qty", reasons, positive=True),
+        bid_qty=_dec(raw, "bid_qty", reasons),
+        ask_qty=_dec(raw, "ask_qty", reasons),
         reference_price=_dec(raw, "reference_price", reasons, positive=True),
         filters=filters,
         fee_rate=_dec(raw, "fee_rate", reasons),
         fee_asset=_text(raw, "fee_asset", reasons),
-        margin_level_status=margin_status,
+        margin_level_status=status_norm,
     )
-    if snapshot.fee_rate < 0 or snapshot.fee_rate >= 1:
+    if snapshot.fee_rate < 0:
         reasons.append("fee_rate_invalid")
     return (None, reasons) if reasons else (snapshot, [])
 
@@ -308,10 +310,7 @@ def parse_contract(raw: Mapping[str, object]) -> tuple[Contract | None, list[str
     reasons: list[str] = []
     approved_raw = raw.get("parameters_approved")
     if not isinstance(approved_raw, bool):
-        reasons.append("parameters_approved_must_be_false")
-        approved_flag = False
-    elif approved_raw is True and not parameters_approved_by_env():
-        reasons.append("parameters_approved_must_be_false")
+        reasons.append("parameters_approved_invalid")
         approved_flag = False
     else:
         approved_flag = approved_raw
@@ -322,6 +321,25 @@ def parse_contract(raw: Mapping[str, object]) -> tuple[Contract | None, list[str
         formula_b = False
     else:
         formula_b = formula_b_raw
+
+    max_eff_lev = _fixture_optional_or_approved_required_dec(
+        raw, "max_effective_leverage", required=approved_flag, reasons=reasons
+    )
+    warn_ml = _fixture_optional_or_approved_required_dec(
+        raw, "warn_margin_level", required=approved_flag, reasons=reasons
+    )
+    emerg_ml = _fixture_optional_or_approved_required_dec(
+        raw, "emergency_margin_level", required=approved_flag, reasons=reasons
+    )
+    tot_liab_ratio = _fixture_optional_or_approved_required_dec(
+        raw, "max_total_liability_net_ratio", required=approved_flag, reasons=reasons
+    )
+    pool_ratio = _fixture_optional_or_approved_required_dec(
+        raw, "max_borrowable_pool_ratio", required=approved_flag, reasons=reasons
+    )
+    min_notional_usdt = _fixture_optional_or_approved_required_dec(
+        raw, "min_order_notional_usdt", required=approved_flag, reasons=reasons
+    )
 
     contract = Contract(
         account_uid=_text(raw, "account_uid", reasons),
@@ -340,13 +358,12 @@ def parse_contract(raw: Mapping[str, object]) -> tuple[Contract | None, list[str
         max_base_over_liability=_dec(raw, "max_base_over_liability", reasons),
         strategy_id=_text(raw, "strategy_id", reasons),
         borrow_step=_dec(raw, "borrow_step", reasons, positive=True),
-        max_effective_leverage=_opt_dec(
-            raw, "max_effective_leverage", MAX_EFFECTIVE_LEVERAGE, reasons
-        ),
-        warn_margin_level=_opt_dec(raw, "warn_margin_level", WARN_MARGIN_LEVEL, reasons),
-        emergency_margin_level=_opt_dec(
-            raw, "emergency_margin_level", EMERGENCY_MARGIN_LEVEL, reasons
-        ),
+        max_effective_leverage=max_eff_lev,
+        warn_margin_level=warn_ml,
+        emergency_margin_level=emerg_ml,
+        max_total_liability_net_ratio=tot_liab_ratio,
+        max_borrowable_pool_ratio=pool_ratio,
+        min_order_notional_usdt=min_notional_usdt,
         formula_b_enabled=formula_b,
     )
     if contract.interest_horizon_hours < 0:
@@ -355,24 +372,37 @@ def parse_contract(raw: Mapping[str, object]) -> tuple[Contract | None, list[str
         reasons.append("max_base_over_liability_invalid")
     if contract.max_snapshot_age_ms <= 0:
         reasons.append("max_snapshot_age_ms_invalid")
-    if approved_flag:
-        if contract.max_leverage > MAX_ACCOUNT_LEVERAGE:
-            reasons.append("contract_max_leverage_exceeds_policy")
-        if contract.max_effective_leverage > MAX_EFFECTIVE_LEVERAGE:
-            reasons.append("contract_effective_leverage_exceeds_policy")
-        if contract.min_margin_level < MIN_ENTRY_MARGIN_LEVEL:
-            reasons.append("contract_min_margin_level_below_policy")
-        if not (
-            EMERGENCY_MARGIN_LEVEL
-            <= contract.emergency_margin_level
-            < contract.warn_margin_level
-            <= contract.min_margin_level
+    if approved_flag and not parameters_approved_by_env():
+        reasons.append("parameters_approved_must_be_false")
+    if approved_flag and not reasons:
+        if contract.max_leverage > HARD_CLASSIC_CROSS_LEVERAGE_CEILING:
+            reasons.append("contract_max_leverage_exceeds_classic_cross_ceiling")
+        if (
+            contract.max_effective_leverage is None
+            or contract.max_effective_leverage > contract.max_leverage
+        ):
+            reasons.append("contract_effective_leverage_exceeds_max_leverage")
+        if (
+            contract.emergency_margin_level is None
+            or contract.warn_margin_level is None
+            or not (
+                Decimal(1)
+                < contract.emergency_margin_level
+                < contract.warn_margin_level
+                < contract.min_margin_level
+            )
         ):
             reasons.append("contract_margin_ladder_invalid")
-        if contract.max_snapshot_age_ms > MAX_ALLOWED_SNAPSHOT_AGE_MS:
-            reasons.append("contract_snapshot_age_exceeds_policy")
-        if contract.interest_horizon_hours > MAX_ALLOWED_INTEREST_HORIZON_HOURS:
-            reasons.append("contract_interest_horizon_exceeds_policy")
+        if (
+            contract.max_total_liability_net_ratio is None
+            or contract.max_total_liability_net_ratio > Decimal(1)
+        ):
+            reasons.append("contract_total_liability_ratio_invalid")
+        if (
+            contract.max_borrowable_pool_ratio is None
+            or contract.max_borrowable_pool_ratio > Decimal(1)
+        ):
+            reasons.append("contract_borrowable_pool_ratio_invalid")
     return (None, reasons) if reasons else (contract, [])
 
 
@@ -436,7 +466,12 @@ def _projected_effective_leverage(
 
 
 def contract_identity_reasons(
-    intent: Intent, contract: Contract, snapshot: Snapshot, gate: Gate
+    intent: Intent,
+    contract: Contract,
+    snapshot: Snapshot,
+    gate: Gate,
+    *,
+    approved_config: ApprovedRiskConfig | None = None,
 ) -> list[str]:
     reasons: list[str] = []
     if intent.purpose != PURPOSE_CROSS_MARGIN_TRACK:
@@ -455,6 +490,11 @@ def contract_identity_reasons(
     else:
         if not parameters_approved_by_env():
             reasons.append("parameters_approved_must_be_false")
+        cfg = approved_config
+        if cfg is None:
+            cfg, cfg_reasons = load_approved_risk_config()
+            if cfg is None:
+                reasons.extend(cfg_reasons)
         if gate.execution_mode not in {APPROVED_DRY_RUN_MODE, LIVE_EXECUTION_MODE}:
             reasons.append("execution_mode_invalid_for_approved_contract")
         if gate.execution_mode == LIVE_EXECUTION_MODE and not live_enabled_by_env():
@@ -463,11 +503,51 @@ def contract_identity_reasons(
             reasons.append("approved_label_mismatch")
         if (
             intent.strategy_id != contract.strategy_id
-            or intent.strategy_id not in APPROVED_CROSS_MARGIN_STRATEGIES
+            or intent.strategy_id not in SUPPORTED_REGIME_STRATEGIES
+            or (cfg is not None and intent.strategy_id not in cfg.approved_strategies)
         ):
             reasons.append("strategy_not_in_approved_allowlist")
         if snapshot.account_type != "MARGIN_1":
             reasons.append("account_type_not_classic_cross_margin")
+        if cfg is not None:
+            if contract.max_leverage > cfg.max_leverage:
+                reasons.append("contract_max_leverage_exceeds_approved_config")
+            if (
+                contract.max_effective_leverage is None
+                or contract.max_effective_leverage > cfg.max_effective_leverage
+            ):
+                reasons.append("contract_effective_leverage_exceeds_approved_config")
+            if contract.min_margin_level < cfg.min_entry_margin_level:
+                reasons.append("contract_min_margin_level_below_approved_config")
+            if (
+                contract.warn_margin_level is None
+                or contract.warn_margin_level < cfg.warn_margin_level
+            ):
+                reasons.append("contract_warn_margin_level_below_approved_config")
+            if (
+                contract.emergency_margin_level is None
+                or contract.emergency_margin_level < cfg.emergency_margin_level
+            ):
+                reasons.append("contract_emergency_margin_level_below_approved_config")
+            if contract.max_snapshot_age_ms > cfg.max_snapshot_age_ms:
+                reasons.append("contract_snapshot_age_exceeds_approved_config")
+            if contract.interest_horizon_hours > cfg.interest_horizon_hours:
+                reasons.append("contract_interest_horizon_exceeds_approved_config")
+            if (
+                contract.max_total_liability_net_ratio is None
+                or contract.max_total_liability_net_ratio > cfg.max_total_liability_net_ratio
+            ):
+                reasons.append("contract_total_liability_exceeds_approved_config")
+            if (
+                contract.max_borrowable_pool_ratio is None
+                or contract.max_borrowable_pool_ratio > cfg.max_borrowable_pool_ratio
+            ):
+                reasons.append("contract_pool_ratio_exceeds_approved_config")
+            if (
+                contract.min_order_notional_usdt is None
+                or contract.min_order_notional_usdt < cfg.min_order_notional_usdt
+            ):
+                reasons.append("contract_min_notional_below_approved_config")
 
     uids = {intent.account_uid, contract.account_uid, snapshot.uid}
     if len(uids) != 1:
@@ -513,8 +593,12 @@ def contract_identity_reasons(
     notional = intent.quantity * intent.limit_price
     if notional < filters.min_notional:
         reasons.append("entry_notional_below_min")
-    if contract.parameters_approved and notional < MIN_ORDER_NOTIONAL_USDT:
-        reasons.append("notional_below_20_usdt_floor")
+    if (
+        contract.parameters_approved
+        and contract.min_order_notional_usdt is not None
+        and notional < contract.min_order_notional_usdt
+    ):
+        reasons.append("notional_below_approved_floor")
     reference = snapshot.reference_price
     if intent.action == "OPEN_SHORT":
         if not (
@@ -529,7 +613,11 @@ def contract_identity_reasons(
             reasons.append("asset_max_borrowable_missing")
         elif intent.quantity > borrowable:
             reasons.append("asset_borrow_insufficient")
-        elif contract.parameters_approved and intent.quantity > borrowable * MAX_BORROWABLE_POOL_RATIO:
+        elif (
+            contract.parameters_approved
+            and contract.max_borrowable_pool_ratio is not None
+            and intent.quantity > borrowable * contract.max_borrowable_pool_ratio
+        ):
             reasons.append("asset_borrow_exceeds_pool_safety_cap")
         tier_limit = snapshot.borrow_limit.get(contract.borrow_asset)
         if contract.parameters_approved and tier_limit is not None and tier_limit > 0:
@@ -558,9 +646,15 @@ def contract_identity_reasons(
         if proj_lev is None or proj_liab is None:
             reasons.append("net_asset_not_positive")
         else:
-            if proj_lev > contract.max_effective_leverage:
+            if (
+                contract.max_effective_leverage is not None
+                and proj_lev > contract.max_effective_leverage
+            ):
                 reasons.append("effective_leverage_exceeded")
-            if proj_liab > MAX_TOTAL_LIABILITY_NET_RATIO:
+            if (
+                contract.max_total_liability_net_ratio is not None
+                and proj_liab > contract.max_total_liability_net_ratio
+            ):
                 reasons.append("total_liability_exceeds_cap")
     if snapshot.fee_asset not in {intent.base_asset, intent.quote_asset}:
         reasons.append("fee_asset_unmodeled")

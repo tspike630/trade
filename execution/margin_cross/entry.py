@@ -115,6 +115,7 @@ def _plan_from_signal_doc(
         planned_take_profit=Decimal(str(doc["take_profit_price"])),
         stop_price=Decimal(str(doc["stop_price"])),
         stop_limit_price=Decimal(str(doc["stop_limit_price"])),
+        risk_config=doc.get("approved_risk_config"),
         macro_halt=doc.get("macro_halt"),
     )
 
@@ -196,6 +197,7 @@ def run_live_command(
         base_url=base_url,
         opener=opener,
         clock_ms=now_fn,
+        kill_switch_path=kill_switch_path,
     )
     track = CrossMarginTrack(
         ledger_path,

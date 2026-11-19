@@ -193,7 +193,9 @@ def build_query_order_payload(symbol: str, client_order_id: str) -> dict[str, st
 
 
 def build_query_oco_payload(symbol: str, list_client_order_id: str) -> dict[str, str]:
-    del symbol  # Cross-margin GET /sapi/v1/margin/orderList forbids symbol.
+    # Official Margin REST docs require symbol when isIsolated="TRUE" and mark it
+    # optional for Cross Margin (isIsolated="FALSE"); omitted locally by policy.
+    del symbol
     return {
         "isIsolated": CROSS_ISOLATED_FLAG,
         "origClientOrderId": list_client_order_id,

@@ -54,9 +54,11 @@ from execution.margin_cross.policy import (
     EMERGENCY_MARGIN_LEVEL_STATUSES,
     LIVE_EXECUTION_MODE,
     PENDING_TRANSACTION_CODE,
+    ApprovedRiskConfig,
     fill_tp_formula_b_enabled,
     kill_switch_active,
     live_gate_reasons,
+    load_approved_risk_config,
     parameters_approved_by_env,
 )
 from execution.margin_cross.protection import otoco_submission_block, plan_oco
@@ -132,15 +134,18 @@ class CrossMarginTrack:
         *,
         allow_live_network: bool = False,
         kill_switch_path: str | os.PathLike[str] | None = None,
+        approved_config: ApprovedRiskConfig | None = None,
     ) -> None:
         self._network_client = getattr(client, "performs_network_io", True) is not False
         self._allow_live_network = bool(allow_live_network)
         self._kill_switch_path = kill_switch_path
+        self._approved_config = approved_config
         if self._network_client:
             reasons = live_gate_reasons(
                 allow_live_network=self._allow_live_network,
                 for_protective_or_repay=True,
                 explicit_kill_path=self._kill_switch_path,
+                approved_config=self._approved_config,
             )
             if reasons:
                 raise LiveNetworkDisabled(
@@ -155,7 +160,8 @@ class CrossMarginTrack:
                 return "live_network_disabled"
             return None
         if execution_mode == APPROVED_DRY_RUN_MODE:
-            if self._network_client or not parameters_approved_by_env():
+            cfg = self._approved_config or load_approved_risk_config()[0]
+            if self._network_client or not parameters_approved_by_env() or cfg is None:
                 return "live_network_disabled"
             return None
         if execution_mode == LIVE_EXECUTION_MODE:
@@ -165,6 +171,7 @@ class CrossMarginTrack:
                 allow_live_network=self._allow_live_network,
                 for_protective_or_repay=for_protective_or_repay,
                 explicit_kill_path=self._kill_switch_path,
+                approved_config=self._approved_config,
             )
             if "kill_switch_active" in reasons and not for_protective_or_repay:
                 return "emergency_stop_blocks_new_risk"
@@ -209,7 +216,7 @@ class CrossMarginTrack:
             return self._result(intent.intent_id, "live_network_disabled", "live_network_disabled")
 
         if row is None:
-            reasons = contract_identity_reasons(intent, contract, snapshot, gate)
+            reasons = contract_identity_reasons(intent, contract, snapshot, gate, approved_config=self._approved_config)
             if reasons:
                 return self._result(
                     intent.intent_id,
@@ -223,7 +230,7 @@ class CrossMarginTrack:
                     "emergency_stop_blocks_new_risk",
                     "emergency_stop_blocks_new_risk",
                 )
-            prior_block = self._blocking_ledger_intent(intent.intent_id, intent.symbol)
+            prior_block = self._blocking_ledger_intent(intent.intent_id, intent.symbol, intent.base_asset)
             if prior_block:
                 return self._result(intent.intent_id, "locked", prior_block)
             if any_liability(snapshot.assets):
@@ -290,7 +297,7 @@ class CrossMarginTrack:
             return self._result(
                 intent.intent_id, "protection_unknown", "oco_query_failed", snapshot=snapshot
             )
-        if listed.get("symbol") not in (None, "", intent.symbol) or not _is_cross(
+        if listed.get("symbol") != intent.symbol or not _is_cross(
             listed.get("isIsolated", False)
         ):
             return self._result(
@@ -314,9 +321,11 @@ class CrossMarginTrack:
         filled = self._filled_protection_leg(intent, snapshot, listed)
         if isinstance(filled, TrackResult):
             return filled
-        return self._repay_after_close(intent, snapshot, contract, gate)
+        return self._repay_after_close(intent, snapshot, contract, gate, filled)
 
-    def _blocking_ledger_intent(self, current_intent_id: str, symbol: str) -> str:
+    def _blocking_ledger_intent(
+        self, current_intent_id: str, symbol: str, base_asset: str = ""
+    ) -> str:
         for item in self.ledger.list_intents():
             other_id = str(item["intent_id"])
             if other_id == current_intent_id:
@@ -328,10 +337,16 @@ class CrossMarginTrack:
                 try:
                     stored = json.loads(str(item["payload_json"]))
                     other_sym = str(stored.get("intent", {}).get("symbol") or "")
+                    other_base = str(stored.get("intent", {}).get("base_asset") or "")
+                    other_borrow = str(stored.get("contract", {}).get("borrow_asset") or "")
                 except (TypeError, ValueError, AttributeError):
                     other_sym = ""
+                    other_base = ""
+                    other_borrow = ""
                 if not other_sym or other_sym == symbol:
                     return "same_symbol_position_open"
+                if base_asset and base_asset in {other_base, other_borrow}:
+                    return "same_base_asset_position_open"
                 continue
             return "unresolved_intent_blocks_new_risk"
         return ""
@@ -678,7 +693,7 @@ class CrossMarginTrack:
         return executed
 
     def _resting_margin_degraded(self, contract: Contract) -> bool:
-        if not contract.parameters_approved:
+        if not contract.parameters_approved or contract.warn_margin_level is None:
             return False
         view = self._view()
         if isinstance(view, TrackResult):
@@ -1038,7 +1053,10 @@ class CrossMarginTrack:
                     "manual_action": "cover_and_repay",
                 },
             )
-        if self._trades_match(intent.symbol, order, quantity) is not True:
+        net_flatten = self._net_base_from_order(
+            intent.symbol, intent.base_asset, order, quantity
+        )
+        if net_flatten is None:
             return self._result(
                 intent.intent_id, "fill_unconfirmed", "flatten_trades", snapshot=snapshot
             )
@@ -1047,9 +1065,11 @@ class CrossMarginTrack:
             "flatten",
             client_key,
             "confirmed",
-            {"executedQty": api_amount(quantity)},
+            {"executedQty": api_amount(quantity), "netBase": api_amount(net_flatten)},
         )
-        repaid = self._repay_full_liability(intent, snapshot, contract, "flatten-repay")
+        repaid = self._repay_full_liability(
+            intent, snapshot, contract, net_flatten, "flatten-repay"
+        )
         if isinstance(repaid, TrackResult):
             return repaid
         flat = self._is_flat(intent)
@@ -1060,6 +1080,42 @@ class CrossMarginTrack:
             account_flat=flat,
             snapshot=snapshot,
         )
+
+    def _baseline_base_qty(self, intent_id: str) -> Decimal | None:
+        row = self.ledger.intent_row(intent_id)
+        if row is None or row["baseline_base"] is None:
+            return None
+        val, err = parse_decimal(row["baseline_base"], "baseline_base")
+        if err or val is None or val < 0:
+            return None
+        return val
+
+    def _expected_open_borrowed(self, intent: Intent) -> Decimal | None:
+        borrow_row = self.ledger.peek(
+            intent.intent_id, "borrow", make_client_id(intent.intent_id, "borrow")
+        )
+        if borrow_row is None or str(borrow_row["state"]) != "confirmed":
+            return Decimal(0)
+        expected = intent.quantity
+        for op_type, role in (("partial_repay", "partial-repay"), ("unwind_repay", "unwind-repay")):
+            op_row = self.ledger.peek(intent.intent_id, op_type, make_client_id(intent.intent_id, role))
+            if op_row is None or str(op_row["state"]) != "confirmed":
+                continue
+            recorded = _extract_op_post_borrowed(op_row)
+            if recorded is not None:
+                expected = recorded
+            else:
+                repaid_amt = _extract_op_amount(op_row)
+                if repaid_amt is None:
+                    return None
+                expected = max(Decimal(0), expected - repaid_amt)
+        for close_role in ("close-repay", "flatten-repay"):
+            close_row = self.ledger.peek(
+                intent.intent_id, "close_repay", make_client_id(intent.intent_id, close_role)
+            )
+            if close_row is not None and str(close_row["state"]) == "confirmed":
+                return Decimal(0)
+        return expected
 
     def _unwind(
         self,
@@ -1074,7 +1130,36 @@ class CrossMarginTrack:
             return view
         assets, _level = view
         base = assets[intent.base_asset]
-        amount = min(base.free, liability(base))
+        unwind_existing = self.ledger.peek(
+            intent.intent_id, "unwind_repay", make_client_id(intent.intent_id, "unwind-repay")
+        )
+        baseline_base = self._baseline_base_qty(intent.intent_id)
+        if baseline_base is None:
+            return self._result(
+                intent.intent_id,
+                "residual_liability_after_unwind",
+                "baseline_base_missing",
+                account_flat=False,
+                snapshot=snapshot,
+            )
+        if unwind_existing is None:
+            expected_borrowed = self._expected_open_borrowed(intent)
+            if expected_borrowed is None or base.borrowed != expected_borrowed:
+                return self._result(
+                    intent.intent_id,
+                    "residual_liability_after_unwind",
+                    "same_asset_external_liability_conflict",
+                    account_flat=False,
+                    snapshot=snapshot,
+                    detail={
+                        "expected_borrowed": api_amount(expected_borrowed or Decimal(0)),
+                        "observed_borrowed": api_amount(base.borrowed),
+                    },
+                )
+            own_avail = max(Decimal(0), base.free - baseline_base)
+            amount = min(own_avail, expected_borrowed + base.interest)
+        else:
+            amount = _extract_op_amount(unwind_existing) or Decimal(0)
         if amount <= 0:
             flat = self._is_flat(intent)
             state = (
@@ -1108,43 +1193,103 @@ class CrossMarginTrack:
         )
 
     def _repay_after_close(
-        self, intent: Intent, snapshot: Snapshot, contract: Contract, gate: Gate
+        self,
+        intent: Intent,
+        snapshot: Snapshot,
+        contract: Contract,
+        gate: Gate,
+        net_cover_base: Decimal,
     ) -> TrackResult:
         view = self._view()
         if isinstance(view, TrackResult):
             return view
         assets, _level = view
-        debt = (
-            liability(assets.get(intent.base_asset))
-            if intent.action == "OPEN_SHORT"
-            else Decimal(0)
-        )
-        if any_liability(assets) and intent.action != "OPEN_SHORT":
-            return self._result(
-                intent.intent_id, "not_flat", "unexpected_liability", snapshot=snapshot
-            )
-        if debt > 0:
-            base = assets[intent.base_asset]
-            if base.free < debt:
-                shortfall = debt - base.free
+        if intent.action != "OPEN_SHORT":
+            if any_liability(assets):
                 return self._result(
                     intent.intent_id,
                     "not_flat",
-                    "base_short_of_liability",
+                    "unexpected_liability",
+                    account_flat=False,
                     snapshot=snapshot,
-                    borrowed=api_amount(base.borrowed),
-                    interest=api_amount(base.interest),
-                    base_free=api_amount(base.free),
+                )
+            flat = self._is_flat(intent)
+            return self._result(
+                intent.intent_id,
+                "clean_flat" if flat else "not_flat",
+                "clean_flat" if flat else "not_flat",
+                phase_ok=flat,
+                account_flat=flat,
+                snapshot=snapshot,
+            )
+
+        base = assets[intent.base_asset]
+        baseline_base = self._baseline_base_qty(intent.intent_id)
+        if baseline_base is None:
+            return self._result(
+                intent.intent_id,
+                "not_flat",
+                "baseline_base_missing",
+                account_flat=False,
+                snapshot=snapshot,
+            )
+        close_key = make_client_id(intent.intent_id, "close-repay")
+        close_existing = self.ledger.peek(intent.intent_id, "close_repay", close_key)
+        if close_existing is not None:
+            prior_amt = _extract_op_amount(close_existing) or Decimal(0)
+            if prior_amt > 0:
+                repaid = self._repay_amount(
+                    intent, snapshot, contract, gate, "close_repay", "close-repay", prior_amt
+                )
+                if isinstance(repaid, TrackResult):
+                    return repaid
+        else:
+            expected_borrowed = self._expected_open_borrowed(intent)
+            if expected_borrowed is None or base.borrowed != expected_borrowed:
+                return self._result(
+                    intent.intent_id,
+                    "not_flat",
+                    "same_asset_external_liability_conflict",
+                    phase_ok=False,
+                    account_flat=False,
+                    snapshot=snapshot,
                     detail={
-                        "liability_shortfall": api_amount(shortfall),
-                        "manual_action": "top_up_base_and_repay",
+                        "expected_borrowed": api_amount(expected_borrowed or Decimal(0)),
+                        "observed_borrowed": api_amount(base.borrowed),
+                        "cover_net_base": api_amount(net_cover_base),
+                        "manual_action": "reconcile_shared_asset_liability",
                     },
                 )
-            repaid = self._repay_amount(
-                intent, snapshot, contract, gate, "close_repay", "close-repay", debt
+            own_debt = expected_borrowed + base.interest
+            intent_available_base = min(
+                base.free,
+                max(Decimal(0), base.free - baseline_base),
+                net_cover_base,
             )
-            if isinstance(repaid, TrackResult):
-                return repaid
+            if own_debt > 0:
+                if intent_available_base < own_debt:
+                    shortfall = own_debt - intent_available_base
+                    return self._result(
+                        intent.intent_id,
+                        "not_flat",
+                        "base_short_of_liability",
+                        phase_ok=False,
+                        account_flat=False,
+                        snapshot=snapshot,
+                        borrowed=api_amount(base.borrowed),
+                        interest=api_amount(base.interest),
+                        base_free=api_amount(base.free),
+                        detail={
+                            "liability_shortfall": api_amount(shortfall),
+                            "manual_action": "top_up_base_and_repay",
+                        },
+                    )
+                repaid = self._repay_amount(
+                    intent, snapshot, contract, gate, "close_repay", "close-repay", own_debt
+                )
+                if isinstance(repaid, TrackResult):
+                    return repaid
+
         flat = self._is_flat(intent)
         return self._result(
             intent.intent_id,
@@ -1156,30 +1301,73 @@ class CrossMarginTrack:
         )
 
     def _repay_full_liability(
-        self, intent: Intent, snapshot: Snapshot, contract: Contract, role: str
+        self,
+        intent: Intent,
+        snapshot: Snapshot,
+        contract: Contract,
+        flatten_net_base: Decimal,
+        role: str,
     ) -> TrackResult | None:
         view = self._view()
         if isinstance(view, TrackResult):
             return view
         assets, _level = view
         base = assets[intent.base_asset]
-        debt = liability(base)
-        if debt == 0:
+        baseline_base = self._baseline_base_qty(intent.intent_id)
+        if baseline_base is None:
+            return self._result(
+                intent.intent_id,
+                "not_flat",
+                "baseline_base_missing",
+                account_flat=False,
+                snapshot=snapshot,
+            )
+        flat_key = make_client_id(intent.intent_id, role)
+        flat_existing = self.ledger.peek(intent.intent_id, "close_repay", flat_key)
+        if flat_existing is not None:
+            prior_amt = _extract_op_amount(flat_existing) or Decimal(0)
+            if prior_amt <= 0:
+                return None
+            dummy_gate = Gate(False, _now(self.ledger, intent.intent_id), OFFLINE_EXECUTION_MODE)
+            return self._repay_amount(
+                intent, snapshot, contract, dummy_gate, "close_repay", role, prior_amt
+            )
+        expected_borrowed = self._expected_open_borrowed(intent)
+        if expected_borrowed is None or base.borrowed != expected_borrowed:
+            return self._result(
+                intent.intent_id,
+                "not_flat",
+                "same_asset_external_liability_conflict",
+                account_flat=False,
+                snapshot=snapshot,
+                detail={
+                    "expected_borrowed": api_amount(expected_borrowed or Decimal(0)),
+                    "observed_borrowed": api_amount(base.borrowed),
+                },
+            )
+        own_debt = expected_borrowed + base.interest
+        if own_debt == 0:
             return None
-        if base.free < debt:
+        intent_available_base = min(
+            base.free,
+            max(Decimal(0), base.free - baseline_base),
+            flatten_net_base,
+        )
+        if intent_available_base < own_debt:
             return self._result(
                 intent.intent_id,
                 "not_flat",
                 "base_short_of_liability",
+                account_flat=False,
                 snapshot=snapshot,
                 detail={
-                    "liability_shortfall": api_amount(debt - base.free),
+                    "liability_shortfall": api_amount(own_debt - intent_available_base),
                     "manual_action": "top_up_base_and_repay",
                 },
             )
         dummy_gate = Gate(False, _now(self.ledger, intent.intent_id), OFFLINE_EXECUTION_MODE)
         return self._repay_amount(
-            intent, snapshot, contract, dummy_gate, "close_repay", role, debt
+            intent, snapshot, contract, dummy_gate, "close_repay", role, own_debt
         )
 
     def _repay_amount(
@@ -1204,6 +1392,23 @@ class CrossMarginTrack:
                 return view_before
             assets_before, _lvl_before = view_before
             base_before = assets_before.get(intent.base_asset)
+            expected_before = self._expected_open_borrowed(intent)
+            if (
+                base_before is not None
+                and expected_before is not None
+                and base_before.borrowed != expected_before
+            ):
+                return self._result(
+                    intent.intent_id,
+                    "not_flat" if op_type == "close_repay" else "residual_liability_after_unwind",
+                    "same_asset_external_liability_conflict",
+                    account_flat=False,
+                    snapshot=snapshot,
+                    detail={
+                        "expected_borrowed": api_amount(expected_before),
+                        "observed_borrowed": api_amount(base_before.borrowed),
+                    },
+                )
             if base_before is None or base_before.free < amount:
                 return self._result(
                     intent.intent_id,
@@ -1266,7 +1471,16 @@ class CrossMarginTrack:
         if isinstance(view, TrackResult):
             return view
         assets, _level = view
-        if liability(assets.get(intent.base_asset)) > 0 and op_type == "close_repay":
+        base_after = assets.get(intent.base_asset)
+        if base_after is not None and op_type in {"partial_repay", "unwind_repay"}:
+            self.ledger.mark(
+                intent.intent_id,
+                op_type,
+                client_key,
+                "confirmed",
+                {"expected_borrowed_after": api_amount(base_after.borrowed)},
+            )
+        if liability(base_after) > 0 and op_type == "close_repay":
             return self._result(
                 intent.intent_id,
                 "repay_unconfirmed",
@@ -1285,11 +1499,16 @@ class CrossMarginTrack:
         base = assets.get(intent.base_asset)
         if base is None:
             return None, "base_asset_missing"
+        expected_borrowed = self._expected_open_borrowed(intent)
+        if expected_borrowed is None or expected_borrowed <= 0:
+            return None, "borrow_principal_unverified"
+        if base.borrowed != expected_borrowed:
+            return None, "same_asset_external_liability_conflict"
         rate = snapshot.hourly_interest_rate.get(contract.borrow_asset)
         if rate is None:
             return None, "asset_interest_rate_missing"
         return cover_buy_quantity(
-            borrowed=base.borrowed,
+            borrowed=expected_borrowed,
             interest=base.interest,
             hourly_rate=rate,
             horizon_hours=contract.interest_horizon_hours,
@@ -1321,7 +1540,7 @@ class CrossMarginTrack:
             return False
         if listed.get("listOrderStatus") != "EXECUTING":
             return False
-        if listed.get("symbol") not in (None, "", intent.symbol):
+        if listed.get("symbol") != intent.symbol:
             return False
         if not _is_cross(listed.get("isIsolated", False)):
             return False
@@ -1349,15 +1568,36 @@ class CrossMarginTrack:
                 return False
         return True
 
+    def _net_base_from_order(
+        self, symbol: str, base_asset: str, order: Mapping[str, Any], executed: Decimal
+    ) -> Decimal | None:
+        if self._trades_match(symbol, order, executed) is not True:
+            return None
+        try:
+            trades = self.client.query_trades(
+                build_query_trades_payload(symbol, order.get("orderId"))
+            )
+        except (MarginExchangeError, MarginTransportTimeout):
+            return None
+        base_fee = Decimal(0)
+        for trade in trades:
+            if str(trade.get("commissionAsset") or "") == base_asset:
+                fee_val, fee_err = parse_decimal(trade.get("commission"), "commission")
+                if fee_err or fee_val is None or fee_val < 0:
+                    return None
+                base_fee += fee_val
+        return max(Decimal(0), executed - base_fee)
+
     def _filled_protection_leg(
         self, intent: Intent, snapshot: Snapshot, listed: Mapping[str, Any]
-    ) -> TrackResult | None:
+    ) -> TrackResult | Decimal:
         orders = listed.get("orders")
         if not isinstance(orders, list):
             return self._result(
                 intent.intent_id, "exit_not_filled", "oco_orders_missing", snapshot=snapshot
             )
         filled = 0
+        net_exit_base = Decimal(0)
         partial_exec = Decimal(0)
         expected_side = "BUY" if intent.action == "OPEN_SHORT" else "SELL"
         for item in orders:
@@ -1385,13 +1625,24 @@ class CrossMarginTrack:
                 )
             exec_qty, _ = parse_decimal(order.get("executedQty", "0"), "executedQty")
             if order.get("status") == "FILLED":
-                if exec_qty is None or self._trades_match(intent.symbol, order, exec_qty) is not True:
+                if exec_qty is None:
                     return self._result(
                         intent.intent_id,
                         "fill_unconfirmed",
                         "protection_trades",
                         snapshot=snapshot,
                     )
+                leg_net = self._net_base_from_order(
+                    intent.symbol, intent.base_asset, order, exec_qty
+                )
+                if leg_net is None:
+                    return self._result(
+                        intent.intent_id,
+                        "fill_unconfirmed",
+                        "protection_trades",
+                        snapshot=snapshot,
+                    )
+                net_exit_base = leg_net
                 filled += 1
             elif exec_qty is not None and exec_qty > 0:
                 partial_exec += exec_qty
@@ -1413,7 +1664,7 @@ class CrossMarginTrack:
                 "protection_leg_conflict",
                 snapshot=snapshot,
             )
-        return None
+        return net_exit_base
 
     def _trades_match(
         self, symbol: str, order: Mapping[str, Any], executed: Decimal
@@ -1525,7 +1776,7 @@ class CrossMarginTrack:
         status_txt = str(account.get("marginLevelStatus") or "EXCESSIVE").upper()
         if status_txt in EMERGENCY_MARGIN_LEVEL_STATUSES:
             return "margin_level_emergency_floor"
-        if contract.parameters_approved and level <= contract.emergency_margin_level:
+        if contract.parameters_approved and contract.emergency_margin_level is not None and level <= contract.emergency_margin_level:
             return "margin_level_emergency_floor"
         if level < contract.min_margin_level:
             return "margin_level_below_contract"
@@ -1689,6 +1940,32 @@ class CrossMarginTrack:
             base_free=base_free,
             detail={} if detail is None else detail,
         )
+
+
+def _extract_op_amount(row: Any) -> Decimal | None:
+    if row is None:
+        return None
+    try:
+        parsed = json.loads(str(row["request_json"]))
+    except (TypeError, ValueError, KeyError):
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    val, err = parse_decimal(parsed.get("amount"), "amount")
+    return None if err or val is None or val < 0 else val
+
+
+def _extract_op_post_borrowed(row: Any) -> Decimal | None:
+    if row is None or not row["response_json"]:
+        return None
+    try:
+        parsed = json.loads(str(row["response_json"]))
+    except (TypeError, ValueError, KeyError):
+        return None
+    if not isinstance(parsed, Mapping) or "expected_borrowed_after" not in parsed:
+        return None
+    val, err = parse_decimal(parsed.get("expected_borrowed_after"), "expected_borrowed_after")
+    return None if err or val is None or val < 0 else val
 
 
 def _extract_op_meta(row: Any) -> dict[str, Any]:

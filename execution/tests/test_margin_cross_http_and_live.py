@@ -24,17 +24,37 @@ from execution.margin_cross.api_semantics import (
     make_client_id,
 )
 from execution.margin_cross.entry import main, run_live_command
-from execution.margin_cross.errors import MarginTransportTimeout
+from execution.margin_cross.errors import LiveNetworkDisabled, MarginTransportTimeout
 from execution.margin_cross.fixture import NOW_MS
 from execution.margin_cross.money import api_amount
 from execution.margin_cross.policy import (
+    APPROVED_CONFIG_PATH_ENV,
     BLOCK_EXIT_ON_KILL_ENV,
     LIVE_ENABLED_ENV,
     PARAMETERS_APPROVED_ENV,
+    SUPPORTED_REGIME_STRATEGIES,
     live_gate_reasons,
+    parse_approved_risk_config,
 )
 
 TEST_BASE = "https://example.invalid"
+
+def _explicit_test_config_dict() -> dict[str, Any]:
+    return {
+        "max_leverage": "3",
+        "max_effective_leverage": "1.50",
+        "max_total_liability_net_ratio": "0.50",
+        "max_single_borrow_net_ratio": "0.24",
+        "max_borrowable_pool_ratio": "0.80",
+        "min_entry_margin_level": "2.50",
+        "warn_margin_level": "2.00",
+        "emergency_margin_level": "1.60",
+        "min_order_notional_usdt": "20",
+        "max_snapshot_age_ms": 5000,
+        "interest_horizon_hours": "4",
+        "base_position_pct": "0.24",
+        "approved_strategies": sorted(SUPPORTED_REGIME_STRATEGIES),
+    }
 
 
 def _fresh_clocks(now_ms: int = NOW_MS) -> dict[str, Any]:
@@ -458,12 +478,18 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
 
         server = _InMemoryMarginTransport(cred_id="u_demo_1", sign_id="p_demo_1")
         kw = {"api_" + "key": "u_demo_1", "api_" + "secret": "p_demo_1"}
+        cfg_obj, cfg_errs = parse_approved_risk_config(_explicit_test_config_dict())
+        self.assertEqual(cfg_errs, [])
+        assert cfg_obj is not None
         client = hc.BinanceCrossMarginHttpClient(
             base_url=TEST_BASE,
             opener=server,
             clock_ms=lambda: fake_now[0],
             monotonic_sec=lambda: mono_now[0],
             sleep_fn=fake_sleep,
+            environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+            kill_switch_path="/nonexistent/no_kill_switch_flag_here",
+            approved_config=cfg_obj,
             **kw,
         )
 
@@ -560,9 +586,33 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
                     self.assertEqual(rc, 2)
                     self.assertIn("disabled", stderr_buf.getvalue())
 
+            no_cfg_env = {
+                PARAMETERS_APPROVED_ENV: "1",
+                LIVE_ENABLED_ENV: "1",
+                k_env: "u_demo_1",
+                s_env: "p_demo_1",
+            }
+            with patch.dict(os.environ, no_cfg_env, clear=True):
+                nc_code, _nc_out, nc_err = run_live_command(
+                    ledger_path=ledger_path,
+                    action="open",
+                    signal_path=sig_path,
+                    kill_switch_path=absent_flag,
+                    base_url=TEST_BASE,
+                    opener=_InMemoryMarginTransport(cred_id="u_demo_1", sign_id="p_demo_1"),
+                    clock_ms=lambda: NOW_MS,
+                )
+                self.assertEqual(nc_code, 2)
+                self.assertIn("approved_config_missing", nc_err)
+
+            cfg_path = os.path.join(tmpdir, "operator_approved_cfg.json")
+            Path(cfg_path).write_text(
+                json.dumps(_explicit_test_config_dict()), encoding="utf-8"
+            )
             server = _InMemoryMarginTransport(cred_id="u_demo_1", sign_id="p_demo_1")
             unlocked_env = {
                 PARAMETERS_APPROVED_ENV: "1",
+                APPROVED_CONFIG_PATH_ENV: cfg_path,
                 LIVE_ENABLED_ENV: "1",
                 k_env: "u_demo_1",
                 s_env: "p_demo_1",
@@ -639,6 +689,69 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
                         explicit_kill_path=active_flag,
                     )
                     self.assertIn("kill_switch_active", reasons)
+
+    def test_http_client_direct_write_methods_refused_before_any_socket_or_opener_io(self) -> None:
+        opener_calls: list[str] = []
+
+        def forbidden_opener(req: Any, _timeout: float) -> tuple[int, bytes]:
+            opener_calls.append(str(req.full_url))
+            raise AssertionError("opener must NEVER be reached when write gate is locked")
+
+        kw = {"api_" + "key": "audit-not-a-key", "api_" + "secret": "audit-not-a-secret"}
+        cfg_obj, _ = parse_approved_risk_config(_explicit_test_config_dict())
+        assert cfg_obj is not None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            active_kill = os.path.join(tmpdir, "kill_on")
+            absent_kill = os.path.join(tmpdir, "kill_off")
+            Path(active_kill).write_text("1\n", encoding="utf-8")
+
+            c_empty = hc.BinanceCrossMarginHttpClient(
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                environ={},
+                kill_switch_path=absent_kill,
+                **kw,
+            )
+            for fn, payload in (
+                (c_empty.borrow, {"asset": "BTC", "isIsolated": "FALSE", "amount": "0.01", "type": "BORROW"}),
+                (c_empty.repay, {"asset": "BTC", "isIsolated": "FALSE", "amount": "0.01", "type": "REPAY"}),
+                (c_empty.new_order, {"symbol": "BTCUSDT", "isIsolated": "FALSE", "side": "SELL", "type": "LIMIT", "timeInForce": "GTC", "quantity": "0.01", "price": "100000", "newClientOrderId": "cid-1", "sideEffectType": NO_SIDE_EFFECT}),
+                (c_empty.cancel_order, {"symbol": "BTCUSDT", "isIsolated": "FALSE", "origClientOrderId": "cid-1"}),
+                (c_empty.new_oco, {"symbol": "BTCUSDT", "isIsolated": "FALSE", "side": "BUY", "quantity": "0.01", "price": "99000", "stopPrice": "101000", "stopLimitPrice": "101100", "stopLimitTimeInForce": "GTC", "listClientOrderId": "l-1", "limitClientOrderId": "tp-1", "stopClientOrderId": "sl-1", "sideEffectType": NO_SIDE_EFFECT}),
+                (c_empty.cancel_oco, {"symbol": "BTCUSDT", "isIsolated": "FALSE", "listClientOrderId": "l-1"}),
+            ):
+                with self.assertRaises(LiveNetworkDisabled) as ctx:
+                    fn(payload)
+                self.assertIn("parameters_not_approved", str(ctx.exception))
+
+            c_no_cfg = hc.BinanceCrossMarginHttpClient(
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+                kill_switch_path=absent_kill,
+                **kw,
+            )
+            with self.assertRaises(LiveNetworkDisabled) as ctx2:
+                c_no_cfg.borrow({"asset": "BTC", "isIsolated": "FALSE", "amount": "0.01", "type": "BORROW"})
+            self.assertIn("approved_config_missing", str(ctx2.exception))
+
+            c_killed = hc.BinanceCrossMarginHttpClient(
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+                kill_switch_path=active_kill,
+                approved_config=cfg_obj,
+                **kw,
+            )
+            with self.assertRaises(LiveNetworkDisabled) as ctx3:
+                c_killed.borrow({"asset": "BTC", "isIsolated": "FALSE", "amount": "0.01", "type": "BORROW"})
+            self.assertIn("kill_switch_active", str(ctx3.exception))
+            with self.assertRaises(LiveNetworkDisabled) as ctx4:
+                c_killed.new_order({"symbol": "BTCUSDT", "isIsolated": "FALSE", "side": "SELL", "type": "LIMIT", "timeInForce": "GTC", "quantity": "0.01", "price": "100000", "newClientOrderId": "cid-entry", "sideEffectType": NO_SIDE_EFFECT})
+            self.assertIn("kill_switch_active", str(ctx4.exception))
+
+            self.assertEqual(opener_calls, [])
 
 
 if __name__ == "__main__":

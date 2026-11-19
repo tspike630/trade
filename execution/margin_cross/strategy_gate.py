@@ -10,10 +10,9 @@ Wires the cross-margin track to:
 3. Approved 5-state directional & defensive routing (anti-squeeze hard veto on
    shorts; State 4/5 short playbooks; State 1/3 long playbooks with State 2/4
    gated off unless explicitly enabled).
-4. Real-time Cross Margin net-asset sizing:
-   ``real_time_net_asset_quote * 0.24 * entry_tier * state_size_multiplier``
-   clamped by ``1.50x`` effective leverage, ``80%`` ``maxBorrowable`` pool cap,
-   and ``20 USDT`` minimum notional, with optional Formula B first-hang TP.
+4. Zero-default operator-approved Cross Margin net-asset sizing:
+   requires ``CROSS_MARGIN_PARAMETERS_APPROVED=1`` plus an explicit zero-default
+   ``ApprovedRiskConfig`` (no pre-installed leverage, margin, borrow, or sizing numbers).
 """
 
 from __future__ import annotations
@@ -42,24 +41,15 @@ from decision_engine.core.volume_z_1h import source_close_is_fresh
 from execution.margin_cross.money import api_amount, on_grid, parse_decimal
 from execution.margin_cross.policy import (
     APPROVED_CONTRACT_LABEL,
-    DEFAULT_INTEREST_HORIZON_HOURS,
-    DEFAULT_MAX_SNAPSHOT_AGE_MS,
-    EMERGENCY_MARGIN_LEVEL,
-    MAX_ACCOUNT_LEVERAGE,
-    MAX_BORROWABLE_POOL_RATIO,
-    MAX_EFFECTIVE_LEVERAGE,
-    MAX_TOTAL_LIABILITY_NET_RATIO,
-    MIN_ENTRY_MARGIN_LEVEL,
-    MIN_ORDER_NOTIONAL_USDT,
-    WARN_MARGIN_LEVEL,
+    ApprovedRiskConfig,
     fill_tp_formula_b_enabled,
+    load_approved_risk_config,
+    parameters_approved_by_env,
+    parse_approved_risk_config,
     state2_long_enabled,
     state4_long_enabled,
 )
 from execution.margin_cross.risk import PURPOSE_CROSS_MARGIN_TRACK, Snapshot, parse_snapshot
-
-BASE_POSITION_PCT = Decimal("0.24")
-MAX_SINGLE_BORROW_NET_RATIO = Decimal("0.24")
 
 UNRULED_KELLY_FRACTIONS = (
     Decimal("0.05"),
@@ -131,7 +121,7 @@ def check_data_freshness(
     clocks: Mapping[str, Any],
     *,
     now_ms: int,
-    max_snapshot_age_ms: int = DEFAULT_MAX_SNAPSHOT_AGE_MS,
+    max_snapshot_age_ms: int,
 ) -> list[str]:
     """Fail-closed freshness gate across account snapshot and all 5-state feature clocks."""
     reasons: list[str] = []
@@ -606,15 +596,47 @@ def build_approved_position_plan(
     stop_limit_price: Decimal,
     borrow_step: Decimal | None = None,
     max_borrow_quantity_cap: Decimal | None = None,
-    interest_horizon_hours: Decimal = DEFAULT_INTEREST_HORIZON_HOURS,
-    max_snapshot_age_ms: int = DEFAULT_MAX_SNAPSHOT_AGE_MS,
+    risk_config: ApprovedRiskConfig | Mapping[str, Any] | None = None,
     macro_halt: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> ApprovedPositionPlan:
-    """Validate freshness, 5-state strategy, and real-time 24% sizing into an Intent + Contract."""
+    """Validate operator approval, zero-default risk config, freshness, and 5-state sizing."""
+    if not parameters_approved_by_env(environ):
+        return ApprovedPositionPlan(
+            allowed=False,
+            reasons=("parameters_not_approved",),
+            regime="blocked",
+            strategy_id="",
+            net_asset_quote=Decimal(0),
+            effective_leverage_after=Decimal(0),
+            target_notional_quote=Decimal(0),
+            quantity=Decimal(0),
+            intent=None,
+            contract=None,
+        )
+    if isinstance(risk_config, ApprovedRiskConfig):
+        cfg, cfg_reasons = risk_config, []
+    elif isinstance(risk_config, Mapping):
+        cfg, cfg_reasons = parse_approved_risk_config(risk_config)
+    else:
+        cfg, cfg_reasons = load_approved_risk_config(environ)
+    if cfg is None or cfg_reasons:
+        return ApprovedPositionPlan(
+            allowed=False,
+            reasons=tuple(cfg_reasons or ["approved_config_missing"]),
+            regime="blocked",
+            strategy_id="",
+            net_asset_quote=Decimal(0),
+            effective_leverage_after=Decimal(0),
+            target_notional_quote=Decimal(0),
+            quantity=Decimal(0),
+            intent=None,
+            contract=None,
+        )
+
     snapshot, snap_reasons = parse_snapshot(snapshot_raw)
     freshness_reasons = check_data_freshness(
-        clocks, now_ms=now_ms, max_snapshot_age_ms=max_snapshot_age_ms
+        clocks, now_ms=now_ms, max_snapshot_age_ms=cfg.max_snapshot_age_ms
     )
     if snap_reasons or snapshot is None or freshness_reasons:
         return ApprovedPositionPlan(
@@ -664,6 +686,19 @@ def build_approved_position_plan(
             intent=None,
             contract=None,
         )
+    if strat.strategy_id not in cfg.approved_strategies:
+        return ApprovedPositionPlan(
+            allowed=False,
+            reasons=("strategy_not_in_approved_config",),
+            regime=strat.regime,
+            strategy_id=strat.strategy_id,
+            net_asset_quote=Decimal(0),
+            effective_leverage_after=Decimal(0),
+            target_notional_quote=Decimal(0),
+            quantity=Decimal(0),
+            intent=None,
+            contract=None,
+        )
 
     total_asset_q, total_liab_q, net_asset_q = account_quote_valuation(
         snapshot, base_asset=base_asset, quote_asset=quote_asset
@@ -682,13 +717,13 @@ def build_approved_position_plan(
             contract=None,
         )
 
-    raw_notional = net_asset_q * BASE_POSITION_PCT * entry_tier * strat.size_multiplier
-    max_single_borrow_notional = net_asset_q * MAX_SINGLE_BORROW_NET_RATIO
+    raw_notional = net_asset_q * cfg.base_position_pct * entry_tier * strat.size_multiplier
+    max_single_borrow_notional = net_asset_q * cfg.max_single_borrow_net_ratio
     max_additional_liab = max(
-        Decimal(0), net_asset_q * MAX_TOTAL_LIABILITY_NET_RATIO - total_liab_q
+        Decimal(0), net_asset_q * cfg.max_total_liability_net_ratio - total_liab_q
     )
     max_lev_headroom = max(
-        Decimal(0), net_asset_q * MAX_EFFECTIVE_LEVERAGE - total_asset_q
+        Decimal(0), net_asset_q * cfg.max_effective_leverage - total_asset_q
     )
 
     chosen_entry = snapshot.reference_price if limit_price is None else limit_price
@@ -704,7 +739,7 @@ def build_approved_position_plan(
             max_lev_headroom,
         )
         borrowable = snapshot.max_borrowable.get(base_asset, Decimal(0))
-        pool_cap_qty = _floor_to_grid(borrowable * MAX_BORROWABLE_POOL_RATIO, eff_borrow_step)
+        pool_cap_qty = _floor_to_grid(borrowable * cfg.max_borrowable_pool_ratio, eff_borrow_step)
         contract_cap_qty = (
             pool_cap_qty
             if max_borrow_quantity_cap is None
@@ -737,7 +772,7 @@ def build_approved_position_plan(
         new_borrow_quote = Decimal(0)
 
     eff_lev_after = (total_asset_q + new_borrow_quote) / net_asset_q
-    if eff_lev_after > MAX_EFFECTIVE_LEVERAGE:
+    if eff_lev_after > cfg.max_effective_leverage:
         return ApprovedPositionPlan(
             allowed=False,
             reasons=("effective_leverage_exceeded",),
@@ -752,7 +787,7 @@ def build_approved_position_plan(
         )
 
     order_notional = quantity * snapped_entry
-    min_floor = max(MIN_ORDER_NOTIONAL_USDT, snapshot.filters.min_notional)
+    min_floor = max(cfg.min_order_notional_usdt, snapshot.filters.min_notional)
     if quantity <= 0 or quantity < snapshot.filters.min_qty or not on_grid(quantity, step):
         return ApprovedPositionPlan(
             allowed=False,
@@ -769,7 +804,7 @@ def build_approved_position_plan(
     if order_notional < min_floor:
         return ApprovedPositionPlan(
             allowed=False,
-            reasons=("notional_below_20_usdt_floor",),
+            reasons=("notional_below_approved_floor",),
             regime=strat.regime,
             strategy_id=strat.strategy_id,
             net_asset_quote=net_asset_q,
@@ -805,14 +840,17 @@ def build_approved_position_plan(
         "borrow_asset": borrow_asset,
         "parameters_approved": True,
         "unapproved_label": APPROVED_CONTRACT_LABEL,
-        "max_leverage": api_amount(MAX_ACCOUNT_LEVERAGE),
-        "max_effective_leverage": api_amount(MAX_EFFECTIVE_LEVERAGE),
-        "min_margin_level": api_amount(MIN_ENTRY_MARGIN_LEVEL),
-        "warn_margin_level": api_amount(WARN_MARGIN_LEVEL),
-        "emergency_margin_level": api_amount(EMERGENCY_MARGIN_LEVEL),
+        "max_leverage": api_amount(cfg.max_leverage),
+        "max_effective_leverage": api_amount(cfg.max_effective_leverage),
+        "min_margin_level": api_amount(cfg.min_entry_margin_level),
+        "warn_margin_level": api_amount(cfg.warn_margin_level),
+        "emergency_margin_level": api_amount(cfg.emergency_margin_level),
+        "max_total_liability_net_ratio": api_amount(cfg.max_total_liability_net_ratio),
+        "max_borrowable_pool_ratio": api_amount(cfg.max_borrowable_pool_ratio),
+        "min_order_notional_usdt": api_amount(cfg.min_order_notional_usdt),
         "max_borrow_quantity": api_amount(max(contract_cap_qty, eff_borrow_step)),
-        "max_snapshot_age_ms": max_snapshot_age_ms,
-        "interest_horizon_hours": api_amount(interest_horizon_hours),
+        "max_snapshot_age_ms": cfg.max_snapshot_age_ms,
+        "interest_horizon_hours": api_amount(cfg.interest_horizon_hours),
         "max_base_over_liability": api_amount(step),
         "strategy_id": strat.strategy_id,
         "borrow_step": api_amount(eff_borrow_step),

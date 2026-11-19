@@ -1,7 +1,9 @@
-"""Ruled cross-margin threshold specification.
+"""Unapproved candidate cross-margin threshold proposals for operator review.
 
-Runtime ``approved`` stays ``False`` unless ``CROSS_MARGIN_PARAMETERS_APPROVED=1``
-is explicitly set by the operator after verification.
+None of the candidate values in this file are active or pre-approved. Runtime
+execution never imports this module and requires an explicit operator-supplied
+zero-default ``CROSS_MARGIN_APPROVED_CONFIG_JSON`` file plus
+``CROSS_MARGIN_PARAMETERS_APPROVED=1``.
 """
 
 from __future__ import annotations
@@ -9,108 +11,105 @@ from __future__ import annotations
 from typing import Any
 
 from execution.margin_cross.policy import (
+    APPROVED_CONFIG_PATH_ENV,
     BORROW_REPAY_MIN_SPACING_SEC,
-    DEFAULT_INTEREST_HORIZON_HOURS,
-    DEFAULT_MAX_SNAPSHOT_AGE_MS,
-    EMERGENCY_MARGIN_LEVEL,
-    MAX_ACCOUNT_LEVERAGE,
-    MAX_BORROWABLE_POOL_RATIO,
-    MAX_EFFECTIVE_LEVERAGE,
-    MAX_TOTAL_LIABILITY_NET_RATIO,
-    MIN_ENTRY_MARGIN_LEVEL,
-    MIN_ORDER_NOTIONAL_USDT,
-    WARN_MARGIN_LEVEL,
-    parameters_approved_by_env,
+    HARD_CLASSIC_CROSS_LEVERAGE_CEILING,
+    PARAMETERS_APPROVED_ENV,
 )
 
 
 def unapproved_threshold_proposal() -> list[dict[str, Any]]:
-    """Return ruled parameter contract; ``approved`` reflects runtime env unlock."""
-    unlocked = parameters_approved_by_env()
-    rows: list[dict[str, Any]] = [
+    """Return candidate discussion proposals; ``approved`` is unconditionally ``False``."""
+    why_locked = (
+        f"Unapproved proposal only; nothing is installed by default. Operator must "
+        f"explicitly supply a zero-default JSON file via {APPROVED_CONFIG_PATH_ENV} "
+        f"and set {PARAMETERS_APPROVED_ENV}=1."
+    )
+    return [
         {
             "item": "max_leverage",
-            "ruled_value": {
-                "account_ceiling": str(MAX_ACCOUNT_LEVERAGE),
-                "effective_portfolio_ceiling": str(MAX_EFFECTIVE_LEVERAGE),
+            "approved": False,
+            "candidate_for_operator_review": {
+                "account_ceiling": str(HARD_CLASSIC_CROSS_LEVERAGE_CEILING),
+                "effective_portfolio_ceiling": "1.50",
             },
             "suggested_for_discussion": (
                 "Classic Cross Margin (MARGIN_1 <= 3x) only; never call "
-                "POST /sapi/v1/margin/max-leverage; cap post-borrow effective "
-                "leverage total_asset / net_asset at 1.50x."
+                "POST /sapi/v1/margin/max-leverage; candidate post-borrow effective "
+                "leverage ceiling 1.50x."
             ),
-            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
+            "why_not_installed": why_locked,
         },
         {
             "item": "min_margin_level",
-            "ruled_value": {
-                "entry_floor": str(MIN_ENTRY_MARGIN_LEVEL),
-                "warn_floor": str(WARN_MARGIN_LEVEL),
-                "emergency_floor": str(EMERGENCY_MARGIN_LEVEL),
+            "approved": False,
+            "candidate_for_operator_review": {
+                "entry_floor": "2.50",
+                "warn_floor": "2.00",
+                "emergency_floor": "1.60",
             },
             "suggested_for_discussion": (
-                "Entry/borrow requires marginLevel >= 2.50 (status EXCESSIVE/NORMAL); "
-                "< 2.00 blocks new borrows and cancels unfilled resting entries; "
-                "<= 1.60 triggers emergency unwind while keeping working OCO intact."
+                "Candidate margin-level ladder: entry >= 2.50, warn < 2.00 "
+                "(cancel unfilled resting entry), emergency <= 1.60."
             ),
-            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
+            "why_not_installed": why_locked,
         },
         {
             "item": "max_borrow_quantity",
-            "ruled_value": {
+            "approved": False,
+            "candidate_for_operator_review": {
+                "base_position_pct": "0.24",
                 "single_borrow_net_asset_ratio": "0.24",
-                "total_liability_net_asset_ratio": str(MAX_TOTAL_LIABILITY_NET_RATIO),
-                "max_borrowable_pool_utilization": str(MAX_BORROWABLE_POOL_RATIO),
-                "min_order_notional_usdt": str(MIN_ORDER_NOTIONAL_USDT),
+                "total_liability_net_asset_ratio": "0.50",
+                "max_borrowable_pool_utilization": "0.80",
+                "min_order_notional_usdt": "20",
             },
             "suggested_for_discussion": (
-                "Single borrow <= 24% of real-time Cross Margin net asset, total liability "
-                "<= 50% of net asset, and <= 80% of GET /sapi/v1/margin/maxBorrowable."
+                "Candidate sizing/borrow caps for discussion only; not active until "
+                "explicitly written into operator-approved config."
             ),
-            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
+            "why_not_installed": why_locked,
         },
         {
             "item": "max_snapshot_age_ms",
-            "ruled_value": DEFAULT_MAX_SNAPSHOT_AGE_MS,
+            "approved": False,
+            "candidate_for_operator_review": 5000,
             "suggested_for_discussion": (
-                "5000ms snapshot TTL plus 5-state feature clocks (indicators/OBI/perp/gamma/volume_z "
-                "3600s, news 90m, LSEG 5m bars 90m, CFTC COT publication calendar)."
+                "Candidate 5000ms account snapshot TTL plus 5-state feature clocks."
             ),
-            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
+            "why_not_installed": why_locked,
         },
         {
             "item": "interest_horizon_hours",
-            "ruled_value": str(DEFAULT_INTEREST_HORIZON_HOURS),
+            "approved": False,
+            "candidate_for_operator_review": "4",
             "suggested_for_discussion": (
-                "4h interest reserve within 1 step_size over-buy bound; repay covers interest "
-                "before principal and verifies borrowed + interest == 0 via GET /sapi/v1/margin/account."
+                "Candidate 4h interest reserve within 1 step_size over-buy bound."
             ),
-            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
+            "why_not_installed": why_locked,
         },
         {
             "item": "exception_and_idempotency_policy",
-            "ruled_value": {
+            "approved": False,
+            "candidate_for_operator_review": {
                 "borrow_repay_min_spacing_sec": str(BORROW_REPAY_MIN_SPACING_SEC),
                 "timeout_retry": "forbidden_readback_only",
-                "residual_shortfall_policy": "repay_from_existing_free_only_else_halt_manual",
+                "same_asset_external_liability": "halt_no_shared_repay",
             },
             "suggested_for_discussion": (
-                "Never blind-retry timed-out borrow/order/OCO/repay; bind via txId/startTime + "
-                "account liability delta; -3007 enters pending lock; -3015 / base shortfall halts "
-                "without sending a second market buy."
+                "Never blind-retry timed-out writes; isolate per-intent principal and "
+                "refuse shared-bucket auto-repay if external same-asset borrow is present."
             ),
-            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
+            "why_not_installed": why_locked,
         },
         {
             "item": "emergency_stop",
-            "ruled_value": "LIVE_TRADING_DISABLED",
+            "approved": False,
+            "candidate_for_operator_review": "LIVE_TRADING_DISABLED",
             "suggested_for_discussion": (
-                "Keep LIVE_TRADING_DISABLED active; blocks new borrows and entries while allowing "
-                "repayment and already-working native OCO protection."
+                "Keep LIVE_TRADING_DISABLED active; blocks new borrows and entries while "
+                "allowing repayment and already-working native OCO protection."
             ),
             "why_not_installed": "Production halt stays active until post-audit sign-off.",
         },
     ]
-    for row in rows:
-        row["approved"] = unlocked
-    return rows

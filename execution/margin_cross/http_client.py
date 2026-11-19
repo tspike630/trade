@@ -41,12 +41,18 @@ import urllib.parse
 import urllib.request
 
 from execution.margin_cross.api_semantics import CROSS_ISOLATED_FLAG, NO_SIDE_EFFECT
-from execution.margin_cross.errors import MarginExchangeError, MarginTransportTimeout
+from execution.margin_cross.errors import (
+    LiveNetworkDisabled,
+    MarginExchangeError,
+    MarginTransportTimeout,
+)
 from execution.margin_cross.money import api_amount, parse_decimal
 from execution.margin_cross.policy import (
     BORROW_REPAY_MIN_SPACING_SEC,
-    MAX_ACCOUNT_LEVERAGE,
+    HARD_CLASSIC_CROSS_LEVERAGE_CEILING,
     MCP_FORBIDDEN_UID,
+    ApprovedRiskConfig,
+    live_gate_reasons,
 )
 
 DEFAULT_BASE_URL = "https://api.binance.com"
@@ -161,6 +167,9 @@ class BinanceCrossMarginHttpClient:
         clock_ms: Callable[[], int] | None = None,
         monotonic_sec: Callable[[], float] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
+        environ: Mapping[str, str] | None = None,
+        kill_switch_path: str | os.PathLike[str] | None = None,
+        approved_config: ApprovedRiskConfig | None = None,
     ) -> None:
         clean_key = api_key.strip()
         clean_secret = api_secret.strip()
@@ -190,6 +199,20 @@ class BinanceCrossMarginHttpClient:
         self._monotonic = monotonic_sec or time.monotonic
         self._sleep = sleep_fn or time.sleep
         self._last_borrow_repay_mono: float | None = None
+        self._environ = environ
+        self._kill_switch_path = kill_switch_path
+        self._approved_config = approved_config
+
+    def _require_live_write_gate(self, *, for_protective_or_repay: bool) -> None:
+        reasons = live_gate_reasons(
+            allow_live_network=True,
+            for_protective_or_repay=for_protective_or_repay,
+            explicit_kill_path=self._kill_switch_path,
+            environ=self._environ,
+            approved_config=self._approved_config,
+        )
+        if reasons:
+            raise LiveNetworkDisabled(f"live_write_blocked:{reasons[0]}")
 
     def _secrets(self) -> tuple[str, str]:
         return (self._api_key, self._api_secret)
@@ -426,8 +449,8 @@ class BinanceCrossMarginHttpClient:
         is_iso = str(payload.get("isIsolated") or CROSS_ISOLATED_FLAG)
         if is_iso != CROSS_ISOLATED_FLAG:
             raise MarginExchangeError(-1102, "isIsolated must be FALSE for cross margin")
-        # Official Binance GET /sapi/v1/margin/orderList:
-        # "symbol: mandatory for isolated margin, not supported for cross margin"
+        # Official Margin REST docs require symbol when isIsolated="TRUE" and mark it
+        # optional on Cross Margin (isIsolated="FALSE"); omitted locally by policy.
         params: dict[str, Any] = {"isIsolated": CROSS_ISOLATED_FLAG}
         if payload.get("orderListId") not in (None, ""):
             params["orderListId"] = str(payload["orderListId"])
@@ -482,6 +505,7 @@ class BinanceCrossMarginHttpClient:
         return [dict(item) for item in raw if isinstance(item, Mapping)]
 
     def borrow(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_live_write_gate(for_protective_or_repay=False)
         self._require_cross_payload(payload, forbid_symbol=True)
         if payload.get("type") != "BORROW":
             raise MarginExchangeError(-1102, "type must be BORROW")
@@ -497,6 +521,7 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def repay(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_live_write_gate(for_protective_or_repay=True)
         self._require_cross_payload(payload, forbid_symbol=True)
         if payload.get("type") != "REPAY":
             raise MarginExchangeError(-1102, "type must be REPAY")
@@ -512,6 +537,11 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def new_order(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        is_flatten_ioc = (
+            str(payload.get("timeInForce") or "") == "IOC"
+            and str(payload.get("newClientOrderId") or "").endswith("-flatten")
+        )
+        self._require_live_write_gate(for_protective_or_repay=is_flatten_ioc)
         self._require_cross_payload(payload)
         self._require_no_side_effect(payload)
         raw = self._request_json(
@@ -525,6 +555,7 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def cancel_order(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_live_write_gate(for_protective_or_repay=True)
         self._require_cross_payload(payload)
         raw = self._request_json(
             method_label="cancel_order",
@@ -537,6 +568,7 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def new_oco(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_live_write_gate(for_protective_or_repay=True)
         self._require_cross_payload(payload)
         self._require_no_side_effect(payload)
         raw = self._request_json(
@@ -550,6 +582,7 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def cancel_oco(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_live_write_gate(for_protective_or_repay=True)
         self._require_cross_payload(payload)
         if not payload.get("symbol"):
             raise MarginExchangeError(-1102, "symbol_required_for_cancel_oco")
@@ -834,7 +867,7 @@ def fetch_live_cross_margin_snapshot(
         return None, "hourly_interest_rate_missing"
     rate_str = str(hourly_rates[0].get("nextHourlyInterestRate") or "")
     account_type = str(margin_account.get("accountType") or "")
-    account_max_lev = "3" if account_type == "MARGIN_1" else str(MAX_ACCOUNT_LEVERAGE + Decimal(2))
+    account_max_lev = "3" if account_type == "MARGIN_1" else str(HARD_CLASSIC_CROSS_LEVERAGE_CEILING + Decimal(2))
     clock_now = int(time.time() * 1000) if observed_at_ms is None else int(observed_at_ms)
 
     snapshot_raw: dict[str, Any] = {
