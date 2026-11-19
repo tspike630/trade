@@ -1266,5 +1266,88 @@ class LifecycleIdempotencyAuditTest(unittest.TestCase):
             self.assertEqual([n for n, _ in case_500["client"].write_log].count("new_order"), 1)
             self.assertEqual([n for n, _ in case_500["client"].write_log].count("new_oco"), 1)
 
+    def test_t341_ambiguous_oco_2018_never_flattens_and_external_interest_blocked_pre_oco(
+        self,
+    ) -> None:
+        """t341 closure: HTTP 400/-2018 on new_oco holds in protection_unknown (0 flatten buyback), and external interest blocks before cover_buy_quantity."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1) Spot-shaped HTTP 400 / -2018 ('Order list does not exist.') or 429 on new_oco
+            # MUST NOT extrapolate spot semantics or trigger an unverified _flatten buyback!
+            for err_code, err_msg, http_st in (
+                (-2018, "Order list does not exist.", 400),
+                (-2013, "Order does not exist.", 400),
+                (-1003, "Too many requests", 429),
+            ):
+                case_amb = short_case()
+                orig_new_oco = case_amb["client"].new_oco
+
+                def raise_amb_oco(
+                    payload: dict[str, Any],
+                    _c: int = err_code,
+                    _m: str = err_msg,
+                    _s: int = http_st,
+                    _cl: Any = case_amb["client"],
+                ) -> dict[str, Any]:
+                    _cl.write_log.append(("new_oco", dict(payload)))
+                    raise MarginExchangeError(_c, _m, http_status=_s)
+
+                case_amb["client"].new_oco = raise_amb_oco  # type: ignore[method-assign]
+                t_amb = CrossMarginTrack(
+                    os.path.join(tmpdir, f"amb_{abs(err_code)}.db"), case_amb["client"]
+                )
+                r_amb = t_amb.open_position(
+                    case_amb["intent"],
+                    case_amb["snapshot"],
+                    case_amb["contract"],
+                    case_amb["gate"],
+                )
+                self.assertEqual(r_amb.state, "protection_unknown")
+                self.assertEqual(r_amb.reason, "oco_unconfirmed")
+                self.assertIsNone(r_amb.account_flat)
+                # Zero flatten BUY orders and zero premature repays!
+                order_sides = [
+                    p.get("side") for n, p in case_amb["client"].write_log if n == "new_order"
+                ]
+                self.assertEqual(order_sides, ["SELL"])
+                self.assertEqual(
+                    [n for n, _ in case_amb["client"].write_log].count("repay"), 0
+                )
+                del orig_new_oco
+
+            # 2) External-principal interest accrued while entry_resting is blocked BEFORE cover_buy_quantity / new_oco!
+            case_ext_pre = short_case()
+            case_ext_pre["client"].interest_on_borrow = Decimal("0")
+            case_ext_pre["intent"]["limit_price"] = "100500"
+            case_ext_pre["contract"]["max_base_over_liability"] = "0.0010"
+            db_pre = os.path.join(tmpdir, "ext_pre_oco.db")
+            t_pre = CrossMarginTrack(db_pre, case_ext_pre["client"])
+            resting = t_pre.open_position(
+                case_ext_pre["intent"],
+                case_ext_pre["snapshot"],
+                case_ext_pre["contract"],
+                case_ext_pre["gate"],
+            )
+            self.assertEqual(resting.state, "entry_resting")
+            # Simulate entry fill + external principal interest row (principal 0.02 != 0.01) while resting
+            entry_cid = make_client_id(str(case_ext_pre["intent"]["intent_id"]), "entry")
+            ord_row = case_ext_pre["client"]._orders[entry_cid]
+            case_ext_pre["client"]._unlock_remainder(ord_row)
+            case_ext_pre["client"]._fill(ord_row, "BTC", "USDT", Decimal("0.01"), Decimal("100500"), "SELL")
+            case_ext_pre["client"].accrue_interest(
+                "BTC", Decimal("0.0002"), principal=Decimal("0.02")
+            )
+            blocked_oco = t_pre.open_position(
+                case_ext_pre["intent"],
+                case_ext_pre["snapshot"],
+                case_ext_pre["contract"],
+                case_ext_pre["gate"],
+            )
+            self.assertEqual(blocked_oco.state, "protection_blocked")
+            self.assertEqual(blocked_oco.reason, "same_asset_external_interest_conflict")
+            self.assertEqual(
+                [n for n, _ in case_ext_pre["client"].write_log].count("new_oco"), 0
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

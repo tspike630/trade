@@ -187,7 +187,7 @@ class OfflineFixtureClient:
         principal: Decimal | None = None,
         accrued_type: str = "PERIODIC",
         isolated_symbol: str = "",
-        accrued_time_ms: int = 1_700_000_001_000,
+        accrued_time_ms: int = 1_763_520_001_000,
     ) -> int:
         row = self.asset(asset)
         eff_principal = row["borrowed"] if principal is None else principal
@@ -312,7 +312,7 @@ class OfflineFixtureClient:
             self._interest_rows.append(
                 {
                     "txId": self._next_id(),
-                    "interestAccruedTime": 1_700_000_000_000,
+                    "interestAccruedTime": 1_763_520_000_000,
                     "asset": asset,
                     "rawAsset": asset,
                     "principal": api_amount(amount),

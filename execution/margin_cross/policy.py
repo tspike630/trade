@@ -314,8 +314,9 @@ def load_approved_risk_config(
     *,
     now_ms: int | None = None,
     expected_account_uid: str | None = None,
+    require_hmac: bool = False,
 ) -> tuple[ApprovedRiskConfig | None, list[str]]:
-    """Load SHA-256-pinned (and optional HMAC-verified) zero-default operator config."""
+    """Load SHA-256-pinned and HMAC-authenticated zero-default operator config."""
     env = os.environ if environ is None else environ
     raw_path = str(env.get(APPROVED_CONFIG_PATH_ENV) or "").strip()
     if not raw_path:
@@ -330,7 +331,14 @@ def load_approved_risk_config(
     if not path.is_file():
         return None, ["approved_config_file_not_found"]
     try:
-        raw_bytes = path.read_bytes()
+        resolved_path = path.resolve()
+    except OSError:
+        return None, ["approved_config_unreadable_or_invalid_json"]
+    repo_root = _repo_root().resolve()
+    if resolved_path == repo_root or repo_root in resolved_path.parents:
+        return None, ["approved_config_inside_repo_forbidden"]
+    try:
+        raw_bytes = resolved_path.read_bytes()
     except OSError:
         return None, ["approved_config_unreadable_or_invalid_json"]
 
@@ -340,7 +348,7 @@ def load_approved_risk_config(
 
     hmac_key = str(env.get(APPROVAL_HMAC_KEY_ENV) or "").strip()
     expected_hmac = str(env.get(APPROVED_CONFIG_HMAC_ENV) or "").strip().lower()
-    if hmac_key or expected_hmac:
+    if require_hmac or hmac_key or expected_hmac:
         if not hmac_key or not expected_hmac:
             return None, ["approved_config_hmac_missing"]
         if not _is_hex64(expected_hmac):
@@ -445,12 +453,14 @@ def live_gate_reasons(
     now_ms: int | None = None,
     expected_account_uid: str | None = None,
     require_bound_uid: bool = False,
+    signer_attested: bool = False,
 ) -> list[str]:
     """Return every reason live cross-margin network access is currently locked.
 
-    Constructor-injected ``approved_config`` NEVER bypasses SHA-256 file pinning:
-    ``load_approved_risk_config`` is always evaluated against ``environ``, and any
-    injected object must also match the SHA-256-pinned file configuration.
+    Constructor-injected ``approved_config`` NEVER bypasses SHA-256 file pinning
+    or cryptographic authentication: ``load_approved_risk_config`` is always
+    evaluated against ``environ``, requiring HMAC-SHA256 verification (or
+    out-of-process Risk Signer attestation) whenever live network access is enabled.
     """
     reasons: list[str] = []
     if not allow_live_network:
@@ -470,6 +480,7 @@ def live_gate_reasons(
         environ,
         now_ms=effective_now,
         expected_account_uid=expected_account_uid,
+        require_hmac=bool(allow_live_network and not signer_attested),
     )
     if file_cfg is None:
         reasons.extend(cfg_reasons)

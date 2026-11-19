@@ -164,8 +164,8 @@ class BinanceCrossMarginHttpClient:
     def __init__(
         self,
         *,
-        api_key: str,
-        api_secret: str,
+        api_key: str = "",
+        api_secret: str = "",
         account_uid: str = "",
         base_url: str | None = None,
         timeout: float = 10.0,
@@ -177,10 +177,18 @@ class BinanceCrossMarginHttpClient:
         environ: Mapping[str, str] | None = None,
         kill_switch_path: str | os.PathLike[str] | None = None,
         approved_config: ApprovedRiskConfig | None = None,
+        signer: Any | None = None,
     ) -> None:
         clean_key = api_key.strip()
         clean_secret = api_secret.strip()
-        if not clean_key or not clean_secret:
+        if signer is not None:
+            if not clean_key:
+                clean_key = str(getattr(signer, "api_key", "") or "").strip()
+            if not clean_key:
+                raise ValueError("missing_api_credentials")
+            if clean_secret:
+                raise ValueError("in_process_secret_forbidden_with_external_signer")
+        elif not clean_key or not clean_secret:
             raise ValueError("missing_api_credentials")
         if recv_window_ms <= 0 or recv_window_ms > 60_000:
             raise ValueError("recv_window_out_of_range")
@@ -194,6 +202,7 @@ class BinanceCrossMarginHttpClient:
         )
         self._api_key = clean_key
         self._api_secret = clean_secret
+        self._signer = signer
         self.account_uid = account_uid.strip()
         self.margin_mode = "CROSS"
         self.base_url = resolved_base.rstrip("/")
@@ -210,21 +219,42 @@ class BinanceCrossMarginHttpClient:
         self._kill_switch_path = kill_switch_path
         self._approved_config = approved_config
 
+    def is_signer_attested(self, *, now_ms: int | None = None) -> bool:
+        if self._signer is None:
+            return False
+        env = os.environ if self._environ is None else self._environ
+        cfg_sha = str(env.get("CROSS_MARGIN_APPROVED_CONFIG_SHA256") or "").strip().lower()
+        if not cfg_sha or not self.account_uid:
+            return False
+        ts = int(self._clock_ms()) if now_ms is None else int(now_ms)
+        try:
+            return bool(
+                self._signer.attest_approval(
+                    config_sha256=cfg_sha,
+                    account_uid=self.account_uid,
+                    now_ms=ts,
+                )
+            )
+        except Exception:
+            return False
+
     def _require_live_network_gate(
         self,
         *,
         for_protective_or_repay: bool,
         label: str = "read",
     ) -> None:
+        now_val = int(self._clock_ms())
         reasons = live_gate_reasons(
             allow_live_network=True,
             for_protective_or_repay=for_protective_or_repay,
             explicit_kill_path=self._kill_switch_path,
             environ=self._environ,
             approved_config=self._approved_config,
-            now_ms=int(self._clock_ms()),
+            now_ms=now_val,
             expected_account_uid=self.account_uid,
             require_bound_uid=True,
+            signer_attested=self.is_signer_attested(now_ms=now_val),
         )
         if reasons:
             raise LiveNetworkDisabled(f"live_{label}_blocked:{reasons[0]}")
@@ -235,8 +265,10 @@ class BinanceCrossMarginHttpClient:
             label="write",
         )
 
-    def _secrets(self) -> tuple[str, str]:
-        return (self._api_key, self._api_secret)
+    def _secrets(self) -> tuple[str, ...]:
+        if self._api_secret:
+            return (self._api_key, self._api_secret)
+        return (self._api_key,)
 
     def _signed_pairs(self, payload: Mapping[str, Any]) -> list[tuple[str, str]]:
         pairs: list[tuple[str, str]] = []
@@ -267,7 +299,23 @@ class BinanceCrossMarginHttpClient:
         data_bytes: bytes | None = None
         if signed:
             headers["X-MBX-APIKEY"] = self._api_key
-            query = sign_margin_query(self._signed_pairs(raw_params), self._api_secret)
+            pairs_to_sign = self._signed_pairs(raw_params)
+            if self._signer is not None:
+                try:
+                    query = str(
+                        self._signer.sign_request(
+                            venue="binance_cross_margin",
+                            method=http_method,
+                            path=path,
+                            pairs=pairs_to_sign,
+                            account_uid=self.account_uid,
+                            for_protective_or_repay=for_protective_or_repay,
+                        )
+                    )
+                except Exception as exc:
+                    raise LiveNetworkDisabled(f"signer_rejected:{exc}") from exc
+            else:
+                query = sign_margin_query(pairs_to_sign, self._api_secret)
             if http_method == "POST":
                 url = f"{self.base_url}{path}"
                 data_bytes = query.encode("utf-8")

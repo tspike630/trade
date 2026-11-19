@@ -80,12 +80,16 @@ def _write_pinned_cfg_env(tmpdir: str, *, uid: str = "88001122", now_ms: int = N
     cfg_file = Path(tmpdir) / f"pinned_{uid}_{now_ms}.json"
     cfg_file.write_bytes(raw_bytes)
     sha = hashlib.sha256(raw_bytes).hexdigest()
+    hmac_key = "operator-test-hmac-secret"
+    mac = hmac.new(hmac_key.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
     cfg_obj, errs = parse_approved_risk_config(doc)
     assert cfg_obj is not None and not errs
     env = {
         PARAMETERS_APPROVED_ENV: "1",
         APPROVED_CONFIG_PATH_ENV: str(cfg_file),
         APPROVED_CONFIG_SHA256_ENV: sha,
+        APPROVAL_HMAC_KEY_ENV: hmac_key,
+        APPROVED_CONFIG_HMAC_ENV: mac,
         LIVE_ENABLED_ENV: "1",
     }
     if extra:
@@ -691,11 +695,41 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
             cfg_bytes = json.dumps(_explicit_test_config_dict()).encode("utf-8")
             Path(cfg_path).write_bytes(cfg_bytes)
             cfg_sha = hashlib.sha256(cfg_bytes).hexdigest()
+            cfg_hmac_key = "cli-operator-hmac-key"
+            cfg_hmac = hmac.new(cfg_hmac_key.encode("utf-8"), cfg_bytes, hashlib.sha256).hexdigest()
             server = _InMemoryMarginTransport(cred_id="u_demo_1", sign_id="p_demo_1")
+            # Unauthenticated SHA-256 without HMAC must fail closed on live CLI
+            with patch.dict(
+                os.environ,
+                {
+                    PARAMETERS_APPROVED_ENV: "1",
+                    APPROVED_CONFIG_PATH_ENV: cfg_path,
+                    APPROVED_CONFIG_SHA256_ENV: cfg_sha,
+                    LIVE_ENABLED_ENV: "1",
+                    k_env: "u_demo_1",
+                    s_env: "p_demo_1",
+                },
+                clear=True,
+            ):
+                unauth_rc, _, unauth_err = run_live_command(
+                    ledger_path=ledger_path,
+                    action="preflight",
+                    signal_path=sig_path,
+                    kill_switch_path=absent_flag,
+                    base_url=TEST_BASE,
+                    opener=server,
+                    clock_ms=lambda: NOW_MS,
+                )
+                self.assertEqual(unauth_rc, 2)
+                self.assertIn("approved_config_hmac_missing", unauth_err)
+                self.assertEqual(server.requests, [])
+
             unlocked_env = {
                 PARAMETERS_APPROVED_ENV: "1",
                 APPROVED_CONFIG_PATH_ENV: cfg_path,
                 APPROVED_CONFIG_SHA256_ENV: cfg_sha,
+                APPROVAL_HMAC_KEY_ENV: cfg_hmac_key,
+                APPROVED_CONFIG_HMAC_ENV: cfg_hmac,
                 LIVE_ENABLED_ENV: "1",
                 k_env: "u_demo_1",
                 s_env: "p_demo_1",
@@ -982,8 +1016,21 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
             )
             self.assertIn("approved_config_sha256_mismatch", r_tampered)
 
-            # Restore untampered bytes and test optional HMAC-SHA256 signature verification
+            # Restore untampered bytes: live gate MUST reject SHA-256 without HMAC authentication
             cfg_path.write_bytes(raw_bytes)
+            r_no_hmac = live_gate_reasons(
+                allow_live_network=True,
+                explicit_kill_path=absent_kill,
+                environ={
+                    PARAMETERS_APPROVED_ENV: "1",
+                    APPROVED_CONFIG_PATH_ENV: str(cfg_path),
+                    APPROVED_CONFIG_SHA256_ENV: good_sha,
+                    LIVE_ENABLED_ENV: "1",
+                },
+                now_ms=NOW_MS,
+                expected_account_uid="88001122",
+            )
+            self.assertIn("approved_config_hmac_missing", r_no_hmac)
             hmac_key = "operator-signing-secret"
             good_hmac = hmac.new(hmac_key.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
             r_bad_hmac = live_gate_reasons(
