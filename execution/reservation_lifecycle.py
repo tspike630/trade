@@ -22,9 +22,42 @@ from decision_engine.core.regime_v2_reservation import (
 from execution.ledger import _stored_qty_positive, _stored_qty_zero
 
 _FLAT_STATUSES = frozenset({"closed", "oco_filled", "closed_canceled"})
-# Binance codes whose documented meaning is that the new order was rejected
-# and not created. HTTP status alone is not one of these.
-_DEFINITE_NEW_ORDER_REJECT_CODES = frozenset({-1013, -1015, -1111, -1121, -2010})
+# Binance codes whose documented meaning is that this request was rejected
+# and no order was created. HTTP status alone is not one of these.
+# -2010 is a family of matching-engine texts, not one of these codes.
+_DEFINITE_NEW_ORDER_REJECT_CODES = frozenset({-1013, -1015, -1111, -1121})
+# Exact -2010 texts that reject this request and do not say a client id or an
+# order is already present. Any other -2010 text stays occupied.
+_DEFINITE_2010_NO_ORDER_MESSAGES = frozenset({
+    "Account has insufficient balance for requested action.",
+    "Market is closed.",
+    "Price * QTY is zero or less.",
+    "IcebergQty exceeds QTY.",
+    "This action is disabled on this account.",
+    "Unsupported order combination",
+    "Order would trigger immediately.",
+    "Stop price would trigger immediately.",
+    "Order would immediately match and take.",
+    "The relationship of the prices for the orders is not correct.",
+    "This symbol is not permitted for this account.",
+    "This symbol is restricted for this account.",
+    "This account may not place or cancel orders.",
+    "Stop loss orders are not supported for this symbol.",
+    "Take profit orders are not supported for this symbol.",
+    "Iceberg orders are not supported for this symbol.",
+    "Quote order qty market orders are not support for this symbol.",
+    "Trailing stop orders are not supported for this symbol.",
+    "Order cancel-replace is not supported.",
+    "OCO orders are not supported for this symbol.",
+})
+_UNPROVEN_2010_MARKERS = (
+    "duplicate",
+    "already",
+    "clientorderid",
+    "client order",
+    "clordid",
+    "existing order",
+)
 # Execution result unknown even when the transport status is 400.
 _UNKNOWN_EXECUTION_CODES = frozenset({-1000, -1001, -1006, -1007, -1008})
 
@@ -142,6 +175,19 @@ def bind_reservation_before_submit(sig: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _code_2010_proves_no_order(msg: object) -> bool:
+    """True only for an exact -2010 text that does not imply an existing order."""
+    if not isinstance(msg, str):
+        return False
+    text = msg.strip()
+    if not text:
+        return False
+    lowered = text.casefold()
+    if any(marker in lowered for marker in _UNPROVEN_2010_MARKERS):
+        return False
+    return text in _DEFINITE_2010_NO_ORDER_MESSAGES
+
+
 def _proven_exchange_rejection(result: Mapping[str, Any]) -> bool:
     if not result.get("order_post_attempted"):
         return False
@@ -153,9 +199,15 @@ def _proven_exchange_rejection(result: Mapping[str, Any]) -> bool:
     code = err.get("code")
     if isinstance(code, bool) or not isinstance(code, int):
         return False
-    if code in _UNKNOWN_EXECUTION_CODES or code not in _DEFINITE_NEW_ORDER_REJECT_CODES:
+    if code in _UNKNOWN_EXECUTION_CODES:
         return False
-    return err.get("status") == 400
+    if err.get("status") != 400:
+        return False
+    if code in _DEFINITE_NEW_ORDER_REJECT_CODES:
+        return True
+    if code == -2010:
+        return _code_2010_proves_no_order(err.get("msg"))
+    return False
 
 
 def _result_occupies(result: Mapping[str, Any]) -> bool:

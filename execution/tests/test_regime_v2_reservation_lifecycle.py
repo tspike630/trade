@@ -30,7 +30,15 @@ from execution.ledger import ExecutionLedger
 from execution.reservation_lifecycle import bind_reservation_before_submit
 
 
-def _reserve(path: str, *, decision_id: int, symbol: str, permitted: bool) -> str:
+def _reserve(
+    path: str,
+    *,
+    decision_id: int,
+    symbol: str,
+    permitted: bool,
+    max_concurrent: int = 3,
+    max_total_pct: float = 0.72,
+) -> str:
     result = try_reserve(
         path,
         {
@@ -47,10 +55,10 @@ def _reserve(path: str, *, decision_id: int, symbol: str, permitted: bool) -> st
         open_count=0,
         cluster_counts={},
         open_exposure_pct=0.0,
-        max_concurrent=3,
+        max_concurrent=max_concurrent,
         state4_max_concurrent=1,
         max_per_cluster=1,
-        max_total_pct=0.72,
+        max_total_pct=max_total_pct,
         state4_max_total_pct=0.30,
         size_pct=0.24,
         cluster_key="",
@@ -431,6 +439,108 @@ class ReservationLifecycleTests(unittest.TestCase):
         dry_rows = [row for row in active_reservations(self.db) if row["mode"] == "dry_run"]
         self.assertEqual(len(dry_rows), 2)
         self.assertEqual(live_rows, [])
+
+    def _reject_through_gateway(
+        self,
+        *,
+        decision_id: int,
+        symbol: str,
+        exchange_error: dict[str, object],
+        pending: bool,
+    ) -> str:
+        key = _reserve(
+            self.db,
+            decision_id=decision_id,
+            symbol=symbol,
+            permitted=True,
+            max_concurrent=8,
+            max_total_pct=2.0,
+        )
+        row = _row(
+            decision_id=decision_id,
+            symbol=symbol,
+            key=key,
+            mode="live_stub",
+            permitted=True,
+        )
+        payload = {
+            "ok": False,
+            "dry_run": False,
+            "executed": 0,
+            "submitted": False,
+            "order_post_attempted": True,
+            "error": f"binance_http_error:400:{exchange_error.get('code')}:{exchange_error.get('msg')}",
+            "symbol": symbol,
+            "exchange_error": exchange_error,
+            "exchange_order_id": None,
+            "consumer_allowed": False,
+        }
+        if pending:
+            _write_decision(self.root / "decision.db", row)
+        with self._gateway(ScriptedSpot(payload)) as gateway:
+            if pending:
+                gateway.process_pending()
+            else:
+                gateway.process_one(row)
+        return key
+
+    def test_duplicate_client_id_2010_is_not_a_proven_no_fill(self) -> None:
+        messages = (
+            "Duplicate order sent.",
+            "Duplicate order sent",
+            "duplicate order sent.",
+            "ClientOrderId is already in use.",
+            "",
+            "unlisted matching-engine text",
+        )
+        symbols = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT")
+        for index, message in enumerate(messages):
+            key = self._reject_through_gateway(
+                decision_id=147860 + index,
+                symbol=symbols[index],
+                exchange_error={"status": 400, "code": -2010, "msg": message},
+                pending=index == 0,
+            )
+            stored = get_reservation(self.db, key)
+            self.assertEqual(stored["status"], "unknown", message)
+            self.assertIsNone(stored["released_at_ms"], message)
+            reopened = sqlite3.connect(self.db)
+            try:
+                status, released = reopened.execute(
+                    "SELECT status, released_at_ms FROM regime_v2_reservation WHERE signal_key = ?",
+                    (key,),
+                ).fetchone()
+            finally:
+                reopened.close()
+            self.assertEqual(status, "unknown", message)
+            self.assertIsNone(released, message)
+
+    def test_insufficient_balance_2010_still_releases_and_filter_reject_stays(self) -> None:
+        balance = self._reject_through_gateway(
+            decision_id=147870,
+            symbol="SOLUSDT",
+            exchange_error={
+                "status": 400,
+                "code": -2010,
+                "msg": "Account has insufficient balance for requested action.",
+            },
+            pending=False,
+        )
+        self.assertEqual(get_reservation(self.db, balance)["release_reason"], "exchange_rejected")
+        filtered = self._reject_through_gateway(
+            decision_id=147871,
+            symbol="BNBUSDT",
+            exchange_error={"status": 400, "code": -1013, "msg": "Filter failure: LOT_SIZE"},
+            pending=True,
+        )
+        self.assertEqual(get_reservation(self.db, filtered)["release_reason"], "exchange_rejected")
+        text_code = self._reject_through_gateway(
+            decision_id=147872,
+            symbol="XRPUSDT",
+            exchange_error={"status": 400, "code": "-2010", "msg": "Duplicate order sent."},
+            pending=False,
+        )
+        self.assertEqual(get_reservation(self.db, text_code)["status"], "unknown")
 
     def test_http_400_unknown_execution_code_stays_occupied(self) -> None:
         key = _reserve(self.db, decision_id=147850, symbol="BTCUSDT", permitted=True)
