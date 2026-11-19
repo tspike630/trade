@@ -80,6 +80,15 @@ from decision_engine.core.perp_microstructure_and_beta_hedge import (
     evaluate_perp_microstructure,
 )
 from decision_engine.core.stop_gap import stop_distance_reason
+from decision_engine.core.regime_v2_policy import (
+    evaluate_s2_squeeze_zone,
+    evaluate_s4_deep_dip_zone,
+    is_s2_squeeze_candidate_row,
+    is_s4_crowded_long_candidate_row,
+    s2_entry_enabled,
+    s4_entry_enabled,
+    v2_contract_active,
+)
 
 ALPHA_FLOOR = 0.08
 ALPHA_CAP = 0.40
@@ -831,6 +840,106 @@ def evaluate_entry_zone(
         "xs_rel_1h": mh_verdict.xs_rel_1h,
         "horizon_regime": mh_verdict.horizon_regime,
     }
+
+    if v2_contract_active():
+        if is_s2_squeeze_candidate_row(row):
+            if not s2_entry_enabled():
+                return _empty(
+                    reason="state2_entry_module_not_live",
+                    tier="squeeze",
+                    ratio=ratio,
+                    zone=(zone_floor, zone_cap),
+                    stop_price=stop_price,
+                    take_profit_price=take_profit,
+                    **common,
+                )
+            s2_adm = evaluate_s2_squeeze_zone(
+                row,
+                low=low,
+                mid=mid,
+                price=price,
+                span=span,
+                alpha=alpha,
+                ratio=ratio,
+                taker_buy_ratio=tbr,
+            )
+            if not s2_adm.admitted:
+                return _empty(
+                    reason=s2_adm.reject_reason or "state2_squeeze_rejected",
+                    tier=s2_adm.tier,
+                    ratio=ratio,
+                    zone=(s2_adm.zone_min, s2_adm.zone_max),
+                    stop_price=s2_adm.stop_price or stop_price,
+                    take_profit_price=take_profit,
+                    **common,
+                )
+            s2_score = compute_composite_alpha_score(
+                row, odds=s2_adm.odds, trade_size_ratio=ratio, taker_buy_ratio=tbr
+            )
+            return _emit(
+                tier=s2_adm.tier,
+                entry_reason=s2_adm.entry_reason,
+                order_type=s2_adm.order_type,
+                limit_price=s2_adm.limit_price,
+                stop_price=s2_adm.stop_price or stop_price,
+                zone_min=s2_adm.zone_min,
+                zone_max=s2_adm.zone_max,
+                multiplier=s2_adm.multiplier,
+                size_note=s2_adm.size_note,
+                composite_alpha_score=s2_score,
+                **base,
+            )
+        is_s4, s4_trap = is_s4_crowded_long_candidate_row(row)
+        if is_s4:
+            if not s4_entry_enabled():
+                return _empty(
+                    reason="state4_deep_entry_undefined",
+                    tier="deep_fade",
+                    ratio=ratio,
+                    zone=(low, _level(low, span, 0.15)),
+                    stop_price=stop_price,
+                    take_profit_price=take_profit,
+                    **common,
+                )
+            s4_adm = evaluate_s4_deep_dip_zone(
+                row,
+                symbol=symbol,
+                low=low,
+                mid=mid,
+                price=price,
+                span=span,
+                alpha=alpha,
+                deep_zone_price=deep if deep is not None else low,
+                ratio=ratio,
+                taker_buy_ratio=tbr,
+                trap_reason=s4_trap,
+            )
+            if not s4_adm.admitted:
+                return _empty(
+                    reason=s4_adm.reject_reason or "state4_deep_dip_rejected",
+                    tier=s4_adm.tier,
+                    ratio=ratio,
+                    zone=(s4_adm.zone_min, s4_adm.zone_max),
+                    stop_price=s4_adm.stop_price or stop_price,
+                    take_profit_price=take_profit,
+                    **common,
+                )
+            s4_score = compute_composite_alpha_score(
+                row, odds=s4_adm.odds, trade_size_ratio=ratio, taker_buy_ratio=tbr
+            )
+            return _emit(
+                tier=s4_adm.tier,
+                entry_reason=s4_adm.entry_reason,
+                order_type=s4_adm.order_type,
+                limit_price=s4_adm.limit_price,
+                stop_price=s4_adm.stop_price or stop_price,
+                zone_min=s4_adm.zone_min,
+                zone_max=s4_adm.zone_max,
+                multiplier=s4_adm.multiplier,
+                size_note=s4_adm.size_note,
+                composite_alpha_score=s4_score,
+                **base,
+            )
 
     if tier == "large_trade":
         zone = (zone_floor, zone_cap)

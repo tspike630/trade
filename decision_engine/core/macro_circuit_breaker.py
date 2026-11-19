@@ -466,8 +466,18 @@ def evaluate_macro_gate(
     ``live_bnb_boll_classic``) are halted unless
     ``DECISION_MACRO_GATE_ALL_PURPOSES=1`` is set.
     """
+    env_check = os.environ if environ is None else environ
+    v2_fail_closed = (
+        str(env_check.get("REGIME_V2_CONTRACT", "")).strip().lower() in _TRUE
+        and str(env_check.get("REGIME_V2_STALE_DATA_POLICY", "")).strip().lower() == "fail_closed"
+        and (purpose in LIVE_BNB_SPOT_PURPOSES or _env_bool(env_check, "DECISION_MACRO_GATE_ALL_PURPOSES"))
+    )
     if path is None:
+        if v2_fail_closed:
+            return MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail="path_unwired")
         return MacroGateStatus.unwired()
+    if v2_fail_closed and not Path(path).expanduser().is_file():
+        return MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail="db_missing")
     env = os.environ if environ is None else environ
     all_purposes = str(env.get("DECISION_MACRO_GATE_ALL_PURPOSES") or "").strip() == "1"
     if not all_purposes and purpose not in LIVE_BNB_SPOT_PURPOSES:

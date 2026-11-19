@@ -46,6 +46,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import os
+import time
+from collections.abc import Mapping
 from typing import Any, Never, Sequence
 
 from decision_engine.core.news_shock_gate import (
@@ -64,6 +66,13 @@ from decision_engine.core.wall_mid_pricing import extract_wall_mid_from_row
 from decision_engine.core.conviction_whitelist import (
     get_conviction_tier,
     is_whitelist_enforced,
+)
+from decision_engine.core.regime_v2_policy import (
+    check_row_and_tick_freshness,
+    enforce_regime_v2_sizing_and_caps,
+    stale_data_fail_closed_active,
+    verify_s2_router_admission,
+    verify_s4_router_admission,
 )
 
 REGIME_1_POSITIVE_GAMMA_PINNED = "positive_gamma_mean_reversion"
@@ -611,6 +620,7 @@ def apply_five_state_regime_router(
     news_snapshot: NewsReadSnapshot | None = None,
     onchain_calibration: OnchainCalibration | None = None,
     aligned_rank_weight: float | None = None,
+    now_ms: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Route candidate signals through the 5-State Market Regime Router.
 
@@ -672,8 +682,18 @@ def apply_five_state_regime_router(
                 overlay.meta.get("news_shock_keyword"),
             )
             news_meta = overlay.meta
+        eff_now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        if regime_v2_contract_enabled():
+            fresh_reasons = check_row_and_tick_freshness(
+                base_row,
+                now_ms=eff_now_ms,
+                news_snapshot=news_snapshot,
+                require_all_clocks=stale_data_fail_closed_active(),
+            )
+            if fresh_reasons:
+                continue
         classified = classification_inputs(base_row)
-        decision = _apply_v2_contract(decision, classified)
+        decision = _apply_v2_contract(decision, classified, signal=sig, row=base_row)
         regime_counts[decision.regime] = regime_counts.get(decision.regime, 0) + 1
 
         if not decision.allow_buy:
@@ -753,6 +773,14 @@ def apply_five_state_regime_router(
         accepted.append(out_sig)
 
     accepted = _rerank_state3_leaders(accepted, aligned_rank_weight if news_snapshot is not None else None)
+    if regime_v2_contract_enabled():
+        eff_clock = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        accepted, _cap_rep = enforce_regime_v2_sizing_and_caps(
+            accepted, hot_rows=hot_rows, now_ms=eff_clock
+        )
+        for item in accepted:
+            if isinstance(item, dict) and str(item.get("action") or "").lower() == "buy":
+                item["_regime_v2_caps_checked"] = True
     return accepted, regime_counts
 
 
@@ -815,13 +843,20 @@ def regime_v2_contract_enabled() -> bool:
 def _apply_v2_contract(
     decision: RegimeRoutingDecision,
     classified: dict[str, Any],
+    *,
+    signal: Mapping[str, Any] | None = None,
+    row: Mapping[str, Any] | None = None,
 ) -> RegimeRoutingDecision:
-    """Map a legacy route onto the t250u contract without inventing an entry.
+    """Map a candidate onto the ruled Regime v2 contract.
 
-    State 2 stays closed: ``funding_z_fade_v1`` is a different threshold and is
-    not the live emitter. State 4 stays closed: no tested deep-fade tier exists.
-    Missing distinguishers do not fall through to a state-1 buy. Hedge stamps
-    are cleared so they cannot be read as permission to loosen beta.
+    - State 1: standard positive-gamma ``LIMIT_MAKER`` (1.00x / 1.00x), dropping
+      whale skew and rejecting missing distinguishers.
+    - State 2: admits only verified S2 short-squeeze ``LIMIT_MAKER`` entries
+      (1.20x / 1.35x); unconfirmed or disabled routes stay closed.
+    - State 3: cross-asset leader pullback ``LIMIT_MAKER`` (1.15x / 1.25x).
+    - State 4: admits only verified S4 deep-dip ``LIMIT_MAKER`` entries on
+      whitelist symbols (0.30x / 0.85x); shallow/market/speculative rejected.
+    - State 5: flat (0.0x).
     """
     if not regime_v2_contract_enabled():
         return decision
@@ -831,29 +866,57 @@ def _apply_v2_contract(
     reason = decision.reject_reason
     playbook = decision.playbook
     order_type = decision.recommended_order_type
+    missing_set = set(classified.get("missing") or [])
+    has_missing_distinguisher = any(name in missing_set for name in _STATE1_DISTINGUISHERS)
+    if decision.regime != REGIME_5_CRISIS_LIQUIDATION_HALT and has_missing_distinguisher and (
+        signal is not None or decision.regime == REGIME_1_POSITIVE_GAMMA_PINNED
+    ):
+        return RegimeRoutingDecision(
+            regime=decision.regime,
+            playbook="tech_boll_fade_standard" if decision.regime == REGIME_1_POSITIVE_GAMMA_PINNED else playbook,
+            allow_buy=False,
+            reject_reason="regime_required_inputs_missing",
+            size_multiplier=0.0,
+            tp_multiplier=tp,
+            enable_trailing_ratchet=False,
+            require_perp_beta_hedge=False,
+            recommended_order_type="NONE",
+        )
     if decision.regime == REGIME_1_POSITIVE_GAMMA_PINNED:
         playbook = "tech_boll_fade_standard"
         size = 1.00
         tp = 1.00
         order_type = "LIMIT_MAKER"
-        if state1_fallthrough_unconfirmed(playbook, classified):
-            allow = False
-            reason = "regime_required_inputs_missing"
-            size = 0.0
-            order_type = "NONE"
-        else:
+        allow = True
+        reason = None
+    elif decision.regime == REGIME_2_SHORT_SQUEEZE_BREAKOUT:
+        s2_ok, s2_reason = verify_s2_router_admission(signal, row)
+        if s2_ok:
             allow = True
             reason = None
-    elif decision.regime == REGIME_2_SHORT_SQUEEZE_BREAKOUT:
-        allow = False
-        reason = "state2_entry_module_not_live"
-        size = 0.0
-        order_type = "NONE"
+            playbook = "state2_squeeze_limit_maker"
+            size = 1.20
+            tp = 1.35
+            order_type = "LIMIT_MAKER"
+        else:
+            allow = False
+            reason = s2_reason or "state2_squeeze_entry_unconfirmed"
+            size = 0.0
+            order_type = "NONE"
     elif decision.regime == REGIME_4_CROWDED_LONG_DEFENSIVE and decision.allow_buy:
-        allow = False
-        reason = "state4_deep_entry_undefined"
-        size = 0.0
-        order_type = "NONE"
+        s4_ok, s4_reason = verify_s4_router_admission(signal, row)
+        if s4_ok:
+            allow = True
+            reason = None
+            playbook = "state4_defensive_deep_limit_maker"
+            size = 0.30
+            tp = 0.85
+            order_type = "LIMIT_MAKER"
+        else:
+            allow = False
+            reason = s4_reason or "state4_deep_dip_conditions_not_met"
+            size = 0.0
+            order_type = "NONE"
     elif decision.regime == REGIME_5_CRISIS_LIQUIDATION_HALT:
         allow = False
         size = 0.0

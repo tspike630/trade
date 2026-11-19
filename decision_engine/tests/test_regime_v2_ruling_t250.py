@@ -56,9 +56,12 @@ class RulingDraftTests(unittest.TestCase):
         self.assertEqual(env["REGIME_V2_STATE2_TP_MULTIPLIER"], "1.35")
         self.assertEqual(env["REGIME_V2_STATE3_TP_MULTIPLIER"], "1.25")
         self.assertEqual(env["REGIME_V2_STATE4_TP_MULTIPLIER"], "0.85")
-        self.assertEqual(env["REGIME_V2_STATE2_ENTRY_STATUS"], "module_not_called")
-        self.assertEqual(env["REGIME_V2_STATE4_ENTRY_STATUS"], "deep_tier_undefined")
-        self.assertEqual(env["REGIME_V2_STALE_DATA_POLICY"], "fail_closed_not_implemented")
+        self.assertEqual(env["REGIME_V2_STATE2_ENTRY_STATUS"], "live_squeeze_limit_maker_gated")
+        self.assertEqual(env["REGIME_V2_STATE4_ENTRY_STATUS"], "live_deep_dip_limit_maker_gated")
+        self.assertEqual(env["REGIME_V2_STALE_DATA_POLICY"], "fail_closed")
+        self.assertEqual(env["REGIME_V2_EQUITY_SOURCE"], "signed_account_snapshot")
+        self.assertEqual(env["REGIME_V2_MAX_CONCURRENT_POSITIONS"], "3")
+        self.assertEqual(env["REGIME_V2_MAX_TOTAL_EXPOSURE_PCT"], "0.72")
         self.assertNotIn("591.", "\n".join(f"{k}={v}" for k, v in env.items()))
 
     def test_router_does_not_read_the_draft_multipliers(self) -> None:
@@ -192,22 +195,40 @@ class ContractWiringTests(unittest.TestCase):
         self.assertAlmostEqual(routed["take_profit_price"], 110.0, places=6)
         self.assertFalse(routed["require_perp_beta_hedge"])
 
-    def test_state2_and_state4_routes_stay_closed(self) -> None:
+    def test_state2_and_state4_routes_stay_closed_when_unconfirmed_or_disabled(self) -> None:
         squeeze = evaluate_five_state_regime(_full(funding_z=-1.8))
         closed = _apply_v2_contract(squeeze, {"missing": [], "inputs": {}})
         self.assertFalse(closed.allow_buy)
-        self.assertEqual(closed.reject_reason, "state2_entry_module_not_live")
+        self.assertEqual(closed.reject_reason, "state2_squeeze_entry_unconfirmed")
         self.assertAlmostEqual(closed.size_multiplier, 0.0, places=6)
         self.assertAlmostEqual(closed.tp_multiplier, 1.35, places=6)
         crowded = evaluate_five_state_regime(
-            _full(global_account_ls_ratio=2.5, whale_retail_divergence=0.50)
+            _full(global_account_ls_ratio=2.10, whale_retail_divergence=0.55)
         )
         defensive = _apply_v2_contract(crowded, {"missing": [], "inputs": {}})
         self.assertFalse(defensive.allow_buy)
-        self.assertEqual(defensive.reject_reason, "state4_deep_entry_undefined")
+        self.assertEqual(defensive.reject_reason, "state4_deep_dip_conditions_not_met")
         self.assertAlmostEqual(defensive.size_multiplier, 0.0, places=6)
         self.assertAlmostEqual(defensive.tp_multiplier, 0.85, places=6)
         self.assertFalse(defensive.require_perp_beta_hedge)
+        old_s2 = os.environ.get("REGIME_V2_STATE2_ENTRY_STATUS")
+        old_s4 = os.environ.get("REGIME_V2_STATE4_ENTRY_STATUS")
+        os.environ["REGIME_V2_STATE2_ENTRY_STATUS"] = "module_not_called"
+        os.environ["REGIME_V2_STATE4_ENTRY_STATUS"] = "deep_tier_undefined"
+        try:
+            s2_off = _apply_v2_contract(squeeze, {"missing": [], "inputs": {}})
+            s4_off = _apply_v2_contract(crowded, {"missing": [], "inputs": {}})
+            self.assertEqual(s2_off.reject_reason, "state2_entry_module_not_live")
+            self.assertEqual(s4_off.reject_reason, "state4_deep_entry_undefined")
+        finally:
+            if old_s2 is None:
+                os.environ.pop("REGIME_V2_STATE2_ENTRY_STATUS", None)
+            else:
+                os.environ["REGIME_V2_STATE2_ENTRY_STATUS"] = old_s2
+            if old_s4 is None:
+                os.environ.pop("REGIME_V2_STATE4_ENTRY_STATUS", None)
+            else:
+                os.environ["REGIME_V2_STATE4_ENTRY_STATUS"] = old_s4
 
     def test_state5_stays_flat(self) -> None:
         crisis = _apply_v2_contract(

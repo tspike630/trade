@@ -115,3 +115,10 @@ bash scripts/regime_v2_kill_dry_run.sh \
 ## 仍未切正式服务
 
 本机没有三份特征库和 `dexscreener.db`。影子干跑只能证明隔离和缺文件，不能代替现网新鲜样本上的五态验收。要在现场做只读干跑，最小输入是：一份脱敏的指标库（含 `decision_volume_z` 与 K 线）、`public_derivatives.db`、`news_events.db`、`data/lseg/lseg_macro.db`，以及每个 purpose 的只读账本副本。不要把这些生产文件复制进本 PR。
+
+## Phase-2 Ruled Strategy & Freshness Gates (`REGIME_V2_CONTRACT=1`)
+
+- **State 2 Squeeze Entry (`live_squeeze_limit_maker_gated`)**: Unified on `tech_boll_fade_v1` (`funding_z <= -1.80` or `funding_rate <= -0.0003` or squeeze cascade or COT squeeze with `whale_retail_divergence >= 1.35`), requiring `taker_buy_ratio >= 0.48`, `obi_top5 >= -0.05`, `trade_size_ratio >= 0.85`, `oi_change_1h > -5%`, `alpha in [0.08, 0.55]`, `odds >= 1.50`, and passive `LIMIT_MAKER` (`1.20x` size, `1.35x` TP stamp; legacy `state2_entry_module_not_live` remains when disabled).
+- **State 4 Deep-Dip Entry (`live_deep_dip_limit_maker_gated`)**: Restricted to Tier S/A whitelist symbols with `boll_z <= -2.20`, `alpha <= 0.15`, `taker_buy_ratio >= 0.38`, `obi_top5 >= -0.15`, `trade_size_ratio >= 0.85`, `odds >= 3.00`, and passive `LIMIT_MAKER` (`0.30x` size, `0.85x` TP stamp).
+- **Real-Time Equity & Concurrency/Exposure Caps**: Reads authenticated `BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH` (`<= 300s`, non-MCP UID) for `live_equity_usdt * 0.24 * entry_tier * state_multiplier` (`>= 20 USDT`), enforcing `<= 3` concurrent positions (`<= 1` in State 4), `<= 1` per sector cluster, `<= 30%` single exposure, `<= 72%` total exposure (`<= 30%` in State 4), `98%` free-USDT buffer, and `<= 0.85` Beta (`<= 0.35` in State 4).
+- **9-Datasource Fail-Closed Clocks (`REGIME_V2_STALE_DATA_POLICY=fail_closed`)**: Record-timestamp freshness enforced across account snapshot (`300s`), spot indicators & turnover (`3600s`), 5m entry kline (`900s`), 1h `volume_z` (`3600s` inclusive), `obi_top5_source_ts_ms` (`3600s`), perp/dislocation/Deribit (`3600s`), whitelist news `fetched_at` (`90m`), LSEG 5m bars (`90m` when open), and CFTC COT `due_cftc_asof`.

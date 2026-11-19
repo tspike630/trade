@@ -15,6 +15,8 @@ flagged ``kline_close_mismatch`` and is not rewritten.
 
 from __future__ import annotations
 
+import os
+
 import sqlite3
 from typing import Any, Sequence
 
@@ -252,6 +254,13 @@ def attach_live_entry_coordinates(
         bar = _match_bar(bars, row)
         if bar is None:
             continue
+        row["entry_kline_5m_close_ms"] = int(bar.close_ms)
+        if str(os.environ.get("REGIME_V2_CONTRACT", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            raw_max_5m = str(os.environ.get("REGIME_V2_ENTRY_KLINE_5M_MAX_AGE_SEC", "900")).strip()
+            max_5m_ms = (int(raw_max_5m) if raw_max_5m.isdigit() and int(raw_max_5m) > 0 else 900) * 1000
+            if int(bar.close_ms) > int(now_ms) + 120_000 or int(now_ms) - int(bar.close_ms) > max_5m_ms:
+                row["entry_zone_coord_error"] = "entry_5m_kline_stale"
+                continue
         end = bars.index(bar)
         window = bars[: end + 1]
         price = _finite(row.get("price_usd"))
