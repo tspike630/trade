@@ -86,6 +86,8 @@ _UNTOUCHED = {
         "172dfbdd84f13312c63f5b27f7d2be4a0ccb04f0aad9baf2364ccce99ae8fb90",
         # Explicit route is checked before the spot gate skip. Another rewrite fails.
         "1a10d32e136a6b008ef086c5cf622d993125bde88b8fd4f7b75bb1d927725c75",
+        # Cross-margin purpose is routed, and spot arms do not claim those rows.
+        "7c6d1ab54cccdea18c16455c8d1a06008c7c7d95d779be66d80e6bc3c24108c3",
     ),
     "execution/ledger.py": (
         "fa1410df2d4d1780b3206a9acc40e32ffd574e5d29aa2c7280bede4b7e7fd0d2",
@@ -96,12 +98,16 @@ _UNTOUCHED = {
         "ff44a21b317788a8a04a25e77633641e2f33d32fa2e79795bef473e9c7f637ed",
         # Explicit margin ledger maintenance on the production tick. Another rewrite fails.
         "a5410a8e34ad415ed8d19eb05cf2b5e69327b1d99a626aecb762e20281da5728",
+        # Cross-margin purpose is not a spot ledger arm.
+        "b799de9f44de057738fc0fe2288a4f2e14cc0c8a43234b17a82d434c0d3b3207",
     ),
     "decision_engine/core/engine.py": (
         # The third hash stamps a caller-supplied account route. Default is none.
         "bac2a0590190973af9059eae5c035804b27390b277d833d10663d9e03b4cfb08",
         "2b5787626f42bb5c40542e39164445688f1bbda0afa3727a9fd7e20d959bd7b3",
         "45c0ef177289b7a3f9d8fe207f2be300773511d68bc2ee1ee3791deef2f397ae",
+        # Indicator scan includes the cross-margin purpose. Spot arms stay fade and classic.
+        "6b76e3bae7f1b73e516e0df25e91df8b2d4e1596edefece71d04968e80045e0c",
     ),
     "decision_engine/core/live_buy_guards.py": (
         "6b3023ed5bdcbb2fdd4b4372ea0d360b147be96ac68016b4d7631fc671991da7",

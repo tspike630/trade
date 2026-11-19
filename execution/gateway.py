@@ -43,6 +43,7 @@ from execution.config import (
     EXECUTION_RISK_ENABLED,
 )
 from execution.binance_account_snapshot import default_live_bnb_adapter
+from decision_engine.core.signal_bus import PURPOSE_LIVE_BNB_CROSS_MARGIN
 from execution.executors.binance_spot_gate import (
     REST_BOOK,
     consumer_read_cursor,
@@ -514,9 +515,17 @@ class ExecutionGateway:
             sql = (
                 "SELECT "
                 + ", ".join(columns)
-                + " FROM decision_log WHERE id > ? ORDER BY id ASC"
+                + " FROM decision_log WHERE id > ?"
             )
             params: list[Any] = [int(since_id)]
+            # Spot arms do not claim or watermark the cross-margin purpose.
+            if "purpose" in columns and sole_live_bnb_purpose(self.accept_purposes) is not None:
+                sql += " AND IFNULL(purpose, '') != ?"
+                params.append(PURPOSE_LIVE_BNB_CROSS_MARGIN)
+            elif self.accept_purposes == frozenset({PURPOSE_LIVE_BNB_CROSS_MARGIN}):
+                sql += " AND purpose = ?"
+                params.append(PURPOSE_LIVE_BNB_CROSS_MARGIN)
+            sql += " ORDER BY id ASC"
             if limit is not None:
                 sql += " LIMIT ?"
                 params.append(int(limit))
@@ -1293,7 +1302,54 @@ class ExecutionGateway:
 
         pm_result: dict[str, Any] | None = None
 
-        if not ok:
+        if str(sig.get("purpose") or "") == PURPOSE_LIVE_BNB_CROSS_MARGIN and ok:
+            routed = self._explicit_account_result(sig, receipt_body)
+            if routed is None:
+                receipt_body["status"] = "cross_margin_refused"
+                receipt_body["note"] = "cross-margin purpose without an explicit route"
+                receipt_body["error"] = "account_route_required"
+                return self._finalize(
+                    execution_log_id=exec_id,
+                    sig=sig,
+                    strategy_id=strategy_id,
+                    action=action,
+                    size_pct_f=size_pct_f,
+                    ok=ok,
+                    errors=errors,
+                    executed=0,
+                    executor="account_route",
+                    exec_error="account_route_required",
+                    risk_reasons=None,
+                    submitted=False,
+                    exec_result={
+                        "ok": False,
+                        "reason": "account_route_required",
+                        "spot_called": False,
+                        "margin_called": False,
+                    },
+                    pm_result=None,
+                    receipt_body=receipt_body,
+                    order_status="rejected",
+                )
+            return self._finalize(
+                execution_log_id=exec_id,
+                sig=sig,
+                strategy_id=strategy_id,
+                action=action,
+                size_pct_f=size_pct_f,
+                ok=ok,
+                errors=errors,
+                executed=int(routed["executed"]),
+                executor=str(routed["executor"]),
+                exec_error=routed["error"],
+                risk_reasons=None,
+                submitted=False,
+                exec_result=routed["exec_result"],
+                pm_result=None,
+                receipt_body=receipt_body,
+                order_status=str(routed["order_status"]),
+            )
+        elif not ok:
             receipt_body["status"] = "validation_failed"
             receipt_body["note"] = "validation_failed; not executed"
         elif is_live_bnb_spot_purpose(sig.get("purpose")) and (

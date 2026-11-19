@@ -54,6 +54,7 @@ from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
+    PURPOSE_LIVE_BNB_CROSS_MARGIN,
     SignalBus,
 )
 from decision_engine.entry_ih_age import filter_buys_by_entry_ih_age
@@ -90,6 +91,8 @@ LIVE_BNB_SPOT_PURPOSES = frozenset(
         PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     }
 )
+# Indicator scan only. Execution still treats fade and classic as the spot arms.
+LIVE_BNB_INDICATOR_PURPOSES = LIVE_BNB_SPOT_PURPOSES | {PURPOSE_LIVE_BNB_CROSS_MARGIN}
 
 
 def scan_limit_for_purpose(purpose: str, explicit: int | None = None) -> int:
@@ -104,7 +107,7 @@ def scan_limit_for_purpose(purpose: str, explicit: int | None = None) -> int:
     """
     if explicit is not None:
         return int(explicit)
-    if purpose in LIVE_BNB_SPOT_PURPOSES:
+    if purpose in LIVE_BNB_INDICATOR_PURPOSES:
         return max(int(de_config.HOT_TOKEN_LIMIT), int(de_config.LIVE_BNB_SCAN_LIMIT))
     return int(de_config.HOT_TOKEN_LIMIT)
 
@@ -163,7 +166,7 @@ class DecisionEngine:
         self.tick_count += 1
         n_ind = self.adapter.count_indicators()
         hot = self.adapter.list_hot_tokens(limit=self.hot_limit)
-        bnb_spot = self.bus.purpose in LIVE_BNB_SPOT_PURPOSES
+        bnb_spot = self.bus.purpose in LIVE_BNB_INDICATOR_PURPOSES
         bnb_source: str | None = None
         turnover_report: dict[str, Any] | None = None
         protection_book = self._protection_snapshot() if bnb_spot else ProtectionBook.unwired()
@@ -172,10 +175,15 @@ class DecisionEngine:
         )
         now_ms = int(time.time() * 1000)
         macro_path = self._macro_db if self._macro_db is not None else resolve_macro_db_path()
+        macro_purpose = (
+            PURPOSE_LIVE_BNB_BOLL_FADE
+            if self.bus.purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN
+            else self.bus.purpose
+        )
         macro_status = evaluate_macro_gate(
             macro_path,
             now_ms=now_ms,
-            purpose=self.bus.purpose,
+            purpose=macro_purpose,
         )
         macro_halt = macro_status.halt_reason
         if bnb_spot:

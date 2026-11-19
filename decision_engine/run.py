@@ -46,6 +46,7 @@ from decision_engine.core.token_cooldown import DEFAULT_TOKEN_COOLDOWN_MIN, Toke
 from decision_engine.core.signal_bus import (  # noqa: E402
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
+    PURPOSE_LIVE_BNB_CROSS_MARGIN,
     PURPOSE_LIVE_CANDIDATE,
     PURPOSE_SAMPLE,
     PURPOSE_SHADOW_010,
@@ -546,6 +547,19 @@ def main(argv: list[str] | None = None) -> int:
         log.error("--shadow-liq-cohorts requires --output-db != --db (isolation)")
         return 2
     keep_live_purpose = False
+    if purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
+        if Path(out_db).name != "dexscreener.db":
+            log.error(
+                "cross-margin purpose requires decision basename dexscreener.db"
+            )
+            return 2
+        keep_live_purpose = True
+        log.info(
+            "cross-margin emitter keeps purpose=%s output_db=%s indicator_db=%s",
+            purpose,
+            out_db,
+            db_path,
+        )
     if args.regime_v2_isolated_purpose:
         if not dry_run:
             log.error("--regime-v2-isolated-purpose requires dry-run")
@@ -598,6 +612,9 @@ def main(argv: list[str] | None = None) -> int:
     log.info("token_cooldown_min=%s", token_cooldown.cooldown_min)
     bus = SignalBus(out_db, dry_run=dry_run, purpose=purpose)
     try:
+        if str(purpose).startswith("shadow") and args.account_route_json:
+            log.error("account route is refused for a shadow purpose")
+            return 2
         account_route, route_error = load_explicit_account_route(args.account_route_json)
         if route_error:
             log.error("%s", route_error)

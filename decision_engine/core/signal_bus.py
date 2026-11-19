@@ -109,6 +109,8 @@ PURPOSE_LIVE_BNB_BOLL_FADE = "live_bnb_boll_fade"
 # Second Binance spot arm: the pre-entry-zone tech_boll_fade legs.
 # Not live_tech_boll_fade (on-chain) and not the paper race shell.
 PURPOSE_LIVE_BNB_BOLL_CLASSIC = "live_bnb_boll_classic"
+# Dedicated cross-margin book. Not a spot arm and not a shadow purpose.
+PURPOSE_LIVE_BNB_CROSS_MARGIN = "live_bnb_cross_margin"
 PURPOSE_RACE_RSI_BOLL_FADE = "race_rsi_boll_fade"
 PURPOSE_RACE_VOL_SQUEEZE_FADE = "race_vol_squeeze_fade"
 PURPOSE_RACE_CS_MOM_1W_R90 = "race_cs_mom_1w_r90"
@@ -181,6 +183,7 @@ PURPOSES = frozenset(
         PURPOSE_RACE_TECH_BOLL_FADE,
         PURPOSE_LIVE_BNB_BOLL_FADE,
         PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+        PURPOSE_LIVE_BNB_CROSS_MARGIN,
         PURPOSE_RACE_RSI_BOLL_FADE,
         PURPOSE_RACE_VOL_SQUEEZE_FADE,
         PURPOSE_RACE_CS_MOM_1W_R90,
