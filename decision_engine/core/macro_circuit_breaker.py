@@ -20,13 +20,25 @@ under four evidence-backed conditions:
    US 2Y yield (``US2YT=RR``) 15m spike >= +3.0 bps, USDJPY (``JPY=``)
    15m carry unwind <= -0.15%, or CME BTC futures (``BTCc1`` vs ``BTC=``)
    basis discount < -15.0 bps.
+
+Calendar and cross-asset files are separate. The calendar path is the
+``path`` argument, then ``DECISION_MACRO_DB``, then ``LSEG_MACRO_DB_PATH``,
+then ``data/lseg/lseg_macro.db`` only when the gate flag is on. The
+cross-asset path is ``DECISION_MACRO_CROSS_ASSET_DB``, then
+``LSEG_CROSS_ASSET_DB_PATH``, then the calendar path that was actually
+opened. A calendar file with no ``cross_asset_bars`` table stays
+``cross_asset_table_missing``. A latest ``utc_ms`` older than 30 minutes
+is ``cross_asset_stale``. Neither state adds a buy halt: the calendar
+rules still decide. A fresh breach keeps the existing ``cross_asset_*``
+halt. Every returned status carries that cross-asset label, including
+when a calendar blackout is the halt reason.
 """
 
 from __future__ import annotations
 
 import os
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -48,6 +60,10 @@ LIVE_BNB_SPOT_PURPOSES = frozenset(
 _MACRO_DB_ENV = (
     "DECISION_MACRO_DB",
     "LSEG_MACRO_DB_PATH",
+)
+_CROSS_ASSET_DB_ENV = (
+    "DECISION_MACRO_CROSS_ASSET_DB",
+    "LSEG_CROSS_ASSET_DB_PATH",
 )
 
 DEFAULT_CB_BEFORE_MIN = 15
@@ -81,6 +97,13 @@ class MacroGateStatus:
     halt_reason: str | None
     detail: str | None = None
     error: str | None = None
+    cross_asset_status: str | None = None
+    cross_asset_path: str | None = None
+    cross_asset_source: str | None = None
+    cross_asset_latest_utc_ms: int | None = None
+    cross_asset_age_ms: int | None = None
+    cross_asset_max_age_ms: int | None = None
+    cross_asset_trigger: str | None = None
 
     @staticmethod
     def unwired() -> MacroGateStatus:
@@ -160,6 +183,140 @@ def resolve_macro_db_path(
         repo_root = Path(__file__).resolve().parents[2]
         return repo_root / "data" / "lseg" / "lseg_macro.db"
     return None
+
+
+def resolve_cross_asset_db_path(
+    environ: Mapping[str, str] | None = None,
+    *,
+    calendar_path: Path | None = None,
+) -> tuple[Path | None, str]:
+    """Return the cross-asset file and which setting selected it.
+
+    ``DECISION_MACRO_CROSS_ASSET_DB`` wins, then ``LSEG_CROSS_ASSET_DB_PATH``.
+    With neither set, the calendar path is reused so an existing one-file
+    caller keeps reading the bars it already has. There is no third default
+    that points at another file.
+    """
+    env = os.environ if environ is None else environ
+    for key in _CROSS_ASSET_DB_ENV:
+        raw = env.get(key)
+        if raw is not None and str(raw).strip():
+            return Path(str(raw).strip()).expanduser(), key
+    if calendar_path is not None:
+        return Path(calendar_path).expanduser(), "calendar_path"
+    return None, "unwired"
+
+
+def describe_cross_asset(
+    path: Path | None,
+    *,
+    now_ms: int,
+    source: str,
+) -> dict[str, Any]:
+    """Read-only age of ``cross_asset_bars``. Does not write and does not halt.
+
+    ``utc_ms`` is the source clock. A bar exactly ``MAX_CROSS_ASSET_AGE_MS``
+    old is still fresh. One millisecond older is ``cross_asset_stale``.
+    """
+    diag: dict[str, Any] = {
+        "status": "cross_asset_unwired",
+        "path": None if path is None else str(Path(path).expanduser()),
+        "source": source,
+        "latest_utc_ms": None,
+        "age_ms": None,
+        "max_age_ms": MAX_CROSS_ASSET_AGE_MS,
+    }
+    if path is None:
+        return diag
+    expanded = Path(path).expanduser()
+    if not expanded.is_file():
+        diag["status"] = "cross_asset_source_missing"
+        return diag
+    try:
+        conn = sqlite3.connect(_ro_uri(expanded), uri=True, timeout=5.0)
+    except (OSError, sqlite3.Error):
+        diag["status"] = "cross_asset_source_unreadable"
+        return diag
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cross_asset_bars'"
+        ).fetchone()
+        if found is None:
+            diag["status"] = "cross_asset_table_missing"
+            return diag
+        row = conn.execute(
+            """
+            SELECT MAX(utc_ms) FROM cross_asset_bars
+            WHERE utc_ms IS NOT NULL AND utc_ms <= ?
+            """,
+            (int(now_ms),),
+        ).fetchone()
+        latest = None if row is None else row[0]
+        if latest is None:
+            diag["status"] = "cross_asset_no_utc"
+            return diag
+        latest_ms = int(latest)
+        age = int(now_ms) - latest_ms
+        diag["latest_utc_ms"] = latest_ms
+        diag["age_ms"] = age
+        diag["status"] = (
+            "cross_asset_stale" if age > MAX_CROSS_ASSET_AGE_MS else "cross_asset_healthy"
+        )
+        return diag
+    except sqlite3.Error:
+        diag["status"] = "cross_asset_source_unreadable"
+        return diag
+    finally:
+        conn.close()
+
+
+def _unwired_cross_asset() -> dict[str, Any]:
+    return {
+        "status": "cross_asset_unwired",
+        "path": None,
+        "source": "unwired",
+        "latest_utc_ms": None,
+        "age_ms": None,
+        "max_age_ms": MAX_CROSS_ASSET_AGE_MS,
+    }
+
+
+def _attach_cross_asset(
+    status: MacroGateStatus,
+    diag: Mapping[str, Any],
+    trigger: str | None = None,
+) -> MacroGateStatus:
+    name = str(diag["status"])
+    if trigger and name == "cross_asset_healthy":
+        name = "cross_asset_triggered"
+    return replace(
+        status,
+        cross_asset_status=name,
+        cross_asset_path=None if diag.get("path") is None else str(diag["path"]),
+        cross_asset_source=None if diag.get("source") is None else str(diag["source"]),
+        cross_asset_latest_utc_ms=diag.get("latest_utc_ms"),
+        cross_asset_age_ms=diag.get("age_ms"),
+        cross_asset_max_age_ms=diag.get("max_age_ms"),
+        cross_asset_trigger=trigger,
+    )
+
+
+def _cross_asset_trigger(
+    path: Path,
+    now_ms: int,
+    env: Mapping[str, str],
+) -> tuple[str | None, str | None]:
+    try:
+        conn = sqlite3.connect(_ro_uri(Path(path).expanduser()), uri=True, timeout=5.0)
+    except (OSError, sqlite3.Error):
+        return None, None
+    try:
+        conn.row_factory = sqlite3.Row
+        return _check_cross_asset(conn, now_ms, env)
+    except sqlite3.Error:
+        return None, None
+    finally:
+        conn.close()
 
 
 def _ro_uri(path: Path) -> str:
@@ -623,31 +780,62 @@ def evaluate_macro_gate(
     all_purposes = str(env.get("DECISION_MACRO_GATE_ALL_PURPOSES") or "").strip() == "1"
     live_gate = purpose in LIVE_BNB_SPOT_PURPOSES or all_purposes
     gate_flag = str(env.get("DECISION_MACRO_GATE_ENABLED") or "").strip().lower()
+
+    def _opened_cross_asset(
+        calendar: Path | None,
+    ) -> tuple[dict[str, Any], str | None, str | None]:
+        cross_path, cross_source = resolve_cross_asset_db_path(env, calendar_path=calendar)
+        diag = describe_cross_asset(cross_path, now_ms=now_ms, source=cross_source)
+        if diag["status"] != "cross_asset_healthy" or cross_path is None:
+            return diag, None, None
+        reason, detail = _cross_asset_trigger(cross_path, now_ms, env)
+        return diag, reason, detail
+
     if path is None and live_gate:
         path = resolve_macro_db_path(env, live_required=True)
         if path is None:
             detail = "gate_disabled" if gate_flag in {"0", "false", "no", "off"} else "path_unwired"
-            return MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail=detail)
+            diag, trigger, _ignored = _opened_cross_asset(None)
+            return _attach_cross_asset(
+                MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail=detail),
+                diag,
+                trigger,
+            )
     if path is None:
         if v2_fail_closed:
-            return MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail="path_unwired")
-        return MacroGateStatus.unwired()
+            diag, trigger, _ignored = _opened_cross_asset(None)
+            return _attach_cross_asset(
+                MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail="path_unwired"),
+                diag,
+                trigger,
+            )
+        return _attach_cross_asset(MacroGateStatus.unwired(), _unwired_cross_asset())
     if not Path(path).expanduser().is_file() and (live_gate or v2_fail_closed):
-        return MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail="db_missing")
+        diag, trigger, _ignored = _opened_cross_asset(Path(path).expanduser())
+        return _attach_cross_asset(
+            MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail="db_missing"),
+            diag,
+            trigger,
+        )
     if not live_gate:
-        return MacroGateStatus.unwired()
+        return _attach_cross_asset(MacroGateStatus.unwired(), _unwired_cross_asset())
+
+    diag, trigger, trigger_detail = _opened_cross_asset(Path(path).expanduser())
+
+    def _finish(status: MacroGateStatus) -> MacroGateStatus:
+        return _attach_cross_asset(status, diag, trigger)
 
     try:
         uri = _ro_uri(Path(path).expanduser())
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
     except (OSError, sqlite3.Error) as exc:
-        return MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}")
+        return _finish(MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}"))
 
     try:
         conn.row_factory = sqlite3.Row
         missing = _has_tables(conn, ("macro_events", "central_bank_events"))
         if missing is not None:
-            return MacroGateStatus.failed(missing)
+            return _finish(MacroGateStatus.failed(missing))
 
         # 1. Central Bank high-impact window [-15m, +45m]
         cb_before_ms = _env_int(env, "MACRO_CB_BEFORE_MIN", DEFAULT_CB_BEFORE_MIN) * 60_000
@@ -666,7 +854,7 @@ def evaluate_macro_gate(
         ).fetchone()
         if cb_row is not None:
             detail = f"{cb_row['country']}:{str(cb_row['event_name'])[:60]}@{cb_row['utc_ts']}"
-            return MacroGateStatus.halted("central_bank_blackout", detail)
+            return _finish(MacroGateStatus.halted("central_bank_blackout", detail))
 
         # 2. Tier-1 Macro Release (Relevance = 3) window [-15m, +30m] (or dynamic surprise window)
         r3_before_ms = _env_int(env, "MACRO_REL3_BEFORE_MIN", DEFAULT_REL3_BEFORE_MIN) * 60_000
@@ -680,7 +868,7 @@ def evaluate_macro_gate(
                 env=env,
             )
             if s_reason is not None:
-                return MacroGateStatus.halted(s_reason, s_detail)
+                return _finish(MacroGateStatus.halted(s_reason, s_detail))
             r3_row = None if fast_cleared else None
         else:
             r3_row = conn.execute(
@@ -697,7 +885,7 @@ def evaluate_macro_gate(
             ).fetchone()
         if r3_row is not None:
             detail = f"{r3_row['country']}:{r3_row['indicator_name']}@{r3_row['utc_ts']}"
-            return MacroGateStatus.halted("macro_rel3_blackout", detail)
+            return _finish(MacroGateStatus.halted("macro_rel3_blackout", detail))
 
         # 3. Tier-2 US Treasury Auction / High-Vol Rel=2 window [-10m, +20m]
         r2_before_ms = _env_int(env, "MACRO_REL2_BEFORE_MIN", DEFAULT_REL2_BEFORE_MIN) * 60_000
@@ -732,12 +920,13 @@ def evaluate_macro_gate(
             ).fetchone()
         if r2_row is not None:
             detail = f"{r2_row['country']}:{r2_row['indicator_name']}@{r2_row['utc_ts']}"
-            return MacroGateStatus.halted("macro_rel2_auction_blackout", detail)
+            return _finish(MacroGateStatus.halted("macro_rel2_auction_blackout", detail))
 
-        # 4. Cross-Asset Contagion Circuit Breakers
-        ca_reason, ca_detail = _check_cross_asset(conn, now_ms, env)
-        if ca_reason is not None:
-            return MacroGateStatus.halted(ca_reason, ca_detail)
+        # 4. Cross-asset contagion uses the cross-asset path, which may be a
+        # different file from the calendar. A missing or stale file does not
+        # add a halt; ``trigger`` is set only when that file is fresh.
+        if trigger is not None:
+            return _finish(MacroGateStatus.halted(trigger, trigger_detail))
 
         gap = _release_calendar_gap(
             conn,
@@ -747,9 +936,9 @@ def evaluate_macro_gate(
             before_ms=cb_before_ms,
         )
         if gap is not None:
-            return MacroGateStatus.halted("macro_lseg_stale_or_missing", gap)
-        return MacroGateStatus.clear()
+            return _finish(MacroGateStatus.halted("macro_lseg_stale_or_missing", gap))
+        return _finish(MacroGateStatus.clear())
     except sqlite3.Error as exc:
-        return MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}")
+        return _finish(MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}"))
     finally:
         conn.close()
