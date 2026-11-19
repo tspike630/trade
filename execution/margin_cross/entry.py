@@ -201,7 +201,34 @@ def run_live_command(
     opener: Opener | None = None,
     clock_ms: Any = None,
 ) -> tuple[int, dict[str, Any] | None, str]:
-    """Execute gated ``--live`` action (``preflight``, ``open``, or ``complete-exit``)."""
+    """CLI wrapper. The document is read here; gates stay in ``open_live_document``."""
+    doc = None
+    if signal_path:
+        doc = json.loads(Path(signal_path).read_text(encoding="utf-8"))
+    return open_live_document(
+        doc,
+        ledger_path=ledger_path,
+        action=action,
+        intent_id=intent_id,
+        kill_switch_path=kill_switch_path,
+        base_url=base_url,
+        opener=opener,
+        clock_ms=clock_ms,
+    )
+
+
+def open_live_document(
+    doc: dict[str, Any] | None,
+    *,
+    ledger_path: str,
+    action: str,
+    intent_id: str = "",
+    kill_switch_path: str | None = None,
+    base_url: str | None = None,
+    opener: Opener | None = None,
+    clock_ms: Any = None,
+) -> tuple[int, dict[str, Any] | None, str]:
+    """Gated live open. Approval is loaded from the pinned file, not from ``doc``."""
     now_fn = clock_ms or (lambda: int(time.time() * 1000))
     now_ms = int(now_fn())
     for_exit = action == "complete-exit"
@@ -271,9 +298,8 @@ def run_live_command(
         code = 0 if closed.phase_ok else 1
         return code, {"mode": LIVE_EXECUTION_MODE, "action": action, "result": closed.as_dict()}, ""
 
-    if not signal_path:
+    if not doc:
         return 2, None, "live cross-margin preflight/open requires --signal-json PATH\n"
-    doc = json.loads(Path(signal_path).read_text(encoding="utf-8"))
     symbol = str(doc["symbol"])
     base_asset = str(doc["base_asset"])
     quote_asset = str(doc.get("quote_asset") or "USDT")

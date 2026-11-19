@@ -10,8 +10,9 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from execution.margin_cross.entry import open_offline_routed
+from execution.margin_cross.entry import open_live_document, open_offline_routed
 from execution.margin_cross.policy import (
+    LIVE_EXECUTION_MODE,
     SUPPORTED_REGIME_STRATEGIES,
     SUPPORTED_SHORT_STRATEGIES,
 )
@@ -46,6 +47,54 @@ def _offline_approval_ok(signal: dict[str, Any]) -> bool:
     if not isinstance(approval, dict) or approval.get("parameters_approved") is not True:
         return False
     return all(approval.get(key) not in (None, "") for key in _OFFLINE_APPROVAL_KEYS)
+
+
+_LIVE_DOCUMENT_KEYS = (
+    "intent_id",
+    "symbol",
+    "base_asset",
+    "quote_asset",
+    "entry_tier",
+    "limit_price",
+    "take_profit_price",
+    "stop_price",
+    "stop_limit_price",
+    "market_row",
+    "clocks",
+    "expected_uid",
+    "fee_rate",
+    "fee_asset",
+)
+
+
+def _live_document(signal: dict[str, Any]) -> dict[str, Any]:
+    """Order fields only. Approval stays in the pinned file."""
+    doc = {key: signal[key] for key in _LIVE_DOCUMENT_KEYS if key in signal and signal[key] is not None}
+    action = signal.get("requested_action") or signal.get("action")
+    if action is not None:
+        doc["action"] = action
+    return doc
+
+
+def _live_failure_reason(
+    payload: dict[str, Any] | None,
+    result: dict[str, Any] | None,
+    err: str,
+) -> str | None:
+    if isinstance(payload, dict) and payload.get("reasons"):
+        return str(payload["reasons"][0])
+    if isinstance(payload, dict) and payload.get("reason"):
+        return str(payload["reason"])
+    if isinstance(result, dict) and result.get("phase_ok") is not True:
+        return str(result.get("reason") or "phase_not_ok")
+    text = (err or "").strip()
+    if text.startswith("live cross-margin network writes are disabled (") and ")" in text:
+        return text.split("(", 1)[1].split(")", 1)[0]
+    if "missing API credentials" in text:
+        return "missing_api_credentials"
+    if "--ledger" in text:
+        return "ledger_required"
+    return text or "live_not_opened"
 
 
 def _refuse(reason: str) -> dict[str, Any]:
@@ -118,6 +167,27 @@ def dispatch_account_route(
         intent_strategy = str(intent.get("strategy_id") or "")
         if intent_strategy and intent_strategy != strategy_id:
             return _refuse("strategy_payload_mismatch")
+
+    if execution_mode == LIVE_EXECUTION_MODE:
+        code, payload, err = open_live_document(
+            _live_document(signal),
+            ledger_path=ledger_path,
+            action="open",
+        )
+        result = payload.get("result") if isinstance(payload, dict) else None
+        called = isinstance(result, dict)
+        reason = _live_failure_reason(payload, result if called else None, err)
+        opened = code == 0 and called and result.get("phase_ok") is True
+        return {
+            "ok": opened,
+            "reason": None if opened else reason,
+            "venue": "binance_cross_margin",
+            "spot_called": False,
+            "margin_called": called,
+            "entry": "execution.margin_cross.entry.open_live_document",
+            "open": result if called else None,
+            "live_code": code,
+        }
 
     if execution_mode == "offline_fixture":
         if not _offline_approval_ok(signal):
