@@ -889,6 +889,7 @@ class CrossMarginTrack:
             planned_tp=intent.take_profit_price,
             actual_fill=avg_fill,
             tick_size=snapshot.filters.tick_size,
+            tp_multiplier=Decimal("1"),
         )
         if adjusted_tp is None:
             return intent

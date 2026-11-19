@@ -579,6 +579,38 @@ def _snap_price_up(value: Decimal, tick: Decimal) -> Decimal:
     return units * tick
 
 
+def _blocked_plan(reason: str) -> ApprovedPositionPlan:
+    return ApprovedPositionPlan(
+        allowed=False,
+        reasons=(reason,),
+        regime="blocked",
+        strategy_id="",
+        net_asset_quote=Decimal(0),
+        effective_leverage_after=Decimal(0),
+        target_notional_quote=Decimal(0),
+        quantity=Decimal(0),
+        intent=None,
+        contract=None,
+    )
+
+
+def _ruled_stop_limit(action: str, snapped_stop: Decimal, tick: Decimal) -> Decimal | None:
+    """20 bps and at least two ticks beyond the snapped stop. Not a fill promise."""
+    if tick <= 0 or snapped_stop <= 0:
+        return None
+    if action == "OPEN_LONG":
+        buffered = min(snapped_stop - (Decimal(2) * tick), _snap_price_down(snapped_stop * Decimal("0.9980"), tick))
+        if buffered <= 0 or buffered > snapped_stop:
+            return None
+    else:
+        buffered = max(snapped_stop + (Decimal(2) * tick), _snap_price_up(snapped_stop * Decimal("1.0020"), tick))
+        if buffered < snapped_stop:
+            return None
+    if buffered <= 0:
+        return None
+    return buffered
+
+
 def build_approved_position_plan(
     *,
     intent_id: str,
@@ -594,7 +626,8 @@ def build_approved_position_plan(
     limit_price: Decimal | None = None,
     planned_take_profit: Decimal,
     stop_price: Decimal,
-    stop_limit_price: Decimal,
+    stop_limit_price: Decimal | None = None,
+    derive_ruled_stop_limit: bool = False,
     borrow_step: Decimal | None = None,
     max_borrow_quantity_cap: Decimal | None = None,
     risk_config: ApprovedRiskConfig | Mapping[str, Any] | None = None,
@@ -774,7 +807,12 @@ def build_approved_position_plan(
         )
         snapped_tp = _snap_price_down(scaled_tp_raw, tick)
         snapped_stop = _snap_price_up(stop_price, tick)
-        snapped_stop_limit = _snap_price_up(stop_limit_price, tick)
+        if derive_ruled_stop_limit:
+            snapped_stop_limit = _ruled_stop_limit("OPEN_SHORT", snapped_stop, tick)
+            if snapped_stop_limit is None:
+                return _blocked_plan("stop_limit_invalid")
+        else:
+            snapped_stop_limit = _snap_price_up(stop_limit_price or Decimal(0), tick)
         borrow_asset = base_asset
         new_borrow_quote = quantity * snapped_entry
     else:
@@ -788,7 +826,12 @@ def build_approved_position_plan(
         )
         snapped_tp = _snap_price_up(scaled_tp_raw, tick)
         snapped_stop = _snap_price_down(stop_price, tick)
-        snapped_stop_limit = _snap_price_down(stop_limit_price, tick)
+        if derive_ruled_stop_limit:
+            snapped_stop_limit = _ruled_stop_limit("OPEN_LONG", snapped_stop, tick)
+            if snapped_stop_limit is None:
+                return _blocked_plan("stop_limit_invalid")
+        else:
+            snapped_stop_limit = _snap_price_down(stop_limit_price or Decimal(0), tick)
         borrow_asset = base_asset
         new_borrow_quote = Decimal(0)
 

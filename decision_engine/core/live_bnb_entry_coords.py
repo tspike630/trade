@@ -98,6 +98,7 @@ def _read_table(
     open_col = _pick(cols, ("open_time_ms", "ts", "open_time", "open_ms"))
     low_col = _pick(cols, ("low", "l"))
     close_col = _pick(cols, ("close", "c"))
+    high_col = _pick(cols, ("high", "h"))
     if symbol_col is None or open_col is None or low_col is None or close_col is None:
         return {}
     vol_col = _pick(cols, ("volume", "base_volume", "v"))
@@ -109,6 +110,8 @@ def _read_table(
     interval_col = _pick(cols, ("interval", "timeframe"))
     exchange_col = "exchange" if "exchange" in cols else None
     selected = [symbol_col, open_col, low_col, close_col]
+    if high_col is not None:
+        selected.append(high_col)
     for extra in (
         vol_col,
         quote_col,
@@ -143,6 +146,10 @@ def _read_table(
         close = _finite(row.get(close_col))
         if open_ms is None or low is None or close is None or low <= 0 or close <= 0:
             continue
+        # Native high only. A missing high is not the close.
+        high = _finite(row.get(high_col)) if high_col is not None else None
+        if high is not None and high <= 0:
+            high = None
         opened = int(open_ms)
         if close_time_col is not None and row.get(close_time_col) is not None:
             close_ms_raw = _finite(row.get(close_time_col))
@@ -164,6 +171,7 @@ def _read_table(
             volume=vol,
             taker_buy_base_volume=taker_base,
             taker_buy_quote_volume=taker_quote,
+            high=high,
         )
     return buckets
 
@@ -273,6 +281,8 @@ def attach_live_entry_coordinates(
             continue
         if _finite(row.get("kline_low")) is None and _finite(row.get("low")) is None:
             row["kline_low"] = bar.low
+        if bar.high is not None and _finite(row.get("kline_high")) is None:
+            row["kline_high"] = bar.high
         if _finite(row.get("boll_mid")) is None and len(window) >= BOLL_LENGTH:
             mid = boll_mid_from_closes([item.close for item in window])
             if mid is not None:

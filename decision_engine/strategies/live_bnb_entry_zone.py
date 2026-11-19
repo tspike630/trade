@@ -172,6 +172,7 @@ class ZoneBar:
     volume: float | None = None
     taker_buy_base_volume: float | None = None
     taker_buy_quote_volume: float | None = None
+    high: float | None = None
 
 
 @dataclass(frozen=True)
@@ -663,6 +664,7 @@ def evaluate_entry_zone(
     *,
     min_change_5m: float = 2.0,
     min_volume_strength: float = 0.5,
+    cross_margin_book: bool = False,
 ) -> EntryDecision:
     """One closed bar → emit a buy intent or a fail-closed reason."""
     symbol = str(row.get("binance_symbol") or "").strip()
@@ -849,7 +851,7 @@ def evaluate_entry_zone(
         "horizon_regime": mh_verdict.horizon_regime,
     }
 
-    if v2_contract_active():
+    if v2_contract_active() and not cross_margin_book:
         if is_s2_squeeze_candidate_row(row):
             if not s2_entry_enabled():
                 return _empty(

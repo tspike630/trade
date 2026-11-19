@@ -175,6 +175,26 @@ def _refused_plan(reason: str) -> ApprovedPositionPlan:
     )
 
 
+def _closed_bar_reference_drift(
+    doc: dict[str, Any], snapshot_raw: dict[str, Any]
+) -> str | None:
+    """Cross-time check only. 30 bps inclusive. Not the same-table close matcher."""
+    raw_close = doc.get("closed_bar_close")
+    raw_ref = snapshot_raw.get("reference_price")
+    if raw_close in (None, "") or raw_ref in (None, ""):
+        return "closed_bar_reference_missing"
+    try:
+        closed = Decimal(str(raw_close))
+        reference = Decimal(str(raw_ref))
+    except Exception:
+        return "closed_bar_reference_invalid"
+    if closed <= 0 or reference <= 0:
+        return "closed_bar_reference_invalid"
+    if abs(reference - closed) / closed > Decimal("0.003"):
+        return "closed_bar_reference_drift"
+    return None
+
+
 def _snapshot_failure_payload(action: str, reason: str) -> dict[str, Any]:
     """Name the snapshot sub-call. A terminal borrow code is not a retry."""
     payload: dict[str, Any] = {
@@ -205,11 +225,13 @@ def _plan_from_signal_doc(
     now_ms: int,
 ):
     doc = bind_document_intent_id(doc)
-    missing = [
-        key
-        for key in ("intent_id", "action", "take_profit_price", "stop_price", "stop_limit_price")
-        if doc.get(key) in (None, "")
-    ]
+    ruled = doc.get("cross_margin_price_contract") == "t447"
+    required = ["intent_id", "action", "take_profit_price", "stop_price"]
+    if ruled:
+        required.append("limit_price")
+    else:
+        required.append("stop_limit_price")
+    missing = [key for key in required if doc.get(key) in (None, "")]
     if missing:
         return _refused_plan("order_fields_missing:" + ",".join(missing))
     symbol = str(doc["symbol"])
@@ -233,7 +255,10 @@ def _plan_from_signal_doc(
         limit_price=limit_px,
         planned_take_profit=Decimal(str(doc["take_profit_price"])),
         stop_price=Decimal(str(doc["stop_price"])),
-        stop_limit_price=Decimal(str(doc["stop_limit_price"])),
+        stop_limit_price=(
+            None if ruled else Decimal(str(doc["stop_limit_price"]))
+        ),
+        derive_ruled_stop_limit=ruled,
         risk_config=doc.get("approved_risk_config"),
         macro_halt=doc.get("macro_halt"),
     )
@@ -398,6 +423,10 @@ def open_live_document(
     )
     if snap_err or snapshot_raw is None:
         return 1, _snapshot_failure_payload(action, str(snap_err or "snapshot_missing")), ""
+    if doc.get("cross_margin_price_contract") == "t447":
+        drift = _closed_bar_reference_drift(doc, snapshot_raw)
+        if drift is not None:
+            return 1, _snapshot_failure_payload(action, drift), ""
 
     existing_row = (
         track.ledger.intent_row(str(doc.get("intent_id") or ""))

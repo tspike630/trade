@@ -33,6 +33,7 @@ from decision_engine.core.portfolio_clusters import (
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
+    PURPOSE_LIVE_BNB_CROSS_MARGIN,
 )
 from decision_engine.core.regime_v2_policy import resolve_boll_z, v2_contract_active
 from decision_engine.core.stop_gap import stop_distance_reason
@@ -101,11 +102,15 @@ class TechBollFadeStrategy(BaseStrategy):
         purpose = str(data.get("purpose") or "")
         if purpose == PURPOSE_LIVE_BNB_BOLL_FADE:
             return self._on_tick_entry_zone(data)
+        if purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
+            return self._on_tick_entry_zone(data, cross_margin_book=True)
         if purpose == PURPOSE_LIVE_BNB_BOLL_CLASSIC:
             return self._on_tick_classic_cex(data)
         return self._on_tick_paper(data)
 
-    def _on_tick_entry_zone(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+    def _on_tick_entry_zone(
+        self, data: dict[str, Any], *, cross_margin_book: bool = False
+    ) -> list[dict[str, Any]]:
         """Live arm only. Paper ``race_tech_boll_fade`` stays on ``_on_tick_paper``.
 
         Neutral keeps multiplier 0.5. If that quote is under 20 USDT,
@@ -128,6 +133,7 @@ class TechBollFadeStrategy(BaseStrategy):
                 row,
                 min_change_5m=self.min_change_5m,
                 min_volume_strength=self.min_volume_strength,
+                cross_margin_book=cross_margin_book,
             )
             if not decision.emit:
                 reason = decision.reject_reason or "entry_zone_rejected"
@@ -251,6 +257,24 @@ class TechBollFadeStrategy(BaseStrategy):
                 lift_extra["orderflow_regime"] = decision.orderflow_regime
             hits += 1
             order_type = decision.order_type or "MARKET"
+            limit_price = decision.limit_price
+            if cross_margin_book and limit_price is None and order_type == "MARKET":
+                limit_price = decision.price
+                order_type = "LIMIT"
+            if cross_margin_book:
+                symbol = str(row.get("binance_symbol") or "")
+                base = symbol[:-4] if symbol.endswith("USDT") and len(symbol) > 4 else symbol
+                lift_extra.update(
+                    {
+                        "cross_margin_price_contract": "t447",
+                        "symbol": symbol,
+                        "base_asset": base,
+                        "quote_asset": "USDT",
+                        "requested_action": "OPEN_LONG",
+                        "closed_bar_close": decision.price,
+                        "market_row": dict(row),
+                    }
+                )
             self.buy(
                 chain_id=str(row.get("chain_id") or ""),
                 token_address=str(row.get("token_address") or ""),
@@ -276,7 +300,7 @@ class TechBollFadeStrategy(BaseStrategy):
                 stop_price=decision.stop_price,
                 take_profit_price=decision.take_profit_price,
                 order_type=order_type,
-                limit_price=decision.limit_price,
+                limit_price=limit_price,
                 position_size_multiplier=multiplier,
                 position_size_note=size_note,
                 entry_reason=decision.entry_reason,

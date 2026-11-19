@@ -50,6 +50,7 @@ from decision_engine.core.bnb_spot_map import (
     stamp_bnb_spot_signals,
 )
 from decision_engine.core.data_adapter import IndicatorDataAdapter
+from decision_engine.strategies.regime_cross_margin import drop_opposite_side_conflicts
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
@@ -76,7 +77,9 @@ def _stamp_explicit_account_route(
         return signals
     stamped: list[dict[str, Any]] = []
     for sig in signals:
-        if str(sig.get("action") or "").lower() != "buy":
+        action = str(sig.get("action") or "").lower()
+        cross_order = sig.get("cross_margin_price_contract") == "t447"
+        if action != "buy" and not cross_order:
             stamped.append(sig)
             continue
         out = dict(sig)
@@ -195,7 +198,10 @@ class DecisionEngine:
             hot = attach_counterparty_context(hot, now_ms=now_ms)
             # Coordinates are the entry-zone overlay. The classic arm reads
             # the factor fields the paper legs already use.
-            if self.bus.purpose == PURPOSE_LIVE_BNB_BOLL_FADE:
+            if self.bus.purpose in {
+                PURPOSE_LIVE_BNB_BOLL_FADE,
+                PURPOSE_LIVE_BNB_CROSS_MARGIN,
+            }:
                 hot = attach_live_entry_coordinates(
                     self.adapter.conn,
                     hot,
@@ -230,6 +236,7 @@ class DecisionEngine:
             "tick": self.tick_count,
             "adapter": self.adapter,
             "purpose": self.bus.purpose,
+            "macro_halt": macro_halt,
         }
         candidates: list[dict[str, Any]] = []
         for strat in self.strategies:
@@ -238,6 +245,16 @@ class DecisionEngine:
                 candidates.extend(out)
             except Exception as exc:  # noqa: BLE001
                 log.exception("strategy %s failed: %s", strat.strategy_id, exc)
+
+        if self.bus.purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
+            before_conflict = len(candidates)
+            candidates = drop_opposite_side_conflicts(candidates)
+            if len(candidates) != before_conflict:
+                log.info(
+                    "cross_margin_conflict_drop before=%s after=%s",
+                    before_conflict,
+                    len(candidates),
+                )
 
         if bnb_spot:
             before = len(candidates)

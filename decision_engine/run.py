@@ -258,8 +258,19 @@ class ShadowCohortRisk(RiskManager):
 
 def build_strategies(args: argparse.Namespace) -> list:
     ids: list[str]
+    strategy_set = getattr(args, "strategy_set", None)
+    if args.all and strategy_set:
+        raise SystemExit("--strategy-set cannot be combined with --all")
+    if strategy_set and args.strategy:
+        raise SystemExit("--strategy-set cannot be combined with --strategy")
     if args.all:
         ids = list_strategies()
+    elif strategy_set == "live_bnb_cross_margin":
+        from decision_engine.strategies.regime_cross_margin import (
+            CROSS_MARGIN_APPROVED_STRATEGIES,
+        )
+
+        ids = list(CROSS_MARGIN_APPROVED_STRATEGIES)
     elif args.strategy:
         ids = [args.strategy]
     else:
@@ -367,6 +378,12 @@ def main(argv: list[str] | None = None) -> int:
         "--strategy",
         default=None,
         help=f"strategy_id (default {de_config.DEFAULT_STRATEGY}); known: {', '.join(list_strategies())}",
+    )
+    parser.add_argument(
+        "--strategy-set",
+        choices=["live_bnb_cross_margin"],
+        default=None,
+        help="run the approved cross-margin set of 8 strategies; refused with --all",
     )
     parser.add_argument(
         "--all",

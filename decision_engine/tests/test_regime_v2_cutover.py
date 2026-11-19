@@ -110,6 +110,8 @@ _UNTOUCHED = {
         "45c0ef177289b7a3f9d8fe207f2be300773511d68bc2ee1ee3791deef2f397ae",
         # Indicator scan includes the cross-margin purpose. Spot arms stay fade and classic.
         "6b76e3bae7f1b73e516e0df25e91df8b2d4e1596edefece71d04968e80045e0c",
+        # Cross-margin sells keep an explicit route, and opposite sides on one symbol drop.
+        "e6f375318e778fc59f657499e982ee8957b824d45053096b0bc82b919f2706eb",
     ),
     "decision_engine/core/live_buy_guards.py": (
         "6b3023ed5bdcbb2fdd4b4372ea0d360b147be96ac68016b4d7631fc671991da7",

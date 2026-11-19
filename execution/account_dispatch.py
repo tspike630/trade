@@ -60,6 +60,8 @@ _LIVE_DOCUMENT_KEYS = (
     "take_profit_price",
     "stop_price",
     "stop_limit_price",
+    "closed_bar_close",
+    "cross_margin_price_contract",
     "market_row",
     "clocks",
     "expected_uid",

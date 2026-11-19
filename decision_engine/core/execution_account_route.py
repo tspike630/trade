@@ -58,6 +58,8 @@ def route_request_from_signal(signal: dict[str, Any]) -> dict[str, Any]:
         "take_profit_price": signal.get("take_profit_price"),
         "stop_price": signal.get("stop_price"),
         "stop_limit_price": signal.get("stop_limit_price"),
+        "closed_bar_close": signal.get("closed_bar_close"),
+        "cross_margin_price_contract": signal.get("cross_margin_price_contract"),
         "market_row": signal.get("market_row"),
         "clocks": signal.get("clocks"),
         "now_ms": signal.get("now_ms"),
