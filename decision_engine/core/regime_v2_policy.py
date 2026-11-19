@@ -31,6 +31,13 @@ from decision_engine.core.portfolio_clusters import (
 )
 from decision_engine.core.protection_halt import read_protection_book
 from decision_engine.core.stop_gap import stop_distance_reason
+from decision_engine.core.regime_v2_reservation import (
+    RELEASE_INTERFACE_BLOCK,
+    active_reservations,
+    reservation_db_path,
+    signal_reservation_key,
+    try_reserve,
+)
 from decision_engine.core.volume_z_1h import source_close_is_fresh
 
 CONTRACT_ENV = "REGIME_V2_CONTRACT"
@@ -80,7 +87,10 @@ S4_LARGE_TRADE_SIZE_RATIO = 1.30
 S4_MIN_ODDS = 3.00
 S4_DEEP_ENTRY_REASONS = frozenset({"state4_deep_limit_maker"})
 
-# Real-Time Equity, Concurrency & Exposure Cap Rulings
+# Real-time equity and cap numbers from commit f06cfb1c, approved by t307
+# (2026-11-19 17:31 HKT). Concurrency 3 (state 4 = 1), total exposure 0.72
+# (state 4 = 0.30), one name per cluster, and 0.30 per name replace the
+# earlier 2 / 0.70 proposals. Beta 0.85 / state 4 0.35 stays as submitted.
 DEFAULT_BASE_POSITION_PCT = 0.24
 DEFAULT_ACCOUNT_SNAPSHOT_MAX_AGE_SEC = 300
 DEFAULT_ENTRY_KLINE_5M_MAX_AGE_SEC = 900
@@ -539,52 +549,60 @@ def verify_s2_router_admission(
     row: Mapping[str, Any] | None,
     *,
     environ: Mapping[str, str] | None = None,
+    now_ms: int | None = None,
 ) -> tuple[bool, str | None]:
-    """Router-side verification that a State-2 buy came from a valid S2 squeeze entry."""
+    """Re-run the squeeze zone on the source row. A pasted reason is not enough."""
     if not s2_entry_enabled(environ):
         return False, "state2_entry_module_not_live"
-    if signal is None or row is None:
+    if row is None:
         return False, "state2_squeeze_entry_unconfirmed"
-    merged: dict[str, Any] = dict(row)
-    merged.update(signal)
-    entry_reason = str(merged.get("entry_reason") or "").strip()
-    order_type = str(merged.get("order_type") or "").strip().upper()
-    tbr = _finite(merged.get("taker_buy_ratio") or merged.get("spot_taker_buy_ratio"))
-    obi = _finite(merged.get("obi_top5") or merged.get("spot_obi_top5"))
-    min_tbr = _env_float("REGIME_V2_S2_MIN_TAKER_BUY_RATIO", S2_MIN_TAKER_BUY_RATIO, environ)
-    min_obi = _env_float("REGIME_V2_S2_MIN_OBI_TOP5", S2_MIN_OBI_TOP5, environ)
-    alpha_cap = _env_float("REGIME_V2_S2_ALPHA_CAP", S2_ALPHA_CAP, environ)
-
-    if tbr is None or tbr < min_tbr - _CMP_EPS:
-        return False, "state2_taker_buy_below_min"
-    if obi is None or obi < min_obi - _CMP_EPS:
-        return False, "state2_obi_top5_below_min"
-    oi_chg = _finite(merged.get("open_interest_change_1h") or merged.get("oi_change_1h_pct"))
-    if oi_chg is not None and oi_chg <= -S2_MAX_OI_DROP_1H_PCT:
-        return False, "state2_oi_collapsing"
-
-    if entry_reason in S2_SQUEEZE_ENTRY_REASONS:
-        if order_type != "LIMIT_MAKER":
+    if not is_s2_squeeze_candidate_row(row, environ=environ):
+        return False, "state2_squeeze_entry_unconfirmed"
+    if now_ms is not None:
+        fresh = check_row_and_tick_freshness(
+            row,
+            now_ms=now_ms,
+            require_all_clocks=True,
+            environ=environ,
+        )
+        if fresh:
+            return False, fresh[0]
+    low = _finite(row.get("kline_low") or row.get("low"))
+    mid = _finite(row.get("boll_mid"))
+    price = _finite(row.get("price_usd") or row.get("price") or row.get("close"))
+    ratio = _finite(row.get("trade_size_ratio"))
+    taker = _finite(row.get("taker_buy_ratio") or row.get("spot_taker_buy_ratio"))
+    if low is None or mid is None or price is None or ratio is None or mid <= low:
+        return False, "state2_squeeze_entry_unconfirmed"
+    span = mid - low
+    alpha = (price - low) / span
+    admission = evaluate_s2_squeeze_zone(
+        row,
+        low=low,
+        mid=mid,
+        price=price,
+        span=span,
+        alpha=alpha,
+        ratio=ratio,
+        taker_buy_ratio=taker,
+        environ=environ,
+    )
+    if not admission.admitted:
+        return False, admission.reject_reason or "state2_squeeze_entry_unconfirmed"
+    if signal is not None:
+        order_type = str(
+            signal.get("order_type") or signal.get("recommended_order_type") or ""
+        ).strip().upper()
+        if order_type and order_type != "LIMIT_MAKER":
             return False, "state2_requires_limit_maker"
-        lim = _finite(merged.get("limit_price"))
-        px = _finite(merged.get("price_usd") or merged.get("price"))
-        if lim is None or px is None or not (0.0 < lim < px):
+        posted_limit = _finite(signal.get("limit_price"))
+        if (
+            posted_limit is not None
+            and admission.limit_price is not None
+            and abs(posted_limit - admission.limit_price) > 1e-6
+        ):
             return False, "state2_limit_price_invalid"
-        return True, None
-
-    alpha = _finite(merged.get("alpha"))
-    lim = _finite(merged.get("limit_price"))
-    px = _finite(merged.get("price_usd") or merged.get("price"))
-    if (
-        order_type == "LIMIT_MAKER"
-        and alpha is not None
-        and S2_ALPHA_FLOOR - _CMP_EPS <= alpha <= alpha_cap + _CMP_EPS
-        and lim is not None
-        and px is not None
-        and 0.0 < lim < px
-    ):
-        return True, None
-    return False, "state2_squeeze_entry_unconfirmed"
+    return True, None
 
 
 def verify_s4_router_admission(
@@ -693,6 +711,28 @@ def _age_invalid(ts_ms: int | None, now_ms: int, window_ms: int) -> bool:
     return age < -120_000 or age > window_ms
 
 
+def _epoch_unit_mismatch(raw: object) -> bool:
+    """True when a millisecond field holds a unix-seconds magnitude. Do not rescale it."""
+    number = _as_int(raw)
+    if number is None and isinstance(raw, str):
+        text = raw.strip()
+        if text.isdigit():
+            number = int(text)
+    if number is None:
+        return False
+    return 1_000_000_000 <= number < 100_000_000_000
+
+
+def _source_clock_ms(raw: object) -> tuple[int | None, str | None]:
+    if raw in (None, ""):
+        return None, None
+    if _epoch_unit_mismatch(raw):
+        return None, "unit"
+    if isinstance(raw, str) and not raw.strip().isdigit():
+        return _parse_iso_ms(raw), None
+    return _as_int(raw), None
+
+
 def query_latest_whitelist_news_fetched_ms(db_path: str | Path | None) -> int | None:
     if db_path is None or not str(db_path).strip():
         return None
@@ -721,6 +761,31 @@ def query_latest_whitelist_news_fetched_ms(db_path: str | Path | None) -> int | 
     return _parse_iso_ms(str(row["fetched_at"]))
 
 
+def entry_kline_5m_clock_reason(
+    row: Mapping[str, Any],
+    *,
+    now_ms: int,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Closed 5-minute bar clock. Missing, future, stale, or seconds-valued stamps fail."""
+    raw = row.get("entry_kline_5m_close_ms")
+    if raw in (None, ""):
+        return "entry_5m_kline_clock_absent"
+    if _epoch_unit_mismatch(raw):
+        return "entry_5m_kline_clock_unit_mismatch"
+    close_ms, unit = _source_clock_ms(raw)
+    if unit == "unit":
+        return "entry_5m_kline_clock_unit_mismatch"
+    if close_ms is None:
+        return "entry_5m_kline_clock_absent"
+    window_ms = _env_int(
+        ENTRY_KLINE_5M_MAX_AGE_ENV, DEFAULT_ENTRY_KLINE_5M_MAX_AGE_SEC, environ
+    ) * 1000
+    if _age_invalid(close_ms, now_ms, window_ms):
+        return "entry_5m_kline_stale"
+    return None
+
+
 def check_row_and_tick_freshness(
     row: Mapping[str, Any],
     *,
@@ -737,6 +802,8 @@ def check_row_and_tick_freshness(
       missing clocks fail closed; otherwise present clocks that are stale fail closed.
     """
     env = os.environ if environ is None else environ
+    if v2_contract_active(env):
+        require_all_clocks = True
     reasons: list[str] = []
     ind_window_ms = int(binance_indicators_fresh_sec()) * 1000
     kline_5m_window_ms = (
@@ -744,14 +811,16 @@ def check_row_and_tick_freshness(
     )
     news_window_ms = int(NEWS_WINDOW_MIN) * 60_000
 
-    # 1. Binance indicators & 24h turnover clock
-    ind_ts = _parse_iso_ms(
-        row.get("indicators_ts_ms")
-        or row.get("_ind_ts_ms")
-        or row.get("tech_updated_at")
-        or row.get("updated_at")
-    )
-    if ind_ts is not None:
+    # 1. Binance indicators. ``updated_at`` is a generic row stamp, not this clock.
+    ind_raw = row.get("indicators_ts_ms")
+    if ind_raw in (None, ""):
+        ind_raw = row.get("_ind_ts_ms")
+    if ind_raw in (None, ""):
+        ind_raw = row.get("tech_updated_at")
+    ind_ts, ind_unit = _source_clock_ms(ind_raw)
+    if ind_unit == "unit":
+        reasons.append("binance_indicators_clock_unit_mismatch")
+    elif ind_ts is not None:
         if _age_invalid(ind_ts, now_ms, ind_window_ms):
             reasons.append("binance_indicators_stale")
     elif require_all_clocks:
@@ -764,9 +833,12 @@ def check_row_and_tick_freshness(
     elif require_all_clocks:
         reasons.append("quote_turnover_clock_absent")
 
-    # 2. 5m entry kline close_time_ms
-    k5_ts = _as_int(row.get("entry_kline_5m_close_ms"))
-    if k5_ts is not None:
+    # 2. 5m entry kline close_time_ms. A seconds value is not rescaled into milliseconds.
+    k5_raw = row.get("entry_kline_5m_close_ms")
+    k5_ts, k5_unit = _source_clock_ms(k5_raw)
+    if k5_unit == "unit":
+        reasons.append("entry_5m_kline_clock_unit_mismatch")
+    elif k5_ts is not None:
         if _age_invalid(k5_ts, now_ms, kline_5m_window_ms):
             reasons.append("entry_5m_kline_stale")
     elif require_all_clocks:
@@ -936,13 +1008,29 @@ def resolve_regime_v2_equity(
                 0.0, 0.0, 0.0, 0.0, None, None,
             )
         uid_str = str(view.get("uid") or "").strip()
+        if v2_contract_active(env) and not uid_str:
+            return LiveEquityView(
+                False, "account_identity_missing", "signed_snapshot",
+                0.0, 0.0, 0.0, 0.0, None, None,
+            )
         if uid_str == MCP_FORBIDDEN_UID:
             return LiveEquityView(
                 False, "mcp_account_forbidden", "signed_snapshot",
                 0.0, 0.0, 0.0, 0.0, None, uid_str,
             )
         raw_doc = json.loads(Path(snap_path_raw).expanduser().read_text(encoding="utf-8"))
-        fetched_ms = _as_int(raw_doc.get("fetched_at_ms"))
+        fetched_raw = raw_doc.get("fetched_at_ms")
+        if v2_contract_active(env) and _epoch_unit_mismatch(fetched_raw):
+            return LiveEquityView(
+                False, "account_snapshot_clock_unit_mismatch", "signed_snapshot",
+                0.0, 0.0, 0.0, 0.0, None, uid_str,
+            )
+        fetched_ms = _as_int(fetched_raw)
+        if v2_contract_active(env) and fetched_ms is None:
+            return LiveEquityView(
+                False, "account_snapshot_clock_absent", "signed_snapshot",
+                0.0, 0.0, 0.0, 0.0, None, uid_str,
+            )
 
         usdt_free = 0.0
         usdt_locked = 0.0
@@ -957,6 +1045,16 @@ def resolve_regime_v2_equity(
             if not isinstance(item, Mapping):
                 continue
             asset = str(item.get("asset") or "").strip().upper()
+            if item.get("free") not in (None, "") and _finite(item.get("free")) is None:
+                return LiveEquityView(
+                    False, "account_balance_not_finite", "signed_snapshot",
+                    0.0, 0.0, 0.0, 0.0, fetched_ms, uid_str,
+                )
+            if item.get("locked") not in (None, "") and _finite(item.get("locked")) is None:
+                return LiveEquityView(
+                    False, "account_balance_not_finite", "signed_snapshot",
+                    0.0, 0.0, 0.0, 0.0, fetched_ms, uid_str,
+                )
             free_v = _finite(item.get("free")) or 0.0
             lock_v = _finite(item.get("locked")) or 0.0
             tot_v = free_v + lock_v
@@ -967,6 +1065,11 @@ def resolve_regime_v2_equity(
                 usdt_locked = lock_v
             elif asset in px_by_base:
                 held_usdt += tot_v * px_by_base[asset]
+            elif v2_contract_active(env):
+                return LiveEquityView(
+                    False, "account_quote_unpriced", "signed_snapshot",
+                    0.0, 0.0, 0.0, 0.0, fetched_ms, uid_str,
+                )
             elif asset in cost_by_base:
                 held_usdt += cost_by_base[asset]
         equity = usdt_free + usdt_locked + held_usdt
@@ -978,6 +1081,28 @@ def resolve_regime_v2_equity(
         return LiveEquityView(
             True, None, "signed_snapshot", equity, usdt_free, usdt_locked,
             held_usdt, fetched_ms, uid_str or None,
+        )
+
+    output_mode = str(env.get("REGIME_V2_OUTPUT_MODE", "")).strip().lower()
+    if v2_contract_active(env):
+        if output_mode == "dry_run":
+            dry_eq = _finite(env.get(DRY_RUN_EQUITY_ENV))
+            if dry_eq is None or dry_eq <= 0:
+                return LiveEquityView(
+                    False, "dry_run_equity_invalid", "dry_run_override",
+                    0.0, 0.0, 0.0, 0.0, None, "dry_run",
+                )
+            committed = sum(cost_by_base.values())
+            default_free = max(0.0, dry_eq - committed)
+            dry_free = _finite(env.get(DRY_RUN_FREE_USDT_ENV))
+            resolved_free = dry_free if dry_free is not None and dry_free >= 0 else default_free
+            return LiveEquityView(
+                True, None, "dry_run_override", dry_eq, resolved_free, 0.0,
+                committed, None, "dry_run",
+            )
+        return LiveEquityView(
+            False, "account_snapshot_stale_or_absent", "unconfigured",
+            0.0, 0.0, 0.0, 0.0, None, None,
         )
 
     dry_eq = _finite(env.get(DRY_RUN_EQUITY_ENV))
@@ -1117,7 +1242,21 @@ def enforce_regime_v2_sizing_and_caps(
             "buys_in": len(buys),
             "buys_kept": 0,
             "dropped": {err_code: len(buys)},
+            "reservation_release_interface": RELEASE_INTERFACE_BLOCK,
         }
+
+    reserve_path = reservation_db_path(env)
+    if reserve_path is None:
+        non_buys = [s for s in signals if str(s.get("action") or "").lower() != "buy"]
+        return non_buys, {
+            "applied": True,
+            "halt_reason": "reservation_store_unconfigured",
+            "buys_in": len(buys),
+            "buys_kept": 0,
+            "dropped": {"reservation_store_unconfigured": len(buys)},
+            "reservation_release_interface": RELEASE_INTERFACE_BLOCK,
+        }
+    held_reservations = active_reservations(reserve_path)
 
     max_conc = _env_int("REGIME_V2_MAX_CONCURRENT_POSITIONS", DEFAULT_MAX_CONCURRENT_POSITIONS, env)
     s4_max_conc = _env_int(
@@ -1170,10 +1309,31 @@ def enforce_regime_v2_sizing_and_caps(
                 pos_pct = DEFAULT_BASE_POSITION_PCT
         open_exposure_pct += pos_pct
         open_beta_sum += pos_pct * symbol_beta_vs_btc(sym)
+    position_cluster_counts = Counter(cluster_counts)
+    position_exposure_pct = open_exposure_pct
+    for held in held_reservations:
+        held_sym = str(held.get("symbol") or "").strip().upper()
+        if held_sym and held_sym not in open_symbols:
+            open_symbols.add(held_sym)
+            held_cluster = str(held.get("cluster_key") or "")
+            if held_cluster:
+                cluster_counts[held_cluster] += 1
+            held_pct = _finite(held.get("size_pct"))
+            if held_pct is not None and held_pct > 0:
+                open_exposure_pct += held_pct
+                open_beta_sum += held_pct * symbol_beta_vs_btc(held_sym)
+            cur_count_extra = 1
+        else:
+            cur_count_extra = 0
+        if held_sym in {str(pos.get("symbol") or "").strip().upper() for pos in open_positions}:
+            cur_count_extra = 0
+        held["_counts_as_open"] = cur_count_extra
 
     dropped: Counter[str] = Counter()
     accepted_ids: set[int] = set()
-    cur_count = len(open_positions)
+    cur_count = len(open_positions) + sum(
+        int(item.get("_counts_as_open") or 0) for item in held_reservations
+    )
     cur_exposure_pct = open_exposure_pct
     cur_beta = open_beta_sum
     cur_new_notional = 0.0
@@ -1187,6 +1347,17 @@ def enforce_regime_v2_sizing_and_caps(
         ).strip().upper()
         regime = str(sig.get("market_regime") or "")
         is_s4 = regime == "crowded_long_defensive"
+
+        own_key = signal_reservation_key(sig)
+        replay = any(str(item.get("signal_key") or "") == own_key for item in held_reservations)
+        if replay:
+            sig["reservation_state"] = "reserved"
+            sig["reservation_idempotent"] = True
+            sig["live_order_permitted"] = eq_view.source == "signed_snapshot"
+            if eq_view.source != "signed_snapshot":
+                sig["mode"] = "dry_run"
+            accepted_ids.add(id(sig))
+            continue
 
         if sym and sym in open_symbols:
             dropped["same_symbol_already_open"] += 1
@@ -1252,6 +1423,49 @@ def enforce_regime_v2_sizing_and_caps(
             sig["equity_source"] = eq_view.source
             if eq_view.fetched_at_ms is not None:
                 sig["equity_snapshot_fetched_at_ms"] = eq_view.fetched_at_ms
+        sig["live_order_permitted"] = eq_view.source == "signed_snapshot"
+        if eq_view.source != "signed_snapshot":
+            sig["mode"] = "dry_run"
+
+        if reserve_path is None:
+            dropped["reservation_store_unconfigured"] += 1
+            continue
+        reserved = try_reserve(
+            reserve_path,
+            sig,
+            now_ms=clock,
+            open_symbols=[str(pos.get("symbol") or "") for pos in open_positions],
+            open_count=len(open_positions),
+            cluster_counts=position_cluster_counts,
+            open_exposure_pct=position_exposure_pct,
+            max_concurrent=max_conc,
+            state4_max_concurrent=s4_max_conc,
+            max_per_cluster=max_cluster,
+            max_total_pct=max_total_pct,
+            state4_max_total_pct=s4_max_total_pct,
+            size_pct=sz,
+            cluster_key=ckey,
+            is_state4=is_s4,
+        )
+        if not reserved.ok:
+            dropped[reserved.reason or "reservation_rejected"] += 1
+            continue
+        sig["reservation_state"] = "reserved"
+        sig["reservation_key"] = reserved.signal_key
+        sig["reservation_idempotent"] = reserved.idempotent
+        if not reserved.idempotent:
+            held_reservations.append(
+                {
+                    "signal_key": reserved.signal_key,
+                    "symbol": sym,
+                    "cluster_key": ckey,
+                    "size_pct": sz,
+                    "regime": regime,
+                }
+            )
+        if reserved.idempotent:
+            accepted_ids.add(id(sig))
+            continue
 
         accepted_ids.add(id(sig))
         if sym:
@@ -1276,6 +1490,7 @@ def enforce_regime_v2_sizing_and_caps(
         "live_equity_usdt": round(eq_view.equity_usdt, 4),
         "usdt_free": round(eq_view.usdt_free, 4),
         "open_positions_count": len(open_positions),
+        "reservation_release_interface": RELEASE_INTERFACE_BLOCK,
         "open_exposure_pct": round(open_exposure_pct, 6),
         "final_exposure_pct": round(cur_exposure_pct, 6),
         "final_portfolio_beta": round(cur_beta, 6),

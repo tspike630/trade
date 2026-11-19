@@ -69,6 +69,7 @@ floor or at/above ``M`` does not get a market buy.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
 
@@ -85,6 +86,7 @@ from decision_engine.core.regime_v2_policy import (
     evaluate_s4_deep_dip_zone,
     is_s2_squeeze_candidate_row,
     is_s4_crowded_long_candidate_row,
+    entry_kline_5m_clock_reason,
     s2_entry_enabled,
     s4_entry_enabled,
     v2_contract_active,
@@ -666,6 +668,12 @@ def evaluate_entry_zone(
     symbol = str(row.get("binance_symbol") or "").strip()
     if not symbol:
         return _empty(reason="binance_symbol_missing")
+    if v2_contract_active():
+        freshness_now = row.get("_freshness_now_ms")
+        clock_now = int(freshness_now) if isinstance(freshness_now, int) and not isinstance(freshness_now, bool) else int(time.time() * 1000)
+        kline_reason = entry_kline_5m_clock_reason(row, now_ms=clock_now)
+        if kline_reason is not None:
+            return _empty(reason=kline_reason)
     coord_error = row.get("entry_zone_coord_error")
     if isinstance(coord_error, str) and coord_error.strip():
         return _empty(reason=coord_error.strip())

@@ -663,8 +663,11 @@ def apply_five_state_regime_router(
             continue
 
         sym = str(sig.get("binance_symbol") or sig.get("token_address") or "").strip().upper()
-        base_row = dict(by_sym.get(sym) or {})
-        base_row.update(sig)
+        source_row = dict(by_sym.get(sym) or {})
+        base_row = dict(sig)
+        for key, value in source_row.items():
+            if value not in (None, ""):
+                base_row[key] = value
 
         decision = evaluate_five_state_regime(base_row, macro_halt=macro_halt)
         news_meta: dict[str, Any] | None = None
@@ -685,15 +688,23 @@ def apply_five_state_regime_router(
         eff_now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
         if regime_v2_contract_enabled():
             fresh_reasons = check_row_and_tick_freshness(
-                base_row,
+                source_row,
                 now_ms=eff_now_ms,
                 news_snapshot=news_snapshot,
-                require_all_clocks=stale_data_fail_closed_active(),
+                require_all_clocks=(
+                    regime_v2_contract_enabled() or stale_data_fail_closed_active()
+                ),
             )
             if fresh_reasons:
                 continue
-        classified = classification_inputs(base_row)
-        decision = _apply_v2_contract(decision, classified, signal=sig, row=base_row)
+        classified = classification_inputs(source_row)
+        decision = _apply_v2_contract(
+            decision,
+            classified,
+            signal=sig,
+            row=source_row,
+            now_ms=eff_now_ms,
+        )
         regime_counts[decision.regime] = regime_counts.get(decision.regime, 0) + 1
 
         if not decision.allow_buy:
@@ -846,6 +857,7 @@ def _apply_v2_contract(
     *,
     signal: Mapping[str, Any] | None = None,
     row: Mapping[str, Any] | None = None,
+    now_ms: int | None = None,
 ) -> RegimeRoutingDecision:
     """Map a candidate onto the ruled Regime v2 contract.
 
@@ -890,7 +902,9 @@ def _apply_v2_contract(
         allow = True
         reason = None
     elif decision.regime == REGIME_2_SHORT_SQUEEZE_BREAKOUT:
-        s2_ok, s2_reason = verify_s2_router_admission(signal, row)
+        s2_ok, s2_reason = verify_s2_router_admission(
+            signal, row, now_ms=now_ms
+        )
         if s2_ok:
             allow = True
             reason = None

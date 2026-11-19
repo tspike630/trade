@@ -28,6 +28,7 @@ from decision_engine.core.regime_v2_acceptance import (
     profile_blocks,
     profile_path,
 )
+from decision_engine.core.regime_v2_reservation import active_reservations, release_reservation
 from decision_engine.core.regime_v2_policy import (
     LiveEquityView,
     check_row_and_tick_freshness,
@@ -42,6 +43,15 @@ from execution import binance_account_snapshot as snap_mod
 
 # Wednesday 2026-11-11 15:00:00 UTC (US & CME active trading session)
 NOW_MS = int(datetime(2026, 11, 11, 15, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def _dry_contract(db: Path) -> dict[str, str]:
+    return {
+        CONTRACT_ENV: "1",
+        "REGIME_V2_OUTPUT_MODE": "dry_run",
+        "REGIME_V2_DRY_RUN_EQUITY_USDT": "10000",
+        "REGIME_V2_RESERVATION_DB": str(db),
+    }
 
 
 def _iso_utc(ms: int) -> str:
@@ -91,6 +101,7 @@ def _complete_market_row(**overrides: object) -> dict[str, object]:
         "rsi_14": 42.0,
         "volume_strength": 1.2,
         "tech_updated_at": _iso_utc(NOW_MS - 60_000),
+        "_freshness_now_ms": NOW_MS,
         "quote_turnover_24h_usof": _iso_utc(NOW_MS - 60_000),
         "quote_turnover_24h_asof": _iso_utc(NOW_MS - 60_000),
         "quote_turnover_24h_usdt": 25_000_000.0,
@@ -111,7 +122,9 @@ def _complete_market_row(**overrides: object) -> dict[str, object]:
 
 class State2SqueezeEntryTests(unittest.TestCase):
     def test_s2_squeeze_admits_verified_maker_and_rejects_weak_flow_or_chasing(self) -> None:
-        with patch.dict(os.environ, {CONTRACT_ENV: "1"}, clear=True):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, _dry_contract(Path(tmp) / "reservations.sqlite"), clear=True
+        ):
             # 1) Valid S2 large squeeze pullback at alpha = 0.42 (rejected under calm S1, admitted under S2!)
             s2_row = _complete_market_row(
                 price_usd=104.2,  # alpha = 0.42 in [0.08, 0.55]
@@ -146,6 +159,10 @@ class State2SqueezeEntryTests(unittest.TestCase):
             self.assertAlmostEqual(sig["regime_tp_multiplier"], 1.35, places=6)
             self.assertAlmostEqual(sig["size_pct"], 0.288, places=6)  # 0.24 * 1.0 * 1.20
             self.assertAlmostEqual(sig["take_profit_price"], 110.0, places=6)
+            for held in active_reservations(os.environ["REGIME_V2_RESERVATION_DB"]):
+                release_reservation(
+                    os.environ["REGIME_V2_RESERVATION_DB"], held["signal_key"], now_ms=NOW_MS
+                )
 
             # 2) Neutral S2 squeeze (0.85 <= ratio < 1.30) uses 0.75 tier -> 0.24 * 0.75 * 1.20 = 0.216
             s2_neutral = _complete_market_row(
@@ -181,7 +198,9 @@ class State2SqueezeEntryTests(unittest.TestCase):
 
 class State4DeepDipEntryTests(unittest.TestCase):
     def test_s4_deep_dip_admits_whitelist_deep_maker_and_rejects_shallow_or_speculative(self) -> None:
-        with patch.dict(os.environ, {CONTRACT_ENV: "1"}, clear=True):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, _dry_contract(Path(tmp) / "reservations.sqlite"), clear=True
+        ):
             # 1) Valid S4 deep dip on whitelist symbol SOLUSDT: boll_z = -2.40, alpha = 0.10 <= 0.15
             s4_row = _complete_market_row(
                 binance_symbol="SOLUSDT",
@@ -280,6 +299,7 @@ class RealTimeEquityAndExposureCapTests(unittest.TestCase):
                 "REGIME_V2_STALE_DATA_POLICY": "fail_closed",
                 "REGIME_V2_EQUITY_SOURCE": "signed_account_snapshot",
                 "BINANCE_SPOT_ACCOUNT_SNAPSHOT_PATH": str(snap_file),
+                "REGIME_V2_RESERVATION_DB": str(Path(tmp) / "reservations.sqlite"),
                 s_key_name: sign_word,
             }
             # Total equity = 700 + 50 + 0.0025 * 100000 = 1000.0 USDT; usdt_free = 700.0
