@@ -107,13 +107,53 @@ class _SlippageAndFlattenClient:
             "executedQty": "1.082",
             "cummulativeQuoteQty": "51.957640",
             "symbol": "DASHUSDT",
+            "fills": [{"tradeId": 1, "qty": "1.082", "commission": "0", "commissionAsset": "DASH", "isBuyer": True}],
         }
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["DASHUSDT"])[0]
+        order_id = (form.get("orderId") or ["2953042815"])[0]
+        return [{
+            "symbol": symbol,
+            "id": 2 if str(order_id) == "7701" else 1,
+            "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+            "qty": "1.082",
+            "commission": "0",
+            "commissionAsset": "DASH",
+            "isBuyer": str(order_id) != "7701",
+        }]
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_oco", signed_query, api_key))
         if self.oco_exc is not None:
             raise self.oco_exc
         return _working_oco()
+
+    def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        form = parse_qs(signed_query)
+        if form.get("origClientOrderId"):
+            raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+        order_id = (form.get("orderId") or [""])[0]
+        if str(order_id) == "7701":
+            return {
+                "symbol": "DASHUSDT",
+                "orderId": 7701,
+                "side": "SELL",
+                "status": "FILLED",
+                "executedQty": "1.082",
+                "origQty": "1.082",
+            }
+        return {
+            "symbol": "DASHUSDT",
+            "orderId": 2953042815,
+            "side": "BUY",
+            "status": "FILLED",
+            "executedQty": "1.082",
+            "origQty": "1.082",
+        }
 
     def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("get_order_list", signed_query, api_key))
@@ -203,7 +243,7 @@ class OcoReanchorAndAutoFlattenTests(unittest.TestCase):
             os.environ,
             self._env(BINANCE_SPOT_REANCHOR_OCO_ON_FILL="1"),
         ):
-            res = adapter.execute(_dash_buy())
+            res = self._adapter(client, auto_flatten_on_oco_fail=True).execute(_dash_buy())
         self.assertTrue(res["ok"], res)
         self.assertEqual(res["executed"], 1)
         self.assertTrue(res["consumer_allowed"])

@@ -40,6 +40,11 @@ from execution.executors.binance_spot_protect import (  # noqa: E402
     resolve_entry_size,
 )
 from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 from execution.run import tick_live_bnb_exits  # noqa: E402
 
 _INFO = {
@@ -59,6 +64,7 @@ class _Client:
     def __init__(self) -> None:
         self.calls: list[tuple[Any, ...]] = []
         self.oco = True
+        self.buy_qty = "1.23"
 
     def exchange_info(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("exchange_info", symbol))
@@ -67,8 +73,47 @@ class _Client:
     def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_order", signed_query, api_key))
         if "side=SELL" in signed_query:
-            return {"orderId": "77", "status": "FILLED", "executedQty": "1.23"}
-        return {"orderId": "99", "status": "FILLED", "executedQty": "1.239"}
+            return {"orderId": "77", "status": "FILLED", "executedQty": "1.23", "side": "SELL", "symbol": "BNBUSDT"}
+        return {"orderId": "99", "status": "FILLED", "executedQty": self.buy_qty, "fills": [{"tradeId": 1, "qty": self.buy_qty, "commission": "0", "commissionAsset": "BNB", "isBuyer": True}]}
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        if str(order_id) == "77":
+            qty = "1.23"
+        elif str(order_id) == "99":
+            qty = self.buy_qty
+        else:
+            return []
+        return [{
+            "symbol": symbol,
+            "id": int(order_id),
+            "orderId": int(order_id),
+            "qty": qty,
+            "commission": "0",
+            "commissionAsset": "BNB",
+            "isBuyer": str(order_id) != "77",
+        }]
+
+    def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        form = parse_qs(signed_query)
+        if form.get("origClientOrderId"):
+            raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or [""])[0]
+        if str(order_id) != "99":
+            raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+        return {
+            "symbol": symbol,
+            "orderId": 99,
+            "side": "BUY",
+            "status": "FILLED",
+            "executedQty": self.buy_qty,
+            "origQty": self.buy_qty,
+        }
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_oco", signed_query, api_key))
@@ -147,6 +192,7 @@ class SizeChainTests(unittest.TestCase):
         self.adapter = BinanceSpotAdapter(
             client=self.client,
             kill_switch_path=self.root / "absent-kill",
+            auto_flatten_on_oco_fail=True,
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
@@ -160,6 +206,7 @@ class SizeChainTests(unittest.TestCase):
                     "ipRestrict": True,
                 },
                 "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+                "uid": 424242,
             },
             production_book="rest_api_key",
             rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
@@ -183,15 +230,43 @@ class SizeChainTests(unittest.TestCase):
         wrote.execute("UPDATE decision_log SET id = 147841")
         wrote.commit()
         wrote.close()
+        ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        if not classic.is_file():
+            ExecutionLedger(classic).close()
+        initialize_spot_ledger_binding(classic, "424242")
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(ledger_path.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
         gw = ExecutionGateway(
             decision_db=db,
-            ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+            ledger_path=ledger_path,
             paper_enabled=False,
             pm_enabled=False,
             accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
             binance_spot=self.adapter,
         )
         gw.__enter__()
+        bound = initialize_spot_ledger_binding(ledger_path, "424242")
+        if bound:
+            raise RuntimeError(bound)
+        membership = bind_registry_membership("424242")
+        if membership:
+            raise RuntimeError(membership)
         self.assertFalse(gw.paper_enabled)
         stats = gw.process_pending()
         self.assertEqual(stats.processed, 1)
@@ -234,7 +309,7 @@ class SizeChainTests(unittest.TestCase):
                 self.assertEqual(oco["quantity"], ["1.23"])
                 held = gw.ledger.binance_spot_position_by_decision(147841)
                 assert held is not None
-                self.assertEqual(held["residual_qty"], "0.009")
+                self.assertIsNone(held["residual_qty"])
                 self.assertEqual(held["status"], "oco_working")
                 # Stop print must not add a market sell over the resting list.
                 again = tick_live_bnb_exits(
@@ -248,6 +323,7 @@ class SizeChainTests(unittest.TestCase):
                 gw.__exit__(None, None, None)
 
     def test_oco_reject_falls_back_to_the_stop_with_paper_off(self) -> None:
+        self.client.buy_qty = "1.239"
         self.client.oco = False
         with mock.patch.dict(os.environ, _env(self.root, "1000")):
             gw, receipt = self._publish_and_run("1000")
@@ -257,18 +333,24 @@ class SizeChainTests(unittest.TestCase):
                 stopped = tick_live_bnb_exits(
                     gw, frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}), {"BNBUSDT": "98"}
                 )
+                row = gw.ledger.binance_spot_position_by_decision(receipt["decision_log_id"])
             finally:
                 gw.__exit__(None, None, None)
-        self.assertFalse(stopped[0]["submitted"], stopped[0])
-        self.assertEqual(stopped[0]["position_status"], "oco_failed")
-        self.assertNotEqual(stopped[0]["protection"], "exchange_oco")
-        self.assertFalse(
+        assert row is not None
+        self.assertEqual(row["status"], "closed_dust")
+        self.assertEqual(row["unprotected_qty"], "0.009")
+        labeled = self.adapter._label_fill_protection(dict(receipt["exec_result"]), qty="1.239")
+        self.assertEqual(labeled["protection_state"], "dust_residual", receipt)
+        self.assertTrue(
             any(c[0] == "new_order" and "side=SELL" in c[1] for c in self.client.calls)
         )
+        self.assertEqual(stopped, [])
 
     def test_long_book_quote_is_sent_at_exchange_precision(self) -> None:
         # 0.05 * 437.63809903 = 21.8819049515. Binance -1111 rejects >8 dp.
+        # The fill is an exact lot so this quote check is not mixed with a dust residual.
         book = "437.63809903"
+        self.client.buy_qty = "1.24"
         with mock.patch.dict(os.environ, _env(self.root, book)):
             gw, receipt = self._publish_and_run(book)
             gw.__exit__(None, None, None)

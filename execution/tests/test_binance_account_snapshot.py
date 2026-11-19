@@ -35,6 +35,11 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
 )
 from execution.executors.binance_spot_protect import ENTRY_MIN_NOTIONAL_USDT  # noqa: E402
 from execution.gateway import ExecutionGateway  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 from execution.live_bnb_watchdog import preflight  # noqa: E402
 
 SECRET = "snapshot-secret-not-a-key"
@@ -423,13 +428,38 @@ class ProductionAssemblyTests(unittest.TestCase):
             ), mock.patch(
                 "execution.executors.binance_spot.urllib.request.urlopen", urlopen
             ):
+                ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+                registry = self.root / "registry.json"
+                classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+                if not classic.is_file():
+                    ExecutionLedger(classic).close()
+                initialize_spot_ledger_binding(classic, "1275399777")
+                registry.write_text(
+                    json.dumps(
+                        {
+                            "required_purposes": [
+                                "live_bnb_boll_fade",
+                                "live_bnb_boll_classic",
+                            ],
+                            "purpose_ledgers": {
+                                "live_bnb_boll_fade": str(ledger_path.resolve()),
+                                "live_bnb_boll_classic": str(classic.resolve()),
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                self.env["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
+                os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
                 with ExecutionGateway(
                     decision_db=self.root / "decision.db",
-                    ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+                    ledger_path=ledger_path,
                     paper_enabled=False,
                     pm_enabled=False,
                     accept_purposes=frozenset({"live_bnb_boll_fade"}),
                 ) as gw:
+                    initialize_spot_ledger_binding(ledger_path, "1275399777")
+                    bind_registry_membership("1275399777")
                     refused = gw.process_one(self._row())
         finally:
             self._net.start()

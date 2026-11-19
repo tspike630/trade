@@ -1,0 +1,9 @@
+source_url: https://www.federalreserve.gov/newsevents/pressreleases/monetary20261118a.htm
+fetched_at_utc: 2026-11-19T13:20:00Z
+kind: fed_minutes
+
+November 18, 2026
+
+Minutes of the Federal Open Market Committee, October 27-28, 2026
+
+For release at 2:00 p.m. EST

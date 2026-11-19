@@ -1,0 +1,22 @@
+source_url: https://www.bls.gov/schedule/news_release/ppi.htm
+fetched_at_utc: 2026-11-19T13:20:00Z
+kind: bls_release_table
+indicator: Producer Price Index
+relevance: 3
+
+| Reference Month | Release Date | Release Time |
+| --- | --- | --- |
+| October 2026 | Nov. 13, 2026 | 08:30 AM |
+| November 2026 | Dec. 15, 2026 | 08:30 AM |
+| December 2026 | Jan. 14, 2027 | 08:30 AM |
+| January 2027 | Feb. 12, 2027 | 08:30 AM |
+| February 2027 | Mar. 12, 2027 | 08:30 AM |
+| March 2027 | Apr. 14, 2027 | 08:30 AM |
+| April 2027 | May 13, 2027 | 08:30 AM |
+| May 2027 | Jun. 11, 2027 | 08:30 AM |
+| June 2027 | Jul. 15, 2027 | 08:30 AM |
+| July 2027 | Aug. 10, 2027 | 08:30 AM |
+| August 2027 | Sep. 10, 2027 | 08:30 AM |
+| September 2027 | Oct. 15, 2027 | 08:30 AM |
+| October 2027 | Nov. 12, 2027 | 08:30 AM |
+| November 2027 | Dec. 15, 2027 | 08:30 AM |

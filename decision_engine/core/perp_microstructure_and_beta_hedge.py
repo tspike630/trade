@@ -715,6 +715,7 @@ def attach_counterparty_context(rows, *, db_path=None, now_ms=None):
                         continue
                     obi_by_sym[str(r["symbol"]).upper()] = r
         disloc_by_sym = {}
+        disloc_ts_by_sym = {}
         if "cross_exchange_spot_baseline" in tables:
             for r in conn.execute("""
                 SELECT c.symbol, c.ts_ms, c.max_venue_dislocation_bps FROM cross_exchange_spot_baseline c
@@ -726,7 +727,9 @@ def attach_counterparty_context(rows, *, db_path=None, now_ms=None):
                     continue
                 val = _finite(r["max_venue_dislocation_bps"])
                 if val is not None:
-                    disloc_by_sym[str(r["symbol"]).upper()] = val
+                    sym_up = str(r["symbol"]).upper()
+                    disloc_by_sym[sym_up] = val
+                    disloc_ts_by_sym[sym_up] = int(r["ts_ms"])
         unlock_by_sym = {}
         if "token_unlock_schedule" in tables:
             have = {
@@ -745,6 +748,7 @@ def attach_counterparty_context(rows, *, db_path=None, now_ms=None):
                     unlock_by_sym[str(r["symbol"]).upper()] = flag
         btc_gamma_regime = None
         btc_dvol_z = None
+        btc_deribit_ts_ms = None
         if "deribit_options_gamma" in tables:
             opt_row = conn.execute("""
                 SELECT ts_ms, gamma_regime, dvol_zscore FROM deribit_options_gamma
@@ -753,6 +757,8 @@ def attach_counterparty_context(rows, *, db_path=None, now_ms=None):
             if opt_row is not None and _ts_is_fresh(opt_row["ts_ms"], clock):
                 btc_gamma_regime = str(opt_row["gamma_regime"] or "") or None
                 btc_dvol_z = _finite(opt_row["dvol_zscore"])
+                btc_deribit_ts_ms = int(opt_row["ts_ms"])
+        unlock_schema_ok = bool(unlock_by_sym) or ("token_unlock_schedule" in tables and {"symbol", "next_unlock_utc", "unlock_pct_circulating"}.issubset({str(item[1]) for item in conn.execute("PRAGMA table_info(token_unlock_schedule)").fetchall()}))
         for row in rows:
             sym = str(row.get("binance_symbol") or row.get("token_address") or "").strip().upper()
             if not sym:
@@ -774,6 +780,14 @@ def attach_counterparty_context(rows, *, db_path=None, now_ms=None):
                 row["gamma_regime"] = btc_gamma_regime
             if row.get("dvol_zscore") is None and btc_dvol_z is not None:
                 row["dvol_zscore"] = btc_dvol_z
+            if _env_true("REGIME_V2_CONTRACT"):
+                if p_row is not None and "ts_ms" in p_row.keys() and p_row["ts_ms"] is not None:
+                    row.setdefault("_perp_counterparty_ts_ms", int(p_row["ts_ms"]))
+                if sym in disloc_ts_by_sym:
+                    row.setdefault("_cross_exchange_ts_ms", disloc_ts_by_sym[sym])
+                if btc_deribit_ts_ms is not None:
+                    row.setdefault("_deribit_gamma_ts_ms", btc_deribit_ts_ms)
+                row.setdefault("_unlock_schedule_verified", unlock_schema_ok)
             # obi_top5 does not read or write volume_z / vol_z_1h. Regime 3
             # evaluates those on their own. The decision-engine kline path
             # owns that writer. Do not overwrite an obi already present, and

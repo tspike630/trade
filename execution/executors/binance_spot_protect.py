@@ -272,29 +272,45 @@ def entry_viability_error(
 
 
 def sellable_base_qty(placed: dict[str, Any] | None, symbol: str) -> str | None:
-    """``executedQty`` minus base-asset commission shown on this fill.
+    """Base left from an order ack that lists every fill's commission.
 
-    Commission in any other asset is ignored. A missing ``fills`` array does
-    not invent a fee.
+    A missing ``fills`` list, an empty list, or a fill with no commission
+    is unknown, not a zero fee. Commission in another asset does not change
+    the base quantity. This is the ack helper. A later buy uses ``myTrades``.
     """
     if not isinstance(placed, dict):
         return None
     executed = _to_decimal(placed.get("executedQty"))
-    if executed is None:
+    if executed is None or executed <= 0:
+        return None
+    fills = placed.get("fills")
+    if not isinstance(fills, list) or not fills:
         return None
     base = symbol[: -len("USDT")] if symbol.endswith("USDT") else ""
     fee = Decimal("0")
-    fills = placed.get("fills")
-    if isinstance(fills, list) and base:
-        for fill in fills:
-            if not isinstance(fill, dict):
-                continue
-            asset = str(fill.get("commissionAsset") or "").upper()
-            if asset != base:
-                continue
-            part = _to_decimal(fill.get("commission"))
-            if part is not None:
-                fee += part
+    qty = Decimal("0")
+    for fill in fills:
+        if not isinstance(fill, dict):
+            return None
+        part_qty = _to_decimal(fill.get("qty"))
+        if part_qty is None or part_qty <= 0:
+            return None
+        qty += part_qty
+        if "commission" not in fill or "commissionAsset" not in fill:
+            return None
+        asset = str(fill.get("commissionAsset") or "").strip().upper()
+        if not asset:
+            return None
+        try:
+            part = Decimal(str(fill.get("commission")).strip())
+        except Exception:
+            return None
+        if not part.is_finite() or part < 0:
+            return None
+        if asset == base:
+            fee += part
+    if qty != executed:
+        return None
     net = executed - fee
     if net <= 0:
         return None
@@ -328,6 +344,8 @@ def dust_archive_fields(
         "exit_reason": "dust_abandon",
         "residual_qty": quantity,
         "residual_quote": quote,
+        "unprotected_qty": quantity,
+        "manual_action": "residual_below_min_is_not_a_complete_exit",
         "last_error": f"dust_untradable:{detail}:{source}",
     }
 
@@ -397,6 +415,97 @@ def protective_band_error(
         mark=mark,
     )
     return error
+
+
+def buy_entry_oco_preflight(
+    *,
+    order_type: str,
+    limit_price: object,
+    stop_price: object,
+    take_profit_price: object,
+    mark: object,
+    mark_source: object,
+    filters: list[Any],
+    resting_ceiling: object = None,
+    ceiling_source: object = None,
+) -> tuple[dict[str, Any], str | None]:
+    """Choose the pre-submit reference for a long entry. Prices are not rewritten.
+
+    A missing or non-positive mark is ``mark_unavailable``. ``MARKET`` must
+    keep the fresh mark strictly inside the tick-aligned stop and take-profit.
+    A resting buy is passive only when ``resting_ceiling`` is a fresh
+    executable ask strictly above the tick-aligned limit. The last price is
+    not that proof. A missing ask is ``ask_unavailable``. The order type
+    string alone is not proof, and ``price_usd`` is not read here.
+    """
+    kind = str(order_type or "").strip().upper()
+    source = None if mark_source in (None, "") else str(mark_source)
+    diag: dict[str, Any] = {
+        "order_type": kind or None,
+        "reference": None,
+        "reference_price": None,
+        "mark": None,
+        "mark_source": source,
+        "ceiling_price": None,
+        "ceiling_source": None,
+        "aligned_stop": None,
+        "aligned_take_profit": None,
+        "aligned_limit": None,
+        "planned_limit": None,
+        "mark_inside_band": None,
+    }
+    mark_n = _to_decimal(mark)
+    if mark_n is None or mark_n <= 0:
+        return diag, "mark_unavailable"
+    diag["mark"] = _decimal_text(mark_n)
+    aligned, align_error = aligned_oco_prices(
+        stop_price=str(stop_price or ""),
+        take_profit_price=str(take_profit_price or ""),
+        filters=filters,
+        mark=None,
+    )
+    if align_error or aligned is None:
+        return diag, align_error or "oco_prices_crossed"
+    diag["aligned_stop"] = _decimal_text(aligned["below_stop"])
+    diag["aligned_take_profit"] = _decimal_text(aligned["above"])
+    diag["mark_inside_band"] = aligned["below_stop"] < mark_n < aligned["above"]
+    if kind == "MARKET":
+        diag["reference"] = "live_mark"
+        diag["reference_price"] = diag["mark"]
+        diag["ceiling_price"] = diag["mark"]
+        diag["ceiling_source"] = "live_mark"
+        if diag["mark_inside_band"] is not True:
+            return diag, "oco_price_restriction"
+        return diag, None
+    if kind in {"LIMIT", "LIMIT_MAKER"}:
+        ceiling_n = _to_decimal(resting_ceiling)
+        if ceiling_n is None or ceiling_n <= 0:
+            return diag, "ask_unavailable"
+        ceiling_label = (
+            str(ceiling_source).strip() if ceiling_source not in (None, "") else "best_ask"
+        )
+    else:
+        return diag, "invalid_order_type"
+    limit_n = _to_decimal(limit_price)
+    if limit_n is None or limit_n <= 0:
+        return diag, "missing_limit_price"
+    diag["planned_limit"] = _decimal_text(limit_n)
+    tick_n = _to_decimal(_tick_size(filters))
+    if tick_n is None or tick_n <= 0:
+        return diag, "oco_missing_tick"
+    aligned_limit = _align(limit_n, tick_n, ROUND_DOWN)
+    if aligned_limit <= 0:
+        return diag, "invalid_limit_price"
+    diag["aligned_limit"] = _decimal_text(aligned_limit)
+    diag["ceiling_price"] = _decimal_text(ceiling_n)
+    diag["ceiling_source"] = ceiling_label
+    diag["reference"] = "planned_entry"
+    diag["reference_price"] = diag["aligned_limit"]
+    if aligned_limit >= ceiling_n:
+        return diag, "limit_would_cross"
+    if not (aligned["below_stop"] < aligned_limit < aligned["above"]):
+        return diag, "oco_price_restriction"
+    return diag, None
 
 
 def reanchor_oco_prices_to_fill(
@@ -480,6 +589,63 @@ def fill_average_price(placed: dict[str, Any] | None) -> str | None:
     if quote is None or qty is None or qty <= 0:
         return None
     return _decimal_text(quote / qty)
+
+
+FILL_TP_FORMULA_B_ENV = "BINANCE_SPOT_FILL_TP_FORMULA_B"
+_APPROVED_TP_MULTIPLIERS = (
+    Decimal("1"),
+    Decimal("1.35"),
+    Decimal("1.25"),
+    Decimal("0.85"),
+)
+
+
+def fill_tp_formula_b_enabled(environ: Any | None = None) -> bool:
+    """First-hang take-profit formula B. Only literal ``1`` turns it on."""
+    env = os.environ if environ is None else environ
+    raw = env.get(FILL_TP_FORMULA_B_ENV) if hasattr(env, "get") else None
+    if raw is None:
+        return False
+    return str(raw).strip() == "1"
+
+
+def approved_tp_multiplier(raw: object) -> Decimal | None:
+    """State take-profit multipliers already ruled. A size multiplier is not accepted."""
+    number = _to_decimal(raw)
+    if number is None:
+        return None
+    for allowed in _APPROVED_TP_MULTIPLIERS:
+        if number == allowed:
+            return allowed
+    return None
+
+
+def formula_b_take_profit(
+    *,
+    fill_average: object,
+    signal_entry: object,
+    signal_take_profit: object,
+    tp_multiplier: object,
+) -> str | None:
+    """``F * [1 + (P / E - 1) * m]``. Missing or unapproved inputs do not invent a price."""
+    fill = _to_decimal(fill_average)
+    entry = _to_decimal(signal_entry)
+    target = _to_decimal(signal_take_profit)
+    multiplier = approved_tp_multiplier(tp_multiplier)
+    if (
+        fill is None
+        or entry is None
+        or target is None
+        or multiplier is None
+        or fill <= 0
+        or entry <= 0
+        or target <= 0
+    ):
+        return None
+    price = fill * (Decimal("1") + (target / entry - Decimal("1")) * multiplier)
+    if not price.is_finite() or price <= 0:
+        return None
+    return _decimal_text(price)
 
 
 def build_spot_oco(
@@ -634,9 +800,11 @@ def classify_oco(payload: dict[str, Any], *, held_qty: str) -> dict[str, Any]:
         "order_list_id": None if list_id is None else str(list_id),
         "above_order_id": above_id,
         "below_order_id": below_id,
+        "order_reports": _reports(payload),
     }
     executed = Decimal("0")
     filled_reason: str | None = None
+    filled_order_id: str | None = None
     any_open = False
     order_qty: Decimal | None = None
     for row in _reports(payload):
@@ -652,11 +820,16 @@ def classify_oco(payload: dict[str, Any], *, held_qty: str) -> dict[str, Any]:
                 filled_reason = "take_profit"
             elif leg in {"STOP_LOSS_LIMIT", "STOP_LOSS"}:
                 filled_reason = "stop_loss"
+            order_id = row.get("orderId")
+            if order_id not in (None, ""):
+                filled_order_id = str(order_id).strip() or filled_order_id
         if status not in _TERMINAL_LEG and status not in {"FILLED", "PARTIALLY_FILLED"}:
             any_open = True
     held = _to_decimal(held_qty) or Decimal("0")
     basis = order_qty if order_qty is not None else held
     base["executed_qty"] = _decimal_text(executed) if executed > 0 else "0"
+    if filled_order_id:
+        base["filled_order_id"] = filled_order_id
     if oco_is_working(payload):
         base["state"] = "partial_working" if executed > 0 else "working"
         if executed > 0 and basis > executed:

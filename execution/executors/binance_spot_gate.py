@@ -28,10 +28,12 @@ inferred.
 
 from __future__ import annotations
 
+import math
 import os
 import re
+import time
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Mapping
 
 from execution.verified_fet import VERIFIED_FET_EXIT
 
@@ -45,6 +47,22 @@ LIVE_BNB_SPOT_PURPOSES = frozenset(
 )
 # Several symbols on one arm. Unset is on. This is not same-symbol pyramiding.
 ALLOW_MULTI_SYMBOL_ENV = "BINANCE_SPOT_ALLOW_MULTI_SYMBOL"
+OCO_READBACK_TTL_ENV = "LIVE_BNB_OCO_READBACK_TTL_SEC"
+OCO_READBACK_TTL_ALIAS_ENV = "BINANCE_SPOT_OCO_READBACK_TTL_SEC"
+DEFAULT_OCO_READBACK_TTL_SEC = 180
+MAX_OCO_MAINTENANCE_REFRESH_SEC = 60
+OCO_READBACK_VERIFIED_STATUS = "verified"
+OCO_READBACK_COLUMNS = (
+    "oco_readback_status",
+    "oco_readback_account_uid",
+    "oco_readback_symbol",
+    "oco_readback_entry_order_id",
+    "oco_readback_list_id",
+    "oco_readback_above_id",
+    "oco_readback_below_id",
+    "oco_readback_covered_qty",
+    "oco_readback_at_ms",
+)
 MCP_POSITION_UID = "1289917075"
 REST_BOOK = "rest_api_key"
 MCP_BOOK = "mcp:1289917075"
@@ -82,7 +100,7 @@ SINGLE_LEG_ORDER_TYPES = frozenset(
     }
 )
 _OCO_WORKING = frozenset({"EXECUTING", "EXEC_STARTED"})
-_TERMINAL_POSITION = frozenset({"closed", "closed_dust", "oco_filled", "closed_canceled"})
+_TERMINAL_POSITION = frozenset({"closed", "oco_filled", "closed_canceled"})
 _ABOVE_LEG = frozenset({"LIMIT_MAKER", "TAKE_PROFIT_LIMIT"})
 _BELOW_LEG = frozenset({"STOP_LOSS_LIMIT"})
 
@@ -193,6 +211,7 @@ def replay_block(decision_id: object, client_id: str | None) -> str | None:
 
 
 def _nonneg_id(raw: object) -> int | None:
+    """Non-negative int, or a digit string. Bool, None, and negatives are not ids."""
     if isinstance(raw, bool) or raw is None:
         return None
     if isinstance(raw, int):
@@ -200,6 +219,37 @@ def _nonneg_id(raw: object) -> int | None:
     if isinstance(raw, str) and raw.strip().isdigit():
         return int(raw.strip())
     return None
+
+
+def _nonneg_decimal(raw: object) -> Decimal | None:
+    """Finite decimal at or above zero. Zero is a value, not a missing field.
+
+    Bool is rejected even though it is an ``int``. ``None``, NaN, Infinity,
+    and negatives are rejected. A float is accepted only when it is finite.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, Decimal):
+        number = raw
+    elif isinstance(raw, int):
+        number = Decimal(raw)
+    elif isinstance(raw, float):
+        if not math.isfinite(raw):
+            return None
+        number = Decimal(str(raw))
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            number = Decimal(text)
+        except InvalidOperation:
+            return None
+    else:
+        return None
+    if not number.is_finite() or number < 0:
+        return None
+    return number
 
 
 def _reports(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -452,7 +502,19 @@ def row_quote_usdt(row: object) -> Decimal | None:
     return Decimal(qty) * Decimal(price)
 
 
+def partial_dust_residual(row: dict[str, Any]) -> bool:
+    """Every ``closed_dust`` row still holds untradable exposure and is non-terminal.
+
+    Missing, blank, or zero ``exit_filled_qty`` (such as whole-qty dust
+    where no exit sell filled) does not make ``closed_dust`` terminal and
+    still blocks subsequent buys.
+    """
+    return str(row.get("status") or "") == "closed_dust"
+
+
 def _nonterminal_spot_row(row: dict[str, Any]) -> bool:
+    if partial_dust_residual(row):
+        return True
     status = str(row.get("status") or "")
     if not status or status == "flat" or status in _TERMINAL_POSITION:
         return False
@@ -639,6 +701,71 @@ def _row_blocks_arm(row: dict[str, Any], arm: str) -> bool:
     return arm == PURPOSE_LIVE_BNB_BOLL_FADE
 
 
+def _readback_proves_zero_residual(row: dict[str, Any]) -> bool:
+    """True when bound readback evidence proves full quantity coverage with no residual."""
+    if _qty_invalid(row.get("unprotected_qty")) or _positive_qty(row.get("unprotected_qty")):
+        return False
+    if str(row.get("oco_readback_status") or "").strip() != OCO_READBACK_VERIFIED_STATUS:
+        return False
+    held_symbol = _symbol_key(row.get("symbol"))
+    ev_symbol = _symbol_key(row.get("oco_readback_symbol"))
+    if held_symbol is None or ev_symbol != held_symbol:
+        return False
+    entry_id = _nonneg_id(row.get("entry_order_id"))
+    if entry_id is None or _nonneg_id(row.get("oco_readback_entry_order_id")) != entry_id:
+        return False
+    list_id = _nonneg_id(row.get("oco_order_list_id"))
+    above_id = _nonneg_id(row.get("oco_above_order_id"))
+    below_id = _nonneg_id(row.get("oco_below_order_id"))
+    if (
+        list_id is None
+        or above_id is None
+        or below_id is None
+        or above_id == below_id
+        or _nonneg_id(row.get("oco_readback_list_id")) != list_id
+        or _nonneg_id(row.get("oco_readback_above_id")) != above_id
+        or _nonneg_id(row.get("oco_readback_below_id")) != below_id
+    ):
+        return False
+    qty_text = _decimal_text(row.get("quantity"))
+    cov_text = _decimal_text(row.get("oco_readback_covered_qty"))
+    if qty_text is None or cov_text is None:
+        return False
+    qty_dec = Decimal(qty_text)
+    cov_dec = Decimal(cov_text)
+    if qty_dec <= 0 or cov_dec < qty_dec:
+        return False
+    return _positive_epoch_ms(row.get("oco_readback_at_ms")) is not None
+
+
+def _residual_blocks_other_symbols(row: dict[str, Any]) -> bool:
+    """True when residual is not proven zero.
+
+    ``0``, ``0.00``, and ``0E-8`` are explicit zero and do not block another
+    symbol. Exact-lot OCO rows keep ``residual_qty = NULL`` in SQLite; a
+    present ``None`` passes only when bound OCO readback evidence proves full
+    A ``ProtectionBook`` row or any row carrying OCO readback columns that
+    omits ``residual_qty`` fails closed. Blank, negative, non-numeric, or
+    positive values always block.
+    """
+    if "residual_qty" not in row:
+        if getattr(row, "_cross_arm_symbol_guard", False) or any(
+            col in row for col in OCO_READBACK_COLUMNS
+        ):
+            return True
+        return False
+    raw = row.get("residual_qty")
+    if raw is None:
+        return not _readback_proves_zero_residual(row)
+    if isinstance(raw, str) and not raw.strip():
+        return True
+    if isinstance(raw, bool) or _qty_invalid(raw):
+        return True
+    if _positive_qty(raw):
+        return True
+    return not _qty_zero(raw)
+
+
 def buy_exposure_block(
     positions: object,
     canonical: object,
@@ -671,7 +798,15 @@ def buy_exposure_block(
     arm = requested if requested in LIVE_BNB_SPOT_PURPOSES else PURPOSE_LIVE_BNB_BOLL_FADE
     rows = canonical if isinstance(canonical, list) else []
     for row in rows:
-        if not isinstance(row, dict) or not _row_blocks_arm(row, arm):
+        if not isinstance(row, dict):
+            continue
+        if not _row_blocks_arm(row, arm):
+            if getattr(row, "_cross_arm_symbol_guard", False):
+                status_other = str(row.get("status") or "")
+                if status_other and status_other not in (_TERMINAL_POSITION | {"flat", "closed"}):
+                    cross_can = cross_arm_symbol_block([row], purpose=arm, symbol=symbol)
+                    if cross_can:
+                        return cross_can
             continue
         status = str(row.get("status") or "")
         if status == "held_naked":
@@ -681,9 +816,17 @@ def buy_exposure_block(
                 return "unbound_position"
     held = positions if isinstance(positions, list) else []
     for row in held:
-        if not isinstance(row, dict) or not _row_blocks_arm(row, arm):
+        if not isinstance(row, dict):
+            continue
+        if not _row_blocks_arm(row, arm):
+            if getattr(row, "_cross_arm_symbol_guard", False):
+                cross = cross_arm_symbol_block([row], purpose=arm, symbol=symbol)
+                if cross:
+                    return cross
             continue
         status = str(row.get("status") or "")
+        if partial_dust_residual(row):
+            return "unprotected_position_blocks_buy"
         if not status or status in _TERMINAL_POSITION:
             continue
         if status == "qty_unconfirmed":
@@ -710,13 +853,509 @@ def buy_exposure_block(
             if blocked:
                 return blocked
             continue
-        if status in {"oco_working", "exit_submitted"}:
+        if status == "oco_partial":
+            return "unprotected_position_blocks_buy"
+        if status == "oco_working":
+            # Local ids are not an exchange read. They are the shape this
+            # gate can see. Execution still has to read the list before it
+            # treats the book as protected.
+            if str(row.get("protection") or "") != "exchange_oco" or not _position_ids_verified(row):
+                return "unprotected_position_blocks_buy"
+            if _residual_blocks_other_symbols(row):
+                return "unprotected_position_blocks_buy"
+            blocked = _same_symbol_open_block(row, symbol)
+            if blocked:
+                return blocked
+            continue
+        if status == "exit_submitted":
             blocked = _same_symbol_open_block(row, symbol)
             if blocked:
                 return blocked
             continue
         return "unprotected_position_blocks_buy"
     return None
+
+
+def hard_unresolved_halt(rows: object) -> str | None:
+    """Halt reasons that an exchange read on this call cannot clear."""
+    held = rows if isinstance(rows, list) else []
+    for row in held:
+        if not isinstance(row, dict):
+            continue
+        purpose = str(row.get("purpose") or "").strip()
+        if purpose and purpose not in LIVE_BNB_SPOT_PURPOSES:
+            continue
+        reason = row_unresolved_reason(row)
+        if reason and reason not in _EVIDENCE_REASONS:
+            return reason
+    return None
+
+
+def _positive_epoch_ms(raw: object) -> int | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.isascii() and text.isdigit():
+            val = int(text)
+            return val if val > 0 else None
+    return None
+
+
+def resolve_oco_readback_ttl_ms(
+    environ: Mapping[str, str] | None = None,
+) -> int | None:
+    """Resolve OCO readback TTL in milliseconds. Invalid config returns ``None``."""
+    env = os.environ if environ is None else environ
+    raw: object = None
+    found = False
+    for key in (OCO_READBACK_TTL_ENV, OCO_READBACK_TTL_ALIAS_ENV):
+        if key in env and env.get(key) is not None:
+            raw = env.get(key)
+            found = True
+            break
+    if not found:
+        return DEFAULT_OCO_READBACK_TTL_SEC * 1000
+    if isinstance(raw, bool):
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    sec = _nonneg_decimal(text)
+    if sec is None or sec <= 0:
+        return None
+    ms = sec * Decimal(1000)
+    if not ms.is_finite() or ms < 1 or ms > Decimal(86_400_000 * 365):
+        return None
+    return int(ms)
+
+
+def _valid_readback_account_id(
+    raw: object,
+    *,
+    expected_account_uid: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    if isinstance(raw, bool) or raw is None:
+        return False
+    ev_uid = str(raw).strip()
+    if not ev_uid or ev_uid in {MCP_POSITION_UID, MCP_BOOK}:
+        return False
+    is_digit_uid = ev_uid.isascii() and ev_uid.isdigit() and int(ev_uid) > 0
+    if not is_digit_uid and ev_uid != REST_BOOK:
+        return False
+    env = os.environ if environ is None else environ
+    bound = str(expected_account_uid or "").strip()
+    if not bound:
+        env_uid = str(env.get("BINANCE_SPOT_REST_UID") or "").strip()
+        if env_uid:
+            if not (env_uid.isascii() and env_uid.isdigit()) or env_uid == MCP_POSITION_UID:
+                return False
+            bound = env_uid
+    if bound:
+        if not (bound.isascii() and bound.isdigit()) or bound == MCP_POSITION_UID:
+            return False
+        return ev_uid == bound
+    return True
+
+
+def persisted_oco_readback_reason(
+    row: dict[str, Any],
+    *,
+    now_ms: object = None,
+    expected_account_uid: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Validate execution-persisted OCO readback evidence for Decision admission.
+
+    Returns ``None`` only when fresh, account/symbol/order/qty-bound readback
+    evidence proves full protective coverage. Three OCO order ids alone never pass.
+    """
+    if _qty_invalid(row.get("unprotected_qty")) or _positive_qty(row.get("unprotected_qty")):
+        return "unprotected_position_blocks_buy"
+    if str(row.get("oco_readback_status") or "").strip() != OCO_READBACK_VERIFIED_STATUS:
+        return "oco_readback_unverified"
+    if "residual_qty" not in row or _residual_blocks_other_symbols(row):
+        return "unprotected_position_blocks_buy"
+    ttl_ms = resolve_oco_readback_ttl_ms(environ)
+    if ttl_ms is None:
+        return "oco_readback_unverified"
+    current_ms = int(time.time() * 1000) if now_ms is None else _positive_epoch_ms(now_ms)
+    if current_ms is None:
+        return "oco_readback_unverified"
+    if not _valid_readback_account_id(
+        row.get("oco_readback_account_uid"),
+        expected_account_uid=expected_account_uid,
+        environ=environ,
+    ):
+        return "oco_readback_unverified"
+    held_symbol = _symbol_key(row.get("symbol"))
+    ev_symbol = _symbol_key(row.get("oco_readback_symbol"))
+    if held_symbol is None or ev_symbol != held_symbol:
+        return "oco_readback_unverified"
+    entry_id = _nonneg_id(row.get("entry_order_id"))
+    ev_entry_id = _nonneg_id(row.get("oco_readback_entry_order_id"))
+    if entry_id is None or ev_entry_id != entry_id:
+        return "oco_readback_unverified"
+    list_id = _nonneg_id(row.get("oco_order_list_id"))
+    above_id = _nonneg_id(row.get("oco_above_order_id"))
+    below_id = _nonneg_id(row.get("oco_below_order_id"))
+    ev_list_id = _nonneg_id(row.get("oco_readback_list_id"))
+    ev_above_id = _nonneg_id(row.get("oco_readback_above_id"))
+    ev_below_id = _nonneg_id(row.get("oco_readback_below_id"))
+    if (
+        list_id is None
+        or above_id is None
+        or below_id is None
+        or above_id == below_id
+        or ev_list_id != list_id
+        or ev_above_id != above_id
+        or ev_below_id != below_id
+    ):
+        return "oco_readback_unverified"
+    qty_text = _decimal_text(row.get("quantity"))
+    cov_text = _decimal_text(row.get("oco_readback_covered_qty"))
+    if qty_text is None or cov_text is None:
+        return "oco_readback_unverified"
+    qty_dec = Decimal(qty_text)
+    cov_dec = Decimal(cov_text)
+    if qty_dec <= 0 or cov_dec < qty_dec:
+        return "oco_readback_unverified"
+    readback_ms = _positive_epoch_ms(row.get("oco_readback_at_ms"))
+    if readback_ms is None or readback_ms > current_ms:
+        return "oco_readback_unverified"
+    if current_ms - readback_ms > ttl_ms:
+        return "oco_readback_stale"
+    return None
+
+
+def account_unresolved_halt(rows: object) -> str | None:
+    """Block every new BUY while this account has an unresolved spot row.
+
+    Three stored ids are not a working list. A zero quantity is not a flat
+    exit. Execution clears ``oco_readback_unverified`` and
+    ``exit_readback_unverified`` only after a live exchange read on that call.
+    """
+    held = rows if isinstance(rows, list) else []
+    for row in held:
+        if not isinstance(row, dict):
+            continue
+        purpose = str(row.get("purpose") or "").strip()
+        if purpose and purpose not in LIVE_BNB_SPOT_PURPOSES:
+            continue
+        reason = row_unresolved_reason(row)
+        if reason:
+            return reason
+    return None
+
+
+def decision_unresolved_halt(
+    rows: object,
+    *,
+    now_ms: object = None,
+    expected_account_uid: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Decision-side halt check using execution-persisted OCO readback evidence.
+
+    Execution itself continues to use ``row_unresolved_reason`` + live REST
+    reads on every buy and never trusts cached ledger columns.
+    """
+    held = rows if isinstance(rows, list) else []
+    for row in held:
+        if not isinstance(row, dict):
+            continue
+        purpose = str(row.get("purpose") or "").strip()
+        if purpose and purpose not in LIVE_BNB_SPOT_PURPOSES:
+            continue
+        reason = row_unresolved_reason(row)
+        if reason is None:
+            continue
+        if reason == "oco_readback_unverified":
+            persisted = persisted_oco_readback_reason(
+                row,
+                now_ms=now_ms,
+                expected_account_uid=expected_account_uid,
+                environ=environ,
+            )
+            if persisted is None:
+                continue
+            return persisted
+        return reason
+    return None
+
+
+def _qty_invalid(raw: object) -> bool:
+    """A present quantity that is not a finite non-negative decimal."""
+    if raw is None or isinstance(raw, bool):
+        return isinstance(raw, bool)
+    if isinstance(raw, str) and not raw.strip():
+        return False
+    return _decimal_text(raw) is None or Decimal(_decimal_text(raw) or "0") < 0
+
+
+def _qty_zero(raw: object) -> bool:
+    """``0``, ``0.00``, and ``0E-8`` are the same zero. Missing is not zero."""
+    text = _decimal_text(raw)
+    return text is not None and Decimal(text) == 0
+
+
+def _zeroed_entry(row: dict[str, Any]) -> bool:
+    """Quantity written as zero does not close an entry.
+
+    Local ``exit_filled_qty`` equal to the entry is not a sell fill. Every
+    zero spelling is the same. A verified exit is an exchange read, elsewhere.
+    """
+    if not str(row.get("entry_order_id") or "").strip():
+        return False
+    if not _qty_zero(row.get("quantity")):
+        return False
+    if _positive_qty(row.get("residual_qty")):
+        return False
+    return True
+
+
+def _positive_qty(raw: object) -> bool:
+    text = _decimal_text(raw)
+    return text is not None and Decimal(text) > 0
+
+
+_LIVE_LEG_STATUS = frozenset({"NEW", "PARTIALLY_FILLED", "PENDING_NEW"})
+_ABOVE_LEG_TYPES = frozenset({"LIMIT_MAKER", "TAKE_PROFIT_LIMIT"})
+_BELOW_LEG_TYPES = frozenset({"STOP_LOSS_LIMIT", "STOP_LOSS"})
+_EVIDENCE_REASONS = frozenset({"oco_readback_unverified", "exit_readback_unverified"})
+
+
+def _leg_remaining(leg: dict[str, Any]) -> Decimal | None:
+    """Open size of one leg. ``origQty`` alone is not the size still working."""
+    original = _decimal_text(leg.get("origQty"))
+    executed = _decimal_text(leg.get("executedQty"))
+    if original is None or executed is None:
+        return None
+    if Decimal(original) < 0 or Decimal(executed) < 0:
+        return None
+    remaining = Decimal(original) - Decimal(executed)
+    if remaining < 0:
+        return None
+    return remaining
+
+
+def oco_readback_covers(
+    payload: object,
+    *,
+    symbol: str,
+    held_net: Decimal,
+    list_id: object,
+    above_id: object,
+    below_id: object,
+) -> bool:
+    """Each live protective leg must still cover ``held_net``.
+
+    Coverage is ``origQty - executedQty`` on the above leg and again on the
+    below leg. The larger leg does not stand in for the smaller one, and the
+    two legs are not added. The response ids must be the recorded ids.
+    """
+    if not isinstance(payload, dict) or held_net <= 0:
+        return False
+    if str(payload.get("listOrderStatus") or "").upper() != "EXECUTING":
+        return False
+    if str(payload.get("listStatusType") or "").upper() not in {"EXEC_STARTED", "EXECUTING"}:
+        return False
+    if str(payload.get("orderListId") or "") != str(list_id or "").strip():
+        return False
+    reported = str(payload.get("symbol") or "").strip().upper()
+    if not reported or reported != str(symbol or "").strip().upper():
+        return False
+    wanted_above = str(above_id or "").strip()
+    wanted_below = str(below_id or "").strip()
+    if _nonneg_id(wanted_above) is None or _nonneg_id(wanted_below) is None:
+        return False
+    if wanted_above == wanted_below:
+        return False
+    reports = payload.get("orderReports")
+    if not isinstance(reports, list):
+        return False
+    above = None
+    below = None
+    for row in reports:
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("type") or "").upper()
+        if above is None and kind in _ABOVE_LEG_TYPES:
+            above = row
+        if below is None and kind in _BELOW_LEG_TYPES:
+            below = row
+    if above is None or below is None:
+        return False
+    if str(above.get("orderId") or "").strip() != wanted_above:
+        return False
+    if str(below.get("orderId") or "").strip() != wanted_below:
+        return False
+    for leg in (above, below):
+        if str(leg.get("symbol") or reported).strip().upper() != reported:
+            return False
+        if str(leg.get("status") or "").upper() not in _LIVE_LEG_STATUS:
+            return False
+        remaining = _leg_remaining(leg)
+        if remaining is None or remaining < held_net:
+            return False
+    return True
+
+
+_FINAL_ORDER_STATUS = frozenset(
+    {"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"}
+)
+
+
+def final_executed_qty(payload: object) -> Decimal | None:
+    """Executed quantity once the remainder cannot fill.
+
+    ``PARTIALLY_FILLED`` and ``NEW`` are not final: the rest of the order
+    can still trade. A canceled or expired order's executed quantity is final.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("status") or "").strip().upper() not in _FINAL_ORDER_STATUS:
+        return None
+    text = _decimal_text(payload.get("executedQty"))
+    if text is None:
+        return None
+    number = Decimal(text)
+    if number <= 0:
+        return None
+    return number
+
+
+def account_order_base(
+    trades: object,
+    *,
+    symbol: str,
+    order_id: object,
+    side: str,
+    executed_qty: Decimal,
+) -> Decimal | None:
+    """Base effect of one final order from its own trades.
+
+    BUY returns executed quantity minus base-asset commission. SELL returns
+    executed quantity plus base-asset commission. A quote or third-asset
+    commission does not change the base. The same numeric trade id counts
+    once. A second copy with a different quantity, fee, asset, or side is
+    unknown. ``isBuyer`` must match ``side``. A missing or non-numeric id
+    is unknown.
+    """
+    if not isinstance(trades, list) or executed_qty <= 0:
+        return None
+    wanted_side = str(side or "").strip().upper()
+    if wanted_side not in {"BUY", "SELL"}:
+        return None
+    wanted_symbol = str(symbol or "").strip().upper()
+    wanted_order = str(order_id or "").strip()
+    base = wanted_symbol[: -len("USDT")] if wanted_symbol.endswith("USDT") else ""
+    if not wanted_symbol or not wanted_order or not base:
+        return None
+    seen: dict[str, tuple[Decimal, Decimal, str, bool]] = {}
+    for trade in trades:
+        if not isinstance(trade, dict):
+            return None
+        raw_id = trade.get("id")
+        if isinstance(raw_id, bool) or raw_id is None:
+            return None
+        text_id = str(raw_id).strip()
+        if not text_id.isdigit():
+            return None
+        number = int(text_id)
+        if number <= 0:
+            return None
+        trade_id = str(number)
+        if str(trade.get("symbol") or "").strip().upper() != wanted_symbol:
+            return None
+        if str(trade.get("orderId") or "").strip() != wanted_order:
+            return None
+        buyer = trade.get("isBuyer")
+        if not isinstance(buyer, bool):
+            return None
+        if wanted_side == "BUY" and buyer is not True:
+            return None
+        if wanted_side == "SELL" and buyer is not False:
+            return None
+        if "commission" not in trade or "commissionAsset" not in trade:
+            return None
+        part_qty = _nonneg_decimal(trade.get("qty"))
+        part_fee = _nonneg_decimal(trade.get("commission"))
+        if part_qty is None or part_qty <= 0 or part_fee is None:
+            return None
+        asset = str(trade.get("commissionAsset") or "").strip().upper()
+        if not asset:
+            return None
+        signature = (part_qty, part_fee, asset, buyer)
+        prior = seen.get(trade_id)
+        if prior is not None and prior != signature:
+            return None
+        seen[trade_id] = signature
+    if not seen:
+        return None
+    qty = Decimal("0")
+    base_fee = Decimal("0")
+    for part_qty, part_fee, asset, _buyer in seen.values():
+        qty += part_qty
+        if asset == base:
+            base_fee += part_fee
+    if qty != executed_qty:
+        return None
+    effect = executed_qty - base_fee if wanted_side == "BUY" else executed_qty + base_fee
+    if not effect.is_finite() or effect <= 0:
+        return None
+    return effect
+
+
+def row_unresolved_reason(row: dict[str, Any]) -> str | None:
+    """Why this row still blocks a buy. Local ids and local fills do not clear it."""
+    if any(
+        _qty_invalid(row.get(key))
+        for key in ("quantity", "residual_qty", "exit_filled_qty", "entry_order_qty")
+    ):
+        return "unprotected_position_blocks_buy"
+    if _positive_qty(row.get("residual_qty")):
+        return "unprotected_position_blocks_buy"
+    if partial_dust_residual(row):
+        return "unprotected_position_blocks_buy"
+    status = str(row.get("status") or "")
+    if _zeroed_entry(row):
+        return "exit_readback_unverified"
+    if status == "oco_working" or (
+        status == "open" and str(row.get("protection") or "") == "exchange_oco"
+    ):
+        if (
+            _position_ids_verified(row)
+            and str(row.get("protection") or "") == "exchange_oco"
+            and _positive_qty(row.get("quantity"))
+        ):
+            return "oco_readback_unverified"
+        return "oco_failed_blocks_buy"
+    if status == "closed_canceled" and _positive_qty(row.get("quantity")):
+        return "unprotected_position_blocks_buy"
+    if not status or status in _TERMINAL_POSITION or status == "flat":
+        return None
+    if status == "held_naked":
+        return "naked_holds_new_buys"
+    if status == "qty_unconfirmed":
+        return "parent_fill_incomplete"
+    if status in {"oco_failed", "oco_unknown"}:
+        return "oco_failed_blocks_buy"
+    if status == "time_stop_unknown":
+        return "time_stop_unconfirmed_blocks_buy"
+    if status == "maker_cancel_unknown":
+        return "maker_resting_blocks_buy"
+    if status == "maker_resting":
+        filled = _decimal_text(row.get("quantity"))
+        if filled is not None and Decimal(filled) > 0:
+            return "unprotected_position_blocks_buy"
+        return None
+    if status == "exit_submitted":
+        return "unprotected_position_blocks_buy"
+    return "unprotected_position_blocks_buy"
 
 
 def cross_arm_symbol_block(

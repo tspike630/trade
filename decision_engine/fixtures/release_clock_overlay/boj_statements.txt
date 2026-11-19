@@ -1,0 +1,31 @@
+fetched_at_utc: 2026-11-19T13:52:00Z
+release_tz: Asia/Tokyo
+decision: adopt
+
+event_key: JPINTN=ECI|JP BOJ Rate Decision|17 Jun|Japan|2025-06-17
+source_url: https://www.boj.or.jp/en/mopo/mpmdeci/state_2025/k250617a.htm
+quote: Statement on Monetary Policy -- Tuesday, June 17 at 12:31
+
+event_key: JPINTN=ECI|JP BOJ Rate Decision|23 Jan|Japan|2026-01-23
+source_url: https://www.boj.or.jp/en/mopo/mpmdeci/state_2026/k260123a.htm
+quote: Statement on Monetary Policy -- Friday, January 23 at 12:07
+
+event_key: JPINTN=ECI|JP BOJ Rate Decision|19 Mar|Japan|2026-03-19
+source_url: https://www.boj.or.jp/en/mopo/mpmdeci/state_2026/k260319a.htm
+quote: Statement on Monetary Policy -- Thursday, March 19 at 11:46
+
+event_key: JPINTN=ECI|JP BOJ Rate Decision|28 Apr|Japan|2026-04-28
+source_url: https://www.boj.or.jp/en/mopo/mpmdeci/mpr_2026/k260428a.pdf
+quote: Statement on Monetary Policy -- Tuesday, April 28 at 12:04
+
+event_key: JPINTN=ECI|JP BOJ Rate Decision|17 Jun|Japan|2026-06-16
+source_url: https://www.boj.or.jp/en/mopo/mpmdeci/mpr_2026/k260616a.pdf
+quote: Change in the Guideline for Money Market Operations -- Tuesday, June 16 at 12:19
+
+event_key: JPINTN=ECI|JP BOJ Rate Decision|31 Jul|Japan|2026-07-31
+source_url: https://www.boj.or.jp/en/mopo/mpmdeci/mpr_2026/k260731a.pdf
+quote: Statement on Monetary Policy -- Friday, July 31 at 12:11
+
+event_key: JPINTN=ECI|JP BOJ Rate Decision|30 Oct|Japan|2026-10-30
+source_url: https://www.boj.or.jp/en/mopo/mpmdeci/mpr_2026/k261030a.pdf
+quote: Statement on Monetary Policy -- Friday, October 30 at 12:02

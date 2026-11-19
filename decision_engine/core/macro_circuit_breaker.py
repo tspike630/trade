@@ -20,16 +20,30 @@ under four evidence-backed conditions:
    US 2Y yield (``US2YT=RR``) 15m spike >= +3.0 bps, USDJPY (``JPY=``)
    15m carry unwind <= -0.15%, or CME BTC futures (``BTCc1`` vs ``BTC=``)
    basis discount < -15.0 bps.
+
+Calendar and cross-asset files are separate. The calendar path is the
+``path`` argument, then ``DECISION_MACRO_DB``, then ``LSEG_MACRO_DB_PATH``,
+then ``data/lseg/lseg_macro.db`` only when the gate flag is on. The
+cross-asset path is ``DECISION_MACRO_CROSS_ASSET_DB``, then
+``LSEG_CROSS_ASSET_DB_PATH``, then the calendar path that was actually
+opened. A calendar file with no ``cross_asset_bars`` table stays
+``cross_asset_table_missing``. A latest ``utc_ms`` older than 30 minutes
+is ``cross_asset_stale``. Neither state adds a buy halt: the calendar
+rules still decide. A fresh breach keeps the existing ``cross_asset_*``
+halt. Every returned status carries that cross-asset label, including
+when a calendar blackout is the halt reason.
 """
 
 from __future__ import annotations
 
 import os
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
@@ -46,6 +60,10 @@ LIVE_BNB_SPOT_PURPOSES = frozenset(
 _MACRO_DB_ENV = (
     "DECISION_MACRO_DB",
     "LSEG_MACRO_DB_PATH",
+)
+_CROSS_ASSET_DB_ENV = (
+    "DECISION_MACRO_CROSS_ASSET_DB",
+    "LSEG_CROSS_ASSET_DB_PATH",
 )
 
 DEFAULT_CB_BEFORE_MIN = 15
@@ -79,6 +97,13 @@ class MacroGateStatus:
     halt_reason: str | None
     detail: str | None = None
     error: str | None = None
+    cross_asset_status: str | None = None
+    cross_asset_path: str | None = None
+    cross_asset_source: str | None = None
+    cross_asset_latest_utc_ms: int | None = None
+    cross_asset_age_ms: int | None = None
+    cross_asset_max_age_ms: int | None = None
+    cross_asset_trigger: str | None = None
 
     @staticmethod
     def unwired() -> MacroGateStatus:
@@ -124,20 +149,174 @@ def _env_bool(env: Mapping[str, str], key: str) -> bool:
     return str(raw).strip().lower() in _TRUE
 
 
-def resolve_macro_db_path(environ: Mapping[str, str] | None = None) -> Path | None:
-    """Return configured LSEG macro SQLite path, or ``None`` when disabled."""
+def resolve_macro_db_path(
+    environ: Mapping[str, str] | None = None,
+    *,
+    live_required: bool = False,
+) -> Path | None:
+    """Return the configured LSEG macro SQLite path.
+
+    ``DECISION_MACRO_GATE_ENABLED=0`` still unwires a non-live caller. A live
+    caller keeps an explicit path, and a missing path stays ``None`` so the
+    live gate can fail closed instead of skipping.
+    """
     env = os.environ if environ is None else environ
     gate_flag = str(env.get("DECISION_MACRO_GATE_ENABLED") or "").strip().lower()
-    if gate_flag in {"0", "false", "no", "off"}:
-        return None
+    explicit: Path | None = None
     for key in _MACRO_DB_ENV:
         raw = env.get(key)
         if raw is not None and str(raw).strip():
-            return Path(str(raw).strip()).expanduser()
+            explicit = Path(str(raw).strip()).expanduser()
+            break
+    if live_required:
+        if explicit is not None:
+            return explicit
+        if gate_flag in {"1", "true", "yes", "on"}:
+            repo_root = Path(__file__).resolve().parents[2]
+            return repo_root / "data" / "lseg" / "lseg_macro.db"
+        return None
+    if gate_flag in {"0", "false", "no", "off"}:
+        return None
+    if explicit is not None:
+        return explicit
     if gate_flag in {"1", "true", "yes", "on"}:
         repo_root = Path(__file__).resolve().parents[2]
         return repo_root / "data" / "lseg" / "lseg_macro.db"
     return None
+
+
+def resolve_cross_asset_db_path(
+    environ: Mapping[str, str] | None = None,
+    *,
+    calendar_path: Path | None = None,
+) -> tuple[Path | None, str]:
+    """Return the cross-asset file and which setting selected it.
+
+    ``DECISION_MACRO_CROSS_ASSET_DB`` wins, then ``LSEG_CROSS_ASSET_DB_PATH``.
+    With neither set, the calendar path is reused so an existing one-file
+    caller keeps reading the bars it already has. There is no third default
+    that points at another file.
+    """
+    env = os.environ if environ is None else environ
+    for key in _CROSS_ASSET_DB_ENV:
+        raw = env.get(key)
+        if raw is not None and str(raw).strip():
+            return Path(str(raw).strip()).expanduser(), key
+    if calendar_path is not None:
+        return Path(calendar_path).expanduser(), "calendar_path"
+    return None, "unwired"
+
+
+def describe_cross_asset(
+    path: Path | None,
+    *,
+    now_ms: int,
+    source: str,
+) -> dict[str, Any]:
+    """Read-only age of ``cross_asset_bars``. Does not write and does not halt.
+
+    ``utc_ms`` is the source clock. A bar exactly ``MAX_CROSS_ASSET_AGE_MS``
+    old is still fresh. One millisecond older is ``cross_asset_stale``.
+    """
+    diag: dict[str, Any] = {
+        "status": "cross_asset_unwired",
+        "path": None if path is None else str(Path(path).expanduser()),
+        "source": source,
+        "latest_utc_ms": None,
+        "age_ms": None,
+        "max_age_ms": MAX_CROSS_ASSET_AGE_MS,
+    }
+    if path is None:
+        return diag
+    expanded = Path(path).expanduser()
+    if not expanded.is_file():
+        diag["status"] = "cross_asset_source_missing"
+        return diag
+    try:
+        conn = sqlite3.connect(_ro_uri(expanded), uri=True, timeout=5.0)
+    except (OSError, sqlite3.Error):
+        diag["status"] = "cross_asset_source_unreadable"
+        return diag
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cross_asset_bars'"
+        ).fetchone()
+        if found is None:
+            diag["status"] = "cross_asset_table_missing"
+            return diag
+        row = conn.execute(
+            """
+            SELECT MAX(utc_ms) FROM cross_asset_bars
+            WHERE utc_ms IS NOT NULL AND utc_ms <= ?
+            """,
+            (int(now_ms),),
+        ).fetchone()
+        latest = None if row is None else row[0]
+        if latest is None:
+            diag["status"] = "cross_asset_no_utc"
+            return diag
+        latest_ms = int(latest)
+        age = int(now_ms) - latest_ms
+        diag["latest_utc_ms"] = latest_ms
+        diag["age_ms"] = age
+        diag["status"] = (
+            "cross_asset_stale" if age > MAX_CROSS_ASSET_AGE_MS else "cross_asset_healthy"
+        )
+        return diag
+    except sqlite3.Error:
+        diag["status"] = "cross_asset_source_unreadable"
+        return diag
+    finally:
+        conn.close()
+
+
+def _unwired_cross_asset() -> dict[str, Any]:
+    return {
+        "status": "cross_asset_unwired",
+        "path": None,
+        "source": "unwired",
+        "latest_utc_ms": None,
+        "age_ms": None,
+        "max_age_ms": MAX_CROSS_ASSET_AGE_MS,
+    }
+
+
+def _attach_cross_asset(
+    status: MacroGateStatus,
+    diag: Mapping[str, Any],
+    trigger: str | None = None,
+) -> MacroGateStatus:
+    name = str(diag["status"])
+    if trigger and name == "cross_asset_healthy":
+        name = "cross_asset_triggered"
+    return replace(
+        status,
+        cross_asset_status=name,
+        cross_asset_path=None if diag.get("path") is None else str(diag["path"]),
+        cross_asset_source=None if diag.get("source") is None else str(diag["source"]),
+        cross_asset_latest_utc_ms=diag.get("latest_utc_ms"),
+        cross_asset_age_ms=diag.get("age_ms"),
+        cross_asset_max_age_ms=diag.get("max_age_ms"),
+        cross_asset_trigger=trigger,
+    )
+
+
+def _cross_asset_trigger(
+    path: Path,
+    now_ms: int,
+    env: Mapping[str, str],
+) -> tuple[str | None, str | None]:
+    try:
+        conn = sqlite3.connect(_ro_uri(Path(path).expanduser()), uri=True, timeout=5.0)
+    except (OSError, sqlite3.Error):
+        return None, None
+    try:
+        conn.row_factory = sqlite3.Row
+        return _check_cross_asset(conn, now_ms, env)
+    except sqlite3.Error:
+        return None, None
+    finally:
+        conn.close()
 
 
 def _ro_uri(path: Path) -> str:
@@ -375,7 +554,7 @@ def _evaluate_dynamic_surprise(
         SELECT {', '.join(select_cols)}
         FROM macro_events
         WHERE relevance = 3
-          AND local_time_hkt != ''
+          AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
           AND utc_ms BETWEEN ? AND ?
         ORDER BY ABS(utc_ms - ?) ASC
         """,
@@ -453,6 +632,131 @@ def _evaluate_dynamic_surprise(
     return None, None, False
 
 
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _hkt_date_ms(day: str) -> int | None:
+    try:
+        parsed = datetime.strptime(day[:10], "%Y-%m-%d").replace(tzinfo=ZoneInfo("Asia/Hong_Kong"))
+    except ValueError:
+        return None
+    return int(parsed.timestamp() * 1000)
+
+
+def _unresolved_release_block(conn: sqlite3.Connection, now_ms: int) -> str | None:
+    """A missing or conflicting clock on a release date blocks that Hong Kong day.
+
+    The date alone is not a clock. It only says a row exists whose time was
+    not resolved, so the day cannot be cleared.
+    """
+    if not _table_exists(conn, "release_event"):
+        return None
+    columns = _table_cols(conn, "release_event")
+    if "release_date_hkt" not in columns or "clock_status" not in columns:
+        return None
+    rows = conn.execute(
+        """
+        SELECT clock_status, release_date_hkt, COUNT(*)
+        FROM release_event
+        WHERE clock_status IN ('absent', 'conflict')
+          AND release_date_hkt IS NOT NULL
+          AND release_date_hkt != ''
+        GROUP BY clock_status, release_date_hkt
+        """
+    ).fetchall()
+    lead = DEFAULT_CB_BEFORE_MIN * 60_000
+    tail = 86_400_000 + DEFAULT_CB_AFTER_MIN * 60_000
+    hits: list[tuple[str, str, int]] = []
+    for status, day, count in rows:
+        start = _hkt_date_ms(str(day))
+        if start is None:
+            continue
+        if start - lead <= now_ms < start + tail:
+            hits.append((str(status), str(day)[:10], int(count)))
+    if not hits:
+        return None
+    hits.sort(key=lambda item: (item[1], item[0]))
+    status, day, count = hits[0]
+    return f"release_clock_unresolved:{status}:{day}:n={count}"
+
+
+def _gate_class_clocks(conn: sqlite3.Connection) -> dict[tuple[str, str], list[int]]:
+    grouped: dict[tuple[str, str], list[int]] = {}
+    rel3 = conn.execute(
+        """
+        SELECT country, utc_ms FROM macro_events
+        WHERE relevance = 3 AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
+        """
+    ).fetchall()
+    for country, stamp in rel3:
+        grouped.setdefault((str(country), "rel3"), []).append(int(stamp))
+    banks = conn.execute(
+        """
+        SELECT country, utc_ms FROM central_bank_events
+        WHERE is_high_impact = 1 AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
+        """
+    ).fetchall()
+    for country, stamp in banks:
+        grouped.setdefault((str(country), "cb_high"), []).append(int(stamp))
+    for key in grouped:
+        grouped[key] = sorted(set(grouped[key]))
+    return grouped
+
+
+def _inside_proven_gap(stamps: list[int], now_ms: int, *, tail_ms: int, lead_ms: int) -> bool:
+    for earlier, later in zip(stamps, stamps[1:]):
+        if earlier + tail_ms < now_ms < later - lead_ms:
+            return True
+    return False
+
+
+def _release_calendar_gap(
+    conn: sqlite3.Connection,
+    now_ms: int,
+    *,
+    rel3_after_ms: int,
+    cb_after_ms: int,
+    before_ms: int,
+) -> str | None:
+    """Return why this instant is not a proven clear, or None when it is.
+
+    One clocked row does not cover a day, a country, or a later date. A
+    country and class are proven only in the open gap between two of that
+    class's own resolved clocks. A low-relevance row is not one of those clocks.
+    """
+    release_n = 0
+    unzoned_n = 0
+    for table in ("macro_events", "central_bank_events"):
+        row = conn.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN local_time_hkt GLOB '*:*' AND utc_ms IS NULL THEN 1 ELSE 0 END)
+            FROM {table}
+            """
+        ).fetchone()
+        release_n += int(row[0] or 0)
+        unzoned_n += int(row[1] or 0)
+    if release_n == 0:
+        return "release_clock_unzoned" if unzoned_n else "release_clock_absent"
+    unresolved = _unresolved_release_block(conn, now_ms)
+    if unresolved is not None:
+        return unresolved
+    classes = _gate_class_clocks(conn)
+    if not classes:
+        return "release_coverage_unproven:no_gate_class"
+    for (country, kind), stamps in sorted(classes.items()):
+        tail = cb_after_ms if kind == "cb_high" else rel3_after_ms
+        if not _inside_proven_gap(stamps, now_ms, tail_ms=tail, lead_ms=before_ms):
+            return f"release_coverage_unproven:{country}:{kind}"
+    return None
+
+
 def evaluate_macro_gate(
     path: str | Path | None,
     *,
@@ -466,24 +770,72 @@ def evaluate_macro_gate(
     ``live_bnb_boll_classic``) are halted unless
     ``DECISION_MACRO_GATE_ALL_PURPOSES=1`` is set.
     """
-    if path is None:
-        return MacroGateStatus.unwired()
+    env_check = os.environ if environ is None else environ
+    v2_fail_closed = (
+        str(env_check.get("REGIME_V2_CONTRACT", "")).strip().lower() in _TRUE
+        and str(env_check.get("REGIME_V2_STALE_DATA_POLICY", "")).strip().lower() == "fail_closed"
+        and (purpose in LIVE_BNB_SPOT_PURPOSES or _env_bool(env_check, "DECISION_MACRO_GATE_ALL_PURPOSES"))
+    )
     env = os.environ if environ is None else environ
     all_purposes = str(env.get("DECISION_MACRO_GATE_ALL_PURPOSES") or "").strip() == "1"
-    if not all_purposes and purpose not in LIVE_BNB_SPOT_PURPOSES:
-        return MacroGateStatus.unwired()
+    live_gate = purpose in LIVE_BNB_SPOT_PURPOSES or all_purposes
+    gate_flag = str(env.get("DECISION_MACRO_GATE_ENABLED") or "").strip().lower()
+
+    def _opened_cross_asset(
+        calendar: Path | None,
+    ) -> tuple[dict[str, Any], str | None, str | None]:
+        cross_path, cross_source = resolve_cross_asset_db_path(env, calendar_path=calendar)
+        diag = describe_cross_asset(cross_path, now_ms=now_ms, source=cross_source)
+        if diag["status"] != "cross_asset_healthy" or cross_path is None:
+            return diag, None, None
+        reason, detail = _cross_asset_trigger(cross_path, now_ms, env)
+        return diag, reason, detail
+
+    if path is None and live_gate:
+        path = resolve_macro_db_path(env, live_required=True)
+        if path is None:
+            detail = "gate_disabled" if gate_flag in {"0", "false", "no", "off"} else "path_unwired"
+            diag, trigger, _ignored = _opened_cross_asset(None)
+            return _attach_cross_asset(
+                MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail=detail),
+                diag,
+                trigger,
+            )
+    if path is None:
+        if v2_fail_closed:
+            diag, trigger, _ignored = _opened_cross_asset(None)
+            return _attach_cross_asset(
+                MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail="path_unwired"),
+                diag,
+                trigger,
+            )
+        return _attach_cross_asset(MacroGateStatus.unwired(), _unwired_cross_asset())
+    if not Path(path).expanduser().is_file() and (live_gate or v2_fail_closed):
+        diag, trigger, _ignored = _opened_cross_asset(Path(path).expanduser())
+        return _attach_cross_asset(
+            MacroGateStatus(configured=True, halt_reason="macro_lseg_stale_or_missing", detail="db_missing"),
+            diag,
+            trigger,
+        )
+    if not live_gate:
+        return _attach_cross_asset(MacroGateStatus.unwired(), _unwired_cross_asset())
+
+    diag, trigger, trigger_detail = _opened_cross_asset(Path(path).expanduser())
+
+    def _finish(status: MacroGateStatus) -> MacroGateStatus:
+        return _attach_cross_asset(status, diag, trigger)
 
     try:
         uri = _ro_uri(Path(path).expanduser())
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
     except (OSError, sqlite3.Error) as exc:
-        return MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}")
+        return _finish(MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}"))
 
     try:
         conn.row_factory = sqlite3.Row
         missing = _has_tables(conn, ("macro_events", "central_bank_events"))
         if missing is not None:
-            return MacroGateStatus.failed(missing)
+            return _finish(MacroGateStatus.failed(missing))
 
         # 1. Central Bank high-impact window [-15m, +45m]
         cb_before_ms = _env_int(env, "MACRO_CB_BEFORE_MIN", DEFAULT_CB_BEFORE_MIN) * 60_000
@@ -493,7 +845,7 @@ def evaluate_macro_gate(
             SELECT country, event_name, utc_ts
             FROM central_bank_events
             WHERE is_high_impact = 1
-              AND local_time_hkt != ''
+              AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
               AND utc_ms BETWEEN ? AND ?
             ORDER BY ABS(utc_ms - ?) ASC
             LIMIT 1
@@ -502,7 +854,7 @@ def evaluate_macro_gate(
         ).fetchone()
         if cb_row is not None:
             detail = f"{cb_row['country']}:{str(cb_row['event_name'])[:60]}@{cb_row['utc_ts']}"
-            return MacroGateStatus.halted("central_bank_blackout", detail)
+            return _finish(MacroGateStatus.halted("central_bank_blackout", detail))
 
         # 2. Tier-1 Macro Release (Relevance = 3) window [-15m, +30m] (or dynamic surprise window)
         r3_before_ms = _env_int(env, "MACRO_REL3_BEFORE_MIN", DEFAULT_REL3_BEFORE_MIN) * 60_000
@@ -516,7 +868,7 @@ def evaluate_macro_gate(
                 env=env,
             )
             if s_reason is not None:
-                return MacroGateStatus.halted(s_reason, s_detail)
+                return _finish(MacroGateStatus.halted(s_reason, s_detail))
             r3_row = None if fast_cleared else None
         else:
             r3_row = conn.execute(
@@ -524,7 +876,7 @@ def evaluate_macro_gate(
                 SELECT country, indicator_name, utc_ts
                 FROM macro_events
                 WHERE relevance = 3
-                  AND local_time_hkt != ''
+                  AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
                   AND utc_ms BETWEEN ? AND ?
                 ORDER BY ABS(utc_ms - ?) ASC
                 LIMIT 1
@@ -533,7 +885,7 @@ def evaluate_macro_gate(
             ).fetchone()
         if r3_row is not None:
             detail = f"{r3_row['country']}:{r3_row['indicator_name']}@{r3_row['utc_ts']}"
-            return MacroGateStatus.halted("macro_rel3_blackout", detail)
+            return _finish(MacroGateStatus.halted("macro_rel3_blackout", detail))
 
         # 3. Tier-2 US Treasury Auction / High-Vol Rel=2 window [-10m, +20m]
         r2_before_ms = _env_int(env, "MACRO_REL2_BEFORE_MIN", DEFAULT_REL2_BEFORE_MIN) * 60_000
@@ -545,7 +897,7 @@ def evaluate_macro_gate(
                 SELECT country, indicator_name, utc_ts
                 FROM macro_events
                 WHERE relevance = 2
-                  AND local_time_hkt != ''
+                  AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
                   AND utc_ms BETWEEN ? AND ?
                 ORDER BY ABS(utc_ms - ?) ASC
                 LIMIT 1
@@ -558,7 +910,7 @@ def evaluate_macro_gate(
                 SELECT country, indicator_name, utc_ts
                 FROM macro_events
                 WHERE relevance = 2
-                  AND local_time_hkt != ''
+                  AND local_time_hkt GLOB '*:*' AND utc_ms IS NOT NULL
                   AND (indicator_name LIKE '%Auc%' OR indicator_name LIKE '%PMI%' OR indicator_name LIKE '%Jobless%')
                   AND utc_ms BETWEEN ? AND ?
                 ORDER BY ABS(utc_ms - ?) ASC
@@ -568,15 +920,25 @@ def evaluate_macro_gate(
             ).fetchone()
         if r2_row is not None:
             detail = f"{r2_row['country']}:{r2_row['indicator_name']}@{r2_row['utc_ts']}"
-            return MacroGateStatus.halted("macro_rel2_auction_blackout", detail)
+            return _finish(MacroGateStatus.halted("macro_rel2_auction_blackout", detail))
 
-        # 4. Cross-Asset Contagion Circuit Breakers
-        ca_reason, ca_detail = _check_cross_asset(conn, now_ms, env)
-        if ca_reason is not None:
-            return MacroGateStatus.halted(ca_reason, ca_detail)
+        # 4. Cross-asset contagion uses the cross-asset path, which may be a
+        # different file from the calendar. A missing or stale file does not
+        # add a halt; ``trigger`` is set only when that file is fresh.
+        if trigger is not None:
+            return _finish(MacroGateStatus.halted(trigger, trigger_detail))
 
-        return MacroGateStatus.clear()
+        gap = _release_calendar_gap(
+            conn,
+            now_ms,
+            rel3_after_ms=r3_after_ms,
+            cb_after_ms=cb_after_ms,
+            before_ms=cb_before_ms,
+        )
+        if gap is not None:
+            return _finish(MacroGateStatus.halted("macro_lseg_stale_or_missing", gap))
+        return _finish(MacroGateStatus.clear())
     except sqlite3.Error as exc:
-        return MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}")
+        return _finish(MacroGateStatus.failed(f"macro_db_unreadable:{exc.__class__.__name__}"))
     finally:
         conn.close()

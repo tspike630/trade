@@ -13,6 +13,7 @@ from pathlib import Path
 from decision_engine.core.bnb_spot_map import CEX_UNIVERSE
 from decision_engine.core.data_adapter import IndicatorDataAdapter
 from decision_engine.core.engine import DecisionEngine
+from decision_engine.tests.quiet_macro import write_quiet_macro
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_FADE,
@@ -98,6 +99,7 @@ def _tick(db: Path, purpose: str) -> tuple[list[sqlite3.Row], dict]:
             [get_strategy("tech_boll_fade_v1")],
             risk=RiskManager(cooldown_sec=0),
             hot_limit=20,
+            macro_db=write_quiet_macro(db.with_name("quiet_macro.db")),
         )
         payload = engine.tick()
     finally:

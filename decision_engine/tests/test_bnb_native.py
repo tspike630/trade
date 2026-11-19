@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 
 import decision_engine  # noqa: F401 — crawler/ on path for logging_setup
+from decision_engine.tests.quiet_macro import write_quiet_macro
 from decision_engine import config as de_config
 from decision_engine.core.bnb_native import (
     _boll_lower,
@@ -231,6 +232,7 @@ class NativeEmitTests(unittest.TestCase):
                 [get_strategy("tech_boll_fade_v1")],
                 risk=RiskManager(cooldown_sec=0),
                 hot_limit=20,
+                macro_db=write_quiet_macro(db.with_name("quiet_macro.db")),
             )
             payload = engine.tick()
         finally:
@@ -671,6 +673,7 @@ class ScanWindowTests(unittest.TestCase):
                 bus,
                 [get_strategy("tech_boll_fade_v1")],
                 risk=RiskManager(cooldown_sec=0),
+                macro_db=write_quiet_macro(db.with_name("quiet_macro.db")),
                 **kwargs,
             )
             payload = engine.tick()

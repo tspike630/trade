@@ -1,0 +1,8 @@
+event_key: Euro Zone|EU Economic and Financial Affairs Council (Budget) Meeting|2026-11-10
+source_url: https://data.consilium.europa.eu/doc/document/CM-4756-2026-INIT/en/pdf
+fetched_at_utc: 2026-11-19T13:52:00Z
+release_tz: Europe/Brussels
+decision: adopt
+quote: 10 November 2026 (09:00)
+
+NOTICE OF MEETING AND PROVISIONAL AGENDA COUNCIL OF THE EUROPEAN UNION (Economic and Financial Affairs/Budget) Europa building, Brussels 10 November 2026 (09:00)

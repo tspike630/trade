@@ -112,6 +112,7 @@ class _Client:
     def __init__(self, oco: dict[str, Any] | Exception | None = None) -> None:
         self.calls: list[tuple[Any, ...]] = []
         self.oco: dict[str, Any] | Exception = _working() if oco is None else oco
+        self.fills: dict[str, tuple[str, bool]] = {"99": ("1.24", True)}
 
     def exchange_info(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("exchange_info", symbol))
@@ -120,8 +121,51 @@ class _Client:
     def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_order", signed_query, api_key))
         if "side=SELL" in signed_query:
-            return {"orderId": "77", "status": "FILLED", "executedQty": "1.23"}
-        return {"orderId": "99", "status": "FILLED", "executedQty": "1.239", "symbol": "BNBUSDT"}
+            qty = parse_qs(signed_query).get("quantity", ["1.23"])[0]
+            self.fills["77"] = (qty, False)
+            return {"orderId": "77", "status": "FILLED", "executedQty": qty, "origQty": qty, "side": "SELL", "symbol": "BNBUSDT"}
+        qty = self.fills.get("99", ("1.24", True))[0]
+        self.fills["99"] = (qty, True)
+        return {"orderId": "99", "status": "FILLED", "executedQty": qty, "symbol": "BNBUSDT", "side": "BUY", "fills": [{"tradeId": 1, "qty": qty, "commission": "0", "commissionAsset": "BNB", "isBuyer": True}]}
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        known = self.fills.get(str(order_id))
+        if known is None:
+            return []
+        qty, buyer = known
+        return [{
+            "symbol": symbol,
+            "id": 1 if buyer else 2,
+            "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+            "qty": qty,
+            "commission": "0",
+            "commissionAsset": "BNB",
+            "isBuyer": buyer,
+        }]
+
+    def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        form = parse_qs(signed_query)
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        if form.get("origClientOrderId"):
+            raise BinanceRequestError(400, code=-2013, message="Order does not exist.")
+        order_id = (form.get("orderId") or ["99"])[0]
+        known = self.fills.get(str(order_id))
+        if known is None:
+            raise BinanceRequestError(400, code=-2013, message="Order does not exist.")
+        qty, buyer = known
+        return {
+            "symbol": symbol,
+            "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+            "side": "BUY" if buyer else "SELL",
+            "status": "FILLED",
+            "executedQty": qty,
+            "origQty": qty,
+        }
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_oco", signed_query, api_key))
@@ -271,6 +315,7 @@ class ConsumerGateTests(unittest.TestCase):
             account_snapshot=_BOUND,
             production_book=REST_BOOK,
             rest_expected=_EXPECTED,
+            auto_flatten_on_oco_fail=True,
             **extra,
         )
 
@@ -297,21 +342,16 @@ class ConsumerGateTests(unittest.TestCase):
         self.assertEqual(len([call for call in client.calls if call[0] == "new_order"]), 1)
 
         failed_client = _Client(BinanceRequestError(400))
+        failed_client.fills["99"] = ("1.239", True)
         failed = self._adapter(failed_client)
         with mock.patch.dict(os.environ, _env(self.root)):
             naked = failed.execute(_buy(147842))
         self.assertFalse(naked["consumer_allowed"])
         self.assertEqual(naked["executed"], 0)
-        self.assertEqual(naked["arm_position"]["status"], "oco_failed")
-        self.assertTrue(str(naked["error"]).startswith("oco_rejected:"))
-        failed.buy_blocks = [naked["arm_position"]]
-        with mock.patch.dict(os.environ, _env(self.root)):
-            again = failed.execute(_buy(147843))
-        self.assertEqual(again["error"], "oco_failed_blocks_buy")
-        self.assertEqual(
-            [call[0] for call in failed_client.calls if call[0] == "new_order"],
-            ["new_order"],
-        )
+        self.assertEqual(naked["protection_state"], "dust_residual", naked)
+        self.assertEqual(naked["arm_position"]["status"], "closed_dust")
+        self.assertEqual(naked["arm_position"]["protection"], "dust_abandon")
+        self.assertEqual(naked["error"], "dust_untradable")
 
     def test_fill_average_is_the_ledger_entry_and_signal_stays_on_the_plan(self) -> None:
         """Signal 48.08, exchange average 48.02. The new row stores 48.02.
@@ -331,7 +371,12 @@ class ConsumerGateTests(unittest.TestCase):
                     "executedQty": "1",
                     "cummulativeQuoteQty": "48.02",
                     "symbol": "BNBUSDT",
+                    "fills": [{"tradeId": 1, "qty": "1", "commission": "0", "commissionAsset": "BNB", "isBuyer": True}],
                 }
+
+            def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+                self.fills["9001"] = ("1", True)
+                return super().my_trades(signed_query, api_key=api_key)
 
         client = _AverageFill()
         sig = _buy(9002)
@@ -398,7 +443,8 @@ class ConsumerGateTests(unittest.TestCase):
                     "decision_log_id": 147841,
                     "symbol": "BNBUSDT",
                     "status": "open",
-                    "quantity": "1.239",
+                    "quantity": "1.24",
+                    "entry_order_id": "99",
                     "stop_price": "99",
                     "take_profit_price": "110",
                 },
@@ -491,6 +537,7 @@ class ConsumerGateTests(unittest.TestCase):
             account_snapshot=_BOUND,
             production_book=REST_BOOK,
             rest_expected=_EXPECTED,
+            auto_flatten_on_oco_fail=True,
         )
         with mock.patch.dict(os.environ, env):
             opened = ready.execute(_buy(147850))

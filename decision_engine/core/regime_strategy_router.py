@@ -46,6 +46,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import os
+import time
+from collections.abc import Mapping
 from typing import Any, Never, Sequence
 
 from decision_engine.core.news_shock_gate import (
@@ -64,6 +66,13 @@ from decision_engine.core.wall_mid_pricing import extract_wall_mid_from_row
 from decision_engine.core.conviction_whitelist import (
     get_conviction_tier,
     is_whitelist_enforced,
+)
+from decision_engine.core.regime_v2_policy import (
+    check_row_and_tick_freshness,
+    enforce_regime_v2_sizing_and_caps,
+    stale_data_fail_closed_active,
+    verify_s2_router_admission,
+    verify_s4_router_admission,
 )
 
 REGIME_1_POSITIVE_GAMMA_PINNED = "positive_gamma_mean_reversion"
@@ -482,6 +491,103 @@ def _rerank_state3_leaders(
     return out
 
 
+# Fields whose absence makes the standard State 1 fallthrough unconfirmed.
+# Absent ``in_unlock_blackout`` and ``xs_systemic_crash`` stay the classifier's
+# existing False; they are recorded, and this tuple does not add a new reject.
+_STATE1_DISTINGUISHERS: tuple[str, ...] = (
+    "funding_rate",
+    "funding_z",
+    "whale_retail_divergence",
+    "global_account_ls_ratio",
+    "gamma_regime",
+    "dvol_zscore",
+    "liq_cascade_regime",
+    "max_venue_dislocation_bps",
+    "cot_regime",
+    "nvda_1h_ret_pct",
+    "smh_1h_ret_pct",
+    "xs_breadth_1h",
+)
+
+_NUMERIC_CLASSIFICATION_INPUTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("funding_rate", ("funding_rate", "lastFundingRate")),
+    ("funding_z", ("funding_z", "jev_funding_z")),
+    ("whale_retail_divergence", ("whale_retail_divergence",)),
+    ("global_account_ls_ratio", ("global_account_ls_ratio",)),
+    ("top_position_ls_ratio", ("top_position_ls_ratio",)),
+    ("dvol_zscore", ("dvol_zscore",)),
+    ("max_venue_dislocation_bps", ("max_venue_dislocation_bps",)),
+    ("nvda_1h_ret_pct", ("nvda_1h_ret_pct",)),
+    ("smh_1h_ret_pct", ("smh_1h_ret_pct",)),
+    ("xs_breadth_1h", ("xs_breadth_1h",)),
+    ("xs_rank_pct_1h", ("xs_rank_pct_1h",)),
+    ("obi_top5", ("obi_top5", "spot_obi_top5")),
+    ("taker_buy_ratio", ("taker_buy_ratio", "spot_taker_buy_ratio")),
+    ("volume_z", ("volume_z", "vol_z_1h")),
+    ("boll_z", ("boll_z", "boll_z_1h")),
+    ("put_wing_iv_residual_pct", ("put_wing_iv_residual_pct",)),
+)
+
+_TEXT_CLASSIFICATION_INPUTS: tuple[str, ...] = (
+    "gamma_regime",
+    "liq_cascade_regime",
+    "cot_regime",
+    "put_wing_residual_provenance",
+)
+
+
+def classification_inputs(row: dict[str, Any]) -> dict[str, Any]:
+    """Values ``evaluate_five_state_regime`` can see, with missing names explicit.
+
+    This does not choose a regime and does not fill a missing feature.
+    """
+    inputs: dict[str, Any] = {}
+    missing: list[str] = []
+    for name, keys in _NUMERIC_CLASSIFICATION_INPUTS:
+        value = None
+        for key in keys:
+            value = _finite(row.get(key))
+            if value is not None:
+                break
+        inputs[name] = value
+        if value is None:
+            missing.append(name)
+    # Same derivation evaluate_five_state_regime uses. A derived value is not missing.
+    if inputs["whale_retail_divergence"] is None:
+        top_ls = inputs["top_position_ls_ratio"]
+        glob_ls = inputs["global_account_ls_ratio"]
+        if top_ls is not None and glob_ls is not None and glob_ls > 0:
+            inputs["whale_retail_divergence"] = top_ls / glob_ls
+            missing.remove("whale_retail_divergence")
+    for name in _TEXT_CLASSIFICATION_INPUTS:
+        text = str(row.get(name) or "").strip()
+        inputs[name] = text or None
+        if not text:
+            missing.append(name)
+    if "in_unlock_blackout" not in row or row.get("in_unlock_blackout") in (None, ""):
+        inputs["in_unlock_blackout"] = None
+        missing.append("in_unlock_blackout")
+    else:
+        raw_unlock = row.get("in_unlock_blackout")
+        inputs["in_unlock_blackout"] = (
+            bool(int(raw_unlock)) if isinstance(raw_unlock, (int, float, bool)) else False
+        )
+    if "xs_systemic_crash" not in row or row.get("xs_systemic_crash") is None:
+        inputs["xs_systemic_crash"] = None
+        missing.append("xs_systemic_crash")
+    else:
+        inputs["xs_systemic_crash"] = bool(row.get("xs_systemic_crash"))
+    return {"inputs": inputs, "missing": missing}
+
+
+def state1_fallthrough_unconfirmed(playbook: str, classified: dict[str, Any]) -> bool:
+    """True when standard State 1 was reached with a distinguisher absent."""
+    if playbook != "tech_boll_fade_standard":
+        return False
+    missing = set(classified.get("missing") or [])
+    return any(name in missing for name in _STATE1_DISTINGUISHERS)
+
+
 def _copy_source_observation(out_sig: dict[str, Any], base_row: dict[str, Any]) -> None:
     """Keep the book and volume values the router just evaluated.
 
@@ -514,14 +620,17 @@ def apply_five_state_regime_router(
     news_snapshot: NewsReadSnapshot | None = None,
     onchain_calibration: OnchainCalibration | None = None,
     aligned_rank_weight: float | None = None,
+    now_ms: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Route candidate signals through the 5-State Market Regime Router.
 
     - Stamps ``market_regime``, ``regime_playbook``, ``recommended_order_type``,
       ``regime_size_multiplier``, ``regime_tp_multiplier``, ``enable_trailing_ratchet``,
-      and ``require_perp_beta_hedge`` onto each accepted BUY signal. ``obi_top5``
-      and ``volume_z`` are copied from the hot row only when the signal does
-      not already carry a finite value.
+      ``require_perp_beta_hedge``, and ``regime_classification`` onto each
+      accepted BUY signal. Classification records the inputs the classifier
+      could see and names the ones that were absent. It does not fill them in
+      and does not change the regime. ``obi_top5`` and ``volume_z`` are copied
+      from the hot row only when the signal does not already carry a finite value.
     - Scales ``size_pct`` by ``decision.size_multiplier`` when the signal was not already
       scaled by the same regime.
     - Filters out BUY signals rejected by their regime playbook (while never blocking SELLs).
@@ -554,8 +663,11 @@ def apply_five_state_regime_router(
             continue
 
         sym = str(sig.get("binance_symbol") or sig.get("token_address") or "").strip().upper()
-        base_row = dict(by_sym.get(sym) or {})
-        base_row.update(sig)
+        source_row = dict(by_sym.get(sym) or {})
+        base_row = dict(sig)
+        for key, value in source_row.items():
+            if value not in (None, ""):
+                base_row[key] = value
 
         decision = evaluate_five_state_regime(base_row, macro_halt=macro_halt)
         news_meta: dict[str, Any] | None = None
@@ -573,6 +685,26 @@ def apply_five_state_regime_router(
                 overlay.meta.get("news_shock_keyword"),
             )
             news_meta = overlay.meta
+        eff_now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        if regime_v2_contract_enabled():
+            fresh_reasons = check_row_and_tick_freshness(
+                source_row,
+                now_ms=eff_now_ms,
+                news_snapshot=news_snapshot,
+                require_all_clocks=(
+                    regime_v2_contract_enabled() or stale_data_fail_closed_active()
+                ),
+            )
+            if fresh_reasons:
+                continue
+        classified = classification_inputs(source_row)
+        decision = _apply_v2_contract(
+            decision,
+            classified,
+            signal=sig,
+            row=source_row,
+            now_ms=eff_now_ms,
+        )
         regime_counts[decision.regime] = regime_counts.get(decision.regime, 0) + 1
 
         if not decision.allow_buy:
@@ -596,10 +728,19 @@ def apply_five_state_regime_router(
         _copy_source_observation(out_sig, base_row)
         out_sig["market_regime"] = decision.regime
         out_sig["regime_playbook"] = decision.playbook
+        classified = classification_inputs(base_row)
+        out_sig["regime_classification"] = {
+            "inputs": classified["inputs"],
+            "missing": classified["missing"],
+            "state1_unconfirmed": state1_fallthrough_unconfirmed(decision.playbook, classified),
+        }
         out_sig["regime_size_multiplier"] = decision.size_multiplier
         out_sig["regime_tp_multiplier"] = decision.tp_multiplier
         out_sig["enable_trailing_ratchet"] = decision.enable_trailing_ratchet
         out_sig["require_perp_beta_hedge"] = decision.require_perp_beta_hedge
+        out_sig["regime_v2_contract"] = regime_v2_contract_enabled()
+        if regime_v2_contract_enabled():
+            out_sig["tp_price_policy"] = "unchanged_until_fill_formula_approved"
         wall_quote = extract_wall_mid_from_row(base_row)
         if wall_quote is not None:
             out_sig["wall_mid_price"] = wall_quote.wall_mid_price
@@ -643,11 +784,37 @@ def apply_five_state_regime_router(
         accepted.append(out_sig)
 
     accepted = _rerank_state3_leaders(accepted, aligned_rank_weight if news_snapshot is not None else None)
+    if regime_v2_contract_enabled():
+        eff_clock = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        accepted, _cap_rep = enforce_regime_v2_sizing_and_caps(
+            accepted, hot_rows=hot_rows, now_ms=eff_clock
+        )
+        for item in accepted:
+            if isinstance(item, dict) and str(item.get("action") or "").lower() == "buy":
+                item["_regime_v2_caps_checked"] = True
     return accepted, regime_counts
 
 
 OPTIMAL_KELLY_ENV = "USE_OPTIMAL_KELLY_MATRIX"
 EXPAND_OCO_TP_ENV = "EXPAND_REGIME_OCO_TP"
+CONTRACT_ENV = "REGIME_V2_CONTRACT"
+
+# t250u sizes and static TP multipliers. Applied only when CONTRACT_ENV is on.
+# They do not rewrite take_profit_price. The fill-average price formula is not
+# unique in the current execution contract, so it stays out of the order.
+_CONTRACT_SIZE_MULTIPLIER = {
+    REGIME_1_POSITIVE_GAMMA_PINNED: 1.00,
+    REGIME_2_SHORT_SQUEEZE_BREAKOUT: 1.20,
+    REGIME_3_CROSS_ASSET_BULL_PULLBACK: 1.15,
+    REGIME_4_CROWDED_LONG_DEFENSIVE: 0.30,
+    REGIME_5_CRISIS_LIQUIDATION_HALT: 0.0,
+}
+_CONTRACT_TP_MULTIPLIER = {
+    REGIME_1_POSITIVE_GAMMA_PINNED: 1.00,
+    REGIME_2_SHORT_SQUEEZE_BREAKOUT: 1.35,
+    REGIME_3_CROSS_ASSET_BULL_PULLBACK: 1.25,
+    REGIME_4_CROWDED_LONG_DEFENSIVE: 0.85,
+}
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
 
@@ -677,6 +844,108 @@ OPTIMAL_FIVE_STATE_PYRAMID_MAX_PCT = {
     4: 0.050,
     5: 0.000,
 }
+
+
+def regime_v2_contract_enabled() -> bool:
+    """True only when the explicit v2 profile is sourced. Unset stays off."""
+    return os.environ.get(CONTRACT_ENV, "").strip().lower() in _TRUTHY
+
+
+def _apply_v2_contract(
+    decision: RegimeRoutingDecision,
+    classified: dict[str, Any],
+    *,
+    signal: Mapping[str, Any] | None = None,
+    row: Mapping[str, Any] | None = None,
+    now_ms: int | None = None,
+) -> RegimeRoutingDecision:
+    """Map a candidate onto the ruled Regime v2 contract.
+
+    - State 1: standard positive-gamma ``LIMIT_MAKER`` (1.00x / 1.00x), dropping
+      whale skew and rejecting missing distinguishers.
+    - State 2: admits only verified S2 short-squeeze ``LIMIT_MAKER`` entries
+      (1.20x / 1.35x); unconfirmed or disabled routes stay closed.
+    - State 3: cross-asset leader pullback ``LIMIT_MAKER`` (1.15x / 1.25x).
+    - State 4: admits only verified S4 deep-dip ``LIMIT_MAKER`` entries on
+      whitelist symbols (0.30x / 0.85x); shallow/market/speculative rejected.
+    - State 5: flat (0.0x).
+    """
+    if not regime_v2_contract_enabled():
+        return decision
+    size = _CONTRACT_SIZE_MULTIPLIER.get(decision.regime, decision.size_multiplier)
+    tp = _CONTRACT_TP_MULTIPLIER.get(decision.regime, decision.tp_multiplier)
+    allow = decision.allow_buy
+    reason = decision.reject_reason
+    playbook = decision.playbook
+    order_type = decision.recommended_order_type
+    missing_set = set(classified.get("missing") or [])
+    has_missing_distinguisher = any(name in missing_set for name in _STATE1_DISTINGUISHERS)
+    if decision.regime != REGIME_5_CRISIS_LIQUIDATION_HALT and has_missing_distinguisher and (
+        signal is not None or decision.regime == REGIME_1_POSITIVE_GAMMA_PINNED
+    ):
+        return RegimeRoutingDecision(
+            regime=decision.regime,
+            playbook="tech_boll_fade_standard" if decision.regime == REGIME_1_POSITIVE_GAMMA_PINNED else playbook,
+            allow_buy=False,
+            reject_reason="regime_required_inputs_missing",
+            size_multiplier=0.0,
+            tp_multiplier=tp,
+            enable_trailing_ratchet=False,
+            require_perp_beta_hedge=False,
+            recommended_order_type="NONE",
+        )
+    if decision.regime == REGIME_1_POSITIVE_GAMMA_PINNED:
+        playbook = "tech_boll_fade_standard"
+        size = 1.00
+        tp = 1.00
+        order_type = "LIMIT_MAKER"
+        allow = True
+        reason = None
+    elif decision.regime == REGIME_2_SHORT_SQUEEZE_BREAKOUT:
+        s2_ok, s2_reason = verify_s2_router_admission(
+            signal, row, now_ms=now_ms
+        )
+        if s2_ok:
+            allow = True
+            reason = None
+            playbook = "state2_squeeze_limit_maker"
+            size = 1.20
+            tp = 1.35
+            order_type = "LIMIT_MAKER"
+        else:
+            allow = False
+            reason = s2_reason or "state2_squeeze_entry_unconfirmed"
+            size = 0.0
+            order_type = "NONE"
+    elif decision.regime == REGIME_4_CROWDED_LONG_DEFENSIVE and decision.allow_buy:
+        s4_ok, s4_reason = verify_s4_router_admission(signal, row)
+        if s4_ok:
+            allow = True
+            reason = None
+            playbook = "state4_defensive_deep_limit_maker"
+            size = 0.30
+            tp = 0.85
+            order_type = "LIMIT_MAKER"
+        else:
+            allow = False
+            reason = s4_reason or "state4_deep_dip_conditions_not_met"
+            size = 0.0
+            order_type = "NONE"
+    elif decision.regime == REGIME_5_CRISIS_LIQUIDATION_HALT:
+        allow = False
+        size = 0.0
+        order_type = "NONE"
+    return RegimeRoutingDecision(
+        regime=decision.regime,
+        playbook=playbook,
+        allow_buy=allow,
+        reject_reason=reason,
+        size_multiplier=size,
+        tp_multiplier=tp,
+        enable_trailing_ratchet=False,
+        require_perp_beta_hedge=False,
+        recommended_order_type=order_type,
+    )
 
 
 def is_optimal_kelly_enabled(row: dict[str, Any] | None = None) -> bool:

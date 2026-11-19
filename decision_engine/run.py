@@ -42,6 +42,8 @@ from decision_engine.core.engine import DecisionEngine, scan_limit_for_purpose  
 from decision_engine.core.risk_manager import RiskManager  # noqa: E402
 from decision_engine.core.token_cooldown import DEFAULT_TOKEN_COOLDOWN_MIN, TokenCooldown  # noqa: E402
 from decision_engine.core.signal_bus import (  # noqa: E402
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+    PURPOSE_LIVE_BNB_BOLL_FADE,
     PURPOSE_LIVE_CANDIDATE,
     PURPOSE_SAMPLE,
     PURPOSE_SHADOW_010,
@@ -390,6 +392,15 @@ def main(argv: list[str] | None = None) -> int:
         "(indicators still read from --db). Default: same as --db.",
     )
     parser.add_argument(
+        "--regime-v2-isolated-purpose",
+        action="store_true",
+        help=(
+            "Dry-run only. Keep purpose live_bnb_boll_fade or "
+            "live_bnb_boll_classic when --output-db is a different file, "
+            "instead of rewriting it to shadow_010. Does not start execution."
+        ),
+    )
+    parser.add_argument(
         "--shadow-liq-cohorts",
         action="store_true",
         help="opt-in shadow: tag buys with liq_bucket (present/missing) and "
@@ -478,7 +489,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.shadow_liq_cohorts and out_db == db_path:
         log.error("--shadow-liq-cohorts requires --output-db != --db (isolation)")
         return 2
-    if args.shadow_liq_cohorts or out_db != db_path:
+    keep_live_purpose = False
+    if args.regime_v2_isolated_purpose:
+        if not dry_run:
+            log.error("--regime-v2-isolated-purpose requires dry-run")
+            return 2
+        if out_db == db_path:
+            log.error("--regime-v2-isolated-purpose requires a different --output-db")
+            return 2
+        if purpose not in {PURPOSE_LIVE_BNB_BOLL_FADE, PURPOSE_LIVE_BNB_BOLL_CLASSIC}:
+            log.error("--regime-v2-isolated-purpose refuses purpose=%s", purpose)
+            return 2
+        keep_live_purpose = True
+        log.info(
+            "regime_v2 isolated dry-run keeps purpose=%s output_db=%s",
+            purpose,
+            out_db,
+        )
+    if not keep_live_purpose and (args.shadow_liq_cohorts or out_db != db_path):
         # Keep an explicit shadow_* purpose (e.g. shadow_selfbuilt_a); otherwise
         # isolate to shadow_010 so output-db never writes paper-eligible rows.
         if str(purpose).startswith("shadow_"):
