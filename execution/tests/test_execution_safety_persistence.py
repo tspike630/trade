@@ -455,14 +455,33 @@ class PersistenceSafetyTests(unittest.TestCase):
         naked = self._held(ledger, 45)
         nid = int(naked["id"])
         ledger.update_binance_spot_position(nid, {"status": "open", "protection": "oco_pending"})
-        flat = adapter.maintain_held_position(
+        posts_before = len(client.ocos)
+        held = adapter.maintain_held_position(
             dict(ledger.binance_spot_position_by_id(nid) or {}),
             "100",
             persist=lambda fields: ledger.update_binance_spot_position(nid, fields),
         )
-        self.assertEqual(flat["book"], "closed")
-        self.assertEqual(len(client.sells), 1)
-        self.assertIn("oco_failed_auto_flattened", str(flat.get("error")))
+        stored = ledger.binance_spot_position_by_id(nid)
+        assert stored is not None
+        self.assertEqual(held["book"], "oco_unknown", held)
+        self.assertEqual(held["error"], "oco_unknown_readback_not_resubmit")
+        self.assertEqual(client.sells, [])
+        self.assertEqual(stored["status"], "oco_unknown")
+        self.assertEqual(stored["stop_price"], "96")
+        self.assertEqual(stored["take_profit_price"], "104")
+        self.assertEqual(len(client.ocos), posts_before + 1)
+        client.list_mode = "working"
+        claimed = adapter.maintain_held_position(
+            dict(stored),
+            "100",
+            persist=lambda fields: ledger.update_binance_spot_position(nid, fields),
+        )
+        claimed_row = ledger.binance_spot_position_by_id(nid)
+        assert claimed_row is not None
+        self.assertEqual(claimed["book"], "oco_working", claimed)
+        self.assertEqual(claimed_row["status"], "oco_working")
+        self.assertEqual(len(client.ocos), posts_before + 1)
+        self.assertEqual(client.sells, [])
 
     def test_resting_maker_reserves_partial_qty_and_ttl_is_terminal(self) -> None:
         client = _Exchange()

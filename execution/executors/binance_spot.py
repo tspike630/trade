@@ -241,26 +241,33 @@ def public_exchange_error(raw: object) -> dict[str, Any] | None:
     return out
 
 
-# GET /api/v3/orderList only. The official miss is HTTP 400
-# {"code":-2018,"msg":"Order list does not exist."}.
+# GET /api/v3/orderList only. The confirmed miss is exactly HTTP 400,
+# code -2018, and msg "Order list does not exist.".
 # -2013 is GET /api/v3/order ("Order does not exist.") for one leg.
 # -2011 is cancel ("Unknown order sent."). Neither code is this miss.
-# A -2018 read after an unknown POST does not authorize another OCO.
+# That confirmed miss does not authorize another OCO or a market sell.
 _ORDER_LIST_ABSENT_CODE = -2018
+_ORDER_LIST_ABSENT_MSG = "Order list does not exist."
 _SINGLE_ORDER_ABSENT_CODES = frozenset({-2011, -2013})
 _UNKNOWN_OCO_READBACK_HOLD = "oco_unknown_readback_not_resubmit"
+_LIST_MISS_HOLD_STATUSES = frozenset({"oco_unknown", "oco_working", "oco_partial"})
 
 
 def order_list_absent(exc: BinanceRequestError) -> bool:
-    """True when the list read's code is ``-2018``.
+    """True only for the confirmed ``GET /api/v3/orderList`` miss.
 
-    The confirmed miss is HTTP 400
-    ``{"code":-2018,"msg":"Order list does not exist."}``. HTTP 404 with the
-    same code is still this miss. Matching it does not authorize another OCO
-    after an unknown submit. A bare 400, 401, 418, 429, ``-1003``, ``-2015``,
-    ``-2013`` (``Order does not exist.``), or ``-2011`` is not this miss.
+    The confirmed body is HTTP 400
+    ``{"code":-2018,"msg":"Order list does not exist."}``. HTTP 404, a
+    different code, or a different msg is not this miss. A 404 falls through
+    to a requery failure: the row keeps its status, and that failure does
+    not POST a replacement list or market-sell. ``-2013``
+    (``Order does not exist.``) is one order, not this miss.
     """
-    return exc.status in {400, 404} and exc.code == _ORDER_LIST_ABSENT_CODE
+    return (
+        exc.status == 400
+        and exc.code == _ORDER_LIST_ABSENT_CODE
+        and exc.msg == _ORDER_LIST_ABSENT_MSG
+    )
 
 
 def single_order_absent(exc: BinanceRequestError) -> bool:
@@ -5383,9 +5390,10 @@ class BinanceSpotAdapter:
 
         ``persist`` runs before the OCO POST so a crash still has the client
         id to requery. Exchange coverage is recorded only after a working
-        list is observed. A timeout does not market-sell. An ``oco_unknown``
-        row that then reads the official list miss stays unknown: that miss
-        does not POST again, sell, or rewrite the stop.
+        list is observed. A timeout does not market-sell. One confirmed
+        list miss does not POST again, sell, or rewrite prices for an
+        unknown, working, or partial row. The next pass reads that same
+        list at most once. An HTTP 200 for it is claimed; it is not replaced.
         """
         row = dict(position)
 
@@ -5576,6 +5584,28 @@ class BinanceSpotAdapter:
                     error=error,
                     protection=row.get("protection") or PROTECTION_PENDING,
                 )
+            if state == "absent" and status in _LIST_MISS_HOLD_STATUSES:
+                # An absent read, including confirmed HTTP 400
+                # {"code":-2018,"msg":"Order list does not exist."}, is not
+                # proof the tracked list is gone. In or out of the band, this
+                # pass stops after that one read: no replacement POST, no
+                # market sell, and no stop or take-profit rewrite. A later
+                # HTTP 200 takes the working path above and claims that list.
+                if status != "oco_unknown":
+                    save(
+                        {
+                            "status": "oco_unknown",
+                            "protection": PROTECTION_PENDING,
+                            "last_error": _UNKNOWN_OCO_READBACK_HOLD,
+                        }
+                    )
+                return self._coverage(
+                    row,
+                    book="oco_unknown",
+                    submitted=False,
+                    error=_UNKNOWN_OCO_READBACK_HOLD,
+                    protection=row.get("protection") or PROTECTION_PENDING,
+                )
             if state == "absent":
                 allowed, band = self._repost_band(row, mark)
                 if not allowed:
@@ -5618,19 +5648,6 @@ class BinanceSpotAdapter:
                         submitted=False,
                         error=stored,
                         protection=PROTECTION_PENDING,
-                    )
-                # Still inside the original band. An unknown submit plus an
-                # absent list read — including the confirmed HTTP 400
-                # {"code":-2018,"msg":"Order list does not exist."} — does not
-                # prove that POST was rejected or will stay invisible. Do not
-                # POST the same or a new listClientOrderId, sell, or rewrite prices.
-                if str(row.get("status") or "") == "oco_unknown":
-                    return self._coverage(
-                        row,
-                        book="oco_unknown",
-                        submitted=False,
-                        error=_UNKNOWN_OCO_READBACK_HOLD,
-                        protection=row.get("protection") or PROTECTION_PENDING,
                     )
                 retry_place = True
             if state in {"unfilled", "partial"}:
@@ -7542,8 +7559,23 @@ class BinanceSpotAdapter:
             )
             if claimed is not None:
                 return claimed
+            # A single miss after an unproven 200 is not a rejected list and
+            # is not a market sell. The same client id stays for a later read.
             if str(found.get("state") or "") == "absent":
-                return self._oco_failed(row, save, verify_error or "native_oco_unverified")
+                save(
+                    {
+                        "status": "oco_unknown",
+                        "protection": PROTECTION_PENDING,
+                        "last_error": _UNKNOWN_OCO_READBACK_HOLD,
+                    }
+                )
+                return self._coverage(
+                    row,
+                    book="oco_unknown",
+                    submitted=False,
+                    error=_UNKNOWN_OCO_READBACK_HOLD,
+                    protection=PROTECTION_PENDING,
+                )
             save(
                 {
                     "status": "oco_unknown",
