@@ -29,6 +29,7 @@ from execution.margin_cross.policy import (
     load_approved_risk_config,
     live_enabled_by_env,
     parameters_approved_by_env,
+    validate_approved_config_window,
 )
 
 PURPOSE_CROSS_MARGIN_TRACK = "cross_margin_track_v1"
@@ -492,9 +493,20 @@ def contract_identity_reasons(
             reasons.append("parameters_approved_must_be_false")
         cfg = approved_config
         if cfg is None:
-            cfg, cfg_reasons = load_approved_risk_config()
+            cfg, cfg_reasons = load_approved_risk_config(
+                now_ms=gate.now_ms,
+                expected_account_uid=snapshot.uid,
+            )
             if cfg is None:
                 reasons.extend(cfg_reasons)
+        else:
+            reasons.extend(
+                validate_approved_config_window(
+                    cfg,
+                    now_ms=gate.now_ms,
+                    expected_account_uid=snapshot.uid,
+                )
+            )
         if gate.execution_mode not in {APPROVED_DRY_RUN_MODE, LIVE_EXECUTION_MODE}:
             reasons.append("execution_mode_invalid_for_approved_contract")
         if gate.execution_mode == LIVE_EXECUTION_MODE and not live_enabled_by_env():

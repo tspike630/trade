@@ -63,6 +63,7 @@ class OfflineFixtureClient:
         self._lists: dict[str, dict[str, Any]] = {}
         self._trades: dict[int, list[dict[str, Any]]] = {}
         self._txs: list[dict[str, Any]] = []
+        self._interest_rows: list[dict[str, Any]] = []
         self._seq = 0
         self.write_log: list[tuple[str, dict[str, Any]]] = []
         self.read_log: list[tuple[str, dict[str, Any]]] = []
@@ -178,6 +179,49 @@ class OfflineFixtureClient:
             }
         ]
 
+    def accrue_interest(
+        self,
+        asset: str,
+        interest_amount: Decimal,
+        *,
+        principal: Decimal | None = None,
+        accrued_type: str = "PERIODIC",
+        isolated_symbol: str = "",
+        accrued_time_ms: int = 1_700_000_001_000,
+    ) -> int:
+        row = self.asset(asset)
+        eff_principal = row["borrowed"] if principal is None else principal
+        row["interest"] += interest_amount
+        tx_id = self._next_id()
+        self._interest_rows.append(
+            {
+                "txId": tx_id,
+                "interestAccruedTime": int(accrued_time_ms),
+                "asset": asset,
+                "rawAsset": asset,
+                "principal": api_amount(eff_principal),
+                "interest": api_amount(interest_amount),
+                "interestRate": api_amount(self.hourly_rate.get(asset, Decimal("0"))),
+                "type": accrued_type,
+                "isolatedSymbol": isolated_symbol,
+            }
+        )
+        return tx_id
+
+    def query_interest_history(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._read("query_interest_history", payload)
+        self._fire("query_interest_history", "before")
+        if "isolatedSymbol" in payload:
+            raise MarginExchangeError(-1102, "isolatedSymbol is not cross")
+        asset = str(payload.get("asset") or "")
+        rows = [
+            dict(item)
+            for item in self._interest_rows
+            if not asset or item.get("asset") == asset
+        ]
+        self._fire("query_interest_history", "after")
+        return {"rows": rows, "total": len(rows)}
+
     def query_borrow_repay(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._read("query_borrow_repay", payload)
         wanted = str(payload.get("type") or "")
@@ -264,6 +308,20 @@ class OfflineFixtureClient:
                 "isolatedSymbol": "",
             }
         )
+        if self.interest_on_borrow > 0:
+            self._interest_rows.append(
+                {
+                    "txId": self._next_id(),
+                    "interestAccruedTime": 1_700_000_000_000,
+                    "asset": asset,
+                    "rawAsset": asset,
+                    "principal": api_amount(amount),
+                    "interest": api_amount(self.interest_on_borrow),
+                    "interestRate": api_amount(self.hourly_rate.get(asset, Decimal("0"))),
+                    "type": "ON_BORROW",
+                    "isolatedSymbol": "",
+                }
+            )
         self._fire("borrow", "after")
         return {"tranId": tx_id}
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import os
 import tempfile
 from typing import Any
@@ -12,7 +13,7 @@ from unittest.mock import patch
 
 from decision_engine.core.cityu_institutional_alpha import due_cftc_asof
 from execution.margin_cross.api_semantics import make_client_id
-from execution.margin_cross.errors import MarginTransportTimeout
+from execution.margin_cross.errors import MarginExchangeError, MarginTransportTimeout
 from execution.margin_cross.fixture import NOW_MS, client_from_snapshot, short_case
 from execution.margin_cross.money import parse_decimal
 from contextlib import contextmanager
@@ -20,7 +21,9 @@ import json
 from pathlib import Path
 from execution.margin_cross.policy import (
     APPROVED_CONFIG_PATH_ENV,
+    APPROVED_CONFIG_SHA256_ENV,
     APPROVED_DRY_RUN_MODE,
+    REQUIRED_APPROVAL_SCOPE,
     ENABLE_STATE2_LONG_ENV,
     ENABLE_STATE4_LONG_ENV,
     FILL_TP_FORMULA_B_ENV,
@@ -44,8 +47,17 @@ from execution.margin_cross.track import CrossMarginTrack
 
 
 
-def _explicit_test_config_dict() -> dict[str, Any]:
+def _explicit_test_config_dict(
+    *,
+    uid: str = "88001122",
+    now_ms: int = NOW_MS,
+) -> dict[str, Any]:
     return {
+        "approval_scope": REQUIRED_APPROVAL_SCOPE,
+        "approved_by": "operator_test_fixture",
+        "approved_account_uid": uid,
+        "approved_at_ms": now_ms - 60_000,
+        "expires_at_ms": now_ms + 86_400_000,
         "max_leverage": "3",
         "max_effective_leverage": "1.50",
         "max_total_liability_net_ratio": "0.50",
@@ -65,8 +77,14 @@ def _explicit_test_config_dict() -> dict[str, Any]:
 @contextmanager
 def _approved_env_ctx(tmpdir: str, extra: dict[str, str] | None = None):
     cfg_path = os.path.join(tmpdir, "approved_cfg.json")
-    Path(cfg_path).write_text(json.dumps(_explicit_test_config_dict()), encoding="utf-8")
-    merged = {PARAMETERS_APPROVED_ENV: "1", APPROVED_CONFIG_PATH_ENV: cfg_path}
+    raw_bytes = json.dumps(_explicit_test_config_dict()).encode("utf-8")
+    Path(cfg_path).write_bytes(raw_bytes)
+    cfg_sha = hashlib.sha256(raw_bytes).hexdigest()
+    merged = {
+        PARAMETERS_APPROVED_ENV: "1",
+        APPROVED_CONFIG_PATH_ENV: cfg_path,
+        APPROVED_CONFIG_SHA256_ENV: cfg_sha,
+    }
     if extra:
         merged.update(extra)
     with patch.dict(os.environ, merged, clear=True):
@@ -1065,6 +1083,188 @@ class LifecycleIdempotencyAuditTest(unittest.TestCase):
             self.assertEqual(r_fd.state, "locked")
             self.assertEqual(r_fd.reason, "same_base_asset_position_open")
 
+
+    def test_interest_history_attribution_blocks_unattributed_or_shared_principal_interest(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Case A: Legitimate PERIODIC interest accrued on intent principal (0.01) within horizon -> clean_flat!
+            case_ok = short_case()
+            case_ok["snapshot"]["hourly_interest_rate"]["BTC"] = "0.01"
+            case_ok["client"].hourly_rate["BTC"] = Decimal("0.01")
+            case_ok["contract"]["interest_horizon_hours"] = "1"
+            case_ok["contract"]["max_base_over_liability"] = "0.0001"
+            t_ok = CrossMarginTrack(os.path.join(tmpdir, "int_ok.db"), case_ok["client"])
+            self.assertEqual(
+                t_ok.open_position(
+                    case_ok["intent"], case_ok["snapshot"], case_ok["contract"], case_ok["gate"]
+                ).state,
+                "protected",
+            )
+            oco_ok = next(p for name, p in case_ok["client"].write_log if name == "new_oco")
+            # Cover bought 0.0102 BTC; accrue 0.0001 periodic interest via official interestHistory
+            case_ok["client"].accrue_interest("BTC", Decimal("0.0001"))
+            case_ok["client"].fill_oco_limit(oco_ok["listClientOrderId"])
+            closed_ok = t_ok.complete_exit(case_ok["intent"]["intent_id"], case_ok["gate"])
+            self.assertEqual(closed_ok.state, "clean_flat")
+            self.assertTrue(closed_ok.account_flat)
+            self.assertEqual([n for n, _ in case_ok["client"].write_log].count("repay"), 1)
+
+            # Case B: Unattributed extra interest (+0.0001 without interestHistory row) even when cover & free BTC (0.0102 + 1.0) can easily pay it -> REFUSED!
+            case_unattr = short_case()
+            case_unattr["snapshot"]["hourly_interest_rate"]["BTC"] = "0.01"
+            case_unattr["client"].hourly_rate["BTC"] = Decimal("0.01")
+            case_unattr["contract"]["interest_horizon_hours"] = "1"
+            case_unattr["contract"]["max_base_over_liability"] = "0.0001"
+            t_unattr = CrossMarginTrack(
+                os.path.join(tmpdir, "int_unattr.db"), case_unattr["client"]
+            )
+            self.assertEqual(
+                t_unattr.open_position(
+                    case_unattr["intent"],
+                    case_unattr["snapshot"],
+                    case_unattr["contract"],
+                    case_unattr["gate"],
+                ).state,
+                "protected",
+            )
+            oco_unattr = next(
+                p for name, p in case_unattr["client"].write_log if name == "new_oco"
+            )
+            case_unattr["client"].asset("BTC")["interest"] += Decimal("0.0001")
+            case_unattr["client"].asset("BTC")["free"] += Decimal("1.0")
+            case_unattr["client"].fill_oco_limit(oco_unattr["listClientOrderId"])
+            closed_unattr = t_unattr.complete_exit(
+                case_unattr["intent"]["intent_id"], case_unattr["gate"]
+            )
+            self.assertEqual(closed_unattr.state, "not_flat")
+            self.assertEqual(closed_unattr.reason, "unattributed_interest_liability_conflict")
+            self.assertFalse(closed_unattr.account_flat)
+            self.assertEqual([n for n, _ in case_unattr["client"].write_log].count("repay"), 0)
+
+            # Case C: Interest row in interestHistory accrued on external/larger principal (0.015 != 0.010) -> REFUSED!
+            case_ext = short_case()
+            case_ext["snapshot"]["hourly_interest_rate"]["BTC"] = "0.01"
+            case_ext["client"].hourly_rate["BTC"] = Decimal("0.01")
+            case_ext["contract"]["interest_horizon_hours"] = "1"
+            case_ext["contract"]["max_base_over_liability"] = "0.0001"
+            t_ext = CrossMarginTrack(os.path.join(tmpdir, "int_ext.db"), case_ext["client"])
+            t_ext.open_position(
+                case_ext["intent"], case_ext["snapshot"], case_ext["contract"], case_ext["gate"]
+            )
+            oco_ext = next(p for name, p in case_ext["client"].write_log if name == "new_oco")
+            case_ext["client"].accrue_interest(
+                "BTC", Decimal("0.0001"), principal=Decimal("0.015")
+            )
+            case_ext["client"].fill_oco_limit(oco_ext["listClientOrderId"])
+            closed_ext = t_ext.complete_exit(case_ext["intent"]["intent_id"], case_ext["gate"])
+            self.assertEqual(closed_ext.state, "not_flat")
+            self.assertEqual(closed_ext.reason, "same_asset_external_interest_conflict")
+            self.assertEqual([n for n, _ in case_ext["client"].write_log].count("repay"), 0)
+
+    def test_wrong_200_claims_5xx_indeterminate_writes_and_429_readback_holds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1) Wrong HTTP 200 on query_order (mismatched clientOrderId / symbol) -> fill_mismatch, NO OCO!
+            case_w_ord = short_case()
+            orig_qo = case_w_ord["client"].query_order
+            case_w_ord["client"].query_order = lambda p: {  # type: ignore[method-assign]
+                **orig_qo(p),
+                "clientOrderId": "wrong-client-id",
+            }
+            t_wo = CrossMarginTrack(os.path.join(tmpdir, "wo.db"), case_w_ord["client"])
+            r_wo = t_wo.open_position(
+                case_w_ord["intent"],
+                case_w_ord["snapshot"],
+                case_w_ord["contract"],
+                case_w_ord["gate"],
+            )
+            self.assertEqual(r_wo.state, "fill_mismatch")
+            self.assertEqual(r_wo.reason, "entry_identity_mismatch")
+            self.assertEqual([n for n, _ in case_w_ord["client"].write_log].count("new_oco"), 0)
+
+            # 2) Wrong HTTP 200 on query_oco (mismatched listClientOrderId) -> protection_unknown, never claims protected!
+            case_w_oco = short_case()
+            orig_qoco = case_w_oco["client"].query_oco
+            case_w_oco["client"].query_oco = lambda p: {  # type: ignore[method-assign]
+                **orig_qoco(p),
+                "listClientOrderId": "foreign-oco-list",
+            }
+            t_woco = CrossMarginTrack(os.path.join(tmpdir, "woco.db"), case_w_oco["client"])
+            r_woco = t_woco.open_position(
+                case_w_oco["intent"],
+                case_w_oco["snapshot"],
+                case_w_oco["contract"],
+                case_w_oco["gate"],
+            )
+            self.assertEqual(r_woco.state, "protection_unknown")
+            self.assertFalse(r_woco.protection_confirmed)
+
+            # 3) Wrong HTTP 200 on query_trades (foreign orderId) -> fill_mismatch, NO OCO!
+            case_w_tr = short_case()
+            orig_qt = case_w_tr["client"].query_trades
+            case_w_tr["client"].query_trades = lambda p: [  # type: ignore[method-assign]
+                {**t, "orderId": 999999} for t in orig_qt(p)
+            ]
+            t_wtr = CrossMarginTrack(os.path.join(tmpdir, "wtr.db"), case_w_tr["client"])
+            r_wtr = t_wtr.open_position(
+                case_w_tr["intent"],
+                case_w_tr["snapshot"],
+                case_w_tr["contract"],
+                case_w_tr["gate"],
+            )
+            self.assertEqual(r_wtr.state, "fill_mismatch")
+            self.assertEqual([n for n, _ in case_w_tr["client"].write_log].count("new_oco"), 0)
+
+            # 4) HTTP 500 / -1001 on new_order BEFORE fill + HTTP 429 on query_order -> holds in entry_unknown (NEVER unwinds/repays!)
+            case_500 = short_case()
+            orig_no = case_500["client"].new_order
+
+            def no_500_before(_payload: dict[str, Any]) -> dict[str, Any]:
+                case_500["client"].write_log.append(("new_order", dict(_payload)))
+                raise MarginExchangeError(-1001, "Internal error", http_status=500)
+
+            case_500["client"].new_order = no_500_before  # type: ignore[method-assign]
+            case_500["client"].query_order = lambda _p: (_ for _ in ()).throw(  # type: ignore[method-assign]
+                MarginExchangeError(-1003, "Too many requests", http_status=429)
+            )
+            db_500 = os.path.join(tmpdir, "indet500.db")
+            t_500 = CrossMarginTrack(db_500, case_500["client"])
+            r_500 = t_500.open_position(
+                case_500["intent"], case_500["snapshot"], case_500["contract"], case_500["gate"]
+            )
+            self.assertEqual(r_500.state, "entry_unknown")
+            self.assertIsNone(r_500.account_flat)
+            self.assertEqual([n for n, _ in case_500["client"].write_log].count("repay"), 0)
+
+            # Suppose that 500 entry order actually filled on the exchange! Next tick reconciles via query_order & arms OCO without duplicate new_order or borrow!
+            entry_cid = make_client_id(str(case_500["intent"]["intent_id"]), "entry")
+            case_500["client"].new_order = orig_no  # type: ignore[method-assign]
+            orig_no(
+                {
+                    "symbol": "BTCUSDT",
+                    "isIsolated": "FALSE",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "timeInForce": "GTC",
+                    "quantity": "0.01",
+                    "price": "100000",
+                    "newClientOrderId": entry_cid,
+                    "sideEffectType": "NO_SIDE_EFFECT",
+                }
+            )
+            # Remove the synthetic write_log entry added by orig_no simulating server-side completion of the first call
+            case_500["client"].write_log.pop()
+            case_500["client"].query_order = short_case()["client"].query_order.__func__.__get__(  # type: ignore[method-assign]
+                case_500["client"]
+            )
+            r_500_rec = CrossMarginTrack(db_500, case_500["client"]).open_position(
+                case_500["intent"], case_500["snapshot"], case_500["contract"], case_500["gate"]
+            )
+            self.assertEqual(r_500_rec.state, "protected")
+            self.assertTrue(r_500_rec.protection_confirmed)
+            self.assertEqual([n for n, _ in case_500["client"].write_log].count("borrow"), 1)
+            self.assertEqual([n for n, _ in case_500["client"].write_log].count("new_order"), 1)
+            self.assertEqual([n for n, _ in case_500["client"].write_log].count("new_oco"), 1)
 
 if __name__ == "__main__":
     unittest.main()

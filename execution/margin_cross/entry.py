@@ -163,11 +163,14 @@ def run_live_command(
     clock_ms: Any = None,
 ) -> tuple[int, dict[str, Any] | None, str]:
     """Execute gated ``--live`` action (``preflight``, ``open``, or ``complete-exit``)."""
+    now_fn = clock_ms or (lambda: int(time.time() * 1000))
+    now_ms = int(now_fn())
     for_exit = action == "complete-exit"
     reasons = live_gate_reasons(
         allow_live_network=True,
         for_protective_or_repay=for_exit,
         explicit_kill_path=kill_switch_path,
+        now_ms=now_ms,
     )
     if reasons:
         return (
@@ -189,8 +192,6 @@ def run_live_command(
             "live cross-margin disabled: missing API credentials; no order, borrow, or repay was sent\n",
         )
 
-    now_fn = clock_ms or (lambda: int(time.time() * 1000))
-    now_ms = int(now_fn())
     client = BinanceCrossMarginHttpClient(
         api_key=api_key,
         api_secret=api_secret,
@@ -204,6 +205,7 @@ def run_live_command(
         client,
         allow_live_network=True,
         kill_switch_path=kill_switch_path,
+        now_ms=now_ms,
     )
     kill_on, _kill_name = kill_switch_active(kill_switch_path)
 

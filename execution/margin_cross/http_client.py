@@ -203,16 +203,29 @@ class BinanceCrossMarginHttpClient:
         self._kill_switch_path = kill_switch_path
         self._approved_config = approved_config
 
-    def _require_live_write_gate(self, *, for_protective_or_repay: bool) -> None:
+    def _require_live_network_gate(
+        self,
+        *,
+        for_protective_or_repay: bool,
+        label: str = "read",
+    ) -> None:
         reasons = live_gate_reasons(
             allow_live_network=True,
             for_protective_or_repay=for_protective_or_repay,
             explicit_kill_path=self._kill_switch_path,
             environ=self._environ,
             approved_config=self._approved_config,
+            now_ms=int(self._clock_ms()),
+            expected_account_uid=self.account_uid or None,
         )
         if reasons:
-            raise LiveNetworkDisabled(f"live_write_blocked:{reasons[0]}")
+            raise LiveNetworkDisabled(f"live_{label}_blocked:{reasons[0]}")
+
+    def _require_live_write_gate(self, *, for_protective_or_repay: bool) -> None:
+        self._require_live_network_gate(
+            for_protective_or_repay=for_protective_or_repay,
+            label="write",
+        )
 
     def _secrets(self) -> tuple[str, str]:
         return (self._api_key, self._api_secret)
@@ -235,7 +248,12 @@ class BinanceCrossMarginHttpClient:
         path: str,
         params: Mapping[str, Any] | None = None,
         signed: bool = True,
+        for_protective_or_repay: bool = True,
     ) -> Any:
+        self._require_live_network_gate(
+            for_protective_or_repay=for_protective_or_repay,
+            label="read" if http_method == "GET" else "write",
+        )
         raw_params = dict(params or {})
         headers = {"User-Agent": "trade-margin-cross"}
         data_bytes: bytes | None = None
@@ -293,7 +311,7 @@ class BinanceCrossMarginHttpClient:
                     raw_msg = parsed.get("msg")
                     if isinstance(raw_msg, str):
                         message = scrub_exchange_message(raw_msg, self._secrets())
-        return MarginExchangeError(code, message)
+        return MarginExchangeError(code, message, http_status=int(status))
 
     def _space_borrow_repay(self) -> None:
         now = float(self._monotonic())
@@ -780,6 +798,11 @@ def fetch_live_cross_margin_snapshot(
         return None, "mcp_account_forbidden"
     if fallback_uid and resolved_uid != fallback_uid:
         return None, "account_uid_mismatch"
+    if (
+        client._approved_config is not None
+        and resolved_uid != client._approved_config.approved_account_uid
+    ):
+        return None, "approved_account_uid_mismatch"
     client.account_uid = resolved_uid
 
     if margin_coin_rows:

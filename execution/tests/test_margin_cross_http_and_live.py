@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -28,10 +30,14 @@ from execution.margin_cross.errors import LiveNetworkDisabled, MarginTransportTi
 from execution.margin_cross.fixture import NOW_MS
 from execution.margin_cross.money import api_amount
 from execution.margin_cross.policy import (
+    APPROVAL_HMAC_KEY_ENV,
+    APPROVED_CONFIG_HMAC_ENV,
     APPROVED_CONFIG_PATH_ENV,
+    APPROVED_CONFIG_SHA256_ENV,
     BLOCK_EXIT_ON_KILL_ENV,
     LIVE_ENABLED_ENV,
     PARAMETERS_APPROVED_ENV,
+    REQUIRED_APPROVAL_SCOPE,
     SUPPORTED_REGIME_STRATEGIES,
     live_gate_reasons,
     parse_approved_risk_config,
@@ -39,8 +45,17 @@ from execution.margin_cross.policy import (
 
 TEST_BASE = "https://example.invalid"
 
-def _explicit_test_config_dict() -> dict[str, Any]:
+def _explicit_test_config_dict(
+    *,
+    uid: str = "88001122",
+    now_ms: int = NOW_MS,
+) -> dict[str, Any]:
     return {
+        "approval_scope": REQUIRED_APPROVAL_SCOPE,
+        "approved_by": "operator_test_fixture",
+        "approved_account_uid": uid,
+        "approved_at_ms": now_ms - 60_000,
+        "expires_at_ms": now_ms + 86_400_000,
         "max_leverage": "3",
         "max_effective_leverage": "1.50",
         "max_total_liability_net_ratio": "0.50",
@@ -122,6 +137,7 @@ class _InMemoryMarginTransport:
         self.fee_rate = Decimal("0.001")
         self.seq = 100
         self.tx_rows: list[dict[str, Any]] = []
+        self.interest_rows: list[dict[str, Any]] = []
         self.orders: dict[str, dict[str, Any]] = {}
         self.oco_lists: dict[str, dict[str, Any]] = {}
         self.trades_by_order: dict[int, list[dict[str, Any]]] = {}
@@ -260,6 +276,16 @@ class _InMemoryMarginTransport:
             }
         if method == "GET" and path == "/api/v3/ticker/price":
             return {"symbol": params["symbol"], "price": api_amount(self.ref_price)}
+        if method == "GET" and path == "/sapi/v1/margin/interestHistory":
+            if "isolatedSymbol" in params:
+                raise AssertionError("isolatedSymbol forbidden on cross margin interestHistory")
+            wanted_asset = params.get("asset", "")
+            ih_rows = [
+                dict(r)
+                for r in self.interest_rows
+                if not wanted_asset or r["asset"] == wanted_asset
+            ]
+            return {"rows": ih_rows, "total": len(ih_rows)}
         if method == "GET" and path == "/sapi/v1/margin/borrow-repay":
             if "txId" not in params and "startTime" not in params:
                 raise AssertionError("GET /sapi/v1/margin/borrow-repay requires txId or startTime")
@@ -292,6 +318,20 @@ class _InMemoryMarginTransport:
                         "type": "MANUAL",
                     }
                 )
+                if self.interest_on_borrow > 0:
+                    self.interest_rows.append(
+                        {
+                            "txId": self._next_id(),
+                            "interestAccruedTime": NOW_MS,
+                            "asset": params["asset"],
+                            "rawAsset": params["asset"],
+                            "principal": api_amount(amt),
+                            "interest": api_amount(self.interest_on_borrow),
+                            "interestRate": api_amount(self.hourly_rate_btc),
+                            "type": "ON_BORROW",
+                            "isolatedSymbol": "",
+                        }
+                    )
             else:
                 pay_int = min(btc["interest"], amt)
                 pay_prin = amt - pay_int
@@ -441,7 +481,23 @@ class _InMemoryMarginTransport:
         qty = Decimal(lim["origQty"])
         if match_exact_liability:
             btc = self.balances["BTC"]
-            btc["interest"] = qty - btc["borrowed"]
+            target_int = qty - btc["borrowed"]
+            delta_int = target_int - btc["interest"]
+            btc["interest"] = target_int
+            if delta_int > 0:
+                self.interest_rows.append(
+                    {
+                        "txId": self._next_id(),
+                        "interestAccruedTime": NOW_MS + 1000,
+                        "asset": "BTC",
+                        "rawAsset": "BTC",
+                        "principal": api_amount(btc["borrowed"]),
+                        "interest": api_amount(delta_int),
+                        "interestRate": api_amount(self.hourly_rate_btc),
+                        "type": "PERIODIC",
+                        "isolatedSymbol": "",
+                    }
+                )
         px = Decimal(lim["price"])
         fee = qty * px * self.fee_rate
         self.balances["USDT"]["free"] -= qty * px + fee
@@ -468,7 +524,7 @@ class _InMemoryMarginTransport:
 
 class RealHttpClientAndLiveEntryTest(unittest.TestCase):
     def test_http_client_signing_spacing_scrubbing_and_wire_contracts(self) -> None:
-        fake_now = [1_763_520_000_000]
+        fake_now = [NOW_MS]
         mono_now = [100.0]
         slept: list[float] = []
 
@@ -525,6 +581,10 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
         t_client = hc.BinanceCrossMarginHttpClient(
             base_url=TEST_BASE,
             opener=timeout_opener,
+            clock_ms=lambda: fake_now[0],
+            environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+            kill_switch_path="/nonexistent/no_kill_switch_flag_here",
+            approved_config=cfg_obj,
             **kw,
         )
         with self.assertRaises(MarginTransportTimeout):
@@ -606,13 +666,14 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
                 self.assertIn("approved_config_missing", nc_err)
 
             cfg_path = os.path.join(tmpdir, "operator_approved_cfg.json")
-            Path(cfg_path).write_text(
-                json.dumps(_explicit_test_config_dict()), encoding="utf-8"
-            )
+            cfg_bytes = json.dumps(_explicit_test_config_dict()).encode("utf-8")
+            Path(cfg_path).write_bytes(cfg_bytes)
+            cfg_sha = hashlib.sha256(cfg_bytes).hexdigest()
             server = _InMemoryMarginTransport(cred_id="u_demo_1", sign_id="p_demo_1")
             unlocked_env = {
                 PARAMETERS_APPROVED_ENV: "1",
                 APPROVED_CONFIG_PATH_ENV: cfg_path,
+                APPROVED_CONFIG_SHA256_ENV: cfg_sha,
                 LIVE_ENABLED_ENV: "1",
                 k_env: "u_demo_1",
                 s_env: "p_demo_1",
@@ -687,6 +748,7 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
                         allow_live_network=True,
                         for_protective_or_repay=True,
                         explicit_kill_path=active_flag,
+                        now_ms=NOW_MS,
                     )
                     self.assertIn("kill_switch_active", reasons)
 
@@ -739,6 +801,7 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
             c_killed = hc.BinanceCrossMarginHttpClient(
                 base_url=TEST_BASE,
                 opener=forbidden_opener,
+                clock_ms=lambda: NOW_MS,
                 environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
                 kill_switch_path=active_kill,
                 approved_config=cfg_obj,
@@ -753,6 +816,200 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
 
             self.assertEqual(opener_calls, [])
 
+
+    def test_all_read_methods_refused_with_zero_opener_io_when_unapproved_or_tampered(self) -> None:
+        opener_calls: list[str] = []
+
+        def forbidden_opener(req: Any, _timeout: float) -> tuple[int, bytes]:
+            opener_calls.append(str(req.full_url))
+            raise AssertionError("opener must NEVER be reached on unapproved read or write")
+
+        kw = {"api_" + "key": "audit-read-key", "api_" + "secret": "audit-read-secret"}
+        cfg_obj, _ = parse_approved_risk_config(_explicit_test_config_dict())
+        assert cfg_obj is not None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            absent_kill = os.path.join(tmpdir, "no_kill")
+            active_kill = os.path.join(tmpdir, "yes_kill")
+            Path(active_kill).write_text("1\n", encoding="utf-8")
+
+            c_unapproved = hc.BinanceCrossMarginHttpClient(
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                clock_ms=lambda: NOW_MS,
+                environ={},
+                kill_switch_path=absent_kill,
+                **kw,
+            )
+            read_invocations = [
+                lambda: c_unapproved.query_account(),
+                lambda: c_unapproved.query_max_borrow({"asset": "BTC"}),
+                lambda: c_unapproved.query_hourly_interest({"assets": "BTC", "isIsolated": "FALSE"}),
+                lambda: c_unapproved.query_interest_history({"asset": "BTC"}),
+                lambda: c_unapproved.query_borrow_repay({"type": "BORROW", "asset": "BTC"}),
+                lambda: c_unapproved.query_order({"symbol": "BTCUSDT", "isIsolated": "FALSE", "origClientOrderId": "c1"}),
+                lambda: c_unapproved.query_oco({"isIsolated": "FALSE", "origClientOrderId": "l1"}),
+                lambda: c_unapproved.query_open_orders({"symbol": "BTCUSDT", "isIsolated": "FALSE"}),
+                lambda: c_unapproved.query_trades({"symbol": "BTCUSDT", "isIsolated": "FALSE", "orderId": "1"}),
+                lambda: c_unapproved.query_spot_account(),
+                lambda: c_unapproved.query_api_restrictions(),
+                lambda: c_unapproved.query_cross_margin_data("BTC"),
+                lambda: c_unapproved.query_exchange_info("BTCUSDT"),
+                lambda: c_unapproved.query_depth("BTCUSDT", limit=5),
+                lambda: c_unapproved.query_ticker_price("BTCUSDT"),
+            ]
+            for invoke in read_invocations:
+                with self.assertRaises(LiveNetworkDisabled) as rctx:
+                    invoke()
+                self.assertIn("parameters_not_approved", str(rctx.exception))
+
+            # Even when approved_config object is injected, empty env / expired TTL / wrong UID / kill+block_exit all keep opener at 0
+            c_injected_empty_env = hc.BinanceCrossMarginHttpClient(
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                clock_ms=lambda: NOW_MS,
+                environ={},
+                kill_switch_path=absent_kill,
+                approved_config=cfg_obj,
+                **kw,
+            )
+            with self.assertRaises(LiveNetworkDisabled):
+                c_injected_empty_env.query_account()
+
+            c_expired = hc.BinanceCrossMarginHttpClient(
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                clock_ms=lambda: NOW_MS + 90_000_000,
+                environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+                kill_switch_path=absent_kill,
+                approved_config=cfg_obj,
+                **kw,
+            )
+            with self.assertRaises(LiveNetworkDisabled) as exp_ctx:
+                c_expired.query_account()
+            self.assertIn("approved_config_expired", str(exp_ctx.exception))
+
+            c_uid_mismatch = hc.BinanceCrossMarginHttpClient(
+                account_uid="99999999",
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                clock_ms=lambda: NOW_MS,
+                environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+                kill_switch_path=absent_kill,
+                approved_config=cfg_obj,
+                **kw,
+            )
+            with self.assertRaises(LiveNetworkDisabled) as uid_ctx:
+                c_uid_mismatch.query_account()
+            self.assertIn("approved_account_uid_mismatch", str(uid_ctx.exception))
+
+            c_kill_exit_blocked = hc.BinanceCrossMarginHttpClient(
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                clock_ms=lambda: NOW_MS,
+                environ={
+                    PARAMETERS_APPROVED_ENV: "1",
+                    LIVE_ENABLED_ENV: "1",
+                    BLOCK_EXIT_ON_KILL_ENV: "1",
+                },
+                kill_switch_path=active_kill,
+                approved_config=cfg_obj,
+                **kw,
+            )
+            with self.assertRaises(LiveNetworkDisabled) as kctx:
+                c_kill_exit_blocked.query_account()
+            self.assertIn("kill_switch_active", str(kctx.exception))
+
+            self.assertEqual(opener_calls, [])
+
+    def test_approved_config_sha256_pinning_hmac_scope_uid_and_ttl_enforcement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            absent_kill = os.path.join(tmpdir, "no_kill")
+            cfg_path = Path(tmpdir) / "cfg.json"
+            raw_doc = _explicit_test_config_dict()
+            raw_bytes = json.dumps(raw_doc).encode("utf-8")
+            cfg_path.write_bytes(raw_bytes)
+            good_sha = hashlib.sha256(raw_bytes).hexdigest()
+
+            # 1) Missing SHA-256 env -> approved_config_sha256_missing
+            r_no_sha = live_gate_reasons(
+                allow_live_network=True,
+                explicit_kill_path=absent_kill,
+                environ={
+                    PARAMETERS_APPROVED_ENV: "1",
+                    APPROVED_CONFIG_PATH_ENV: str(cfg_path),
+                    LIVE_ENABLED_ENV: "1",
+                },
+                now_ms=NOW_MS,
+            )
+            self.assertIn("approved_config_sha256_missing", r_no_sha)
+
+            # 2) 1-byte tampered file -> approved_config_sha256_mismatch
+            cfg_path.write_bytes(raw_bytes + b" ")
+            r_tampered = live_gate_reasons(
+                allow_live_network=True,
+                explicit_kill_path=absent_kill,
+                environ={
+                    PARAMETERS_APPROVED_ENV: "1",
+                    APPROVED_CONFIG_PATH_ENV: str(cfg_path),
+                    APPROVED_CONFIG_SHA256_ENV: good_sha,
+                    LIVE_ENABLED_ENV: "1",
+                },
+                now_ms=NOW_MS,
+            )
+            self.assertIn("approved_config_sha256_mismatch", r_tampered)
+
+            # Restore untampered bytes and test optional HMAC-SHA256 signature verification
+            cfg_path.write_bytes(raw_bytes)
+            hmac_key = "operator-signing-secret"
+            good_hmac = hmac.new(hmac_key.encode("utf-8"), raw_bytes, hashlib.sha256).hexdigest()
+            r_bad_hmac = live_gate_reasons(
+                allow_live_network=True,
+                explicit_kill_path=absent_kill,
+                environ={
+                    PARAMETERS_APPROVED_ENV: "1",
+                    APPROVED_CONFIG_PATH_ENV: str(cfg_path),
+                    APPROVED_CONFIG_SHA256_ENV: good_sha,
+                    APPROVAL_HMAC_KEY_ENV: hmac_key,
+                    APPROVED_CONFIG_HMAC_ENV: "0" * 64,
+                    LIVE_ENABLED_ENV: "1",
+                },
+                now_ms=NOW_MS,
+            )
+            self.assertIn("approved_config_hmac_mismatch", r_bad_hmac)
+
+            r_good_hmac = live_gate_reasons(
+                allow_live_network=True,
+                explicit_kill_path=absent_kill,
+                environ={
+                    PARAMETERS_APPROVED_ENV: "1",
+                    APPROVED_CONFIG_PATH_ENV: str(cfg_path),
+                    APPROVED_CONFIG_SHA256_ENV: good_sha,
+                    APPROVAL_HMAC_KEY_ENV: hmac_key,
+                    APPROVED_CONFIG_HMAC_ENV: good_hmac,
+                    LIVE_ENABLED_ENV: "1",
+                },
+                now_ms=NOW_MS,
+                expected_account_uid="88001122",
+            )
+            self.assertEqual(r_good_hmac, [])
+
+            # 3) Spot scope / placeholder approver / excessive >7d TTL all fail closed
+            spot_cfg, spot_r = parse_approved_risk_config(
+                {**raw_doc, "approval_scope": "live_bnb_boll_fade"}
+            )
+            self.assertIsNone(spot_cfg)
+            self.assertIn("approved_scope_not_cross_margin_only", spot_r)
+
+            ph_cfg, ph_r = parse_approved_risk_config({**raw_doc, "approved_by": "cursor"})
+            self.assertIsNone(ph_cfg)
+            self.assertIn("approved_by_placeholder_rejected", ph_r)
+
+            long_ttl_cfg, ttl_r = parse_approved_risk_config(
+                {**raw_doc, "expires_at_ms": NOW_MS + 30 * 86_400_000}
+            )
+            self.assertIsNone(long_ttl_cfg)
+            self.assertIn("approved_config_ttl_invalid_or_excessive", ttl_r)
 
 if __name__ == "__main__":
     unittest.main()

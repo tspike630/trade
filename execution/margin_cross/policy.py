@@ -1,14 +1,23 @@
-"""Cross-margin structural safety invariants, zero-default operator config loader, and gates.
+"""Cross-margin structural safety invariants, pinned zero-default config loader, and gates.
 
 No leverage, borrow-ratio, margin-level, snapshot-age, interest-horizon, or
-position-sizing threshold has a built-in live default here. Missing or
-unapproved thresholds fail closed:
+position-sizing threshold has a built-in live default here. Missing, unpinned,
+expired, scope-mismatched, or UID-mismatched configs fail closed:
 - ``CROSS_MARGIN_PARAMETERS_APPROVED`` must equal literal ``"1"``.
 - ``CROSS_MARGIN_APPROVED_CONFIG_JSON`` must point to a readable JSON file
-  explicitly specifying every required threshold with zero defaults.
+  explicitly specifying every required threshold and governance field.
+- ``CROSS_MARGIN_APPROVED_CONFIG_SHA256`` must match the exact SHA-256 hex digest
+  of that file (and when ``CROSS_MARGIN_APPROVAL_HMAC_KEY`` is configured,
+  ``CROSS_MARGIN_APPROVED_CONFIG_HMAC`` must match HMAC-SHA256 of the raw bytes).
+- ``approval_scope`` must equal literal ``"binance_cross_margin_only"`` (spot
+  concurrency or exposure rulings never authorize cross-margin leverage).
+- ``approved_by``, ``approved_account_uid``, ``approved_at_ms``, and bounded
+  ``expires_at_ms`` are mandatory and verified against runtime clock and UID.
 - ``CROSS_MARGIN_LIVE_ENABLED`` must equal literal ``"1"`` for live network I/O.
 - Active kill-switch flag/file blocks new live risk.
 
+Code enforces integrity, scope, UID, and TTL checks on operator-supplied input;
+live deployment still requires explicit out-of-band human risk sign-off.
 Never calls ``POST /sapi/v1/margin/max-leverage`` and never accepts MCP sub-account
 uid ``1289917075`` or isolated / Cross-Pro (>3x) margin accounts.
 """
@@ -18,15 +27,21 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 from execution.margin_cross.money import parse_decimal
 
 PARAMETERS_APPROVED_ENV = "CROSS_MARGIN_PARAMETERS_APPROVED"
 APPROVED_CONFIG_PATH_ENV = "CROSS_MARGIN_APPROVED_CONFIG_JSON"
+APPROVED_CONFIG_SHA256_ENV = "CROSS_MARGIN_APPROVED_CONFIG_SHA256"
+APPROVAL_HMAC_KEY_ENV = "CROSS_MARGIN_APPROVAL_HMAC_KEY"
+APPROVED_CONFIG_HMAC_ENV = "CROSS_MARGIN_APPROVED_CONFIG_HMAC"
 LIVE_ENABLED_ENV = "CROSS_MARGIN_LIVE_ENABLED"
 BLOCK_EXIT_ON_KILL_ENV = "CROSS_MARGIN_BLOCK_EXIT_ON_KILL"
 FILL_TP_FORMULA_B_ENV = "CROSS_MARGIN_FILL_TP_FORMULA_B"
@@ -37,9 +52,29 @@ LIVE_DISABLED_FLAG_ENV = "LIVE_TRADING_DISABLED"
 DEFAULT_KILL_SWITCH_NAME = "LIVE_TRADING_DISABLED"
 
 APPROVED_CONTRACT_LABEL = "OPERATOR_APPROVED_CROSS_MARGIN_V1"
+REQUIRED_APPROVAL_SCOPE = "binance_cross_margin_only"
 APPROVED_DRY_RUN_MODE = "approved_dry_run"
 LIVE_EXECUTION_MODE = "live"
 MCP_FORBIDDEN_UID = "1289917075"
+MAX_APPROVAL_TTL_MS = 7 * 86_400_000
+
+_FORBIDDEN_PLACEHOLDER_APPROVERS = frozenset(
+    {
+        "",
+        "auto",
+        "agent",
+        "cursor",
+        "bot",
+        "default",
+        "placeholder",
+        "todo",
+        "tbd",
+        "unapproved",
+        "spot",
+        "spot_ruling",
+    }
+)
+_HEX64_CHARS = frozenset("0123456789abcdef")
 
 # Exchange-protocol structural ceiling for Classic Cross Margin (MARGIN_1 <= 3x).
 # This is an upper protocol bound, NOT a default contract parameter.
@@ -78,8 +113,13 @@ REPAY_EXCEED_LIABILITY_CODE = -3015
 
 @dataclass(frozen=True)
 class ApprovedRiskConfig:
-    """Explicit zero-default operator-approved risk & sizing configuration."""
+    """Explicit zero-default operator-supplied risk, identity, scope, and TTL config."""
 
+    approval_scope: str
+    approved_by: str
+    approved_account_uid: str
+    approved_at_ms: int
+    expires_at_ms: int
     max_leverage: Decimal
     max_effective_leverage: Decimal
     max_total_liability_net_ratio: Decimal
@@ -93,6 +133,17 @@ class ApprovedRiskConfig:
     interest_horizon_hours: Decimal
     base_position_pct: Decimal
     approved_strategies: frozenset[str]
+
+
+def _req_str(raw: Mapping[str, Any], field: str, reasons: list[str]) -> str:
+    if field not in raw or raw.get(field) is None:
+        reasons.append(f"approved_param_{field}_missing")
+        return ""
+    val = raw.get(field)
+    if not isinstance(val, str) or not val.strip():
+        reasons.append(f"approved_param_{field}_invalid")
+        return ""
+    return val.strip()
 
 
 def _req_dec(
@@ -120,7 +171,11 @@ def _req_int_ms(raw: Mapping[str, Any], field: str, reasons: list[str]) -> int:
     if field not in raw or raw.get(field) is None:
         reasons.append(f"approved_param_{field}_missing")
         return 0
-    val, err = parse_decimal(raw.get(field), field)
+    raw_val = raw.get(field)
+    if isinstance(raw_val, bool):
+        reasons.append(f"approved_param_{field}_invalid")
+        return 0
+    val, err = parse_decimal(raw_val, field)
     if err or val is None or val != val.to_integral_value() or val <= 0:
         reasons.append(f"approved_param_{field}_invalid")
         return 0
@@ -130,10 +185,17 @@ def _req_int_ms(raw: Mapping[str, Any], field: str, reasons: list[str]) -> int:
 def parse_approved_risk_config(
     raw: Mapping[str, Any] | None,
 ) -> tuple[ApprovedRiskConfig | None, list[str]]:
-    """Parse explicit operator risk config with ZERO fallback defaults."""
+    """Parse explicit operator risk & governance config with ZERO fallback defaults."""
     if not isinstance(raw, Mapping):
         return None, ["approved_config_missing"]
     reasons: list[str] = []
+
+    scope = _req_str(raw, "approval_scope", reasons)
+    approved_by = _req_str(raw, "approved_by", reasons)
+    approved_uid = _req_str(raw, "approved_account_uid", reasons)
+    approved_at_ms = _req_int_ms(raw, "approved_at_ms", reasons)
+    expires_at_ms = _req_int_ms(raw, "expires_at_ms", reasons)
+
     max_lev = _req_dec(raw, "max_leverage", reasons)
     max_eff_lev = _req_dec(raw, "max_effective_leverage", reasons)
     max_tot_liab = _req_dec(raw, "max_total_liability_net_ratio", reasons)
@@ -163,6 +225,14 @@ def parse_approved_risk_config(
                 strategies.add(name)
 
     if not reasons:
+        if scope != REQUIRED_APPROVAL_SCOPE:
+            reasons.append("approved_scope_not_cross_margin_only")
+        if approved_by.lower() in _FORBIDDEN_PLACEHOLDER_APPROVERS:
+            reasons.append("approved_by_placeholder_rejected")
+        if approved_uid == MCP_FORBIDDEN_UID:
+            reasons.append("mcp_account_forbidden")
+        if expires_at_ms <= approved_at_ms or (expires_at_ms - approved_at_ms) > MAX_APPROVAL_TTL_MS:
+            reasons.append("approved_config_ttl_invalid_or_excessive")
         if max_lev > HARD_CLASSIC_CROSS_LEVERAGE_CEILING:
             reasons.append("approved_max_leverage_exceeds_classic_cross_ceiling")
         if max_eff_lev > max_lev:
@@ -182,6 +252,11 @@ def parse_approved_risk_config(
         return None, reasons
     return (
         ApprovedRiskConfig(
+            approval_scope=scope,
+            approved_by=approved_by,
+            approved_account_uid=approved_uid,
+            approved_at_ms=approved_at_ms,
+            expires_at_ms=expires_at_ms,
             max_leverage=max_lev,
             max_effective_leverage=max_eff_lev,
             max_total_liability_net_ratio=max_tot_liab,
@@ -200,22 +275,98 @@ def parse_approved_risk_config(
     )
 
 
+def validate_approved_config_window(
+    cfg: ApprovedRiskConfig,
+    *,
+    now_ms: int | None = None,
+    expected_account_uid: str | None = None,
+) -> list[str]:
+    """Verify scope, UID binding, and time-validity window on an ``ApprovedRiskConfig``."""
+    reasons: list[str] = []
+    if cfg.approval_scope != REQUIRED_APPROVAL_SCOPE:
+        reasons.append("approved_scope_not_cross_margin_only")
+    if cfg.approved_by.strip().lower() in _FORBIDDEN_PLACEHOLDER_APPROVERS:
+        reasons.append("approved_by_placeholder_rejected")
+    if cfg.approved_account_uid == MCP_FORBIDDEN_UID:
+        reasons.append("mcp_account_forbidden")
+    if (
+        isinstance(expected_account_uid, str)
+        and expected_account_uid.strip()
+        and expected_account_uid.strip() != cfg.approved_account_uid
+    ):
+        reasons.append("approved_account_uid_mismatch")
+    if cfg.expires_at_ms <= cfg.approved_at_ms or (cfg.expires_at_ms - cfg.approved_at_ms) > MAX_APPROVAL_TTL_MS:
+        reasons.append("approved_config_ttl_invalid_or_excessive")
+    if now_ms is not None:
+        if int(now_ms) < cfg.approved_at_ms:
+            reasons.append("approved_config_not_yet_valid")
+        elif int(now_ms) >= cfg.expires_at_ms:
+            reasons.append("approved_config_expired")
+    return reasons
+
+
+def _is_hex64(value: str) -> bool:
+    return len(value) == 64 and all(ch in _HEX64_CHARS for ch in value)
+
+
 def load_approved_risk_config(
     environ: Mapping[str, str] | None = None,
+    *,
+    now_ms: int | None = None,
+    expected_account_uid: str | None = None,
 ) -> tuple[ApprovedRiskConfig | None, list[str]]:
-    """Load explicit zero-default operator config from ``CROSS_MARGIN_APPROVED_CONFIG_JSON``."""
+    """Load SHA-256-pinned (and optional HMAC-verified) zero-default operator config."""
     env = os.environ if environ is None else environ
     raw_path = str(env.get(APPROVED_CONFIG_PATH_ENV) or "").strip()
     if not raw_path:
         return None, ["approved_config_missing"]
+    expected_sha = str(env.get(APPROVED_CONFIG_SHA256_ENV) or "").strip().lower()
+    if not expected_sha:
+        return None, ["approved_config_sha256_missing"]
+    if not _is_hex64(expected_sha):
+        return None, ["approved_config_sha256_invalid"]
+
     path = Path(raw_path).expanduser()
     if not path.is_file():
         return None, ["approved_config_file_not_found"]
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raw_bytes = path.read_bytes()
+    except OSError:
         return None, ["approved_config_unreadable_or_invalid_json"]
-    return parse_approved_risk_config(doc)
+
+    actual_sha = hashlib.sha256(raw_bytes).hexdigest()
+    if not hmac.compare_digest(actual_sha, expected_sha):
+        return None, ["approved_config_sha256_mismatch"]
+
+    hmac_key = str(env.get(APPROVAL_HMAC_KEY_ENV) or "").strip()
+    expected_hmac = str(env.get(APPROVED_CONFIG_HMAC_ENV) or "").strip().lower()
+    if hmac_key or expected_hmac:
+        if not hmac_key or not expected_hmac:
+            return None, ["approved_config_hmac_missing"]
+        if not _is_hex64(expected_hmac):
+            return None, ["approved_config_hmac_invalid"]
+        actual_hmac = hmac.new(
+            hmac_key.encode("utf-8"), raw_bytes, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(actual_hmac, expected_hmac):
+            return None, ["approved_config_hmac_mismatch"]
+
+    try:
+        doc = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, ["approved_config_unreadable_or_invalid_json"]
+    cfg, parse_reasons = parse_approved_risk_config(doc)
+    if cfg is None or parse_reasons:
+        return None, parse_reasons
+    effective_now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    win_reasons = validate_approved_config_window(
+        cfg,
+        now_ms=effective_now,
+        expected_account_uid=expected_account_uid,
+    )
+    if win_reasons:
+        return None, win_reasons
+    return cfg, []
 
 
 def _repo_root() -> Path:
@@ -291,8 +442,10 @@ def live_gate_reasons(
     explicit_kill_path: str | os.PathLike[str] | None = None,
     environ: Mapping[str, str] | None = None,
     approved_config: ApprovedRiskConfig | None = None,
+    now_ms: int | None = None,
+    expected_account_uid: str | None = None,
 ) -> list[str]:
-    """Return every reason live cross-margin execution is currently locked."""
+    """Return every reason live cross-margin network access is currently locked."""
     reasons: list[str] = []
     if not allow_live_network:
         reasons.append("live_network_not_authorized")
@@ -300,9 +453,22 @@ def live_gate_reasons(
         reasons.append("parameters_not_approved")
     cfg = approved_config
     if cfg is None:
-        cfg, cfg_reasons = load_approved_risk_config(environ)
+        cfg, cfg_reasons = load_approved_risk_config(
+            environ,
+            now_ms=now_ms,
+            expected_account_uid=expected_account_uid,
+        )
         if cfg is None:
             reasons.extend(cfg_reasons)
+    else:
+        effective_now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        reasons.extend(
+            validate_approved_config_window(
+                cfg,
+                now_ms=effective_now,
+                expected_account_uid=expected_account_uid,
+            )
+        )
     if not live_enabled_by_env(environ):
         reasons.append("cross_margin_live_disabled")
     kill_on, _kill_name = kill_switch_active(explicit_kill_path, environ)

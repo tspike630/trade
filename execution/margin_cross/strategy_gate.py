@@ -1,4 +1,4 @@
-"""Approved 5-state strategy routing, real-time 24% sizing, and freshness gates.
+"""Approved 5-state strategy routing, real-time operator-configured sizing, and freshness gates.
 
 Wires the cross-margin track to:
 1. Data-staleness fail-closed clocks (indicators 3600s, L2 OBI 3600s, perp
@@ -48,6 +48,7 @@ from execution.margin_cross.policy import (
     parse_approved_risk_config,
     state2_long_enabled,
     state4_long_enabled,
+    validate_approved_config_window,
 )
 from execution.margin_cross.risk import PURPOSE_CROSS_MARGIN_TRACK, Snapshot, parse_snapshot
 
@@ -614,12 +615,32 @@ def build_approved_position_plan(
             intent=None,
             contract=None,
         )
+    raw_snap_uid = (
+        str(snapshot_raw.get("uid") or "").strip()
+        if isinstance(snapshot_raw, Mapping)
+        else ""
+    )
     if isinstance(risk_config, ApprovedRiskConfig):
-        cfg, cfg_reasons = risk_config, []
+        cfg = risk_config
+        cfg_reasons = validate_approved_config_window(
+            cfg,
+            now_ms=now_ms,
+            expected_account_uid=raw_snap_uid or None,
+        )
     elif isinstance(risk_config, Mapping):
         cfg, cfg_reasons = parse_approved_risk_config(risk_config)
+        if cfg is not None and not cfg_reasons:
+            cfg_reasons = validate_approved_config_window(
+                cfg,
+                now_ms=now_ms,
+                expected_account_uid=raw_snap_uid or None,
+            )
     else:
-        cfg, cfg_reasons = load_approved_risk_config(environ)
+        cfg, cfg_reasons = load_approved_risk_config(
+            environ,
+            now_ms=now_ms,
+            expected_account_uid=raw_snap_uid or None,
+        )
     if cfg is None or cfg_reasons:
         return ApprovedPositionPlan(
             allowed=False,
