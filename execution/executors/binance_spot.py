@@ -2477,6 +2477,13 @@ class BinanceSpotAdapter:
                 return "oco_readback_list_mismatch"
         return self._side_conflict(recon, require_explicit=require_explicit_side)
 
+    def _has_order_reports(self, recon: dict[str, Any]) -> bool:
+        raw = self._list_payload(recon)
+        for reports_list in (raw.get("orderReports"), recon.get("order_reports")):
+            if isinstance(reports_list, list) and any(isinstance(item, dict) for item in reports_list):
+                return True
+        return False
+
     def _side_conflict(self, recon: dict[str, Any], *, require_explicit: bool = False) -> str | None:
         raw = self._list_payload(recon)
         if "side" in raw and str(raw.get("side") or "").strip().upper() != "SELL":
@@ -5784,7 +5791,12 @@ class BinanceSpotAdapter:
             state = str(recon.get("state") or "")
             if state in {"working", "partial_working"}:
                 claim_required = self._claim_gate(row, status)
-                side_err = self._side_conflict(recon, require_explicit=claim_required)
+                # A present leg without an explicit SELL side is not protection,
+                # including a later read of a row that is already oco_working.
+                side_err = self._side_conflict(
+                    recon,
+                    require_explicit=claim_required or self._has_order_reports(recon),
+                )
                 if side_err:
                     return self._persist_readback_hold(row, save, side_err)
                 if claim_required:

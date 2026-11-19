@@ -85,8 +85,8 @@ def _working_oco() -> dict[str, Any]:
             {"orderId": 10},
         ],
         "orderReports": [
-            {"orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "executedQty": "0"},
-            {"orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "executedQty": "0"},
+            {"orderId": 11, "type": "LIMIT_MAKER", "side": "SELL", "status": "NEW", "executedQty": "0"},
+            {"orderId": 10, "type": "STOP_LOSS_LIMIT", "side": "SELL", "status": "NEW", "executedQty": "0"},
         ],
     }
 

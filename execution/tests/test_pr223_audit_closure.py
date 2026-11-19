@@ -1242,6 +1242,116 @@ class Pr223AuditClosureTests(unittest.TestCase):
         self.assertEqual(persisted_final["unprotected_qty"], "1.23")
         reopened.close()
 
+    def test_working_refresh_without_explicit_sell_side_is_not_protected(self) -> None:
+        """A later list body that omits side must not keep an already-working row protected."""
+        body = _live_oco_body(list_id=42, client_id="bnbfade-ol-61", qty="1.23")
+        for report in body["orderReports"]:
+            report.pop("side", None)
+        calls: list[str] = []
+
+        class _NoSide:
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _EXCHANGE_INFO
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                calls.append("get_order_list")
+                return body
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                calls.append("new_oco")
+                raise AssertionError("missing side must not post")
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                calls.append("new_order")
+                raise AssertionError("missing side must not sell")
+
+        row = {
+            "id": 61,
+            "decision_log_id": 61,
+            "symbol": "BNBUSDT",
+            "status": "oco_working",
+            "protection": PROTECTION_EXCHANGE,
+            "quantity": "1.23",
+            "stop_price": "99.00",
+            "take_profit_price": "110.00",
+            "entry_order_id": "99",
+            "oco_order_list_id": "42",
+            "oco_list_client_id": "bnbfade-ol-61",
+            "oco_above_order_id": "11",
+            "oco_below_order_id": "10",
+            "unprotected_qty": "1.23",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+        saved = dict(row)
+        with mock.patch.dict(os.environ, self.base_env, clear=False):
+            out = _make_adapter_bound(self.absent_kill, _NoSide(), auto_flatten=True).maintain_held_position(
+                dict(row),
+                "102.00",
+                persist=lambda fields: (saved.update(fields), dict(saved))[1],
+            )
+        self.assertEqual(out["book"], "oco_unknown", out)
+        self.assertEqual(saved["status"], "oco_unknown")
+        self.assertEqual(saved["last_error"], "oco_readback_side_mismatch")
+        self.assertEqual(saved["unprotected_qty"], "1.23")
+        self.assertEqual(saved["stop_price"], "99.00")
+        self.assertEqual(saved["take_profit_price"], "110.00")
+        self.assertNotIn("new_oco", calls)
+        self.assertNotIn("new_order", calls)
+        self.assertEqual(
+            buy_exposure_block([saved], [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+            "oco_failed_blocks_buy",
+        )
+
+        db_path = Path(self._tmp.name) / "missing-side.db"
+        ledger = ExecutionLedger(db_path)
+        armed = ledger.arm_binance_spot_position(
+            {
+                "decision_log_id": 62,
+                "symbol": "BNBUSDT",
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "status": "oco_working",
+                "protection": PROTECTION_EXCHANGE,
+                "quantity": "1.23",
+                "stop_price": "99.00",
+                "take_profit_price": "110.00",
+                "entry_price": "102.00",
+                "entry_order_id": "99",
+            }
+        )
+        pid = int(armed["id"])
+        ledger.update_binance_spot_position(
+            pid,
+            {
+                "status": "oco_working",
+                "protection": PROTECTION_EXCHANGE,
+                "oco_order_list_id": "42",
+                "oco_list_client_id": "bnbfade-ol-61",
+                "oco_above_order_id": "11",
+                "oco_below_order_id": "10",
+                "unprotected_qty": "1.23",
+            },
+        )
+        with mock.patch.dict(os.environ, self.base_env, clear=False):
+            _make_adapter_bound(self.absent_kill, _NoSide(), auto_flatten=True).maintain_held_position(
+                dict(ledger.binance_spot_position_by_id(pid) or {}),
+                "102.00",
+                persist=lambda fields: ledger.update_binance_spot_position(pid, fields),
+            )
+        ledger.close()
+        reopened = ExecutionLedger(db_path)
+        kept = reopened.binance_spot_position_by_id(pid)
+        assert kept is not None
+        self.assertEqual(kept["status"], "oco_unknown")
+        self.assertEqual(kept["unprotected_qty"], "1.23")
+        self.assertEqual(kept["stop_price"], "99.00")
+        self.assertEqual(kept["take_profit_price"], "110.00")
+        fade = reopened.list_binance_spot_buy_blocks(PURPOSE_LIVE_BNB_BOLL_FADE)
+        self.assertEqual(
+            buy_exposure_block(fade, [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+            "oco_failed_blocks_buy",
+        )
+        reopened.close()
+
 
 if __name__ == "__main__":
     unittest.main()

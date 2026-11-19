@@ -80,8 +80,8 @@ def _working(list_id: int, above: int, below: int, client: str) -> dict[str, Any
         "symbol": "BNBUSDT",
         "orders": [{"orderId": above}, {"orderId": below}],
         "orderReports": [
-            {"orderId": above, "type": "LIMIT_MAKER", "status": "NEW", "executedQty": "0"},
-            {"orderId": below, "type": "STOP_LOSS_LIMIT", "status": "NEW", "executedQty": "0"},
+            {"orderId": above, "type": "LIMIT_MAKER", "side": "SELL", "status": "NEW", "executedQty": "0"},
+            {"orderId": below, "type": "STOP_LOSS_LIMIT", "side": "SELL", "status": "NEW", "executedQty": "0"},
         ],
     }
 

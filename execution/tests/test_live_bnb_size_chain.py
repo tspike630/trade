@@ -124,10 +124,11 @@ class _Client:
             "listOrderStatus": "EXECUTING",
             "listStatusType": "EXEC_STARTED",
             "orderReports": [
-                {"orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "price": "110", "executedQty": "0"},
+                {"orderId": 11, "type": "LIMIT_MAKER", "side": "SELL", "status": "NEW", "price": "110", "executedQty": "0"},
                 {
                     "orderId": 10,
                     "type": "STOP_LOSS_LIMIT",
+                    "side": "SELL",
                     "status": "NEW",
                     "price": "98.99",
                     "stopPrice": "99",
@@ -149,8 +150,8 @@ class _Client:
             "listOrderStatus": "EXECUTING",
             "listStatusType": "EXEC_STARTED",
             "orderReports": [
-                {"orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "executedQty": "0"},
-                {"orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "executedQty": "0"},
+                {"orderId": 11, "type": "LIMIT_MAKER", "side": "SELL", "status": "NEW", "executedQty": "0"},
+                {"orderId": 10, "type": "STOP_LOSS_LIMIT", "side": "SELL", "status": "NEW", "executedQty": "0"},
             ],
         }
 
