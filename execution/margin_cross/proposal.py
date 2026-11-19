@@ -1,49 +1,116 @@
-"""Unapproved threshold suggestions. The track does not import this module."""
+"""Ruled cross-margin threshold specification.
+
+Runtime ``approved`` stays ``False`` unless ``CROSS_MARGIN_PARAMETERS_APPROVED=1``
+is explicitly set by the operator after verification.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
+from execution.margin_cross.policy import (
+    BORROW_REPAY_MIN_SPACING_SEC,
+    DEFAULT_INTEREST_HORIZON_HOURS,
+    DEFAULT_MAX_SNAPSHOT_AGE_MS,
+    EMERGENCY_MARGIN_LEVEL,
+    MAX_ACCOUNT_LEVERAGE,
+    MAX_BORROWABLE_POOL_RATIO,
+    MAX_EFFECTIVE_LEVERAGE,
+    MAX_TOTAL_LIABILITY_NET_RATIO,
+    MIN_ENTRY_MARGIN_LEVEL,
+    MIN_ORDER_NOTIONAL_USDT,
+    WARN_MARGIN_LEVEL,
+    parameters_approved_by_env,
+)
+
 
 def unapproved_threshold_proposal() -> list[dict[str, Any]]:
-    """Discussion numbers only. ``approved`` is false on every row."""
-    rows = [
+    """Return ruled parameter contract; ``approved`` reflects runtime env unlock."""
+    unlocked = parameters_approved_by_env()
+    rows: list[dict[str, Any]] = [
         {
             "item": "max_leverage",
-            "suggested_for_discussion": "Do not call POST /sapi/v1/margin/max-leverage. SDK notes classic 3x initial risk ratio 1.5 and 5x ratio 1.25.",
-            "why_not_installed": "杨 has not set a leverage ceiling. The five-state 24% spot weight is not a borrow multiple.",
+            "ruled_value": {
+                "account_ceiling": str(MAX_ACCOUNT_LEVERAGE),
+                "effective_portfolio_ceiling": str(MAX_EFFECTIVE_LEVERAGE),
+            },
+            "suggested_for_discussion": (
+                "Classic Cross Margin (MARGIN_1 <= 3x) only; never call "
+                "POST /sapi/v1/margin/max-leverage; cap post-borrow effective "
+                "leverage total_asset / net_asset at 1.50x."
+            ),
+            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
         },
         {
             "item": "min_margin_level",
-            "suggested_for_discussion": "A floor well above the SDK's 1.5 initial ratio for 3x, for example 3, once 杨 picks the leverage.",
-            "why_not_installed": "No approved distance from liquidation. The contract field has no default.",
+            "ruled_value": {
+                "entry_floor": str(MIN_ENTRY_MARGIN_LEVEL),
+                "warn_floor": str(WARN_MARGIN_LEVEL),
+                "emergency_floor": str(EMERGENCY_MARGIN_LEVEL),
+            },
+            "suggested_for_discussion": (
+                "Entry/borrow requires marginLevel >= 2.50 (status EXCESSIVE/NORMAL); "
+                "< 2.00 blocks new borrows and cancels unfilled resting entries; "
+                "<= 1.60 triggers emergency unwind while keeping working OCO intact."
+            ),
+            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
         },
         {
             "item": "max_borrow_quantity",
-            "suggested_for_discussion": "Per-asset GET /sapi/v1/margin/maxBorrowable amount, then a separate notional cap 杨 sets. USDT borrowable does not apply to other assets.",
-            "why_not_installed": "No approved borrow cap.",
+            "ruled_value": {
+                "single_borrow_net_asset_ratio": "0.24",
+                "total_liability_net_asset_ratio": str(MAX_TOTAL_LIABILITY_NET_RATIO),
+                "max_borrowable_pool_utilization": str(MAX_BORROWABLE_POOL_RATIO),
+                "min_order_notional_usdt": str(MIN_ORDER_NOTIONAL_USDT),
+            },
+            "suggested_for_discussion": (
+                "Single borrow <= 24% of real-time Cross Margin net asset, total liability "
+                "<= 50% of net asset, and <= 80% of GET /sapi/v1/margin/maxBorrowable."
+            ),
+            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
         },
         {
             "item": "max_snapshot_age_ms",
-            "suggested_for_discussion": "5000",
-            "why_not_installed": "Freshness window is part of the unapproved contract.",
+            "ruled_value": DEFAULT_MAX_SNAPSHOT_AGE_MS,
+            "suggested_for_discussion": (
+                "5000ms snapshot TTL plus 5-state feature clocks (indicators/OBI/perp/gamma/volume_z "
+                "3600s, news 90m, LSEG 5m bars 90m, CFTC COT publication calendar)."
+            ),
+            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
         },
         {
             "item": "interest_horizon_hours",
-            "suggested_for_discussion": "24",
-            "why_not_installed": "The dry-run fixture uses 0 so accrued interest can repay to exact zero. That is not a policy.",
+            "ruled_value": str(DEFAULT_INTEREST_HORIZON_HOURS),
+            "suggested_for_discussion": (
+                "4h interest reserve within 1 step_size over-buy bound; repay covers interest "
+                "before principal and verifies borrowed + interest == 0 via GET /sapi/v1/margin/account."
+            ),
+            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
         },
         {
-            "item": "max_base_over_liability",
-            "suggested_for_discussion": "One lot step, only if 杨 accepts the residual base.",
-            "why_not_installed": "Over-buy would leave a long after a short repay.",
+            "item": "exception_and_idempotency_policy",
+            "ruled_value": {
+                "borrow_repay_min_spacing_sec": str(BORROW_REPAY_MIN_SPACING_SEC),
+                "timeout_retry": "forbidden_readback_only",
+                "residual_shortfall_policy": "repay_from_existing_free_only_else_halt_manual",
+            },
+            "suggested_for_discussion": (
+                "Never blind-retry timed-out borrow/order/OCO/repay; bind via txId/startTime + "
+                "account liability delta; -3007 enters pending lock; -3015 / base shortfall halts "
+                "without sending a second market buy."
+            ),
+            "why_not_installed": "Locked until CROSS_MARGIN_PARAMETERS_APPROVED=1.",
         },
         {
             "item": "emergency_stop",
-            "suggested_for_discussion": "Keep the production halt. This track blocks new borrow and entry when its own gate is true, and still allows repay and an already-working OCO.",
-            "why_not_installed": "This package does not read or delete the production halt file.",
+            "ruled_value": "LIVE_TRADING_DISABLED",
+            "suggested_for_discussion": (
+                "Keep LIVE_TRADING_DISABLED active; blocks new borrows and entries while allowing "
+                "repayment and already-working native OCO protection."
+            ),
+            "why_not_installed": "Production halt stays active until post-audit sign-off.",
         },
     ]
     for row in rows:
-        row["approved"] = False
+        row["approved"] = unlocked
     return rows

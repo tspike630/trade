@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 
@@ -39,6 +39,8 @@ class Ledger:
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def intent_row(self, intent_id: str) -> sqlite3.Row | None:
@@ -46,6 +48,12 @@ class Ledger:
             return conn.execute(
                 "SELECT * FROM intents WHERE intent_id = ?", (intent_id,)
             ).fetchone()
+
+    def list_intents(self) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM intents ORDER BY updated_ms ASC, intent_id ASC"
+            ).fetchall()
 
     def insert_intent(
         self,
@@ -59,10 +67,12 @@ class Ledger:
         baseline_base: str | None,
     ) -> bool:
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT canonical FROM intents WHERE intent_id = ?", (intent_id,)
             ).fetchone()
             if existing is not None:
+                conn.commit()
                 return False
             conn.execute(
                 """
@@ -81,6 +91,7 @@ class Ledger:
                     now_ms,
                 ),
             )
+            conn.commit()
         return True
 
     def set_state(

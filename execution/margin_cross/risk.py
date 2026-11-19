@@ -1,22 +1,48 @@
 """Explicit cross-margin risk contract.
 
-Missing, non-finite, stale, or mismatched inputs fail closed. No field has an
-approved default. ``parameters_approved`` must be false; a true flag is rejected
-rather than treated as permission to trade.
+Missing, non-finite, stale, or mismatched inputs fail closed.
+By default ``CROSS_MARGIN_PARAMETERS_APPROVED`` is off, so ``parameters_approved``
+must be false and only offline fixture verification can run. When operator
+approval is explicitly enabled via ``CROSS_MARGIN_PARAMETERS_APPROVED=1``,
+``parameters_approved=True`` is validated against the ruled risk ceilings in
+``execution.margin_cross.policy``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Mapping
 
 from execution.margin_cross.money import on_grid, parse_decimal
+from execution.margin_cross.policy import (
+    ALLOWED_MARGIN_LEVEL_STATUSES,
+    APPROVED_CONTRACT_LABEL,
+    APPROVED_CROSS_MARGIN_STRATEGIES,
+    APPROVED_DRY_RUN_MODE,
+    EMERGENCY_MARGIN_LEVEL,
+    EMERGENCY_MARGIN_LEVEL_STATUSES,
+    LIVE_EXECUTION_MODE,
+    MAX_ACCOUNT_LEVERAGE,
+    MAX_ALLOWED_INTEREST_HORIZON_HOURS,
+    MAX_ALLOWED_SNAPSHOT_AGE_MS,
+    MAX_BORROWABLE_POOL_RATIO,
+    MAX_EFFECTIVE_LEVERAGE,
+    MAX_TOTAL_LIABILITY_NET_RATIO,
+    MCP_FORBIDDEN_UID,
+    MIN_ENTRY_MARGIN_LEVEL,
+    MIN_ORDER_NOTIONAL_USDT,
+    WARN_MARGIN_LEVEL,
+    live_enabled_by_env,
+    parameters_approved_by_env,
+)
 
 PURPOSE_CROSS_MARGIN_TRACK = "cross_margin_track_v1"
 OFFLINE_FIXTURE_STRATEGY_ID = "FIXTURE_UNAPPROVED_NOT_A_STRATEGY"
 REQUIRED_UNAPPROVED_LABEL = "NOT_APPROVED_FIXTURE"
 OFFLINE_EXECUTION_MODE = "offline_fixture"
+
+_ALL_MARGIN_STATUSES = ALLOWED_MARGIN_LEVEL_STATUSES | EMERGENCY_MARGIN_LEVEL_STATUSES
 
 
 @dataclass(frozen=True)
@@ -57,6 +83,7 @@ class Snapshot:
     filters: Filters
     fee_rate: Decimal
     fee_asset: str
+    margin_level_status: str = "EXCESSIVE"
 
 
 @dataclass(frozen=True)
@@ -77,6 +104,10 @@ class Contract:
     max_base_over_liability: Decimal
     strategy_id: str
     borrow_step: Decimal
+    max_effective_leverage: Decimal = MAX_EFFECTIVE_LEVERAGE
+    warn_margin_level: Decimal = WARN_MARGIN_LEVEL
+    emergency_margin_level: Decimal = EMERGENCY_MARGIN_LEVEL
+    formula_b_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,6 +190,19 @@ def _dec(
     return number
 
 
+def _opt_dec(
+    raw: Mapping[str, object],
+    field: str,
+    default: Decimal,
+    reasons: list[str],
+    *,
+    positive: bool = True,
+) -> Decimal:
+    if field not in raw or raw.get(field) is None:
+        return default
+    return _dec(raw, field, reasons, positive=positive)
+
+
 def _dec_map(
     raw: Mapping[str, object], field: str, reasons: list[str]
 ) -> dict[str, Decimal]:
@@ -227,6 +271,12 @@ def parse_snapshot(raw: Mapping[str, object]) -> tuple[Snapshot | None, list[str
     reasons: list[str] = []
     filters_raw = raw.get("filters")
     filters = parse_filters(filters_raw if isinstance(filters_raw, Mapping) else {}, reasons)
+    status_raw = raw.get("margin_level_status", "EXCESSIVE")
+    if not isinstance(status_raw, str) or status_raw.strip().upper() not in _ALL_MARGIN_STATUSES:
+        reasons.append("margin_level_status_invalid")
+        margin_status = "EXCESSIVE"
+    else:
+        margin_status = status_raw.strip().upper()
     snapshot = Snapshot(
         uid=_text(raw, "uid", reasons),
         margin_mode=_text(raw, "margin_mode", reasons),
@@ -247,6 +297,7 @@ def parse_snapshot(raw: Mapping[str, object]) -> tuple[Snapshot | None, list[str
         filters=filters,
         fee_rate=_dec(raw, "fee_rate", reasons),
         fee_asset=_text(raw, "fee_asset", reasons),
+        margin_level_status=margin_status,
     )
     if snapshot.fee_rate < 0 or snapshot.fee_rate >= 1:
         reasons.append("fee_rate_invalid")
@@ -255,9 +306,23 @@ def parse_snapshot(raw: Mapping[str, object]) -> tuple[Snapshot | None, list[str
 
 def parse_contract(raw: Mapping[str, object]) -> tuple[Contract | None, list[str]]:
     reasons: list[str] = []
-    approved = raw.get("parameters_approved")
-    if approved is not False:
+    approved_raw = raw.get("parameters_approved")
+    if not isinstance(approved_raw, bool):
         reasons.append("parameters_approved_must_be_false")
+        approved_flag = False
+    elif approved_raw is True and not parameters_approved_by_env():
+        reasons.append("parameters_approved_must_be_false")
+        approved_flag = False
+    else:
+        approved_flag = approved_raw
+
+    formula_b_raw = raw.get("formula_b_enabled", False)
+    if not isinstance(formula_b_raw, bool):
+        reasons.append("formula_b_enabled_invalid")
+        formula_b = False
+    else:
+        formula_b = formula_b_raw
+
     contract = Contract(
         account_uid=_text(raw, "account_uid", reasons),
         mode=_text(raw, "mode", reasons),
@@ -265,7 +330,7 @@ def parse_contract(raw: Mapping[str, object]) -> tuple[Contract | None, list[str
         base_asset=_text(raw, "base_asset", reasons),
         quote_asset=_text(raw, "quote_asset", reasons),
         borrow_asset=_text(raw, "borrow_asset", reasons),
-        parameters_approved=False,
+        parameters_approved=approved_flag,
         unapproved_label=_text(raw, "unapproved_label", reasons),
         max_leverage=_dec(raw, "max_leverage", reasons, positive=True),
         min_margin_level=_dec(raw, "min_margin_level", reasons, positive=True),
@@ -275,6 +340,14 @@ def parse_contract(raw: Mapping[str, object]) -> tuple[Contract | None, list[str
         max_base_over_liability=_dec(raw, "max_base_over_liability", reasons),
         strategy_id=_text(raw, "strategy_id", reasons),
         borrow_step=_dec(raw, "borrow_step", reasons, positive=True),
+        max_effective_leverage=_opt_dec(
+            raw, "max_effective_leverage", MAX_EFFECTIVE_LEVERAGE, reasons
+        ),
+        warn_margin_level=_opt_dec(raw, "warn_margin_level", WARN_MARGIN_LEVEL, reasons),
+        emergency_margin_level=_opt_dec(
+            raw, "emergency_margin_level", EMERGENCY_MARGIN_LEVEL, reasons
+        ),
+        formula_b_enabled=formula_b,
     )
     if contract.interest_horizon_hours < 0:
         reasons.append("interest_horizon_hours_invalid")
@@ -282,6 +355,24 @@ def parse_contract(raw: Mapping[str, object]) -> tuple[Contract | None, list[str
         reasons.append("max_base_over_liability_invalid")
     if contract.max_snapshot_age_ms <= 0:
         reasons.append("max_snapshot_age_ms_invalid")
+    if approved_flag:
+        if contract.max_leverage > MAX_ACCOUNT_LEVERAGE:
+            reasons.append("contract_max_leverage_exceeds_policy")
+        if contract.max_effective_leverage > MAX_EFFECTIVE_LEVERAGE:
+            reasons.append("contract_effective_leverage_exceeds_policy")
+        if contract.min_margin_level < MIN_ENTRY_MARGIN_LEVEL:
+            reasons.append("contract_min_margin_level_below_policy")
+        if not (
+            EMERGENCY_MARGIN_LEVEL
+            <= contract.emergency_margin_level
+            < contract.warn_margin_level
+            <= contract.min_margin_level
+        ):
+            reasons.append("contract_margin_ladder_invalid")
+        if contract.max_snapshot_age_ms > MAX_ALLOWED_SNAPSHOT_AGE_MS:
+            reasons.append("contract_snapshot_age_exceeds_policy")
+        if contract.interest_horizon_hours > MAX_ALLOWED_INTEREST_HORIZON_HOURS:
+            reasons.append("contract_interest_horizon_exceeds_policy")
     return (None, reasons) if reasons else (contract, [])
 
 
@@ -320,26 +411,69 @@ def parse_gate(raw: Mapping[str, object]) -> tuple[Gate | None, list[str]]:
     return (None, reasons) if reasons else (gate, [])
 
 
+def _projected_effective_leverage(
+    intent: Intent, snapshot: Snapshot
+) -> tuple[Decimal | None, Decimal | None]:
+    quote_row = snapshot.assets.get(intent.quote_asset)
+    base_row = snapshot.assets.get(intent.base_asset)
+    if quote_row is None or base_row is None:
+        return None, None
+    total_asset = (quote_row.free + quote_row.locked) + (
+        (base_row.free + base_row.locked) * snapshot.reference_price
+    )
+    total_liab = (quote_row.borrowed + quote_row.interest) + (
+        (base_row.borrowed + base_row.interest) * snapshot.reference_price
+    )
+    net_asset = total_asset - total_liab
+    if net_asset <= 0:
+        return None, None
+    added_borrow = (
+        intent.quantity * intent.limit_price if intent.action == "OPEN_SHORT" else Decimal(0)
+    )
+    projected_lev = (total_asset + added_borrow) / net_asset
+    projected_liab_ratio = (total_liab + added_borrow) / net_asset
+    return projected_lev, projected_liab_ratio
+
+
 def contract_identity_reasons(
     intent: Intent, contract: Contract, snapshot: Snapshot, gate: Gate
 ) -> list[str]:
     reasons: list[str] = []
-    if gate.execution_mode != OFFLINE_EXECUTION_MODE:
-        reasons.append("live_network_disabled")
     if intent.purpose != PURPOSE_CROSS_MARGIN_TRACK:
         reasons.append("purpose_not_cross_margin_track")
-    if (
-        intent.strategy_id != OFFLINE_FIXTURE_STRATEGY_ID
-        or contract.strategy_id != OFFLINE_FIXTURE_STRATEGY_ID
-    ):
-        reasons.append("strategy_not_in_offline_fixture_allowlist")
-    if contract.unapproved_label != REQUIRED_UNAPPROVED_LABEL:
-        reasons.append("unapproved_label_required")
-    if contract.parameters_approved is not False:
-        reasons.append("parameters_approved_must_be_false")
+
+    if not contract.parameters_approved:
+        if gate.execution_mode != OFFLINE_EXECUTION_MODE:
+            reasons.append("live_network_disabled")
+        if (
+            intent.strategy_id != OFFLINE_FIXTURE_STRATEGY_ID
+            or contract.strategy_id != OFFLINE_FIXTURE_STRATEGY_ID
+        ):
+            reasons.append("strategy_not_in_offline_fixture_allowlist")
+        if contract.unapproved_label != REQUIRED_UNAPPROVED_LABEL:
+            reasons.append("unapproved_label_required")
+    else:
+        if not parameters_approved_by_env():
+            reasons.append("parameters_approved_must_be_false")
+        if gate.execution_mode not in {APPROVED_DRY_RUN_MODE, LIVE_EXECUTION_MODE}:
+            reasons.append("execution_mode_invalid_for_approved_contract")
+        if gate.execution_mode == LIVE_EXECUTION_MODE and not live_enabled_by_env():
+            reasons.append("live_network_disabled")
+        if contract.unapproved_label != APPROVED_CONTRACT_LABEL:
+            reasons.append("approved_label_mismatch")
+        if (
+            intent.strategy_id != contract.strategy_id
+            or intent.strategy_id not in APPROVED_CROSS_MARGIN_STRATEGIES
+        ):
+            reasons.append("strategy_not_in_approved_allowlist")
+        if snapshot.account_type != "MARGIN_1":
+            reasons.append("account_type_not_classic_cross_margin")
+
     uids = {intent.account_uid, contract.account_uid, snapshot.uid}
     if len(uids) != 1:
         reasons.append("uid_mismatch")
+    if MCP_FORBIDDEN_UID in uids:
+        reasons.append("mcp_account_forbidden")
     if intent.mode != "CROSS" or contract.mode != "CROSS" or snapshot.margin_mode != "CROSS":
         reasons.append("mode_not_cross")
     if "ISOLATED" in snapshot.account_type.upper():
@@ -357,6 +491,8 @@ def contract_identity_reasons(
         reasons.append("account_flags_closed")
     if snapshot.account_max_leverage > contract.max_leverage:
         reasons.append("account_leverage_above_contract")
+    if snapshot.margin_level_status not in ALLOWED_MARGIN_LEVEL_STATUSES:
+        reasons.append("margin_level_status_unsafe")
     age = gate.now_ms - snapshot.observed_at_ms
     if age < 0 or age > contract.max_snapshot_age_ms:
         reasons.append("snapshot_stale_or_future")
@@ -374,8 +510,11 @@ def contract_identity_reasons(
     ):
         if not on_grid(price, filters.tick_size):
             reasons.append(f"{name}_off_tick")
-    if intent.quantity * intent.limit_price < filters.min_notional:
+    notional = intent.quantity * intent.limit_price
+    if notional < filters.min_notional:
         reasons.append("entry_notional_below_min")
+    if contract.parameters_approved and notional < MIN_ORDER_NOTIONAL_USDT:
+        reasons.append("notional_below_20_usdt_floor")
     reference = snapshot.reference_price
     if intent.action == "OPEN_SHORT":
         if not (
@@ -390,6 +529,12 @@ def contract_identity_reasons(
             reasons.append("asset_max_borrowable_missing")
         elif intent.quantity > borrowable:
             reasons.append("asset_borrow_insufficient")
+        elif contract.parameters_approved and intent.quantity > borrowable * MAX_BORROWABLE_POOL_RATIO:
+            reasons.append("asset_borrow_exceeds_pool_safety_cap")
+        tier_limit = snapshot.borrow_limit.get(contract.borrow_asset)
+        if contract.parameters_approved and tier_limit is not None and tier_limit > 0:
+            if intent.quantity > tier_limit:
+                reasons.append("asset_borrow_exceeds_tier_limit")
         if intent.quantity > contract.max_borrow_quantity:
             reasons.append("contract_borrow_quantity_exceeded")
         if not on_grid(intent.quantity, contract.borrow_step):
@@ -408,6 +553,15 @@ def contract_identity_reasons(
         reasons.append("margin_level_below_contract")
     if contract.borrow_asset not in snapshot.assets or intent.quote_asset not in snapshot.assets:
         reasons.append("snapshot_asset_row_missing")
+    elif contract.parameters_approved:
+        proj_lev, proj_liab = _projected_effective_leverage(intent, snapshot)
+        if proj_lev is None or proj_liab is None:
+            reasons.append("net_asset_not_positive")
+        else:
+            if proj_lev > contract.max_effective_leverage:
+                reasons.append("effective_leverage_exceeded")
+            if proj_liab > MAX_TOTAL_LIABILITY_NET_RATIO:
+                reasons.append("total_liability_exceeds_cap")
     if snapshot.fee_asset not in {intent.base_asset, intent.quote_asset}:
         reasons.append("fee_asset_unmodeled")
     return reasons

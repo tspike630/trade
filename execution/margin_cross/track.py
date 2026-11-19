@@ -1,17 +1,30 @@
-"""Cross-margin state machine.
+"""Cross-margin state machine with timeout & restart idempotency guarantees.
 
-Unknown writes are queried and then left alone. A second borrow, order, OCO,
-or repay is not sent for the same ledger key. Working native protection is
-not cancelled. Live HTTP is not available; ``performs_network_io`` must be
-false or construction fails.
+Invariants enforced across crashes, timeouts, and multi-tick restarts:
+1. A second borrow, entry order, cancel, OCO, flatten, or repay is NEVER sent
+   for the same ledger key.
+2. Any unresolved, unknown, naked, or unflat intent in the ledger blocks new
+   intents across ticks/restarts, and any ``protected`` intent blocks same-symbol
+   pyramiding.
+3. Network timeouts on both writes and reads transition cleanly to indeterminate
+   states and reconcile strictly via official readback (``borrow-repay`` with
+   ``startTime`` & ``prior_tx_ids`` + account liability delta, ``order``,
+   ``orderList``, ``myTrades``, ``openOrders``, ``account``).
+4. Working native OCO protection is never cancelled or replaced.
+5. Live network transport stays disabled unless ``allow_live_network=True``,
+   ``CROSS_MARGIN_PARAMETERS_APPROVED=1``, ``CROSS_MARGIN_LIVE_ENABLED=1``,
+   and ``LIVE_TRADING_DISABLED`` is absent (while protective exit/repay of an
+   already-open intent remains permitted unless ``CROSS_MARGIN_BLOCK_EXIT_ON_KILL=1``).
 """
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from decimal import Decimal
-from typing import Any, Mapping
+import json
+import os
+from typing import Any
 
 from execution.margin_cross.accounting import any_liability, cover_buy_quantity, liability
 from execution.margin_cross.api_semantics import (
@@ -22,7 +35,9 @@ from execution.margin_cross.api_semantics import (
     build_limit_payload,
     build_max_borrow_payload,
     build_query_oco_payload,
+    build_query_open_orders_payload,
     build_query_order_payload,
+    build_query_trades_payload,
     build_repay_payload,
     make_client_id,
     validate_otoco_payload,
@@ -34,6 +49,16 @@ from execution.margin_cross.errors import (
 )
 from execution.margin_cross.ledger import Ledger
 from execution.margin_cross.money import api_amount, parse_decimal
+from execution.margin_cross.policy import (
+    APPROVED_DRY_RUN_MODE,
+    EMERGENCY_MARGIN_LEVEL_STATUSES,
+    LIVE_EXECUTION_MODE,
+    PENDING_TRANSACTION_CODE,
+    fill_tp_formula_b_enabled,
+    kill_switch_active,
+    live_gate_reasons,
+    parameters_approved_by_env,
+)
 from execution.margin_cross.protection import otoco_submission_block, plan_oco
 from execution.margin_cross.risk import (
     OFFLINE_EXECUTION_MODE,
@@ -48,6 +73,25 @@ from execution.margin_cross.risk import (
     parse_intent,
     parse_snapshot,
 )
+from execution.margin_cross.strategy_gate import apply_formula_b_take_profit
+
+_CLEAN_TERMINAL_STATES = frozenset(
+    {
+        "clean_flat",
+        "protection_failed_flattened",
+        "entry_rejected_unwound",
+        "risk_dropped_unwound",
+        "emergency_unwound",
+        "locked",
+        "borrow_rejected",
+        "entry_rejected",
+        "otoco_not_submitted",
+        "live_network_disabled",
+        "emergency_stop_blocks_new_risk",
+        "intent_conflict",
+    }
+)
+_WORKING_PROTECTED_STATES = frozenset({"protected", "protection_still_working"})
 
 
 @dataclass
@@ -81,13 +125,53 @@ class TrackResult:
 
 
 class CrossMarginTrack:
-    def __init__(self, ledger_path: str, client: Any) -> None:
-        if getattr(client, "performs_network_io", True) is not False:
-            raise LiveNetworkDisabled(
-                "cross-margin live transport is disabled in this build"
+    def __init__(
+        self,
+        ledger_path: str,
+        client: Any,
+        *,
+        allow_live_network: bool = False,
+        kill_switch_path: str | os.PathLike[str] | None = None,
+    ) -> None:
+        self._network_client = getattr(client, "performs_network_io", True) is not False
+        self._allow_live_network = bool(allow_live_network)
+        self._kill_switch_path = kill_switch_path
+        if self._network_client:
+            reasons = live_gate_reasons(
+                allow_live_network=self._allow_live_network,
+                for_protective_or_repay=True,
+                explicit_kill_path=self._kill_switch_path,
             )
+            if reasons:
+                raise LiveNetworkDisabled(
+                    f"cross-margin live transport is disabled ({reasons[0]})"
+                )
         self.client = client
         self.ledger = Ledger(ledger_path)
+
+    def _mode_block(self, execution_mode: str, *, for_protective_or_repay: bool) -> str | None:
+        if execution_mode == OFFLINE_EXECUTION_MODE:
+            if self._network_client:
+                return "live_network_disabled"
+            return None
+        if execution_mode == APPROVED_DRY_RUN_MODE:
+            if self._network_client or not parameters_approved_by_env():
+                return "live_network_disabled"
+            return None
+        if execution_mode == LIVE_EXECUTION_MODE:
+            if not self._network_client:
+                return "live_network_disabled"
+            reasons = live_gate_reasons(
+                allow_live_network=self._allow_live_network,
+                for_protective_or_repay=for_protective_or_repay,
+                explicit_kill_path=self._kill_switch_path,
+            )
+            if "kill_switch_active" in reasons and not for_protective_or_repay:
+                return "emergency_stop_blocks_new_risk"
+            if reasons:
+                return "live_network_disabled"
+            return None
+        return "live_network_disabled"
 
     def submit_otoco(self, payload: Mapping[str, Any]) -> TrackResult:
         """OTOCO is parsed and then refused. No client call."""
@@ -110,9 +194,20 @@ class CrossMarginTrack:
         if isinstance(parsed, TrackResult):
             return parsed
         intent, snapshot, contract, gate = parsed
-        if gate.execution_mode != OFFLINE_EXECUTION_MODE:
-            return self._result(intent.intent_id, "live_network_disabled", "live_network_disabled")
         row = self.ledger.intent_row(intent.intent_id)
+        mode_err = self._mode_block(
+            gate.execution_mode,
+            for_protective_or_repay=row is not None,
+        )
+        if mode_err == "emergency_stop_blocks_new_risk":
+            return self._result(
+                intent.intent_id,
+                "emergency_stop_blocks_new_risk",
+                "emergency_stop_blocks_new_risk",
+            )
+        if mode_err:
+            return self._result(intent.intent_id, "live_network_disabled", "live_network_disabled")
+
         if row is None:
             reasons = contract_identity_reasons(intent, contract, snapshot, gate)
             if reasons:
@@ -127,6 +222,13 @@ class CrossMarginTrack:
                     intent.intent_id,
                     "emergency_stop_blocks_new_risk",
                     "emergency_stop_blocks_new_risk",
+                )
+            prior_block = self._blocking_ledger_intent(intent.intent_id, intent.symbol)
+            if prior_block:
+                return self._result(intent.intent_id, "locked", prior_block)
+            if any_liability(snapshot.assets):
+                return self._result(
+                    intent.intent_id, "locked", "existing_liability_blocks_new_open"
                 )
             mismatch = self._match_fresh_account(snapshot, contract)
             if mismatch:
@@ -152,11 +254,22 @@ class CrossMarginTrack:
             if isinstance(restored, TrackResult):
                 return restored
             intent, snapshot, contract, gate = restored
+            if gate.execution_mode == LIVE_EXECUTION_MODE:
+                kill_on, _name = kill_switch_active(self._kill_switch_path)
+                if kill_on and not gate.emergency_stop:
+                    gate = Gate(
+                        emergency_stop=True,
+                        now_ms=gate.now_ms,
+                        execution_mode=gate.execution_mode,
+                    )
         return self._continue(intent, snapshot, contract, gate)
 
     def complete_exit(self, intent_id: str, gate_raw: Mapping[str, Any]) -> TrackResult:
         gate, gate_reasons = parse_gate(gate_raw)
-        if gate is None or gate_reasons or gate.execution_mode != OFFLINE_EXECUTION_MODE:
+        if gate is None or gate_reasons:
+            return self._result(intent_id, "live_network_disabled", "live_network_disabled")
+        mode_err = self._mode_block(gate.execution_mode, for_protective_or_repay=True)
+        if mode_err:
             return self._result(intent_id, "live_network_disabled", "live_network_disabled")
         row = self.ledger.intent_row(intent_id)
         if row is None:
@@ -168,11 +281,24 @@ class CrossMarginTrack:
         intent, snapshot, contract, gate = parsed
         list_id = make_client_id(intent.intent_id, "oco-list")
         if self.ledger.peek(intent.intent_id, "oco", list_id) is None:
-            return self._result(intent.intent_id, "not_ready", "protection_not_placed", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "not_ready", "protection_not_placed", snapshot=snapshot
+            )
         try:
             listed = self.client.query_oco(build_query_oco_payload(intent.symbol, list_id))
-        except MarginExchangeError:
-            return self._result(intent.intent_id, "protection_unknown", "oco_query_failed", snapshot=snapshot)
+        except (MarginExchangeError, MarginTransportTimeout):
+            return self._result(
+                intent.intent_id, "protection_unknown", "oco_query_failed", snapshot=snapshot
+            )
+        if listed.get("symbol") not in (None, "", intent.symbol) or not _is_cross(
+            listed.get("isIsolated", False)
+        ):
+            return self._result(
+                intent.intent_id,
+                "side_effect_violation",
+                "oco_symbol_or_isolated_mismatch",
+                snapshot=snapshot,
+            )
         if listed.get("listOrderStatus") == "EXECUTING":
             return self._result(
                 intent.intent_id,
@@ -182,11 +308,33 @@ class CrossMarginTrack:
                 snapshot=snapshot,
             )
         if listed.get("listOrderStatus") != "ALL_DONE":
-            return self._result(intent.intent_id, "exit_not_filled", "exit_not_filled", snapshot=snapshot)
-        filled = self._filled_protection_leg(intent, listed)
+            return self._result(
+                intent.intent_id, "exit_not_filled", "exit_not_filled", snapshot=snapshot
+            )
+        filled = self._filled_protection_leg(intent, snapshot, listed)
         if isinstance(filled, TrackResult):
             return filled
         return self._repay_after_close(intent, snapshot, contract, gate)
+
+    def _blocking_ledger_intent(self, current_intent_id: str, symbol: str) -> str:
+        for item in self.ledger.list_intents():
+            other_id = str(item["intent_id"])
+            if other_id == current_intent_id:
+                continue
+            state = str(item["state"])
+            if state in _CLEAN_TERMINAL_STATES:
+                continue
+            if state in _WORKING_PROTECTED_STATES:
+                try:
+                    stored = json.loads(str(item["payload_json"]))
+                    other_sym = str(stored.get("intent", {}).get("symbol") or "")
+                except (TypeError, ValueError, AttributeError):
+                    other_sym = ""
+                if not other_sym or other_sym == symbol:
+                    return "same_symbol_position_open"
+                continue
+            return "unresolved_intent_blocks_new_risk"
+        return ""
 
     def _continue(
         self, intent: Intent, snapshot: Snapshot, contract: Contract, gate: Gate
@@ -199,6 +347,34 @@ class CrossMarginTrack:
         if isinstance(entry, TrackResult):
             return entry
         return self._ensure_protection(intent, snapshot, contract, gate, entry)
+
+    def _capture_transfer_baseline(
+        self, kind: str, asset: str, now_ms: int
+    ) -> dict[str, Any]:
+        meta: dict[str, Any] = {
+            "started_ms": int(now_ms),
+            "prior_tx_ids": [],
+            "pre_borrowed": None,
+            "pre_interest": None,
+        }
+        try:
+            body = self.client.query_borrow_repay(build_borrow_query_payload(asset, kind))
+        except (MarginExchangeError, MarginTransportTimeout):
+            body = None
+        if isinstance(body, Mapping):
+            prior_ids: list[str] = []
+            for row in body.get("rows") or []:
+                if isinstance(row, Mapping) and row.get("txId") not in (None, ""):
+                    prior_ids.append(str(row["txId"]))
+            meta["prior_tx_ids"] = prior_ids
+        view = self._view()
+        if not isinstance(view, TrackResult):
+            assets, _level = view
+            asset_row = assets.get(asset)
+            if asset_row is not None:
+                meta["pre_borrowed"] = api_amount(asset_row.borrowed)
+                meta["pre_interest"] = api_amount(asset_row.interest)
+        return meta
 
     def _ensure_borrow(
         self, intent: Intent, snapshot: Snapshot, contract: Contract, gate: Gate
@@ -217,19 +393,44 @@ class CrossMarginTrack:
             blocked = self._new_risk_block(contract)
             if blocked:
                 return self._result(intent.intent_id, "locked", blocked, snapshot=snapshot)
-            flag = self.ledger.begin_operation(intent.intent_id, "borrow", client_key, payload)
+            baseline = self._capture_transfer_baseline(
+                "BORROW", contract.borrow_asset, gate.now_ms
+            )
+            stored_req = {**payload, "_meta": baseline}
+            flag = self.ledger.begin_operation(
+                intent.intent_id, "borrow", client_key, stored_req
+            )
             if flag != "inserted":
                 return self._result(intent.intent_id, "borrow_unknown", "borrow_not_inserted")
             try:
                 response = self.client.borrow(payload)
             except MarginTransportTimeout:
                 self.ledger.mark(intent.intent_id, "borrow", client_key, "unknown", None)
-                if not self._bind_transfer("BORROW", contract.borrow_asset, intent.quantity):
+                if not self._bind_transfer(
+                    "BORROW", contract.borrow_asset, intent.quantity, baseline
+                ):
                     return self._result(
-                        intent.intent_id, "borrow_unknown", "borrow_unconfirmed", snapshot=snapshot
+                        intent.intent_id,
+                        "borrow_unknown",
+                        "borrow_unconfirmed",
+                        snapshot=snapshot,
                     )
                 self.ledger.mark(intent.intent_id, "borrow", client_key, "confirmed", {"bound": True})
             except MarginExchangeError as exc:
+                if exc.code == PENDING_TRANSACTION_CODE:
+                    self.ledger.mark(
+                        intent.intent_id,
+                        "borrow",
+                        client_key,
+                        "pending_lock",
+                        {"code": exc.code, "message": exc.message},
+                    )
+                    return self._result(
+                        intent.intent_id,
+                        "borrow_unknown",
+                        "borrow_pending_transaction_lock",
+                        snapshot=snapshot,
+                    )
                 self.ledger.mark(
                     intent.intent_id,
                     "borrow",
@@ -248,15 +449,23 @@ class CrossMarginTrack:
         else:
             state = str(existing["state"])
             if state == "rejected":
-                return self._result(intent.intent_id, "borrow_rejected", "borrow_rejected", snapshot=snapshot)
+                return self._result(
+                    intent.intent_id, "borrow_rejected", "borrow_rejected", snapshot=snapshot
+                )
+            op_meta = _extract_op_meta(existing)
             if state != "confirmed" and not self._bind_transfer(
-                "BORROW", contract.borrow_asset, intent.quantity
+                "BORROW", contract.borrow_asset, intent.quantity, op_meta
             ):
                 return self._result(
-                    intent.intent_id, "borrow_unknown", "borrow_unconfirmed", snapshot=snapshot
+                    intent.intent_id,
+                    "borrow_unknown",
+                    "borrow_unconfirmed",
+                    snapshot=snapshot,
                 )
             if state != "confirmed":
-                self.ledger.mark(intent.intent_id, "borrow", client_key, "confirmed", {"bound": True})
+                self.ledger.mark(
+                    intent.intent_id, "borrow", client_key, "confirmed", {"bound": True}
+                )
         if getattr(self.client, "interrupt_after", None) == "borrow":
             return self._result(
                 intent.intent_id,
@@ -290,7 +499,9 @@ class CrossMarginTrack:
                     return self._unwind(intent, snapshot, contract, gate, blocked)
                 return self._result(intent.intent_id, "locked", blocked, snapshot=snapshot)
             if side == "SELL" and intent.quantity > self.client.bid_qty:
-                return self._unwind(intent, snapshot, contract, gate, "sell_liquidity_insufficient")
+                return self._unwind(
+                    intent, snapshot, contract, gate, "sell_liquidity_insufficient"
+                )
             if side == "BUY" and intent.quantity > self.client.ask_qty:
                 return self._result(
                     intent.intent_id, "locked", "buy_liquidity_insufficient", snapshot=snapshot
@@ -316,7 +527,9 @@ class CrossMarginTrack:
                     {"code": exc.code, "message": exc.message},
                 )
                 if intent.action == "OPEN_SHORT":
-                    return self._unwind(intent, snapshot, contract, gate, f"entry_rejected_{exc.code}")
+                    return self._unwind(
+                        intent, snapshot, contract, gate, f"entry_rejected_{exc.code}"
+                    )
                 return self._result(
                     intent.intent_id,
                     "entry_rejected",
@@ -328,26 +541,46 @@ class CrossMarginTrack:
         elif str(existing["state"]) == "rejected":
             if intent.action == "OPEN_SHORT":
                 return self._unwind(intent, snapshot, contract, gate, "entry_rejected")
-            return self._result(intent.intent_id, "entry_rejected", "entry_rejected", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "entry_rejected", "entry_rejected", snapshot=snapshot
+            )
         resolved = self._resolve_entry(intent, snapshot, contract, gate, client_key, side)
         if isinstance(resolved, TrackResult):
             return resolved
         if getattr(self.client, "interrupt_after", None) == "entry":
             return self._result(
-                intent.intent_id, "interrupted_after_entry", "interrupted_after_entry", snapshot=snapshot
+                intent.intent_id,
+                "interrupted_after_entry",
+                "interrupted_after_entry",
+                snapshot=snapshot,
             )
+        return self._repay_unsold_short_remainder(intent, snapshot, contract, gate, resolved)
+
+    def _repay_unsold_short_remainder(
+        self,
+        intent: Intent,
+        snapshot: Snapshot,
+        contract: Contract,
+        gate: Gate,
+        executed: Decimal,
+    ) -> TrackResult | Decimal:
         if intent.action == "OPEN_SHORT":
             borrow_amount = intent.quantity
-            unsold = borrow_amount - resolved
+            unsold = borrow_amount - executed
             if unsold < 0:
-                return self._result(intent.intent_id, "fill_mismatch", "sold_more_than_borrowed", snapshot=snapshot)
+                return self._result(
+                    intent.intent_id,
+                    "fill_mismatch",
+                    "sold_more_than_borrowed",
+                    snapshot=snapshot,
+                )
             if unsold > 0:
                 partial = self._repay_amount(
                     intent, snapshot, contract, gate, "partial_repay", "partial-repay", unsold
                 )
                 if isinstance(partial, TrackResult):
                     return partial
-        return resolved
+        return executed
 
     def _resolve_entry(
         self,
@@ -359,25 +592,47 @@ class CrossMarginTrack:
         side: str,
     ) -> TrackResult | Decimal:
         row = self.ledger.peek(intent.intent_id, "entry", client_key)
-        unknown = row is not None and str(row["state"]) == "unknown"
+        indeterminate = row is not None and str(row["state"]) in {"unknown", "started"}
         try:
             order = self.client.query_order(build_query_order_payload(intent.symbol, client_key))
-        except MarginExchangeError as exc:
-            if exc.code == -2013 and unknown:
-                return self._result(intent.intent_id, "entry_unknown", "entry_unconfirmed", snapshot=snapshot)
-            return self._result(intent.intent_id, "fill_unconfirmed", "order_query_failed", snapshot=snapshot)
-        if not _is_cross(order.get("isIsolated")) or _unexpected_borrow(order):
-            self.ledger.mark(intent.intent_id, "entry", client_key, "rejected", {"violation": True})
+        except MarginTransportTimeout:
             return self._result(
-                intent.intent_id, "side_effect_violation", "side_effect_or_isolated", snapshot=snapshot
+                intent.intent_id,
+                "entry_unknown" if indeterminate else "fill_unconfirmed",
+                "order_query_timeout",
+                snapshot=snapshot,
+            )
+        except MarginExchangeError as exc:
+            if exc.code == -2013 and indeterminate:
+                return self._result(
+                    intent.intent_id, "entry_unknown", "entry_unconfirmed", snapshot=snapshot
+                )
+            return self._result(
+                intent.intent_id, "fill_unconfirmed", "order_query_failed", snapshot=snapshot
+            )
+        if not _is_cross(order.get("isIsolated")) or _unexpected_borrow(order):
+            self.ledger.mark(
+                intent.intent_id, "entry", client_key, "rejected", {"violation": True}
+            )
+            return self._result(
+                intent.intent_id,
+                "side_effect_violation",
+                "side_effect_or_isolated",
+                snapshot=snapshot,
             )
         if order.get("side") != side:
-            return self._result(intent.intent_id, "fill_mismatch", "entry_side_mismatch", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "fill_mismatch", "entry_side_mismatch", snapshot=snapshot
+            )
         status = str(order.get("status") or "")
         if status == "NEW":
-            if gate.emergency_stop:
-                return self._cancel_and_unwind(intent, snapshot, contract, gate, client_key)
-            return self._result(intent.intent_id, "entry_resting", "entry_resting", snapshot=snapshot)
+            if gate.emergency_stop or self._resting_margin_degraded(contract):
+                return self._cancel_and_unwind(
+                    intent, snapshot, contract, gate, client_key
+                )
+            return self._result(
+                intent.intent_id, "entry_resting", "entry_resting", snapshot=snapshot
+            )
         if status == "PARTIALLY_FILLED":
             cancelled = self._cancel_remainder(intent, snapshot, client_key)
             if isinstance(cancelled, TrackResult):
@@ -386,28 +641,50 @@ class CrossMarginTrack:
             status = str(order.get("status") or "")
         executed, problem = parse_decimal(order.get("executedQty"), "executedQty")
         if problem or executed is None or executed < 0:
-            return self._result(intent.intent_id, "fill_unconfirmed", "executed_qty_invalid", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "fill_unconfirmed", "executed_qty_invalid", snapshot=snapshot
+            )
         if status in {"CANCELED", "EXPIRED", "REJECTED"} and executed == 0:
             if intent.action == "OPEN_SHORT":
                 return self._unwind(intent, snapshot, contract, gate, "entry_not_filled")
-            return self._result(intent.intent_id, "entry_rejected", "entry_not_filled", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "entry_rejected", "entry_not_filled", snapshot=snapshot
+            )
         if status not in {"FILLED", "CANCELED", "EXPIRED"}:
-            return self._result(intent.intent_id, "fill_unconfirmed", "entry_status_open", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "fill_unconfirmed", "entry_status_open", snapshot=snapshot
+            )
         trades_ok = self._trades_match(intent.symbol, order, executed)
         if trades_ok is False:
             self.ledger.mark(intent.intent_id, "entry", client_key, "mismatch", {})
-            return self._result(intent.intent_id, "fill_mismatch", "trade_qty_mismatch", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "fill_mismatch", "trade_qty_mismatch", snapshot=snapshot
+            )
         if trades_ok is None:
             self.ledger.mark(intent.intent_id, "entry", client_key, "awaiting_evidence", {})
-            return self._result(intent.intent_id, "fill_unconfirmed", "trades_delayed", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "fill_unconfirmed", "trades_delayed", snapshot=snapshot
+            )
         self.ledger.mark(
             intent.intent_id,
             "entry",
             client_key,
             "confirmed",
-            {"executedQty": api_amount(executed)},
+            {
+                "executedQty": api_amount(executed),
+                "orderId": order.get("orderId"),
+            },
         )
         return executed
+
+    def _resting_margin_degraded(self, contract: Contract) -> bool:
+        if not contract.parameters_approved:
+            return False
+        view = self._view()
+        if isinstance(view, TrackResult):
+            return False
+        _assets, level = view
+        return level < contract.warn_margin_level
 
     def _cancel_remainder(
         self, intent: Intent, snapshot: Snapshot, entry_key: str
@@ -433,13 +710,19 @@ class CrossMarginTrack:
                 self.ledger.mark(intent.intent_id, "entry_cancel", cancel_key, "confirmed", {})
         try:
             order = self.client.query_order(build_query_order_payload(intent.symbol, entry_key))
-        except MarginExchangeError:
+        except (MarginExchangeError, MarginTransportTimeout):
             return self._result(
-                intent.intent_id, "partial_cancel_unknown", "partial_cancel_unknown", snapshot=snapshot
+                intent.intent_id,
+                "partial_cancel_unknown",
+                "partial_cancel_unknown",
+                snapshot=snapshot,
             )
         if order.get("status") in {"NEW", "PARTIALLY_FILLED"}:
             return self._result(
-                intent.intent_id, "partial_cancel_unknown", "partial_cancel_unknown", snapshot=snapshot
+                intent.intent_id,
+                "partial_cancel_unknown",
+                "partial_cancel_unknown",
+                snapshot=snapshot,
             )
         self.ledger.mark(intent.intent_id, "entry_cancel", cancel_key, "confirmed", {})
         return order
@@ -455,12 +738,106 @@ class CrossMarginTrack:
         cancelled = self._cancel_remainder(intent, snapshot, entry_key)
         if isinstance(cancelled, TrackResult):
             return cancelled
-        executed, _ = parse_decimal(cancelled.get("executedQty"), "executedQty")
-        if executed and executed > 0:
+        executed, err = parse_decimal(cancelled.get("executedQty"), "executedQty")
+        if err or executed is None or executed < 0:
             return self._result(
-                intent.intent_id, "fill_unconfirmed", "resting_cancel_left_a_fill", snapshot=snapshot
+                intent.intent_id, "fill_unconfirmed", "executed_qty_invalid", snapshot=snapshot
             )
-        return self._unwind(intent, snapshot, contract, gate, "emergency_cancelled_entry")
+        if executed > 0:
+            # Cancel raced against a real fill: verify trades, repay unsold borrow,
+            # and arm protective OCO immediately so exposure is never left naked.
+            trades_ok = self._trades_match(intent.symbol, cancelled, executed)
+            if trades_ok is False:
+                self.ledger.mark(intent.intent_id, "entry", entry_key, "mismatch", {})
+                return self._result(
+                    intent.intent_id, "fill_mismatch", "trade_qty_mismatch", snapshot=snapshot
+                )
+            if trades_ok is None:
+                self.ledger.mark(intent.intent_id, "entry", entry_key, "awaiting_evidence", {})
+                return self._result(
+                    intent.intent_id, "fill_unconfirmed", "trades_delayed", snapshot=snapshot
+                )
+            self.ledger.mark(
+                intent.intent_id,
+                "entry",
+                entry_key,
+                "confirmed",
+                {
+                    "executedQty": api_amount(executed),
+                    "orderId": cancelled.get("orderId"),
+                },
+            )
+            settled = self._repay_unsold_short_remainder(
+                intent, snapshot, contract, gate, executed
+            )
+            if isinstance(settled, TrackResult):
+                return settled
+            return self._result_or_protect(intent, snapshot, contract, gate, settled)
+        if intent.action == "OPEN_SHORT":
+            return self._unwind(intent, snapshot, contract, gate, "emergency_cancelled_entry")
+        return self._result(
+            intent.intent_id,
+            "emergency_unwound",
+            "emergency_cancelled_entry",
+            account_flat=self._is_flat(intent),
+            snapshot=snapshot,
+        )
+
+    def _result_or_protect(
+        self,
+        intent: Intent,
+        snapshot: Snapshot,
+        contract: Contract,
+        gate: Gate,
+        executed: Decimal,
+    ) -> TrackResult:
+        return self._ensure_protection(intent, snapshot, contract, gate, executed)
+
+    def _effective_protection_intent(
+        self, intent: Intent, snapshot: Snapshot, contract: Contract
+    ) -> Intent:
+        if not (contract.formula_b_enabled or fill_tp_formula_b_enabled()):
+            return intent
+        entry_key = make_client_id(intent.intent_id, "entry")
+        try:
+            order = self.client.query_order(build_query_order_payload(intent.symbol, entry_key))
+        except (MarginExchangeError, MarginTransportTimeout):
+            return intent
+        avg_fill = self._weighted_fill_price(intent.symbol, order)
+        if avg_fill is None or avg_fill <= 0:
+            return intent
+        adjusted_tp = apply_formula_b_take_profit(
+            action=intent.action,
+            planned_entry=intent.limit_price,
+            planned_tp=intent.take_profit_price,
+            actual_fill=avg_fill,
+            tick_size=snapshot.filters.tick_size,
+        )
+        if adjusted_tp is None:
+            return intent
+        return replace(intent, take_profit_price=adjusted_tp)
+
+    def _weighted_fill_price(self, symbol: str, order: Mapping[str, Any]) -> Decimal | None:
+        try:
+            trades = self.client.query_trades(
+                build_query_trades_payload(symbol, order.get("orderId"))
+            )
+        except (MarginExchangeError, MarginTransportTimeout):
+            return None
+        if not trades:
+            return None
+        total_qty = Decimal(0)
+        total_quote = Decimal(0)
+        for trade in trades:
+            qty, q_err = parse_decimal(trade.get("qty"), "qty")
+            px, p_err = parse_decimal(trade.get("price"), "price")
+            if q_err or p_err or qty is None or px is None or qty <= 0 or px <= 0:
+                return None
+            total_qty += qty
+            total_quote += qty * px
+        if total_qty <= 0:
+            return None
+        return total_quote / total_qty
 
     def _ensure_protection(
         self,
@@ -478,7 +855,9 @@ class CrossMarginTrack:
         if intent.action == "OPEN_SHORT":
             quantity, reason = self._short_cover(intent, snapshot, contract, assets)
             if quantity is None:
-                return self._result(intent.intent_id, "protection_blocked", reason, snapshot=snapshot)
+                return self._result(
+                    intent.intent_id, "protection_blocked", reason, snapshot=snapshot
+                )
         else:
             base = assets.get(intent.base_asset)
             if base is None or base.free != executed:
@@ -491,9 +870,17 @@ class CrossMarginTrack:
             quantity = executed
         rate_problem = self._interest_matches(snapshot, contract)
         if intent.action == "OPEN_SHORT" and rate_problem:
-            return self._result(intent.intent_id, "protection_blocked", rate_problem, snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "protection_blocked", rate_problem, snapshot=snapshot
+            )
+        list_id = make_client_id(intent.intent_id, "oco-list")
+        existing = self.ledger.peek(intent.intent_id, "oco", list_id)
+        if existing is None:
+            plan_intent = self._effective_protection_intent(intent, snapshot, contract)
+        else:
+            plan_intent = _stored_oco_intent(intent, existing)
         plan, plan_reason = plan_oco(
-            intent,
+            plan_intent,
             quantity=quantity,
             reference_price=snapshot.reference_price,
             tick=snapshot.filters.tick_size,
@@ -510,8 +897,9 @@ class CrossMarginTrack:
                 "buy_liquidity_insufficient",
             }:
                 return self._flatten(intent, snapshot, contract, quantity, plan_reason)
-            return self._result(intent.intent_id, "protection_blocked", plan_reason, snapshot=snapshot)
-        existing = self.ledger.peek(intent.intent_id, "oco", plan.list_client_order_id)
+            return self._result(
+                intent.intent_id, "protection_blocked", plan_reason, snapshot=snapshot
+            )
         if existing is not None and str(existing["state"]) == "rejected":
             return self._flatten(intent, snapshot, contract, quantity, "oco_rejected")
         if existing is None:
@@ -530,15 +918,29 @@ class CrossMarginTrack:
                     "rejected",
                     {"code": exc.code},
                 )
-                return self._flatten(intent, snapshot, contract, quantity, f"oco_rejected_{exc.code}")
+                return self._flatten(
+                    intent, snapshot, contract, quantity, f"oco_rejected_{exc.code}"
+                )
             else:
-                self.ledger.mark(intent.intent_id, "oco", plan.list_client_order_id, "awaiting_evidence", {})
+                self.ledger.mark(
+                    intent.intent_id, "oco", plan.list_client_order_id, "awaiting_evidence", {}
+                )
         if not self._oco_is_live(intent, plan.list_client_order_id, plan.side, quantity):
             current = self.ledger.peek(intent.intent_id, "oco", plan.list_client_order_id)
             if current is not None and str(current["state"]) != "unknown":
-                self.ledger.mark(intent.intent_id, "oco", plan.list_client_order_id, "unknown", None)
-            return self._result(intent.intent_id, "protection_unknown", "oco_unconfirmed", snapshot=snapshot)
-        self.ledger.mark(intent.intent_id, "oco", plan.list_client_order_id, "confirmed", {})
+                self.ledger.mark(
+                    intent.intent_id, "oco", plan.list_client_order_id, "unknown", None
+                )
+            return self._result(
+                intent.intent_id, "protection_unknown", "oco_unconfirmed", snapshot=snapshot
+            )
+        self.ledger.mark(
+            intent.intent_id,
+            "oco",
+            plan.list_client_order_id,
+            "confirmed",
+            {"take_profit_price": plan.payload["price"], "stop_price": plan.payload["stopPrice"]},
+        )
         self.ledger.set_state(intent.intent_id, "protected", _now(self.ledger, intent.intent_id))
         return self._result(
             intent.intent_id,
@@ -547,7 +949,12 @@ class CrossMarginTrack:
             phase_ok=True,
             protection_confirmed=True,
             snapshot=snapshot,
-            detail={"protection_side": plan.side, "protection_qty": api_amount(quantity)},
+            detail={
+                "protection_side": plan.side,
+                "protection_qty": api_amount(quantity),
+                "take_profit_price": plan.payload["price"],
+                "stop_price": plan.payload["stopPrice"],
+            },
         )
 
     def _flatten(
@@ -562,7 +969,11 @@ class CrossMarginTrack:
         existing = self.ledger.peek(intent.intent_id, "flatten", client_key)
         if existing is not None and str(existing["state"]) == "rejected":
             return self._result(
-                intent.intent_id, "protection_rejected_naked", reason, snapshot=snapshot
+                intent.intent_id,
+                "protection_rejected_naked",
+                reason,
+                snapshot=snapshot,
+                detail={"unprotected_qty": api_amount(quantity), "manual_action": "cover_and_repay"},
             )
         payload = build_limit_payload(
             symbol=intent.symbol,
@@ -576,35 +987,68 @@ class CrossMarginTrack:
             self.ledger.begin_operation(intent.intent_id, "flatten", client_key, payload)
             try:
                 self.client.new_order(payload)
-            except (MarginTransportTimeout, MarginExchangeError) as exc:
-                state = "unknown" if isinstance(exc, MarginTransportTimeout) else "rejected"
-                self.ledger.mark(intent.intent_id, "flatten", client_key, state, {})
-                if state == "rejected":
-                    return self._result(
-                        intent.intent_id, "protection_rejected_naked", reason, snapshot=snapshot
-                    )
-                return self._result(
-                    intent.intent_id, "protection_unknown", "flatten_unconfirmed", snapshot=snapshot
+            except MarginTransportTimeout:
+                self.ledger.mark(intent.intent_id, "flatten", client_key, "unknown", None)
+            except MarginExchangeError as exc:
+                self.ledger.mark(
+                    intent.intent_id, "flatten", client_key, "rejected", {"code": exc.code}
                 )
-            self.ledger.mark(intent.intent_id, "flatten", client_key, "awaiting_evidence", {})
-        elif str(existing["state"]) == "unknown":
-            return self._result(
-                intent.intent_id, "protection_unknown", "flatten_unconfirmed", snapshot=snapshot
-            )
+                return self._result(
+                    intent.intent_id,
+                    "protection_rejected_naked",
+                    reason,
+                    snapshot=snapshot,
+                    detail={
+                        "unprotected_qty": api_amount(quantity),
+                        "manual_action": "cover_and_repay",
+                    },
+                )
+            else:
+                self.ledger.mark(
+                    intent.intent_id, "flatten", client_key, "awaiting_evidence", {}
+                )
+
+        row_after = self.ledger.peek(intent.intent_id, "flatten", client_key)
+        was_indeterminate = row_after is not None and str(row_after["state"]) in {
+            "unknown",
+            "started",
+        }
         try:
             order = self.client.query_order(build_query_order_payload(intent.symbol, client_key))
-        except MarginExchangeError:
+        except (MarginExchangeError, MarginTransportTimeout):
             return self._result(
                 intent.intent_id, "protection_unknown", "flatten_unconfirmed", snapshot=snapshot
             )
         executed, _ = parse_decimal(order.get("executedQty"), "executedQty")
         if order.get("status") != "FILLED" or executed != quantity:
+            if was_indeterminate and order.get("status") in {"NEW", "PARTIALLY_FILLED", "PENDING_NEW"}:
+                return self._result(
+                    intent.intent_id, "protection_unknown", "flatten_unconfirmed", snapshot=snapshot
+                )
             self.ledger.mark(intent.intent_id, "flatten", client_key, "rejected", {})
+            rem = quantity - (executed or Decimal(0))
             return self._result(
-                intent.intent_id, "protection_rejected_naked", reason, snapshot=snapshot
+                intent.intent_id,
+                "protection_rejected_naked",
+                reason,
+                snapshot=snapshot,
+                detail={
+                    "unprotected_qty": api_amount(max(Decimal(0), rem)),
+                    "flatten_executed_qty": api_amount(executed or Decimal(0)),
+                    "manual_action": "cover_and_repay",
+                },
             )
         if self._trades_match(intent.symbol, order, quantity) is not True:
-            return self._result(intent.intent_id, "fill_unconfirmed", "flatten_trades", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "fill_unconfirmed", "flatten_trades", snapshot=snapshot
+            )
+        self.ledger.mark(
+            intent.intent_id,
+            "flatten",
+            client_key,
+            "confirmed",
+            {"executedQty": api_amount(quantity)},
+        )
         repaid = self._repay_full_liability(intent, snapshot, contract, "flatten-repay")
         if isinstance(repaid, TrackResult):
             return repaid
@@ -633,7 +1077,11 @@ class CrossMarginTrack:
         amount = min(base.free, liability(base))
         if amount <= 0:
             flat = self._is_flat(intent)
-            state = "risk_dropped_unwound" if reason == "margin_level_below_contract" else "entry_rejected_unwound"
+            state = (
+                "risk_dropped_unwound"
+                if reason.startswith("margin_level_")
+                else "entry_rejected_unwound"
+            )
             if reason.startswith("emergency") or reason == "emergency_stop_blocks_new_risk":
                 state = "emergency_unwound"
             return self._result(
@@ -649,7 +1097,7 @@ class CrossMarginTrack:
         if isinstance(repaid, TrackResult):
             return repaid
         flat = self._is_flat(intent)
-        if reason == "margin_level_below_contract":
+        if reason.startswith("margin_level_"):
             state = "risk_dropped_unwound" if flat else "residual_liability_after_unwind"
         elif "emergency" in reason:
             state = "emergency_unwound" if flat else "residual_liability_after_unwind"
@@ -666,12 +1114,19 @@ class CrossMarginTrack:
         if isinstance(view, TrackResult):
             return view
         assets, _level = view
-        debt = liability(assets.get(intent.base_asset)) if intent.action == "OPEN_SHORT" else Decimal(0)
+        debt = (
+            liability(assets.get(intent.base_asset))
+            if intent.action == "OPEN_SHORT"
+            else Decimal(0)
+        )
         if any_liability(assets) and intent.action != "OPEN_SHORT":
-            return self._result(intent.intent_id, "not_flat", "unexpected_liability", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "not_flat", "unexpected_liability", snapshot=snapshot
+            )
         if debt > 0:
             base = assets[intent.base_asset]
             if base.free < debt:
+                shortfall = debt - base.free
                 return self._result(
                     intent.intent_id,
                     "not_flat",
@@ -680,6 +1135,10 @@ class CrossMarginTrack:
                     borrowed=api_amount(base.borrowed),
                     interest=api_amount(base.interest),
                     base_free=api_amount(base.free),
+                    detail={
+                        "liability_shortfall": api_amount(shortfall),
+                        "manual_action": "top_up_base_and_repay",
+                    },
                 )
             repaid = self._repay_amount(
                 intent, snapshot, contract, gate, "close_repay", "close-repay", debt
@@ -709,12 +1168,19 @@ class CrossMarginTrack:
             return None
         if base.free < debt:
             return self._result(
-                intent.intent_id, "not_flat", "base_short_of_liability", snapshot=snapshot
+                intent.intent_id,
+                "not_flat",
+                "base_short_of_liability",
+                snapshot=snapshot,
+                detail={
+                    "liability_shortfall": api_amount(debt - base.free),
+                    "manual_action": "top_up_base_and_repay",
+                },
             )
-        gate_holder = self.ledger.intent_row(intent.intent_id)
-        del gate_holder
-        dummy_gate = Gate(False, 0, OFFLINE_EXECUTION_MODE)
-        return self._repay_amount(intent, snapshot, contract, dummy_gate, "close_repay", role, debt)
+        dummy_gate = Gate(False, _now(self.ledger, intent.intent_id), OFFLINE_EXECUTION_MODE)
+        return self._repay_amount(
+            intent, snapshot, contract, dummy_gate, "close_repay", role, debt
+        )
 
     def _repay_amount(
         self,
@@ -726,22 +1192,54 @@ class CrossMarginTrack:
         role: str,
         amount: Decimal,
     ) -> TrackResult | None:
-        del gate
+        del contract
         if amount <= 0:
             return None
         client_key = make_client_id(intent.intent_id, role)
         payload = build_repay_payload(intent.base_asset, amount)
         existing = self.ledger.peek(intent.intent_id, op_type, client_key)
         if existing is None:
-            self.ledger.begin_operation(intent.intent_id, op_type, client_key, payload)
+            view_before = self._view()
+            if isinstance(view_before, TrackResult):
+                return view_before
+            assets_before, _lvl_before = view_before
+            base_before = assets_before.get(intent.base_asset)
+            if base_before is None or base_before.free < amount:
+                return self._result(
+                    intent.intent_id,
+                    "not_flat",
+                    "base_short_of_liability",
+                    snapshot=snapshot,
+                )
+            baseline = self._capture_transfer_baseline(
+                "REPAY", intent.base_asset, gate.now_ms
+            )
+            stored_req = {**payload, "_meta": baseline}
+            self.ledger.begin_operation(intent.intent_id, op_type, client_key, stored_req)
             try:
                 response = self.client.repay(payload)
             except MarginTransportTimeout:
                 self.ledger.mark(intent.intent_id, op_type, client_key, "unknown", None)
-                if not self._bind_transfer("REPAY", intent.base_asset, amount):
-                    return self._result(intent.intent_id, "repay_unknown", "repay_unconfirmed", snapshot=snapshot)
+                if not self._bind_transfer("REPAY", intent.base_asset, amount, baseline):
+                    return self._result(
+                        intent.intent_id, "repay_unknown", "repay_unconfirmed", snapshot=snapshot
+                    )
                 self.ledger.mark(intent.intent_id, op_type, client_key, "confirmed", {"bound": True})
             except MarginExchangeError as exc:
+                if exc.code == PENDING_TRANSACTION_CODE:
+                    self.ledger.mark(
+                        intent.intent_id,
+                        op_type,
+                        client_key,
+                        "pending_lock",
+                        {"code": exc.code},
+                    )
+                    return self._result(
+                        intent.intent_id,
+                        "repay_unknown",
+                        "repay_pending_transaction_lock",
+                        snapshot=snapshot,
+                    )
                 self.ledger.mark(
                     intent.intent_id, op_type, client_key, "rejected", {"code": exc.code}
                 )
@@ -754,10 +1252,15 @@ class CrossMarginTrack:
             else:
                 self.ledger.mark(intent.intent_id, op_type, client_key, "confirmed", response)
         elif str(existing["state"]) == "rejected":
-            return self._result(intent.intent_id, "repay_rejected", "repay_rejected", snapshot=snapshot)
+            return self._result(
+                intent.intent_id, "repay_rejected", "repay_rejected", snapshot=snapshot
+            )
         elif str(existing["state"]) != "confirmed":
-            if not self._bind_transfer("REPAY", intent.base_asset, amount):
-                return self._result(intent.intent_id, "repay_unknown", "repay_unconfirmed", snapshot=snapshot)
+            op_meta = _extract_op_meta(existing)
+            if not self._bind_transfer("REPAY", intent.base_asset, amount, op_meta):
+                return self._result(
+                    intent.intent_id, "repay_unknown", "repay_unconfirmed", snapshot=snapshot
+                )
             self.ledger.mark(intent.intent_id, op_type, client_key, "confirmed", {"bound": True})
         view = self._view()
         if isinstance(view, TrackResult):
@@ -765,7 +1268,10 @@ class CrossMarginTrack:
         assets, _level = view
         if liability(assets.get(intent.base_asset)) > 0 and op_type == "close_repay":
             return self._result(
-                intent.intent_id, "repay_unconfirmed", "liability_remains_after_repay", snapshot=snapshot
+                intent.intent_id,
+                "repay_unconfirmed",
+                "liability_remains_after_repay",
+                snapshot=snapshot,
             )
         return None
 
@@ -798,7 +1304,7 @@ class CrossMarginTrack:
             rows = self.client.query_hourly_interest(
                 build_hourly_interest_payload(contract.borrow_asset)
             )
-        except MarginExchangeError:
+        except (MarginExchangeError, MarginTransportTimeout):
             return "interest_query_failed"
         if not rows:
             return "interest_query_failed"
@@ -811,9 +1317,13 @@ class CrossMarginTrack:
     def _oco_is_live(self, intent: Intent, list_id: str, side: str, quantity: Decimal) -> bool:
         try:
             listed = self.client.query_oco(build_query_oco_payload(intent.symbol, list_id))
-        except MarginExchangeError:
+        except (MarginExchangeError, MarginTransportTimeout):
             return False
         if listed.get("listOrderStatus") != "EXECUTING":
+            return False
+        if listed.get("symbol") not in (None, "", intent.symbol):
+            return False
+        if not _is_cross(listed.get("isIsolated", False)):
             return False
         orders = listed.get("orders")
         if not isinstance(orders, list) or len(orders) != 2:
@@ -825,7 +1335,7 @@ class CrossMarginTrack:
                 order = self.client.query_order(
                     build_query_order_payload(intent.symbol, str(item.get("clientOrderId")))
                 )
-            except MarginExchangeError:
+            except (MarginExchangeError, MarginTransportTimeout):
                 return False
             qty, problem = parse_decimal(order.get("origQty"), "origQty")
             if (
@@ -839,38 +1349,80 @@ class CrossMarginTrack:
                 return False
         return True
 
-    def _filled_protection_leg(self, intent: Intent, listed: Mapping[str, Any]) -> TrackResult | None:
+    def _filled_protection_leg(
+        self, intent: Intent, snapshot: Snapshot, listed: Mapping[str, Any]
+    ) -> TrackResult | None:
         orders = listed.get("orders")
         if not isinstance(orders, list):
-            return self._result(intent.intent_id, "exit_not_filled", "oco_orders_missing")
+            return self._result(
+                intent.intent_id, "exit_not_filled", "oco_orders_missing", snapshot=snapshot
+            )
         filled = 0
+        partial_exec = Decimal(0)
         expected_side = "BUY" if intent.action == "OPEN_SHORT" else "SELL"
         for item in orders:
             if not isinstance(item, Mapping):
-                return self._result(intent.intent_id, "exit_not_filled", "oco_orders_missing")
+                return self._result(
+                    intent.intent_id, "exit_not_filled", "oco_orders_missing", snapshot=snapshot
+                )
             try:
                 order = self.client.query_order(
                     build_query_order_payload(intent.symbol, str(item.get("clientOrderId")))
                 )
-            except MarginExchangeError:
-                return self._result(intent.intent_id, "fill_unconfirmed", "protection_order_query_failed")
+            except (MarginExchangeError, MarginTransportTimeout):
+                return self._result(
+                    intent.intent_id,
+                    "fill_unconfirmed",
+                    "protection_order_query_failed",
+                    snapshot=snapshot,
+                )
             if order.get("side") != expected_side:
-                return self._result(intent.intent_id, "fill_mismatch", "protection_side_mismatch")
+                return self._result(
+                    intent.intent_id,
+                    "fill_mismatch",
+                    "protection_side_mismatch",
+                    snapshot=snapshot,
+                )
+            exec_qty, _ = parse_decimal(order.get("executedQty", "0"), "executedQty")
             if order.get("status") == "FILLED":
-                executed, _ = parse_decimal(order.get("executedQty"), "executedQty")
-                if executed is None or self._trades_match(intent.symbol, order, executed) is not True:
-                    return self._result(intent.intent_id, "fill_unconfirmed", "protection_trades")
+                if exec_qty is None or self._trades_match(intent.symbol, order, exec_qty) is not True:
+                    return self._result(
+                        intent.intent_id,
+                        "fill_unconfirmed",
+                        "protection_trades",
+                        snapshot=snapshot,
+                    )
                 filled += 1
+            elif exec_qty is not None and exec_qty > 0:
+                partial_exec += exec_qty
         if filled != 1:
-            return self._result(intent.intent_id, "fill_mismatch", "protection_leg_conflict")
+            if filled == 0 and partial_exec > 0:
+                return self._result(
+                    intent.intent_id,
+                    "exit_partially_filled_halted",
+                    "protection_partial_fill_manual_review",
+                    snapshot=snapshot,
+                    detail={
+                        "partial_exit_qty": api_amount(partial_exec),
+                        "manual_action": "reconcile_partial_oco_and_repay",
+                    },
+                )
+            return self._result(
+                intent.intent_id,
+                "fill_mismatch",
+                "protection_leg_conflict",
+                snapshot=snapshot,
+            )
         return None
 
     def _trades_match(
         self, symbol: str, order: Mapping[str, Any], executed: Decimal
     ) -> bool | None:
         try:
-            trades = self.client.query_trades({"symbol": symbol, "orderId": order.get("orderId")})
-        except MarginExchangeError:
+            trades = self.client.query_trades(
+                build_query_trades_payload(symbol, order.get("orderId"))
+            )
+        except (MarginExchangeError, MarginTransportTimeout):
             return None
         if not trades:
             return None
@@ -887,33 +1439,94 @@ class CrossMarginTrack:
             return False
         return True
 
-    def _bind_transfer(self, kind: str, asset: str, amount: Decimal) -> bool:
+    def _bind_transfer(
+        self,
+        kind: str,
+        asset: str,
+        amount: Decimal,
+        op_meta: Mapping[str, Any] | None = None,
+    ) -> bool:
+        meta = dict(op_meta or {})
+        started_ms = meta.get("started_ms")
+        start_query_ms = (
+            max(0, int(started_ms) - 5000)
+            if isinstance(started_ms, int) and started_ms > 0
+            else None
+        )
+        prior_ids = {str(x) for x in (meta.get("prior_tx_ids") or [])}
         try:
-            body = self.client.query_borrow_repay(build_borrow_query_payload(asset, kind))
-        except MarginExchangeError:
+            body = self.client.query_borrow_repay(
+                build_borrow_query_payload(asset, kind, start_time_ms=start_query_ms)
+            )
+        except (MarginExchangeError, MarginTransportTimeout):
             return False
         matches = []
         for row in body.get("rows") or []:
-            if row.get("status") != "CONFIRMED" or row.get("asset") != asset or row.get("type") != kind:
+            if not isinstance(row, Mapping):
+                continue
+            tx_id = str(row.get("txId") or "")
+            if tx_id and tx_id in prior_ids:
+                continue
+            if str(row.get("isolatedSymbol") or "").strip() != "":
+                continue
+            if row.get("asset") != asset:
+                continue
+            # Real Binance returns type="MANUAL" (or "AUTO"); fixture returns "BORROW"/"REPAY".
+            row_type = str(row.get("type") or "")
+            if row_type not in {kind, "MANUAL"}:
+                continue
+            status = str(row.get("status") or "")
+            if status == "PENDING":
+                return False
+            if status != "CONFIRMED":
                 continue
             number, problem = parse_decimal(row.get("amount"), "amount")
             if problem or number != amount:
                 continue
             matches.append(row)
-        return len(matches) == 1
+        if len(matches) != 1:
+            return False
+
+        # Cross-verify live account liability delta against pre-operation baseline.
+        view = self._view()
+        if isinstance(view, TrackResult):
+            return False
+        assets, _level = view
+        current = assets.get(asset)
+        if current is None:
+            return False
+        pre_borrowed, pb_err = parse_decimal(meta.get("pre_borrowed"), "pre_borrowed")
+        pre_interest, pi_err = parse_decimal(meta.get("pre_interest"), "pre_interest")
+        if kind == "BORROW" and not pb_err and pre_borrowed is not None:
+            if current.borrowed < pre_borrowed + amount:
+                return False
+        if kind == "REPAY" and not pb_err and not pi_err and pre_borrowed is not None and pre_interest is not None:
+            pre_liab = pre_borrowed + pre_interest
+            cur_liab = current.borrowed + current.interest
+            if pre_liab > 0 and cur_liab >= pre_liab:
+                return False
+        return True
 
     def _new_risk_block(self, contract: Contract) -> str:
         view = self._view()
         if isinstance(view, TrackResult):
             return view.reason
         _assets, level = view
-        account = self.client.query_account()
+        try:
+            account = self.client.query_account()
+        except (MarginExchangeError, MarginTransportTimeout):
+            return "account_read_failed"
         if account.get("tradeEnabled") is not True or account.get("borrowEnabled") is not True:
             return "account_flags_closed"
         if not str(account.get("accountType") or "").startswith("MARGIN"):
             return "account_type_not_cross_margin"
         if "ISOLATED" in str(account.get("accountType") or "").upper():
             return "isolated_account_rejected"
+        status_txt = str(account.get("marginLevelStatus") or "EXCESSIVE").upper()
+        if status_txt in EMERGENCY_MARGIN_LEVEL_STATUSES:
+            return "margin_level_emergency_floor"
+        if contract.parameters_approved and level <= contract.emergency_margin_level:
+            return "margin_level_emergency_floor"
         if level < contract.min_margin_level:
             return "margin_level_below_contract"
         return ""
@@ -929,7 +1542,7 @@ class CrossMarginTrack:
             rates = self.client.query_hourly_interest(
                 build_hourly_interest_payload(contract.borrow_asset)
             )
-        except MarginExchangeError:
+        except (MarginExchangeError, MarginTransportTimeout):
             return "account_read_failed"
         if account.get("tradeEnabled") is not snapshot.trade_enabled:
             return "account_readback_mismatch"
@@ -945,7 +1558,7 @@ class CrossMarginTrack:
         wire = _wire_assets(account)
         if isinstance(wire, str):
             return wire
-        for asset in (intent_assets(snapshot)):
+        for asset in intent_assets(snapshot):
             left = snapshot.assets.get(asset)
             right = wire.get(asset)
             if left is None or right is None:
@@ -972,7 +1585,7 @@ class CrossMarginTrack:
     def _view(self) -> tuple[dict[str, AssetRow], Decimal] | TrackResult:
         try:
             account = self.client.query_account()
-        except MarginExchangeError:
+        except (MarginExchangeError, MarginTransportTimeout):
             return self._result("", "locked", "account_read_failed")
         assets = _wire_assets(account)
         if isinstance(assets, str):
@@ -1003,9 +1616,9 @@ class CrossMarginTrack:
             return False
         try:
             open_orders = self.client.query_open_orders(
-                {"symbol": intent.symbol, "isIsolated": "FALSE"}
+                build_query_open_orders_payload(intent.symbol)
             )
-        except MarginExchangeError:
+        except (MarginExchangeError, MarginTransportTimeout):
             return False
         return not open_orders
 
@@ -1062,19 +1675,45 @@ class CrossMarginTrack:
             account_flat = None
         if intent_id:
             self.ledger.set_state(intent_id, state, _now(self.ledger, intent_id))
+        live_blocked = not (self._network_client and self._allow_live_network)
         return TrackResult(
             intent_id=intent_id,
             state=state,
             phase_ok=phase_ok,
             account_flat=account_flat,
             protection_confirmed=protection_confirmed,
-            live_writes_blocked=True,
+            live_writes_blocked=live_blocked,
             reason=reason,
             borrowed=borrowed,
             interest=interest,
             base_free=base_free,
             detail={} if detail is None else detail,
         )
+
+
+def _extract_op_meta(row: Any) -> dict[str, Any]:
+    if row is None:
+        return {}
+    try:
+        parsed = json.loads(str(row["request_json"]))
+    except (TypeError, ValueError, KeyError):
+        return {}
+    if isinstance(parsed, Mapping) and isinstance(parsed.get("_meta"), Mapping):
+        return dict(parsed["_meta"])
+    return {}
+
+
+def _stored_oco_intent(intent: Intent, row: Any) -> Intent:
+    try:
+        parsed = json.loads(str(row["request_json"]))
+    except (TypeError, ValueError, KeyError):
+        return intent
+    if not isinstance(parsed, Mapping):
+        return intent
+    stored_tp, err = parse_decimal(parsed.get("price"), "price")
+    if err or stored_tp is None or stored_tp <= 0:
+        return intent
+    return replace(intent, take_profit_price=stored_tp)
 
 
 def _unknown_state(state: str) -> bool:

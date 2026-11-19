@@ -1,61 +1,37 @@
-"""REST payloads checked against binance-sdk-margin-trading 8.12.0.
+"""REST payloads checked against binance-sdk-margin-trading 8.12.0 and official REST docs.
 
 The SDK speaks snake_case Python arguments. The signed REST query uses the
 camelCase names below. This module does not import the SDK and does not send
 HTTP. OTO / OTOCO builders exist so their conditional parameters are tested;
 the track does not submit them.
 
-Evidence (read from the connector source, not from a live account):
-
+Evidence:
 - package version 8.12.0 in ``clients/margin_trading/pyproject.toml``
   https://github.com/binance/binance-connector-python/blob/master/clients/margin_trading/pyproject.toml
 - changelog 8.12.0 (2026-11-17)
   https://github.com/binance/binance-connector-python/blob/master/clients/margin_trading/CHANGELOG.md
-- ``POST /sapi/v1/margin/order`` ``margin_account_new_order``
-- ``POST /sapi/v1/margin/order/oco`` ``margin_account_new_oco``
-- ``POST /sapi/v1/margin/order/oto`` ``margin_account_new_oto``
-- ``POST /sapi/v1/margin/order/otoco`` ``margin_account_new_otoco``
-- ``POST /sapi/v1/margin/borrow-repay`` and ``GET /sapi/v1/margin/borrow-repay``
-- ``GET /sapi/v1/margin/maxBorrowable`` (per asset; omitting isolatedSymbol is cross)
-- ``GET /sapi/v1/margin/account``
-- ``GET /sapi/v1/margin/next-hourly-interest-rate``
-- ``GET /sapi/v1/margin/order``, ``GET /sapi/v1/margin/orderList``,
-  ``GET /sapi/v1/margin/myTrades``
-- SDK catalog links point at
+- Official Trade / Borrow-Repay / Account Margin REST API catalogs:
   https://developers.binance.com/en/docs/catalog/core-trading-margin-trading/api/rest-api/trade
-  and the borrow-repay / account sections of the same catalog.
+  https://developers.binance.com/en/docs/catalog/core-trading-margin-trading/api/rest-api/borrow-repay
+  https://developers.binance.com/en/docs/catalog/core-trading-margin-trading/api/rest-api/account
+  https://developers.binance.com/en/docs/products/margin-trading/best-practice
 
-Borrow-repay error notes copied from the SDK docstring, not re-demonstrated
-on the exchange this round: -3045 insufficient inventory, -3006 exceed max
-borrowable, -3012 asset borrow banned, -3015 repay exceeds liability or would
-leave a below-minimum remainder, -3007 pending borrow/repay transaction.
-
-``isIsolated`` is the string TRUE or FALSE. FALSE is cross. Borrow requires it.
-``symbol`` on borrow-repay is isolated-only and is omitted here.
-
-Order and OCO ``sideEffectType`` enums include NO_SIDE_EFFECT, MARGIN_BUY,
-AUTO_REPAY, AUTO_BORROW_REPAY. OTO and OTOCO do **not** include AUTO_REPAY
-(SDK 8.1.1 added AUTO_BORROW_REPAY to OTO/OTOCO; their enum is NO_SIDE_EFFECT,
-MARGIN_BUY, AUTO_BORROW_REPAY). This track builds NO_SIDE_EFFECT only.
-
-SDK 8.12.0 raises RequiredError when OTO ``working_iceberg_qty`` is omitted,
-while the same docstring says iceberg quantity is only valid with GTC. The
-REST builder below treats iceberg as optional and does not invent a zero.
-
-OCO price inequality is not restated in the margin SDK docstring. Spot OCO
-docs require BUY limit < last < stop and SELL limit > last > stop
-(https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md).
-The protection planner applies that inequality as a local pre-check. It was
-not re-proven against a live margin order this round.
-
-``GET /sapi/v1/margin/account`` does not return the account uid.
+Key wire constraints:
+- ``isIsolated`` is ``"FALSE"`` for Cross Margin. ``symbol`` on borrow-repay is
+  isolated-only and is omitted.
+- ``GET /sapi/v1/margin/orderList`` specifies ``symbol`` as mandatory for isolated
+  margin and **not supported for cross margin**; ``build_query_oco_payload`` omits
+  ``symbol`` accordingly.
+- ``GET /sapi/v1/margin/borrow-repay`` requires ``txId`` or ``startTime``.
+- Order and OCO ``sideEffectType`` is fixed to ``NO_SIDE_EFFECT``; borrow and repay
+  are always explicit ledgered operations.
 """
 
 from __future__ import annotations
 
+from decimal import Decimal
 import hashlib
 import re
-from decimal import Decimal
 
 from execution.margin_cross.money import api_amount
 
@@ -92,6 +68,9 @@ EVIDENCE_LINKS = (
     "https://github.com/binance/binance-connector-python/blob/master/clients/margin_trading/src/binance_sdk_margin_trading/rest_api/api/borrow_repay_api.py",
     "https://github.com/binance/binance-connector-python/blob/master/clients/margin_trading/src/binance_sdk_margin_trading/rest_api/api/account_api.py",
     "https://developers.binance.com/en/docs/catalog/core-trading-margin-trading/api/rest-api/trade",
+    "https://developers.binance.com/en/docs/catalog/core-trading-margin-trading/api/rest-api/borrow-repay",
+    "https://developers.binance.com/en/docs/catalog/core-trading-margin-trading/api/rest-api/account",
+    "https://developers.binance.com/en/docs/products/margin-trading/best-practice",
     "https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md",
 )
 
@@ -214,11 +193,18 @@ def build_query_order_payload(symbol: str, client_order_id: str) -> dict[str, st
 
 
 def build_query_oco_payload(symbol: str, list_client_order_id: str) -> dict[str, str]:
-    # SDK query param is origClientOrderId, not listClientOrderId.
+    del symbol  # Cross-margin GET /sapi/v1/margin/orderList forbids symbol.
+    return {
+        "isIsolated": CROSS_ISOLATED_FLAG,
+        "origClientOrderId": list_client_order_id,
+    }
+
+
+def build_cancel_oco_payload(symbol: str, list_client_order_id: str) -> dict[str, str]:
     return {
         "symbol": symbol,
         "isIsolated": CROSS_ISOLATED_FLAG,
-        "origClientOrderId": list_client_order_id,
+        "listClientOrderId": list_client_order_id,
     }
 
 
@@ -230,6 +216,21 @@ def build_cancel_payload(symbol: str, client_order_id: str) -> dict[str, str]:
     }
 
 
+def build_query_open_orders_payload(symbol: str) -> dict[str, str]:
+    return {
+        "symbol": symbol,
+        "isIsolated": CROSS_ISOLATED_FLAG,
+    }
+
+
+def build_query_trades_payload(symbol: str, order_id: object) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "isIsolated": CROSS_ISOLATED_FLAG,
+        "orderId": order_id,
+    }
+
+
 def build_max_borrow_payload(asset: str) -> dict[str, str]:
     return {"asset": asset}
 
@@ -238,10 +239,30 @@ def build_hourly_interest_payload(asset: str) -> dict[str, str]:
     return {"assets": asset, "isIsolated": CROSS_ISOLATED_FLAG}
 
 
-def build_borrow_query_payload(asset: str, borrow_or_repay: str) -> dict[str, str]:
+def build_interest_history_payload(
+    asset: str, *, start_time_ms: int | None = None, size: int = 50
+) -> dict[str, str]:
+    out = {"asset": asset, "size": str(int(size))}
+    if start_time_ms is not None and start_time_ms >= 0:
+        out["startTime"] = str(int(start_time_ms))
+    return out
+
+
+def build_borrow_query_payload(
+    asset: str,
+    borrow_or_repay: str,
+    *,
+    tx_id: int | None = None,
+    start_time_ms: int | None = None,
+) -> dict[str, str]:
     if borrow_or_repay not in {"BORROW", "REPAY"}:
         raise ValueError("borrow_query_type_invalid")
-    return {"type": borrow_or_repay, "asset": asset}
+    payload = {"type": borrow_or_repay, "asset": asset}
+    if tx_id is not None and tx_id > 0:
+        payload["txId"] = str(int(tx_id))
+    elif start_time_ms is not None and start_time_ms >= 0:
+        payload["startTime"] = str(int(start_time_ms))
+    return payload
 
 
 def _require(payload: dict[str, object], field: str, reasons: list[str]) -> str:
