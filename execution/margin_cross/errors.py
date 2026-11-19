@@ -2,13 +2,6 @@
 
 from __future__ import annotations
 
-# Explicit pre-execution parameter, filter, or balance rejection codes on POST /sapi/v1/margin/order/oco.
-# Spot-style list lookup codes (-2018 "Order list does not exist.", -2011, -2013), rate limits (-1003),
-# clock skew (-1021), and malformed responses (-1000) are NEVER treated as proven OCO rejections.
-_DETERMINISTIC_PRE_EXEC_OCO_REJECT_CODES = frozenset(
-    {-1013, -1100, -1102, -1111, -1116, -1117, -1121, -2010, -3006, -3045}
-)
-
 
 class LiveNetworkDisabled(RuntimeError):
     """Live margin HTTP transport is locked by approval, enable, or kill-switch gates."""
@@ -53,14 +46,13 @@ class MarginExchangeError(Exception):
 
     @property
     def is_deterministic_pre_exec_oco_reject(self) -> bool:
-        """True strictly for confirmed pre-execution filter/balance rejects on new_oco.
+        """Integer codes do not prove a margin OCO failed before it landed.
 
-        HTTP 400 / -2018 ('Order list does not exist.') and any unrecognized or
-        ambiguous margin OCO error return False so the track holds in
-        ``protection_unknown`` instead of triggering an unverified buyback.
+        ``-2010`` is reused for filter or balance text and for duplicate
+        client-order text. A duplicate can mean the list already exists, and a
+        momentarily empty ``openOrders`` read does not prove otherwise. This
+        build has no margin-protocol evidence that any code plus a clean locked
+        balance is a completed rejection, so the automatic flatten path stays
+        closed. Returning false is that closure, not a claim about the exchange.
         """
-        if self.is_indeterminate or self.is_rate_limited:
-            return False
-        if self.http_status not in {None, 400}:
-            return False
-        return self.code in _DETERMINISTIC_PRE_EXEC_OCO_REJECT_CODES
+        return False

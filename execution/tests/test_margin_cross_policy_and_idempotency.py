@@ -840,46 +840,34 @@ class LifecycleIdempotencyAuditTest(unittest.TestCase):
             self.assertTrue(recovered.protection_confirmed)
             self.assertEqual(recovered.detail["protection_qty"], "0.004")
 
-    def test_oco_reject_ioc_flatten_timeout_recovers_on_restart_without_duplicate_flatten(
-        self,
-    ) -> None:
+    def test_oco_code_does_not_start_flatten_and_restart_does_not_buy_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             case = short_case()
             case["client"].interest_on_borrow = Decimal("0")
             case["client"].fail_next(
                 "new_oco", when="before", kind="exchange", code=-2010, message="OCO rejected"
             )
-            case["client"].fail_next("new_order", when="after", kind="timeout", on_call=2)
-            orig_qo = case["client"].query_order
-            flatten_cid = make_client_id(str(case["intent"]["intent_id"]), "flatten")
-            first_flatten_q = [True]
-
-            def qo_timeout_once(payload: dict[str, Any]) -> dict[str, Any]:
-                if payload.get("origClientOrderId") == flatten_cid and first_flatten_q[0]:
-                    first_flatten_q[0] = False
-                    raise MarginTransportTimeout("query_order")
-                return orig_qo(payload)
-
-            case["client"].query_order = qo_timeout_once  # type: ignore[method-assign]
-            ledger_path = os.path.join(tmpdir, "flatten-recover.db")
+            ledger_path = os.path.join(tmpdir, "no-flatten.db")
             track = CrossMarginTrack(ledger_path, case["client"])
             tick1 = track.open_position(
                 case["intent"], case["snapshot"], case["contract"], case["gate"]
             )
             self.assertEqual(tick1.state, "protection_unknown")
-            self.assertEqual(tick1.reason, "flatten_unconfirmed")
-
+            flatten_cid = make_client_id(str(case["intent"]["intent_id"]), "flatten")
+            self.assertFalse(
+                any(
+                    p.get("newClientOrderId") == flatten_cid
+                    for m, p in case["client"].write_log
+                    if m == "new_order"
+                )
+            )
+            self.assertEqual(len([m for m, _p in case["client"].write_log if m == "repay"]), 0)
+            frozen = [m for m, _p in case["client"].write_log]
             tick2 = CrossMarginTrack(ledger_path, case["client"]).open_position(
                 case["intent"], case["snapshot"], case["contract"], case["gate"]
             )
-            self.assertEqual(tick2.state, "protection_failed_flattened")
-            self.assertTrue(tick2.account_flat)
-            flatten_orders = [
-                p
-                for m, p in case["client"].write_log
-                if m == "new_order" and p.get("newClientOrderId") == flatten_cid
-            ]
-            self.assertEqual(len(flatten_orders), 1)
+            self.assertEqual(tick2.state, "protection_unknown")
+            self.assertEqual([m for m, _p in case["client"].write_log], frozen)
 
     def test_query_transport_timeouts_across_readback_paths_never_crash_or_duplicate(self) -> None:
         for read_method in (

@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 from execution.margin_cross.accounting import cover_buy_quantity  # noqa: E402
 from execution.margin_cross.api_semantics import (  # noqa: E402
     build_borrow_payload,
+    make_client_id,
     validate_oto_payload,
     validate_otoco_payload,
 )
@@ -216,24 +217,24 @@ class MarginCrossTrackTest(unittest.TestCase):
         self.assertEqual(second.state, "protected")
         self.assertEqual(_names(case["client"]).count("new_order"), 1)
 
-    def test_oco_reject_flatten_and_naked(self) -> None:
+    def test_oco_reject_does_not_flatten_and_restart_does_not_buy_back(self) -> None:
         case = short_case()
         case["client"].fail_next("new_oco", kind="reject", code=-2010, message="oco rejected")
-        _track, opened = self._open(case)
-        self.assertEqual(opened.state, "protection_failed_flattened")
+        track, opened = self._open(case)
+        self.assertEqual(opened.state, "protection_unknown")
         self.assertFalse(opened.phase_ok)
-        self.assertTrue(opened.account_flat)
-        naked = short_case()
-        naked["client"].fail_next("new_oco", kind="reject", code=-2010, message="oco rejected")
-        naked["client"].fail_next(
-            "new_order", kind="reject", code=-2010, message="flatten rejected", on_call=2
+        self.assertIsNone(opened.account_flat)
+        self.assertNotIn("repay", _names(case["client"]))
+        flatten_id = make_client_id(str(case["intent"]["intent_id"]), "flatten")
+        self.assertFalse(
+            any(payload.get("newClientOrderId") == flatten_id for _name, payload in case["client"].write_log)
         )
-        track, failed = self._open(naked)
-        self.assertEqual(failed.state, "protection_rejected_naked")
-        self.assertFalse(failed.account_flat)
-        before = len(naked["client"].write_log)
-        track.open_position(naked["intent"], naked["snapshot"], naked["contract"], naked["gate"])
-        self.assertEqual(len(naked["client"].write_log), before)
+        before = list(_names(case["client"]))
+        second = track.open_position(
+            case["intent"], case["snapshot"], case["contract"], case["gate"]
+        )
+        self.assertEqual(second.state, "protection_unknown")
+        self.assertEqual(_names(case["client"]), before)
 
     def test_oco_timeout_unknown_does_not_resubmit(self) -> None:
         case = short_case()

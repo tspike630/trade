@@ -978,6 +978,18 @@ class CrossMarginTrack:
                 intent.intent_id, "protection_blocked", plan_reason, snapshot=snapshot
             )
         if existing is not None and str(existing["state"]) == "rejected":
+            # A stored code-only reject is not proof the list is absent.
+            # Do not start a buyback. An already-started flatten may only resume.
+            flatten_row = self.ledger.peek(
+                intent.intent_id, "flatten", make_client_id(intent.intent_id, "flatten")
+            )
+            if flatten_row is None:
+                return self._result(
+                    intent.intent_id,
+                    "protection_unknown",
+                    "oco_reject_not_proven",
+                    snapshot=snapshot,
+                )
             return self._flatten(intent, snapshot, contract, quantity, "oco_rejected")
         if existing is None:
             self.ledger.begin_operation(
@@ -988,42 +1000,16 @@ class CrossMarginTrack:
             except MarginTransportTimeout:
                 self.ledger.mark(intent.intent_id, "oco", plan.list_client_order_id, "unknown", None)
             except MarginExchangeError as exc:
-                if not exc.is_deterministic_pre_exec_oco_reject:
-                    # Ambiguous, rate-limited, 5xx, or spot-shaped list lookup errors
-                    # (such as HTTP 400 / -2018 'Order list does not exist.') NEVER
-                    # prove the margin OCO was not accepted and NEVER trigger buyback.
-                    self.ledger.mark(
-                        intent.intent_id,
-                        "oco",
-                        plan.list_client_order_id,
-                        "unknown",
-                        {"code": exc.code},
-                    )
-                elif self._oco_is_live(intent, plan.list_client_order_id, plan.side, quantity):
-                    self.ledger.mark(
-                        intent.intent_id, "oco", plan.list_client_order_id, "awaiting_evidence", {}
-                    )
-                elif not self._confirm_no_resting_oco_before_flatten(
-                    intent, plan.list_client_order_id
-                ):
-                    self.ledger.mark(
-                        intent.intent_id,
-                        "oco",
-                        plan.list_client_order_id,
-                        "unknown",
-                        {"code": exc.code},
-                    )
-                else:
-                    self.ledger.mark(
-                        intent.intent_id,
-                        "oco",
-                        plan.list_client_order_id,
-                        "rejected",
-                        {"code": exc.code},
-                    )
-                    return self._flatten(
-                        intent, snapshot, contract, quantity, f"oco_rejected_{exc.code}"
-                    )
+                # No integer code, message variant, or empty openOrders read proves
+                # the POST missed the book. Occupy the slot and do not buy back.
+                # A later query may still bind a list that actually exists.
+                self.ledger.mark(
+                    intent.intent_id,
+                    "oco",
+                    plan.list_client_order_id,
+                    "unknown",
+                    {"code": exc.code, "message": exc.message},
+                )
             else:
                 self.ledger.mark(
                     intent.intent_id, "oco", plan.list_client_order_id, "awaiting_evidence", {}
@@ -1639,42 +1625,6 @@ class CrossMarginTrack:
                 snapshot=snapshot,
             )
         return None
-
-    def _confirm_no_resting_oco_before_flatten(
-        self, intent: Intent, list_client_id: str
-    ) -> bool:
-        """Verify openOrders and locked funds prove no OCO leg is resting before flatten."""
-        expected_children = {
-            list_client_id,
-            make_client_id(intent.intent_id, "oco-limit"),
-            make_client_id(intent.intent_id, "oco-stop"),
-        }
-        try:
-            open_orders = self.client.query_open_orders(
-                build_query_open_orders_payload(intent.symbol)
-            )
-        except (MarginExchangeError, MarginTransportTimeout):
-            return False
-        if not isinstance(open_orders, list):
-            return False
-        for order in open_orders:
-            if not isinstance(order, Mapping):
-                return False
-            cid = str(order.get("clientOrderId") or "")
-            if cid in expected_children:
-                return False
-        view = self._view()
-        if isinstance(view, TrackResult):
-            return False
-        assets, _level = view
-        quote_row = assets.get(intent.quote_asset)
-        base_row = assets.get(intent.base_asset)
-        if intent.action == "OPEN_SHORT":
-            if quote_row is None or quote_row.locked > 0:
-                return False
-        elif base_row is None or base_row.locked > 0:
-            return False
-        return True
 
     def _verify_attributed_interest(
         self,
