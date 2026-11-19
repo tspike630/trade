@@ -34,6 +34,12 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from decision_engine.core.bnb_spot_map import classify_listed_symbol
+from decision_engine.core.covariance_beta_sizer import (
+    DEFAULT_MAX_PAIR_CORR,
+    ENV_COV_BETA_SIZER,
+    cov_beta_sizer_enabled,
+    estimate_shrunk_covariance_and_betas,
+)
 
 ENV_INVERSE_VOL_SIZING = "LIVE_BNB_INVERSE_VOL_SIZING"
 ENV_TARGET_STOP_PCT = "LIVE_BNB_TARGET_STOP_PCT"
@@ -263,6 +269,43 @@ def compute_inverse_vol_size(
     )
 
 
+def covariance_open_exposure_block(
+    positions: Sequence[Any],
+    *,
+    purpose: str,
+    symbol: str | None,
+    returns_by_symbol: dict[str, Sequence[float]] | None = None,
+    max_pair_corr: float = DEFAULT_MAX_PAIR_CORR,
+    enabled: bool | None = None,
+) -> str | None:
+    """Continuous shrunk-covariance pairwise correlation guard across open book positions."""
+    is_on = cov_beta_sizer_enabled() if enabled is None else bool(enabled)
+    if not is_on or not returns_by_symbol or not isinstance(symbol, str) or not symbol.strip():
+        return None
+    cand_sym = symbol.strip().upper()
+    model = estimate_shrunk_covariance_and_betas(returns_by_symbol)
+    if model is None or cand_sym not in model.volatility:
+        return None
+    buy_base = base_asset_of(cand_sym)
+    for row in positions:
+        if not isinstance(row, dict):
+            continue
+        row_purpose = str(row.get("purpose") or "").strip()
+        if row_purpose and row_purpose != purpose:
+            continue
+        status = str(row.get("status") or "").strip()
+        if status not in _OPEN_STATUSES:
+            continue
+        held_sym = str(row.get("symbol") or "").strip().upper()
+        held_base = base_asset_of(held_sym)
+        if not held_sym or held_base is None or held_base == buy_base:
+            continue
+        rho = model.pair_correlation(cand_sym, held_sym)
+        if rho is not None and rho >= float(max_pair_corr):
+            return f"covariance_corr_cap:{held_sym}:{rho:.3f}"
+    return None
+
+
 def cluster_open_exposure_block(
     positions: Sequence[Any],
     *,
@@ -270,8 +313,19 @@ def cluster_open_exposure_block(
     symbol: str | None,
     max_open: int | None = None,
     enabled: bool | None = None,
+    returns_by_symbol: dict[str, Sequence[float]] | None = None,
+    max_pair_corr: float = DEFAULT_MAX_PAIR_CORR,
 ) -> str | None:
-    """Return block reason if the open book already holds ``max_open`` symbols in the same beta cluster."""
+    """Return block reason if the open book breaches covariance correlation or sector cluster caps."""
+    cov_block = covariance_open_exposure_block(
+        positions,
+        purpose=purpose,
+        symbol=symbol,
+        returns_by_symbol=returns_by_symbol,
+        max_pair_corr=max_pair_corr,
+    )
+    if cov_block is not None:
+        return cov_block
     is_on = cluster_cap_enabled() if enabled is None else bool(enabled)
     if not is_on:
         return None

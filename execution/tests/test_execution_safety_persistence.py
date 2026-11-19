@@ -143,6 +143,7 @@ class _Exchange:
                     {
                         "symbol": "BNBUSDT",
                         "orderId": 6001,
+                        "side": "SELL",
                         "type": "LIMIT_MAKER",
                         "status": "NEW",
                         "origQty": "1.00",
@@ -151,6 +152,7 @@ class _Exchange:
                     {
                         "symbol": "BNBUSDT",
                         "orderId": 6002,
+                        "side": "SELL",
                         "type": "STOP_LOSS_LIMIT",
                         "status": "NEW",
                         "origQty": "1.00",

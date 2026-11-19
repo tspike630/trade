@@ -2361,6 +2361,50 @@ class BinanceSpotAdapter:
             return False
         return self._list_identity(row) or self._unconfirmed_submit_marker(row)
 
+    def _reread_budget_key(self, row: dict[str, Any]) -> tuple[str, str] | None:
+        list_order = str(row.get("oco_order_list_id") or "").strip()
+        list_client = str(row.get("oco_list_client_id") or "").strip()
+        ident = f"id:{list_order}" if list_order else (f"cid:{list_client}" if list_client else "")
+        if not ident:
+            return None
+        return (self._row_mutex_key(row), ident)
+
+    def _parse_absent_reread_count(self, row: dict[str, Any]) -> int:
+        marker = str(row.get("oco_list_status") or "").strip()
+        if marker.startswith("ABSENT_REREAD_"):
+            suffix = marker[len("ABSENT_REREAD_") :]
+            if suffix.isascii() and suffix.isdigit():
+                return min(_SAME_LIST_REREAD_BUDGET, max(0, int(suffix)))
+        return 0
+
+    def _get_reread_state(self, key: tuple[str, str] | None) -> tuple[int, bool]:
+        if key is None:
+            return (0, False)
+        store = getattr(self, "_reread_budget_state", None)
+        if not isinstance(store, dict):
+            return (0, False)
+        entry = store.get(key)
+        if isinstance(entry, tuple) and len(entry) == 2:
+            return (int(entry[0]), bool(entry[1]))
+        return (0, False)
+
+    def _set_reread_state(self, key: tuple[str, str] | None, seen: int, open_done: bool) -> None:
+        if key is None:
+            return
+        store = getattr(self, "_reread_budget_state", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._reread_budget_state = store
+        store[key] = (int(seen), bool(open_done))
+
+    def _clear_reread_state_for_row(self, row: dict[str, Any]) -> None:
+        store = getattr(self, "_reread_budget_state", None)
+        if not isinstance(store, dict):
+            return
+        row_key = self._row_mutex_key(row)
+        for k in [k for k in store if k[0] == row_key]:
+            store.pop(k, None)
+
     def _persist_readback_hold(
         self,
         row: dict[str, Any],
@@ -2384,6 +2428,9 @@ class BinanceSpotAdapter:
             "last_error": stored,
             "manual_action": "halt_new_buys_and_manually_close_or_protect_the_fill",
         }
+        seen_2018 = row.get("_reread_2018_seen")
+        if isinstance(seen_2018, int) and seen_2018 > 0 and stored == "oco_list_absent:-2018":
+            fields["oco_list_status"] = f"ABSENT_REREAD_{min(_SAME_LIST_REREAD_BUDGET, seen_2018)}"
         if held_qty and held_qty not in {"0", "0.0", "0.00"}:
             fields["unprotected_qty"] = held_qty
         save(fields)
@@ -2399,7 +2446,13 @@ class BinanceSpotAdapter:
         raw = recon.get("raw_payload")
         return raw if isinstance(raw, dict) else {}
 
-    def _identity_conflict(self, row: dict[str, Any], recon: dict[str, Any]) -> str | None:
+    def _identity_conflict(
+        self,
+        row: dict[str, Any],
+        recon: dict[str, Any],
+        *,
+        require_explicit_side: bool = False,
+    ) -> str | None:
         """A body that names a different symbol, list, or leg. Missing fields do not conflict."""
         raw = self._list_payload(recon)
         reported = str(raw.get("symbol") or "").strip().upper()
@@ -2422,9 +2475,9 @@ class BinanceSpotAdapter:
             got = str(recon.get(got_key) or "").strip()
             if stored and got and stored != got:
                 return "oco_readback_list_mismatch"
-        return self._side_conflict(recon)
+        return self._side_conflict(recon, require_explicit=require_explicit_side)
 
-    def _side_conflict(self, recon: dict[str, Any]) -> str | None:
+    def _side_conflict(self, recon: dict[str, Any], *, require_explicit: bool = False) -> str | None:
         raw = self._list_payload(recon)
         if "side" in raw and str(raw.get("side") or "").strip().upper() != "SELL":
             return "oco_readback_side_mismatch"
@@ -2434,14 +2487,22 @@ class BinanceSpotAdapter:
                 if isinstance(ord_item, dict) and "side" in ord_item:
                     if str(ord_item.get("side") or "").strip().upper() != "SELL":
                         return "oco_readback_side_mismatch"
+        saw_explicit_sell_leg = False
         for reports_list in (raw.get("orderReports"), recon.get("order_reports")):
             if not isinstance(reports_list, list):
                 continue
             for leg in reports_list:
-                if not isinstance(leg, dict) or "side" not in leg:
+                if not isinstance(leg, dict):
+                    return "oco_readback_side_mismatch"
+                if "side" not in leg:
+                    if require_explicit:
+                        return "oco_readback_side_mismatch"
                     continue
                 if str(leg.get("side") or "").strip().upper() != "SELL":
                     return "oco_readback_side_mismatch"
+                saw_explicit_sell_leg = True
+        if require_explicit and not saw_explicit_sell_leg:
+            return "oco_readback_side_mismatch"
         return None
 
     def _protective_claim(self, row: dict[str, Any], recon: dict[str, Any]) -> bool:
@@ -2452,7 +2513,7 @@ class BinanceSpotAdapter:
         account uid; the query is the adapter's signed key, and the symbol
         plus list identity are what this body can prove.
         """
-        if self._identity_conflict(row, recon):
+        if self._identity_conflict(row, recon, require_explicit_side=True):
             return False
         raw = self._list_payload(recon)
         if not str(raw.get("symbol") or "").strip():
@@ -5707,13 +5768,27 @@ class BinanceSpotAdapter:
                 recon = self._reread_same_list(row)
             else:
                 recon = self._reconcile_oco(row)
+                if (
+                    str(recon.get("state") or "") == "absent"
+                    and str(recon.get("error") or "") == "oco_list_absent:-2018"
+                    and self._readback_hold_row(row, status)
+                ):
+                    bkey = self._reread_budget_key(row)
+                    prior_seen = max(
+                        self._parse_absent_reread_count(row),
+                        self._get_reread_state(bkey)[0],
+                    )
+                    next_seen = min(_SAME_LIST_REREAD_BUDGET, prior_seen + 1)
+                    self._set_reread_state(bkey, next_seen, next_seen >= _SAME_LIST_REREAD_BUDGET)
+                    row["_reread_2018_seen"] = next_seen
             state = str(recon.get("state") or "")
             if state in {"working", "partial_working"}:
-                side_err = self._side_conflict(recon)
+                claim_required = self._claim_gate(row, status)
+                side_err = self._side_conflict(recon, require_explicit=claim_required)
                 if side_err:
                     return self._persist_readback_hold(row, save, side_err)
-                if self._claim_gate(row, status):
-                    conflict = self._identity_conflict(row, recon)
+                if claim_required:
+                    conflict = self._identity_conflict(row, recon, require_explicit_side=True)
                     if conflict or not self._protective_claim(row, recon):
                         return self._persist_readback_hold(
                             row,
@@ -5765,7 +5840,7 @@ class BinanceSpotAdapter:
                 )
             if state == "filled":
                 if self._claim_gate(row, status):
-                    conflict = self._identity_conflict(row, recon)
+                    conflict = self._identity_conflict(row, recon, require_explicit_side=True)
                     raw_list = self._list_payload(recon)
                     reports = raw_list.get("orderReports") if isinstance(raw_list.get("orderReports"), list) else None
                     if conflict or not reports:
@@ -5776,6 +5851,7 @@ class BinanceSpotAdapter:
                         )
                 fields = self._official_oco_fill_fields(row, recon)
                 if fields is not None:
+                    self._clear_reread_state_for_row(row)
                     save(fields)
                     return self._coverage(
                         row,
@@ -7899,30 +7975,48 @@ class BinanceSpotAdapter:
         return fields
 
     def _reread_same_list(self, row: dict[str, Any]) -> dict[str, Any]:
-        """Read this row's list at most twice, then stop.
+        """Read this row's list at most twice across passes, then stop.
 
         The second ``GET /api/v3/orderList`` uses the same stored id and runs
         only after the confirmed HTTP 400 / -2018 miss. A timeout, 404, -2013,
         418, 429, or 5xx stops after the first read. One ``open_orders`` read
-        may follow two confirmed misses. It does not POST, sell, or restore
-        protection; only a later matching list body can do that.
+        may follow two confirmed misses. Once two confirmed misses are recorded
+        (in ledger or adapter memory), stale in-memory rows do not spend new
+        GETs. It does not POST, sell, or restore protection.
         """
-        seen = 0
+        if not self._gates().get("live_enabled"):
+            return {"state": "requery_failed", "error": "binance_spot_live_disabled"}
+        bkey = self._reread_budget_key(row)
+        persisted_seen = self._parse_absent_reread_count(row)
+        mem_seen, mem_open_done = self._get_reread_state(bkey)
+        seen = max(persisted_seen, mem_seen)
+        open_done = mem_open_done or (persisted_seen >= _SAME_LIST_REREAD_BUDGET)
+        if seen >= _SAME_LIST_REREAD_BUDGET:
+            if not open_done:
+                self._read_open_orders_once(row)
+                open_done = True
+            self._set_reread_state(bkey, seen, open_done)
+            row["_reread_2018_seen"] = seen
+            return {"state": "absent", "error": "oco_list_absent:-2018"}
         latest = self._reconcile_oco(row)
-        seen += 1
         while (
-            seen < _SAME_LIST_REREAD_BUDGET
-            and str(latest.get("state") or "") == "absent"
+            str(latest.get("state") or "") == "absent"
             and str(latest.get("error") or "") == "oco_list_absent:-2018"
         ):
-            latest = self._reconcile_oco(row)
             seen += 1
+            self._set_reread_state(bkey, seen, open_done)
+            row["_reread_2018_seen"] = seen
+            if seen >= _SAME_LIST_REREAD_BUDGET:
+                break
+            latest = self._reconcile_oco(row)
         if (
-            seen == _SAME_LIST_REREAD_BUDGET
+            seen >= _SAME_LIST_REREAD_BUDGET
             and str(latest.get("state") or "") == "absent"
             and str(latest.get("error") or "") == "oco_list_absent:-2018"
+            and not open_done
         ):
             self._read_open_orders_once(row)
+            self._set_reread_state(bkey, seen, True)
         return latest
 
     def _read_open_orders_once(self, row: dict[str, Any]) -> None:
@@ -8148,6 +8242,7 @@ class BinanceSpotAdapter:
                 fields.update({col: None for col in OCO_READBACK_COLUMNS})
         elif any(row.get(col) not in (None, "") for col in OCO_READBACK_COLUMNS):
             fields.update({col: None for col in OCO_READBACK_COLUMNS})
+        self._clear_reread_state_for_row(row)
         save(fields)
         row.update(fields)
         partial = fields["status"] == "oco_partial"

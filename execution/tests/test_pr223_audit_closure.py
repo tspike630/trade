@@ -1060,14 +1060,188 @@ class Pr223AuditClosureTests(unittest.TestCase):
                 "get_order_list",
                 "get_order_list",
                 "open_orders",
-                "get_order_list",
-                "get_order_list",
-                "open_orders",
             ],
         )
         self.assertEqual(shared_saved["status"], "oco_unknown")
         self.assertEqual(shared_saved["unprotected_qty"], "1.23")
         self.assertEqual(shared_saved["last_error"], "oco_list_absent:-2018")
+
+    def test_t340_missing_side_key_on_legs_never_claims_or_clears_unprotected_qty(self) -> None:
+        """t340 Blocker 1: Omitting the 'side' key from one or both orderReports legs never claims oco_working or clears unprotected_qty."""
+        from decimal import Decimal
+        from execution.executors.binance_spot_gate import oco_readback_covers
+
+        base_row = {
+            "id": 95,
+            "decision_log_id": 85,
+            "symbol": "BNBUSDT",
+            "status": "oco_unknown",
+            "protection": PROTECTION_PENDING,
+            "quantity": "1.23",
+            "stop_price": "99.00",
+            "take_profit_price": "110.00",
+            "entry_order_id": "99",
+            "oco_order_list_id": "42",
+            "oco_list_client_id": "bnbfade-ol-85",
+            "oco_above_order_id": "11",
+            "oco_below_order_id": "10",
+            "unprotected_qty": "1.23",
+            "manual_action": "halt_new_buys_and_manually_close_or_protect_the_fill",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+
+        for mode in ("both_missing_side", "above_missing_side", "below_missing_side"):
+            with self.subTest(mode=mode):
+                body = _live_oco_body(
+                    symbol="BNBUSDT",
+                    list_id=42,
+                    client_id="bnbfade-ol-85",
+                    above_id=11,
+                    below_id=10,
+                    qty="1.23",
+                )
+                if mode in ("both_missing_side", "above_missing_side"):
+                    body["orderReports"][0].pop("side", None)
+                if mode in ("both_missing_side", "below_missing_side"):
+                    body["orderReports"][1].pop("side", None)
+
+                self.assertFalse(
+                    oco_readback_covers(
+                        body,
+                        symbol="BNBUSDT",
+                        held_net=Decimal("1.23"),
+                        list_id="42",
+                        above_id="11",
+                        below_id="10",
+                    )
+                )
+
+                class _NoSideLegClient:
+                    def exchange_info(self, symbol: str) -> dict[str, Any]:
+                        return _EXCHANGE_INFO
+
+                    def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                        return body
+
+                    def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                        raise AssertionError("missing-side readback must never post new_oco")
+
+                    def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                        raise AssertionError("missing-side readback must never sell")
+
+                saved = dict(base_row)
+                with mock.patch.dict(os.environ, self.base_env, clear=False):
+                    out = _make_adapter_bound(
+                        self.absent_kill, _NoSideLegClient(), auto_flatten=True
+                    ).maintain_held_position(
+                        dict(base_row),
+                        "102.00",
+                        persist=lambda f, s=saved: (s.update(f), dict(s))[1],
+                    )
+                self.assertEqual(out["book"], "oco_unknown")
+                self.assertEqual(saved["status"], "oco_unknown")
+                self.assertEqual(saved["last_error"], "oco_readback_side_mismatch")
+                self.assertEqual(saved["unprotected_qty"], "1.23")
+                self.assertEqual(
+                    saved["manual_action"],
+                    "halt_new_buys_and_manually_close_or_protect_the_fill",
+                )
+
+    def test_t340_stale_in_memory_row_and_sqlite_restart_exhaust_reread_budget(self) -> None:
+        """t340 Blocker 2: Neither a stale in-memory row nor a restarted SQLite row spends >2 get_order_list GETs across passes."""
+        miss_2018 = BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+        calls: list[str] = []
+
+        class _StrictTwoReadClient:
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _EXCHANGE_INFO
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                calls.append("get_order_list")
+                if calls.count("get_order_list") > 2:
+                    raise AssertionError("total get_order_list calls exceeded bounded 2-GET budget")
+                raise miss_2018
+
+            def open_orders(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+                calls.append("open_orders")
+                if calls.count("open_orders") > 1:
+                    raise AssertionError("open_orders exceeded 1-GET budget")
+                return []
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise AssertionError("must never post new_oco")
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                raise AssertionError("must never sell")
+
+        db_path = Path(self._tmp.name) / "t340_budget.db"
+        ledger = ExecutionLedger(db_path)
+        armed = ledger.arm_binance_spot_position(
+            {
+                "decision_log_id": 88,
+                "symbol": "BNBUSDT",
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "status": "oco_unknown",
+                "protection": PROTECTION_PENDING,
+                "quantity": "1.23",
+                "stop_price": "99.00",
+                "take_profit_price": "110.00",
+                "entry_price": "102.00",
+                "entry_order_id": "99",
+            }
+        )
+        pid = int(armed["id"])
+        stale_row = dict(
+            ledger.update_binance_spot_position(
+                pid,
+                {
+                    "status": "oco_unknown",
+                    "protection": PROTECTION_PENDING,
+                    "oco_order_list_id": "42",
+                    "oco_list_client_id": "bnbfade-ol-88",
+                    "oco_above_order_id": "11",
+                    "oco_below_order_id": "10",
+                },
+            )
+            or {}
+        )
+        adapter = _make_adapter_bound(self.absent_kill, _StrictTwoReadClient(), auto_flatten=True)
+        with mock.patch.dict(os.environ, self.base_env, clear=False):
+            # Pass 1 consumes the 2-GET reread budget + 1 open_orders read
+            p1 = adapter.maintain_held_position(
+                dict(stale_row),
+                "102.00",
+                persist=lambda f: ledger.update_binance_spot_position(pid, f),
+            )
+            # Pass 2 deliberately feeds the STALE in-memory row again -> 0 extra GETs!
+            p2 = adapter.maintain_held_position(
+                dict(stale_row),
+                "90.00",
+                persist=lambda f: ledger.update_binance_spot_position(pid, f),
+            )
+        self.assertEqual(p1["book"], "oco_unknown")
+        self.assertEqual(p2["book"], "oco_unknown")
+        self.assertEqual(p2["error"], "oco_list_absent:-2018")
+        self.assertEqual(calls, ["get_order_list", "get_order_list", "open_orders"])
+        ledger.close()
+
+        # Pass 3: Reopen SQLite ledger in a brand-new adapter -> still 0 extra GETs!
+        reopened = ExecutionLedger(db_path)
+        fresh_adapter = _make_adapter_bound(self.absent_kill, _StrictTwoReadClient(), auto_flatten=True)
+        with mock.patch.dict(os.environ, self.base_env, clear=False):
+            p3 = fresh_adapter.maintain_held_position(
+                dict(reopened.binance_spot_position_by_id(pid) or {}),
+                "90.00",
+                persist=lambda f: reopened.update_binance_spot_position(pid, f),
+            )
+        self.assertEqual(p3["book"], "oco_unknown")
+        self.assertEqual(p3["error"], "oco_list_absent:-2018")
+        self.assertEqual(calls, ["get_order_list", "get_order_list", "open_orders"])
+        persisted_final = reopened.binance_spot_position_by_id(pid)
+        assert persisted_final is not None
+        self.assertEqual(persisted_final["unprotected_qty"], "1.23")
+        reopened.close()
+
 
 if __name__ == "__main__":
     unittest.main()

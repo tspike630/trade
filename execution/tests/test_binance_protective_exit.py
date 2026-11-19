@@ -112,6 +112,7 @@ def _live_cover(
             {
                 "symbol": symbol,
                 "orderId": above,
+                "side": "SELL",
                 "type": "LIMIT_MAKER",
                 "status": "NEW",
                 "origQty": qty,
@@ -120,6 +121,7 @@ def _live_cover(
             {
                 "symbol": symbol,
                 "orderId": below,
+                "side": "SELL",
                 "type": "STOP_LOSS_LIMIT",
                 "status": "NEW",
                 "origQty": qty,
@@ -1237,7 +1239,7 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
         self.assertEqual(outside["error"], "oco_list_absent:-2018")
         self.assertFalse(outside["submitted"], outside)
         self.assertEqual(inside["book"], "oco_unknown", inside)
-        self.assertEqual([call[0] for call in client.calls].count("get_order_list"), 4)
+        self.assertEqual([call[0] for call in client.calls].count("get_order_list"), 2)
         self.assertNotIn("new_oco", [call[0] for call in client.calls])
         self.assertNotIn("new_order", [call[0] for call in client.calls])
         self.assertEqual(saved["status"], "oco_unknown")

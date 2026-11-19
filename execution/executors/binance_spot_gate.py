@@ -1174,6 +1174,14 @@ def oco_readback_covers(
         return False
     if wanted_above == wanted_below:
         return False
+    if "side" in payload and str(payload.get("side") or "").strip().upper() != "SELL":
+        return False
+    orders_list = payload.get("orders")
+    if isinstance(orders_list, list):
+        for ord_item in orders_list:
+            if isinstance(ord_item, dict) and "side" in ord_item:
+                if str(ord_item.get("side") or "").strip().upper() != "SELL":
+                    return False
     reports = payload.get("orderReports")
     if not isinstance(reports, list):
         return False
@@ -1194,6 +1202,8 @@ def oco_readback_covers(
     if str(below.get("orderId") or "").strip() != wanted_below:
         return False
     for leg in (above, below):
+        if str(leg.get("side") or "").strip().upper() != "SELL":
+            return False
         if str(leg.get("symbol") or reported).strip().upper() != reported:
             return False
         if str(leg.get("status") or "").upper() not in _LIVE_LEG_STATUS:

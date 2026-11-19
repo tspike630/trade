@@ -39,6 +39,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from execution.markout_tca import read_markout_summary_ro  # noqa: E402
 from execution.slippage_report import percentile, summarize  # noqa: E402
 
 DEFAULT_ROUND_TRIP_FEE_BPS = 20.0  # 10 bps entry + 10 bps exit
@@ -329,6 +330,7 @@ def build_tca_report(
     sl_total = exit_counts.get("stop_loss", 0)
     decided_total = tp_total + sl_total
     ob_source_total = ws_l2_hits + rest_fallback_hits
+    markout_summary = read_markout_summary_ro(ledger_path)
 
     return {
         "report": "binance_spot_tca",
@@ -344,6 +346,7 @@ def build_tca_report(
             "exchange_error_codes": dict(sorted(exchange_error_codes.items())),
         },
         "implementation_shortfall_bps": summarize(shortfall_bps_list),
+        "markout_toxicity": markout_summary,
         "pre_trade_orderbook": {
             "spread_bps": summarize(orderbook_spreads),
             "impact_bps": summarize(orderbook_impacts),
@@ -405,6 +408,18 @@ def format_tca_markdown(report: dict[str, Any]) -> str:
         f"- **Take-Profit**: `{perf['take_profit_count']}` | **Stop-Loss**: `{perf['stop_loss_count']}` | **Win Rate**: `{_f(perf['win_rate'] * 100.0 if perf['win_rate'] is not None else None)}%`",
         f"- **Mean Net Return**: `{_f(net_stats['mean'])} bps` | **P50 Net Return**: `{_f(net_stats['p50'])} bps`",
     ]
+    mk = report.get("markout_toxicity")
+    if isinstance(mk, dict) and int(mk.get("observations_total") or 0) > 0:
+        m5 = mk.get("markout_5s_bps") or {}
+        m60 = mk.get("markout_60s_bps") or {}
+        tox = mk.get("toxic_fill_rate_5s")
+        lines.extend(
+            [
+                "",
+                "## 4. Post-Fill Markout & Adverse Selection (5s / 60s)",
+                f"- **Observations**: `{mk['observations_total']}` | **Mean 5s Markout**: `{_f(m5.get('mean'))} bps` | **Mean 60s Markout**: `{_f(m60.get('mean'))} bps` | **5s Toxic Fill Rate**: `{_f(tox * 100.0 if tox is not None else None)}%`",
+            ]
+        )
     return "\n".join(lines) + "\n"
 
 

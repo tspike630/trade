@@ -139,6 +139,7 @@ class _Client:
         body["symbol"] = symbol
         for report in body["orderReports"]:
             report["symbol"] = symbol
+            report["side"] = "SELL"
             report["origQty"] = "100"
             report["executedQty"] = "0"
             report["status"] = "NEW"
@@ -1643,6 +1644,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 {
                     "symbol": "BNBUSDT",
                     "orderId": 11,
+                    "side": "SELL",
                     "type": "LIMIT_MAKER",
                     "status": "NEW",
                     "origQty": "0.25",
@@ -1651,6 +1653,7 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                 {
                     "symbol": "BNBUSDT",
                     "orderId": 10,
+                    "side": "SELL",
                     "type": "STOP_LOSS_LIMIT",
                     "status": "NEW",
                     "origQty": "0.25",
@@ -1808,8 +1811,8 @@ class ClassicGatewayProtectionTests(unittest.TestCase):
                     "listOrderStatus": "EXECUTING",
                     "listStatusType": "EXEC_STARTED",
                     "orderReports": [
-                        {"symbol": symbol, "orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "origQty": qty, "executedQty": "0"},
-                        {"symbol": symbol, "orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "origQty": qty, "executedQty": "0"},
+                        {"symbol": symbol, "orderId": 11, "side": "SELL", "type": "LIMIT_MAKER", "status": "NEW", "origQty": qty, "executedQty": "0"},
+                        {"symbol": symbol, "orderId": 10, "side": "SELL", "type": "STOP_LOSS_LIMIT", "status": "NEW", "origQty": qty, "executedQty": "0"},
                     ],
                 }
 
