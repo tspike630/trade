@@ -40,7 +40,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from execution.margin_cross.api_semantics import CROSS_ISOLATED_FLAG, NO_SIDE_EFFECT
+from execution.margin_cross.api_semantics import (
+    CLIENT_ID_RE,
+    CROSS_ISOLATED_FLAG,
+    NO_SIDE_EFFECT,
+    ORDER_SIDES,
+    ORDER_TYPES,
+    TIME_IN_FORCE,
+)
 from execution.margin_cross.errors import (
     LiveNetworkDisabled,
     MarginExchangeError,
@@ -216,7 +223,8 @@ class BinanceCrossMarginHttpClient:
             environ=self._environ,
             approved_config=self._approved_config,
             now_ms=int(self._clock_ms()),
-            expected_account_uid=self.account_uid or None,
+            expected_account_uid=self.account_uid,
+            require_bound_uid=True,
         )
         if reasons:
             raise LiveNetworkDisabled(f"live_{label}_blocked:{reasons[0]}")
@@ -325,8 +333,12 @@ class BinanceCrossMarginHttpClient:
 
     @staticmethod
     def _require_cross_payload(payload: Mapping[str, Any], *, forbid_symbol: bool = False) -> None:
+        if not isinstance(payload, Mapping):
+            raise MarginExchangeError(-1102, "payload_must_be_mapping")
         if payload.get("isIsolated") != CROSS_ISOLATED_FLAG:
             raise MarginExchangeError(-1102, "isIsolated must be FALSE for cross margin")
+        if "isolatedSymbol" in payload:
+            raise MarginExchangeError(-1102, "isolatedSymbol forbidden on cross margin")
         if forbid_symbol and "symbol" in payload:
             raise MarginExchangeError(-1102, "symbol is isolated-only")
 
@@ -337,7 +349,34 @@ class BinanceCrossMarginHttpClient:
         if "autoRepayAtCancel" in payload:
             raise MarginExchangeError(-1102, "autoRepayAtCancel forbidden on explicit track")
 
+    @staticmethod
+    def _require_token(raw_val: object, field: str) -> str:
+        if not isinstance(raw_val, str) or not raw_val.strip():
+            raise MarginExchangeError(-1102, f"{field}_required")
+        cleaned = raw_val.strip()
+        if not cleaned.isalnum() or len(cleaned) > 30:
+            raise MarginExchangeError(-1102, f"{field}_invalid")
+        return cleaned
+
+    @staticmethod
+    def _require_positive_amount(payload: Mapping[str, Any], field: str) -> Decimal:
+        raw_val = payload.get(field)
+        if isinstance(raw_val, bool) or raw_val is None or raw_val == "":
+            raise MarginExchangeError(-1102, f"{field}_required")
+        val, err = parse_decimal(raw_val, field)
+        if err or val is None or val <= 0:
+            raise MarginExchangeError(-1102, f"positive_{field}_required")
+        return val
+
+    @staticmethod
+    def _require_client_id_field(payload: Mapping[str, Any], field: str) -> str:
+        raw_val = payload.get(field)
+        if not isinstance(raw_val, str) or CLIENT_ID_RE.fullmatch(raw_val) is None:
+            raise MarginExchangeError(-1102, f"{field}_invalid")
+        return raw_val
+
     def query_account(self) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
         raw = self._request_json(
             method_label="query_account",
             http_method="GET",
@@ -346,8 +385,6 @@ class BinanceCrossMarginHttpClient:
         if not isinstance(raw, dict):
             raise MarginExchangeError(-1000, "account_payload_invalid")
         out = dict(raw)
-        # On a zero-liability Cross Margin account, Binance may report
-        # marginLevel="0.00000000" with marginLevelStatus="EXCESSIVE".
         level, level_err = parse_decimal(out.get("marginLevel"), "marginLevel")
         total_liab, liab_err = parse_decimal(
             out.get("totalLiabilityOfBtc", "0"), "totalLiabilityOfBtc"
@@ -366,11 +403,12 @@ class BinanceCrossMarginHttpClient:
         return out
 
     def query_max_borrow(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
+        if not isinstance(payload, Mapping):
+            raise MarginExchangeError(-1102, "payload_must_be_mapping")
         if "isolatedSymbol" in payload:
             raise MarginExchangeError(-1102, "isolatedSymbol forbidden on cross margin")
-        asset = str(payload.get("asset") or "").strip()
-        if not asset:
-            raise MarginExchangeError(-1102, "asset_required")
+        asset = self._require_token(payload.get("asset"), "asset")
         raw = self._request_json(
             method_label="query_max_borrow",
             http_method="GET",
@@ -382,6 +420,7 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def query_hourly_interest(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
         self._require_cross_payload(payload)
         assets = str(payload.get("assets") or "").strip()
         if not assets:
@@ -397,12 +436,17 @@ class BinanceCrossMarginHttpClient:
         return [dict(item) for item in raw if isinstance(item, Mapping)]
 
     def query_interest_history(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
+        if not isinstance(payload, Mapping):
+            raise MarginExchangeError(-1102, "payload_must_be_mapping")
         if "isolatedSymbol" in payload:
             raise MarginExchangeError(-1102, "isolatedSymbol forbidden on cross margin")
         params: dict[str, Any] = {}
-        for key in ("asset", "startTime", "endTime", "current", "size"):
+        if payload.get("asset") not in (None, ""):
+            params["asset"] = self._require_token(payload.get("asset"), "asset")
+        for key in ("startTime", "endTime", "current", "size"):
             if payload.get(key) not in (None, ""):
-                params[key] = payload[key]
+                params[key] = str(payload[key]).strip()
         raw = self._request_json(
             method_label="query_interest_history",
             http_method="GET",
@@ -414,6 +458,9 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def query_borrow_repay(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
+        if not isinstance(payload, Mapping):
+            raise MarginExchangeError(-1102, "payload_must_be_mapping")
         if "isolatedSymbol" in payload:
             raise MarginExchangeError(-1102, "isolatedSymbol forbidden on cross margin")
         kind = str(payload.get("type") or "").strip()
@@ -421,7 +468,7 @@ class BinanceCrossMarginHttpClient:
             raise MarginExchangeError(-1102, "borrow_repay_type_invalid")
         params: dict[str, Any] = {"type": kind}
         if payload.get("asset") not in (None, ""):
-            params["asset"] = str(payload["asset"]).strip()
+            params["asset"] = self._require_token(payload.get("asset"), "asset")
         if payload.get("txId") not in (None, ""):
             params["txId"] = str(payload["txId"]).strip()
         elif payload.get("startTime") not in (None, ""):
@@ -442,15 +489,19 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def query_order(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
         self._require_cross_payload(payload)
+        symbol = self._require_token(payload.get("symbol"), "symbol")
         params: dict[str, Any] = {
-            "symbol": str(payload.get("symbol") or ""),
+            "symbol": symbol,
             "isIsolated": CROSS_ISOLATED_FLAG,
         }
         if payload.get("orderId") not in (None, ""):
-            params["orderId"] = str(payload["orderId"])
+            params["orderId"] = str(payload["orderId"]).strip()
         elif payload.get("origClientOrderId") not in (None, ""):
-            params["origClientOrderId"] = str(payload["origClientOrderId"])
+            params["origClientOrderId"] = self._require_client_id_field(
+                payload, "origClientOrderId"
+            )
         else:
             raise MarginExchangeError(-1102, "order_identifier_required")
         raw = self._request_json(
@@ -464,16 +515,21 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def query_oco(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
+        if not isinstance(payload, Mapping):
+            raise MarginExchangeError(-1102, "payload_must_be_mapping")
+        if "isolatedSymbol" in payload or "symbol" in payload:
+            raise MarginExchangeError(-1102, "symbol_forbidden_on_cross_margin_query_oco")
         is_iso = str(payload.get("isIsolated") or CROSS_ISOLATED_FLAG)
         if is_iso != CROSS_ISOLATED_FLAG:
             raise MarginExchangeError(-1102, "isIsolated must be FALSE for cross margin")
-        # Official Margin REST docs require symbol when isIsolated="TRUE" and mark it
-        # optional on Cross Margin (isIsolated="FALSE"); omitted locally by policy.
         params: dict[str, Any] = {"isIsolated": CROSS_ISOLATED_FLAG}
         if payload.get("orderListId") not in (None, ""):
-            params["orderListId"] = str(payload["orderListId"])
+            params["orderListId"] = str(payload["orderListId"]).strip()
         elif payload.get("origClientOrderId") not in (None, ""):
-            params["origClientOrderId"] = str(payload["origClientOrderId"])
+            params["origClientOrderId"] = self._require_client_id_field(
+                payload, "origClientOrderId"
+            )
         else:
             raise MarginExchangeError(-1102, "order_list_identifier_required")
         raw = self._request_json(
@@ -487,10 +543,11 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def query_open_orders(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
         self._require_cross_payload(payload)
         params: dict[str, Any] = {"isIsolated": CROSS_ISOLATED_FLAG}
         if payload.get("symbol") not in (None, ""):
-            params["symbol"] = str(payload["symbol"])
+            params["symbol"] = self._require_token(payload.get("symbol"), "symbol")
         raw = self._request_json(
             method_label="query_open_orders",
             http_method="GET",
@@ -502,16 +559,19 @@ class BinanceCrossMarginHttpClient:
         return [dict(item) for item in raw if isinstance(item, Mapping)]
 
     def query_trades(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-        symbol = str(payload.get("symbol") or "").strip()
-        if not symbol:
-            raise MarginExchangeError(-1102, "symbol_required")
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
+        if not isinstance(payload, Mapping):
+            raise MarginExchangeError(-1102, "payload_must_be_mapping")
+        if "isolatedSymbol" in payload:
+            raise MarginExchangeError(-1102, "isolatedSymbol forbidden on cross margin")
+        symbol = self._require_token(payload.get("symbol"), "symbol")
         is_iso = str(payload.get("isIsolated") or CROSS_ISOLATED_FLAG)
         if is_iso != CROSS_ISOLATED_FLAG:
             raise MarginExchangeError(-1102, "isIsolated must be FALSE for cross margin")
         params: dict[str, Any] = {"symbol": symbol, "isIsolated": CROSS_ISOLATED_FLAG}
         for opt in ("orderId", "startTime", "endTime", "fromId", "limit"):
             if payload.get(opt) not in (None, ""):
-                params[opt] = str(payload[opt])
+                params[opt] = str(payload[opt]).strip()
         raw = self._request_json(
             method_label="query_trades",
             http_method="GET",
@@ -527,12 +587,21 @@ class BinanceCrossMarginHttpClient:
         self._require_cross_payload(payload, forbid_symbol=True)
         if payload.get("type") != "BORROW":
             raise MarginExchangeError(-1102, "type must be BORROW")
+        asset = self._require_token(payload.get("asset"), "asset")
+        amount = self._require_positive_amount(payload, "amount")
+        clean_params = {
+            "asset": asset,
+            "isIsolated": CROSS_ISOLATED_FLAG,
+            "amount": api_amount(amount),
+            "type": "BORROW",
+        }
         self._space_borrow_repay()
         raw = self._request_json(
             method_label="borrow",
             http_method="POST",
             path=MARGIN_BORROW_REPAY_PATH,
-            params=payload,
+            params=clean_params,
+            for_protective_or_repay=False,
         )
         if not isinstance(raw, dict):
             raise MarginExchangeError(-1000, "borrow_response_invalid")
@@ -543,12 +612,21 @@ class BinanceCrossMarginHttpClient:
         self._require_cross_payload(payload, forbid_symbol=True)
         if payload.get("type") != "REPAY":
             raise MarginExchangeError(-1102, "type must be REPAY")
+        asset = self._require_token(payload.get("asset"), "asset")
+        amount = self._require_positive_amount(payload, "amount")
+        clean_params = {
+            "asset": asset,
+            "isIsolated": CROSS_ISOLATED_FLAG,
+            "amount": api_amount(amount),
+            "type": "REPAY",
+        }
         self._space_borrow_repay()
         raw = self._request_json(
             method_label="repay",
             http_method="POST",
             path=MARGIN_BORROW_REPAY_PATH,
-            params=payload,
+            params=clean_params,
+            for_protective_or_repay=True,
         )
         if not isinstance(raw, dict):
             raise MarginExchangeError(-1000, "repay_response_invalid")
@@ -556,17 +634,37 @@ class BinanceCrossMarginHttpClient:
 
     def new_order(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         is_flatten_ioc = (
-            str(payload.get("timeInForce") or "") == "IOC"
+            isinstance(payload, Mapping)
+            and str(payload.get("timeInForce") or "") == "IOC"
             and str(payload.get("newClientOrderId") or "").endswith("-flatten")
         )
         self._require_live_write_gate(for_protective_or_repay=is_flatten_ioc)
         self._require_cross_payload(payload)
         self._require_no_side_effect(payload)
+        if "quoteOrderQty" in payload:
+            raise MarginExchangeError(-1102, "quoteOrderQty_forbidden")
+        symbol = self._require_token(payload.get("symbol"), "symbol")
+        side = str(payload.get("side") or "")
+        if side not in ORDER_SIDES:
+            raise MarginExchangeError(-1102, "side_invalid")
+        otype = str(payload.get("type") or "")
+        if otype not in ORDER_TYPES:
+            raise MarginExchangeError(-1102, "order_type_invalid")
+        self._require_positive_amount(payload, "quantity")
+        self._require_client_id_field(payload, "newClientOrderId")
+        if otype in {"LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT", "LIMIT_MAKER"}:
+            self._require_positive_amount(payload, "price")
+        if otype in {"LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"}:
+            if str(payload.get("timeInForce") or "") not in TIME_IN_FORCE:
+                raise MarginExchangeError(-1102, "timeInForce_invalid")
+        if otype in {"STOP_LOSS", "STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"}:
+            self._require_positive_amount(payload, "stopPrice")
         raw = self._request_json(
             method_label="new_order",
             http_method="POST",
             path=MARGIN_ORDER_PATH,
             params=payload,
+            for_protective_or_repay=is_flatten_ioc,
         )
         if not isinstance(raw, dict):
             raise MarginExchangeError(-1000, "new_order_response_invalid")
@@ -575,11 +673,19 @@ class BinanceCrossMarginHttpClient:
     def cancel_order(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         self._require_live_write_gate(for_protective_or_repay=True)
         self._require_cross_payload(payload)
+        self._require_token(payload.get("symbol"), "symbol")
+        has_oid = payload.get("orderId") not in (None, "")
+        has_cid = payload.get("origClientOrderId") not in (None, "")
+        if not has_oid and not has_cid:
+            raise MarginExchangeError(-1102, "order_identifier_required")
+        if has_cid:
+            self._require_client_id_field(payload, "origClientOrderId")
         raw = self._request_json(
             method_label="cancel_order",
             http_method="DELETE",
             path=MARGIN_ORDER_PATH,
             params=payload,
+            for_protective_or_repay=True,
         )
         if not isinstance(raw, dict):
             raise MarginExchangeError(-1000, "cancel_order_response_invalid")
@@ -589,11 +695,26 @@ class BinanceCrossMarginHttpClient:
         self._require_live_write_gate(for_protective_or_repay=True)
         self._require_cross_payload(payload)
         self._require_no_side_effect(payload)
+        self._require_token(payload.get("symbol"), "symbol")
+        if str(payload.get("side") or "") not in ORDER_SIDES:
+            raise MarginExchangeError(-1102, "side_invalid")
+        self._require_positive_amount(payload, "quantity")
+        self._require_positive_amount(payload, "price")
+        self._require_positive_amount(payload, "stopPrice")
+        self._require_positive_amount(payload, "stopLimitPrice")
+        if str(payload.get("stopLimitTimeInForce") or "") not in TIME_IN_FORCE:
+            raise MarginExchangeError(-1102, "stopLimitTimeInForce_invalid")
+        l_cid = self._require_client_id_field(payload, "listClientOrderId")
+        lim_cid = self._require_client_id_field(payload, "limitClientOrderId")
+        stp_cid = self._require_client_id_field(payload, "stopClientOrderId")
+        if len({l_cid, lim_cid, stp_cid}) != 3:
+            raise MarginExchangeError(-1102, "oco_client_ids_must_be_distinct")
         raw = self._request_json(
             method_label="new_oco",
             http_method="POST",
             path=MARGIN_OCO_PATH,
             params=payload,
+            for_protective_or_repay=True,
         )
         if not isinstance(raw, dict):
             raise MarginExchangeError(-1000, "new_oco_response_invalid")
@@ -602,19 +723,26 @@ class BinanceCrossMarginHttpClient:
     def cancel_oco(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         self._require_live_write_gate(for_protective_or_repay=True)
         self._require_cross_payload(payload)
-        if not payload.get("symbol"):
-            raise MarginExchangeError(-1102, "symbol_required_for_cancel_oco")
+        self._require_token(payload.get("symbol"), "symbol")
+        has_lid = payload.get("orderListId") not in (None, "")
+        has_lcid = payload.get("listClientOrderId") not in (None, "")
+        if not has_lid and not has_lcid:
+            raise MarginExchangeError(-1102, "order_list_identifier_required")
+        if has_lcid:
+            self._require_client_id_field(payload, "listClientOrderId")
         raw = self._request_json(
             method_label="cancel_oco",
             http_method="DELETE",
             path=MARGIN_ORDER_LIST_PATH,
             params=payload,
+            for_protective_or_repay=True,
         )
         if not isinstance(raw, dict):
             raise MarginExchangeError(-1000, "cancel_oco_response_invalid")
         return raw
 
     def query_spot_account(self) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
         raw = self._request_json(
             method_label="query_spot_account",
             http_method="GET",
@@ -626,6 +754,7 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def query_api_restrictions(self) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
         raw = self._request_json(
             method_label="query_api_restrictions",
             http_method="GET",
@@ -636,22 +765,26 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def query_cross_margin_data(self, coin: str) -> list[dict[str, Any]]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
+        clean_coin = self._require_token(coin, "coin")
         raw = self._request_json(
             method_label="query_cross_margin_data",
             http_method="GET",
             path=MARGIN_CROSS_DATA_PATH,
-            params={"coin": coin},
+            params={"coin": clean_coin},
         )
         if not isinstance(raw, list):
             raise MarginExchangeError(-1000, "cross_margin_data_invalid")
         return [dict(item) for item in raw if isinstance(item, Mapping)]
 
     def query_exchange_info(self, symbol: str) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
+        clean_sym = self._require_token(symbol, "symbol")
         raw = self._request_json(
             method_label="query_exchange_info",
             http_method="GET",
             path=EXCHANGE_INFO_PATH,
-            params={"symbol": symbol},
+            params={"symbol": clean_sym},
             signed=False,
         )
         if not isinstance(raw, dict):
@@ -659,11 +792,15 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def query_depth(self, symbol: str, *, limit: int = 5) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
+        clean_sym = self._require_token(symbol, "symbol")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise MarginExchangeError(-1102, "positive_limit_required")
         raw = self._request_json(
             method_label="query_depth",
             http_method="GET",
             path=DEPTH_PATH,
-            params={"symbol": symbol, "limit": str(int(limit))},
+            params={"symbol": clean_sym, "limit": str(int(limit))},
             signed=False,
         )
         if not isinstance(raw, dict):
@@ -671,17 +808,18 @@ class BinanceCrossMarginHttpClient:
         return raw
 
     def query_ticker_price(self, symbol: str) -> dict[str, Any]:
+        self._require_live_network_gate(for_protective_or_repay=True, label="read")
+        clean_sym = self._require_token(symbol, "symbol")
         raw = self._request_json(
             method_label="query_ticker_price",
             http_method="GET",
             path=TICKER_PRICE_PATH,
-            params={"symbol": symbol},
+            params={"symbol": clean_sym},
             signed=False,
         )
         if not isinstance(raw, dict):
             raise MarginExchangeError(-1000, "ticker_price_invalid")
         return raw
-
 
 def _zero_asset_liabilities(raw_assets: object) -> bool:
     if not isinstance(raw_assets, list):
@@ -798,6 +936,8 @@ def fetch_live_cross_margin_snapshot(
         return None, "mcp_account_forbidden"
     if fallback_uid and resolved_uid != fallback_uid:
         return None, "account_uid_mismatch"
+    if client.account_uid and resolved_uid != client.account_uid:
+        return None, "approved_account_uid_mismatch"
     if (
         client._approved_config is not None
         and resolved_uid != client._approved_config.approved_account_uid

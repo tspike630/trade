@@ -26,10 +26,11 @@ from execution.margin_cross.api_semantics import (
     make_client_id,
 )
 from execution.margin_cross.entry import main, run_live_command
-from execution.margin_cross.errors import LiveNetworkDisabled, MarginTransportTimeout
+from execution.margin_cross.errors import LiveNetworkDisabled, MarginExchangeError, MarginTransportTimeout
 from execution.margin_cross.fixture import NOW_MS
 from execution.margin_cross.money import api_amount
 from execution.margin_cross.policy import (
+    ApprovedRiskConfig,
     APPROVAL_HMAC_KEY_ENV,
     APPROVED_CONFIG_HMAC_ENV,
     APPROVED_CONFIG_PATH_ENV,
@@ -71,6 +72,25 @@ def _explicit_test_config_dict(
         "approved_strategies": sorted(SUPPORTED_REGIME_STRATEGIES),
     }
 
+
+
+def _write_pinned_cfg_env(tmpdir: str, *, uid: str = "88001122", now_ms: int = NOW_MS, extra: dict[str, str] | None = None) -> tuple[ApprovedRiskConfig, dict[str, str]]:
+    doc = _explicit_test_config_dict(uid=uid, now_ms=now_ms)
+    raw_bytes = json.dumps(doc).encode("utf-8")
+    cfg_file = Path(tmpdir) / f"pinned_{uid}_{now_ms}.json"
+    cfg_file.write_bytes(raw_bytes)
+    sha = hashlib.sha256(raw_bytes).hexdigest()
+    cfg_obj, errs = parse_approved_risk_config(doc)
+    assert cfg_obj is not None and not errs
+    env = {
+        PARAMETERS_APPROVED_ENV: "1",
+        APPROVED_CONFIG_PATH_ENV: str(cfg_file),
+        APPROVED_CONFIG_SHA256_ENV: sha,
+        LIVE_ENABLED_ENV: "1",
+    }
+    if extra:
+        env.update(extra)
+    return cfg_obj, env
 
 def _fresh_clocks(now_ms: int = NOW_MS) -> dict[str, Any]:
     as_of_utc = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
@@ -532,18 +552,19 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
             slept.append(round(sec, 4))
             mono_now[0] += sec
 
+        tmp_holder = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_holder.cleanup)
         server = _InMemoryMarginTransport(cred_id="u_demo_1", sign_id="p_demo_1")
         kw = {"api_" + "key": "u_demo_1", "api_" + "secret": "p_demo_1"}
-        cfg_obj, cfg_errs = parse_approved_risk_config(_explicit_test_config_dict())
-        self.assertEqual(cfg_errs, [])
-        assert cfg_obj is not None
+        cfg_obj, pinned_env = _write_pinned_cfg_env(tmp_holder.name)
         client = hc.BinanceCrossMarginHttpClient(
+            account_uid="88001122",
             base_url=TEST_BASE,
             opener=server,
             clock_ms=lambda: fake_now[0],
             monotonic_sec=lambda: mono_now[0],
             sleep_fn=fake_sleep,
-            environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+            environ=pinned_env,
             kill_switch_path="/nonexistent/no_kill_switch_flag_here",
             approved_config=cfg_obj,
             **kw,
@@ -579,10 +600,11 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
             raise urllib.error.URLError("network down")
 
         t_client = hc.BinanceCrossMarginHttpClient(
+            account_uid="88001122",
             base_url=TEST_BASE,
             opener=timeout_opener,
             clock_ms=lambda: fake_now[0],
-            environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+            environ=pinned_env,
             kill_switch_path="/nonexistent/no_kill_switch_flag_here",
             approved_config=cfg_obj,
             **kw,
@@ -798,11 +820,13 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
                 c_no_cfg.borrow({"asset": "BTC", "isIsolated": "FALSE", "amount": "0.01", "type": "BORROW"})
             self.assertIn("approved_config_missing", str(ctx2.exception))
 
+            _k_cfg, k_pinned_env = _write_pinned_cfg_env(tmpdir)
             c_killed = hc.BinanceCrossMarginHttpClient(
+                account_uid="88001122",
                 base_url=TEST_BASE,
                 opener=forbidden_opener,
                 clock_ms=lambda: NOW_MS,
-                environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+                environ=k_pinned_env,
                 kill_switch_path=active_kill,
                 approved_config=cfg_obj,
                 **kw,
@@ -876,11 +900,13 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
             with self.assertRaises(LiveNetworkDisabled):
                 c_injected_empty_env.query_account()
 
+            _r_cfg, r_pinned_env = _write_pinned_cfg_env(tmpdir)
             c_expired = hc.BinanceCrossMarginHttpClient(
+                account_uid="88001122",
                 base_url=TEST_BASE,
                 opener=forbidden_opener,
                 clock_ms=lambda: NOW_MS + 90_000_000,
-                environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+                environ=r_pinned_env,
                 kill_switch_path=absent_kill,
                 approved_config=cfg_obj,
                 **kw,
@@ -894,7 +920,7 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
                 base_url=TEST_BASE,
                 opener=forbidden_opener,
                 clock_ms=lambda: NOW_MS,
-                environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+                environ=r_pinned_env,
                 kill_switch_path=absent_kill,
                 approved_config=cfg_obj,
                 **kw,
@@ -904,14 +930,11 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
             self.assertIn("approved_account_uid_mismatch", str(uid_ctx.exception))
 
             c_kill_exit_blocked = hc.BinanceCrossMarginHttpClient(
+                account_uid="88001122",
                 base_url=TEST_BASE,
                 opener=forbidden_opener,
                 clock_ms=lambda: NOW_MS,
-                environ={
-                    PARAMETERS_APPROVED_ENV: "1",
-                    LIVE_ENABLED_ENV: "1",
-                    BLOCK_EXIT_ON_KILL_ENV: "1",
-                },
+                environ={**r_pinned_env, BLOCK_EXIT_ON_KILL_ENV: "1"},
                 kill_switch_path=active_kill,
                 approved_config=cfg_obj,
                 **kw,
@@ -1010,6 +1033,183 @@ class RealHttpClientAndLiveEntryTest(unittest.TestCase):
             )
             self.assertIsNone(long_ttl_cfg)
             self.assertIn("approved_config_ttl_invalid_or_excessive", ttl_r)
+
+    def test_t320_injected_config_empty_uid_and_incomplete_write_payload_probes(self) -> None:
+        """Exact reproduction & regression guard for the 3 failed probes in PR222-audit-t320.md."""
+        opener_calls: list[str] = []
+
+        def forbidden_opener(req: Any, _timeout: float) -> tuple[int, bytes]:
+            opener_calls.append(str(req.full_url))
+            raise AssertionError("opener must NEVER be called in any t320 negative probe")
+
+        kw = {"api_" + "key": "t320-probe-key", "api_" + "secret": "t320-probe-secret"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            absent_kill = os.path.join(tmpdir, "absent_kill")
+            cfg_obj, pinned_env = _write_pinned_cfg_env(tmpdir)
+
+            # Probe 1: Constructor-injected approved_config + two literal "1" env flags WITHOUT SHA-256 file -> opener == 0!
+            c_injected_no_sha = hc.BinanceCrossMarginHttpClient(
+                account_uid="88001122",
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                clock_ms=lambda: NOW_MS,
+                environ={PARAMETERS_APPROVED_ENV: "1", LIVE_ENABLED_ENV: "1"},
+                kill_switch_path=absent_kill,
+                approved_config=cfg_obj,
+                **kw,
+            )
+            with self.assertRaises(LiveNetworkDisabled) as p1_ctx:
+                c_injected_no_sha.borrow(
+                    {"asset": "BTC", "isIsolated": "FALSE", "amount": "0.01", "type": "BORROW"}
+                )
+            self.assertIn("approved_config_missing", str(p1_ctx.exception))
+
+            # Also: injected config differing from SHA-256-pinned file -> approved_config_injected_mismatch, opener == 0!
+            alt_cfg, _ = parse_approved_risk_config(
+                {**_explicit_test_config_dict(), "max_leverage": "2"}
+            )
+            assert alt_cfg is not None
+            c_injected_diff = hc.BinanceCrossMarginHttpClient(
+                account_uid="88001122",
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                clock_ms=lambda: NOW_MS,
+                environ=pinned_env,
+                kill_switch_path=absent_kill,
+                approved_config=alt_cfg,
+                **kw,
+            )
+            with self.assertRaises(LiveNetworkDisabled) as p1b_ctx:
+                c_injected_diff.borrow(
+                    {"asset": "BTC", "isIsolated": "FALSE", "amount": "0.01", "type": "BORROW"}
+                )
+            self.assertIn("approved_config_injected_mismatch", str(p1b_ctx.exception))
+
+            # Probe 2: Client account_uid="" (unbound) even with valid SHA-256-pinned file + injected config -> opener == 0!
+            c_empty_uid = hc.BinanceCrossMarginHttpClient(
+                account_uid="",
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                clock_ms=lambda: NOW_MS,
+                environ=pinned_env,
+                kill_switch_path=absent_kill,
+                approved_config=cfg_obj,
+                **kw,
+            )
+            for empty_uid_call in (
+                lambda: c_empty_uid.new_order(
+                    {
+                        "symbol": "BTCUSDT",
+                        "isIsolated": "FALSE",
+                        "side": "SELL",
+                        "type": "LIMIT",
+                        "timeInForce": "GTC",
+                        "quantity": "0.01",
+                        "price": "100000",
+                        "newClientOrderId": "cid-t320-1",
+                        "sideEffectType": NO_SIDE_EFFECT,
+                    }
+                ),
+                lambda: c_empty_uid.borrow(
+                    {"asset": "BTC", "isIsolated": "FALSE", "amount": "0.01", "type": "BORROW"}
+                ),
+                lambda: c_empty_uid.query_account(),
+            ):
+                with self.assertRaises(LiveNetworkDisabled) as p2_ctx:
+                    empty_uid_call()
+                self.assertIn("account_uid_unbound", str(p2_ctx.exception))
+
+            # Probe 3: Gate fully open, direct write calls missing required fields (asset, amount, symbol, quantity, price, ids) -> fail closed BEFORE opener (opener == 0)!
+            c_open = hc.BinanceCrossMarginHttpClient(
+                account_uid="88001122",
+                base_url=TEST_BASE,
+                opener=forbidden_opener,
+                clock_ms=lambda: NOW_MS,
+                environ=pinned_env,
+                kill_switch_path=absent_kill,
+                approved_config=cfg_obj,
+                **kw,
+            )
+            malformed_write_calls = [
+                lambda: c_open.borrow({"isIsolated": "FALSE", "type": "BORROW"}),
+                lambda: c_open.borrow({"isIsolated": "FALSE", "type": "BORROW", "asset": "BTC"}),
+                lambda: c_open.borrow({"isIsolated": "FALSE", "type": "BORROW", "asset": "BTC", "amount": "0"}),
+                lambda: c_open.repay({"isIsolated": "FALSE", "type": "REPAY"}),
+                lambda: c_open.repay({"isIsolated": "FALSE", "type": "REPAY", "asset": "BTC", "amount": "-0.01"}),
+                lambda: c_open.new_order({"isIsolated": "FALSE", "sideEffectType": NO_SIDE_EFFECT}),
+                lambda: c_open.new_order({"symbol": "BTCUSDT", "isIsolated": "FALSE", "side": "SELL", "type": "LIMIT", "sideEffectType": NO_SIDE_EFFECT}),
+                lambda: c_open.cancel_order({"symbol": "BTCUSDT", "isIsolated": "FALSE"}),
+                lambda: c_open.new_oco({"symbol": "BTCUSDT", "isIsolated": "FALSE", "side": "BUY", "sideEffectType": NO_SIDE_EFFECT}),
+                lambda: c_open.cancel_oco({"symbol": "BTCUSDT", "isIsolated": "FALSE"}),
+            ]
+            for bad_call in malformed_write_calls:
+                with self.assertRaises(MarginExchangeError) as p3_ctx:
+                    bad_call()
+                self.assertEqual(p3_ctx.exception.code, -1102)
+
+            self.assertEqual(opener_calls, [])
+
+            # Bonus: Full two-pass live open replay via run_live_command sends borrow=1, new_order=1, new_oco=1!
+            ledger_replay = os.path.join(tmpdir, "replay_live.db")
+            sig_replay = os.path.join(tmpdir, "sig_replay.json")
+            Path(sig_replay).write_text(
+                json.dumps(
+                    {
+                        "intent_id": "short-replay-t320",
+                        "symbol": "BTCUSDT",
+                        "base_asset": "BTC",
+                        "quote_asset": "USDT",
+                        "action": "OPEN_SHORT",
+                        "entry_tier": "1.0",
+                        "take_profit_price": "97000",
+                        "stop_price": "101500",
+                        "stop_limit_price": "101600",
+                        "market_row": _state4_short_market_row(),
+                        "clocks": _fresh_clocks(NOW_MS),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            k_env = getattr(hc, "API_KEY_ENV_NAMES")[0]
+            s_env = getattr(hc, "API_SECRET_ENV_NAMES")[0]
+            srv_replay = _InMemoryMarginTransport(cred_id="u_demo_1", sign_id="p_demo_1")
+            with patch.dict(
+                os.environ,
+                {**pinned_env, k_env: "u_demo_1", s_env: "p_demo_1"},
+                clear=True,
+            ):
+                rc1, out1, _ = run_live_command(
+                    ledger_path=ledger_replay,
+                    action="open",
+                    signal_path=sig_replay,
+                    kill_switch_path=absent_kill,
+                    base_url=TEST_BASE,
+                    opener=srv_replay,
+                    clock_ms=lambda: NOW_MS,
+                )
+                rc2, out2, _ = run_live_command(
+                    ledger_path=ledger_replay,
+                    action="open",
+                    signal_path=sig_replay,
+                    kill_switch_path=absent_kill,
+                    base_url=TEST_BASE,
+                    opener=srv_replay,
+                    clock_ms=lambda: NOW_MS,
+                )
+            self.assertEqual(rc1, 0)
+            self.assertEqual(rc2, 0)
+            assert out1 is not None and out2 is not None
+            self.assertEqual(out1["result"]["state"], "protected")
+            self.assertEqual(out2["result"]["state"], "protected")
+            post_paths = [path for method, path, _ in srv_replay.requests if method == "POST"]
+            self.assertEqual(
+                post_paths,
+                [
+                    "/sapi/v1/margin/borrow-repay",
+                    "/sapi/v1/margin/order",
+                    "/sapi/v1/margin/order/oco",
+                ],
+            )
 
 if __name__ == "__main__":
     unittest.main()

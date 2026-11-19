@@ -444,31 +444,42 @@ def live_gate_reasons(
     approved_config: ApprovedRiskConfig | None = None,
     now_ms: int | None = None,
     expected_account_uid: str | None = None,
+    require_bound_uid: bool = False,
 ) -> list[str]:
-    """Return every reason live cross-margin network access is currently locked."""
+    """Return every reason live cross-margin network access is currently locked.
+
+    Constructor-injected ``approved_config`` NEVER bypasses SHA-256 file pinning:
+    ``load_approved_risk_config`` is always evaluated against ``environ``, and any
+    injected object must also match the SHA-256-pinned file configuration.
+    """
     reasons: list[str] = []
     if not allow_live_network:
         reasons.append("live_network_not_authorized")
     if not parameters_approved_by_env(environ):
         reasons.append("parameters_not_approved")
-    cfg = approved_config
-    if cfg is None:
-        cfg, cfg_reasons = load_approved_risk_config(
-            environ,
-            now_ms=now_ms,
-            expected_account_uid=expected_account_uid,
-        )
-        if cfg is None:
-            reasons.extend(cfg_reasons)
-    else:
-        effective_now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    effective_now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if approved_config is not None:
         reasons.extend(
             validate_approved_config_window(
-                cfg,
+                approved_config,
                 now_ms=effective_now,
                 expected_account_uid=expected_account_uid,
             )
         )
+    file_cfg, cfg_reasons = load_approved_risk_config(
+        environ,
+        now_ms=effective_now,
+        expected_account_uid=expected_account_uid,
+    )
+    if file_cfg is None:
+        reasons.extend(cfg_reasons)
+    elif approved_config is not None and approved_config != file_cfg:
+        reasons.append("approved_config_injected_mismatch")
+    if require_bound_uid:
+        if not isinstance(expected_account_uid, str) or not expected_account_uid.strip():
+            reasons.append("account_uid_unbound")
+        elif expected_account_uid.strip() == MCP_FORBIDDEN_UID:
+            reasons.append("mcp_account_forbidden")
     if not live_enabled_by_env(environ):
         reasons.append("cross_margin_live_disabled")
     kill_on, _kill_name = kill_switch_active(explicit_kill_path, environ)

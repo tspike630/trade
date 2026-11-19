@@ -37,6 +37,7 @@ from execution.margin_cross.policy import (
     LIVE_EXECUTION_MODE,
     kill_switch_active,
     live_gate_reasons,
+    load_approved_risk_config,
     parameters_approved_by_env,
 )
 from execution.margin_cross.proposal import unapproved_threshold_proposal
@@ -192,19 +193,30 @@ def run_live_command(
             "live cross-margin disabled: missing API credentials; no order, borrow, or repay was sent\n",
         )
 
+    pinned_cfg, cfg_errs = load_approved_risk_config(now_ms=now_ms)
+    if pinned_cfg is None or cfg_errs:
+        err_code = cfg_errs[0] if cfg_errs else "approved_config_missing"
+        return (
+            2,
+            None,
+            f"live cross-margin network writes are disabled ({err_code}); no order, borrow, or repay was sent\n",
+        )
     client = BinanceCrossMarginHttpClient(
         api_key=api_key,
         api_secret=api_secret,
+        account_uid=pinned_cfg.approved_account_uid,
         base_url=base_url,
         opener=opener,
         clock_ms=now_fn,
         kill_switch_path=kill_switch_path,
+        approved_config=pinned_cfg,
     )
     track = CrossMarginTrack(
         ledger_path,
         client,
         allow_live_network=True,
         kill_switch_path=kill_switch_path,
+        approved_config=pinned_cfg,
         now_ms=now_ms,
     )
     kill_on, _kill_name = kill_switch_active(kill_switch_path)
@@ -243,6 +255,46 @@ def run_live_command(
         return (
             1,
             {"mode": LIVE_EXECUTION_MODE, "action": action, "ok": False, "reason": snap_err},
+            "",
+        )
+
+    existing_row = (
+        track.ledger.intent_row(str(doc.get("intent_id") or ""))
+        if action == "open"
+        else None
+    )
+    if existing_row is not None:
+        stored_doc = json.loads(str(existing_row["payload_json"]))
+        st_intent = dict(stored_doc["intent"])
+        if (
+            str(doc.get("symbol") or "") != str(st_intent.get("symbol") or "")
+            or str(doc.get("action") or "") != str(st_intent.get("action") or "")
+            or str(doc.get("base_asset") or "") != str(st_intent.get("base_asset") or "")
+        ):
+            return (
+                1,
+                {
+                    "mode": LIVE_EXECUTION_MODE,
+                    "action": "open",
+                    "ok": False,
+                    "reason": "intent_identity_conflict",
+                },
+                "",
+            )
+        gate = {
+            "emergency_stop": kill_on,
+            "now_ms": now_ms,
+            "execution_mode": LIVE_EXECUTION_MODE,
+        }
+        resumed = track.open_position(
+            st_intent,
+            dict(stored_doc["snapshot"]),
+            dict(stored_doc["contract"]),
+            gate,
+        )
+        return (
+            0 if resumed.phase_ok else 1,
+            {"mode": LIVE_EXECUTION_MODE, "action": "open", "result": resumed.as_dict()},
             "",
         )
 
