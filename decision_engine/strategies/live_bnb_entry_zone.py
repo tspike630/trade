@@ -670,6 +670,17 @@ def evaluate_entry_zone(
     symbol = str(row.get("binance_symbol") or "").strip()
     if not symbol:
         return _empty(reason="binance_symbol_missing")
+    if cross_margin_book:
+        now = _finite(row.get("_freshness_now_ms"))
+        close_ms = _finite(row.get("kline_close_time_ms"))
+        if close_ms is None:
+            close_ms = _finite(row.get("entry_kline_5m_close_ms"))
+        if now is not None and close_ms is None:
+            return _empty(reason="kline_bar_missing")
+        if now is not None and close_ms is not None:
+            age = now - close_ms
+            if age < -120_000 or age > 900_000:
+                return _empty(reason="entry_5m_kline_stale")
     if v2_contract_active():
         freshness_now = row.get("_freshness_now_ms")
         clock_now = int(freshness_now) if isinstance(freshness_now, int) and not isinstance(freshness_now, bool) else int(time.time() * 1000)

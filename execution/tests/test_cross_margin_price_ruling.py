@@ -356,5 +356,231 @@ class ProducerExecutionTests(unittest.TestCase):
             socket.create_connection = saved_create  # type: ignore[assignment]
 
 
+class CrossMarginBarIdentityTests(unittest.TestCase):
+    def test_strict_high_does_not_use_the_latest_bar_or_a_carried_value(self) -> None:
+        import sqlite3
+
+        from decision_engine.core.live_bnb_entry_coords import attach_live_entry_coordinates
+
+        now = 1_700_000_000_000
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """
+            CREATE TABLE binance_klines (
+                symbol TEXT, interval TEXT, open_time_ms INTEGER,
+                high REAL, low REAL, close REAL, close_time_ms INTEGER
+            )
+            """
+        )
+        matched_close = now - 60_000
+        latest_close = now - 10_000
+        conn.executemany(
+            "INSERT INTO binance_klines VALUES (?, '5m', ?, ?, ?, ?, ?)",
+            [
+                ("BTCUSDT", matched_close - 300_000, 111.0, 90.0, 100.0, matched_close),
+                ("BTCUSDT", latest_close - 300_000, 99999.0, 40.0, 50.0, latest_close),
+            ],
+        )
+        missing_clock = {
+            "binance_symbol": "BTCUSDT",
+            "price_usd": 100.0,
+            "kline_high": 12345.0,
+        }
+        attach_live_entry_coordinates(conn, [missing_clock], now_ms=now, strict_bar=True)
+        self.assertEqual(missing_clock.get("entry_zone_coord_error"), "kline_bar_missing")
+        self.assertNotIn("kline_high", missing_clock)
+
+        carried = {
+            "binance_symbol": "BTCUSDT",
+            "kline_close_time_ms": matched_close,
+            "price_usd": 100.0,
+            "kline_high": 1.0,
+        }
+        attach_live_entry_coordinates(conn, [carried], now_ms=now, strict_bar=True)
+        self.assertNotIn("entry_zone_coord_error", carried)
+        self.assertEqual(carried.get("kline_high"), 111.0)
+
+        mismatch = {
+            "binance_symbol": "BTCUSDT",
+            "kline_close_time_ms": matched_close,
+            "price_usd": 101.0,
+            "kline_high": 1.0,
+        }
+        attach_live_entry_coordinates(conn, [mismatch], now_ms=now, strict_bar=True)
+        self.assertEqual(mismatch.get("entry_zone_coord_error"), "kline_close_mismatch")
+        self.assertNotIn("kline_high", mismatch)
+
+        stale = {
+            "binance_symbol": "BTCUSDT",
+            "kline_close_time_ms": now - 900_001,
+            "price_usd": 100.0,
+            "kline_high": 1.0,
+        }
+        conn.execute(
+            "INSERT INTO binance_klines VALUES ('BTCUSDT', '5m', ?, 111, 90, 100, ?)",
+            (now - 900_001 - 300_000, now - 900_001),
+        )
+        attach_live_entry_coordinates(conn, [stale], now_ms=now, strict_bar=True)
+        self.assertEqual(stale.get("entry_zone_coord_error"), "entry_5m_kline_stale")
+        self.assertNotIn("kline_high", stale)
+
+        fresh = {
+            "binance_symbol": "BTCUSDT",
+            "kline_close_time_ms": now - 900_000,
+            "price_usd": 100.0,
+        }
+        conn.execute(
+            "INSERT INTO binance_klines VALUES ('BTCUSDT', '5m', ?, 222, 90, 100, ?)",
+            (now - 900_000 - 300_000, now - 900_000),
+        )
+        attach_live_entry_coordinates(conn, [fresh], now_ms=now, strict_bar=True)
+        self.assertNotIn("entry_zone_coord_error", fresh)
+        self.assertEqual(fresh.get("kline_high"), 222.0)
+
+        spot = {
+            "binance_symbol": "BTCUSDT",
+            "price_usd": 50.0,
+        }
+        attach_live_entry_coordinates(conn, [spot], now_ms=now, strict_bar=False)
+        self.assertEqual(spot.get("kline_high"), 99999.0)
+        conn.close()
+
+        refused = order_for_strategy(
+            "regime5_crisis_contagion_short",
+            {
+                "price_usd": 100.0,
+                "kline_low": 90.0,
+                "boll_mid": 95.0,
+                "kline_high": 110.0,
+                "kline_close_time_ms": 1_000,
+                "_freshness_now_ms": 1_000 + 900_001,
+            },
+        )
+        self.assertEqual(refused[1], "entry_5m_kline_stale")
+
+    def test_tech_without_primary_pair_reaches_fake_entry_and_oco(self) -> None:
+        import contextlib
+        import io
+        import os
+        import socket
+        import tempfile
+        import time
+        from pathlib import Path
+
+        from decision_engine.core.engine import _stamp_explicit_account_route
+        from decision_engine.core.signal_bus import PURPOSE_LIVE_BNB_BOLL_FADE
+        from decision_engine.strategies.tech_boll_fade import TechBollFadeStrategy
+        from execution.margin_cross import http_client as hc
+        from execution.run import main as execution_main
+        from execution.tests.test_margin_cross_http_and_live import _InMemoryMarginTransport
+        from execution.tests.test_margin_cross_policy_and_idempotency import (
+            _fresh_clocks,
+            _state1_long_market_row,
+        )
+        from execution.tests.test_margin_live_production_path import (
+            _TEST_API_KEY,
+            _TEST_API_SECRET,
+            _UID,
+            _approved_file,
+        )
+
+        class _Blocked(socket.socket):
+            def connect(self, address):  # type: ignore[override]
+                raise OSError("tech_pair_network_blocked")
+
+        now = int(time.time() * 1000)
+        low = 99600.0
+        span = 2000.0
+        row = dict(_state1_long_market_row())
+        row.update(
+            binance_symbol="BTCUSDT",
+            chain_id="binance",
+            token_address="BTCUSDT",
+            kline_low=low,
+            boll_mid=low + span,
+            price_usd=low + 0.20 * span,
+            trade_size_ratio=1.3,
+            change_5m=-0.5,
+            volume_strength=0.1,
+            boll_lower=low,
+            liquidity_usd=90_000,
+            kline_close_time_ms=now - 60_000,
+            _freshness_now_ms=now,
+            clocks=_fresh_clocks(now),
+        )
+        row.pop("primary_pair_address", None)
+        spot = TechBollFadeStrategy().on_tick(
+            {"hot_tokens": [dict(row)], "purpose": PURPOSE_LIVE_BNB_BOLL_FADE}
+        )
+        self.assertTrue(spot)
+        self.assertIsNone(spot[0].get("pair_address"))
+        produced = TechBollFadeStrategy().on_tick(
+            {"hot_tokens": [row], "purpose": PURPOSE_LIVE_BNB_CROSS_MARGIN}
+        )
+        self.assertEqual(len(produced), 1, TechBollFadeStrategy().rejected)
+        self.assertEqual(produced[0]["pair_address"], "BTCUSDT")
+        self.assertEqual(produced[0]["limit_price"], row["price_usd"])
+        saved_socket = socket.socket
+        saved_create = socket.create_connection
+        saved_opener = hc._default_opener
+        socket.socket = _Blocked  # type: ignore[misc]
+        socket.create_connection = lambda *a, **k: (_ for _ in ()).throw(OSError("blocked"))  # type: ignore[assignment]
+        transport = _InMemoryMarginTransport(
+            cred_id=_TEST_API_KEY, sign_id=_TEST_API_SECRET, uid=int(_UID)
+        )
+        hc._default_opener = transport
+        try:
+            with tempfile.TemporaryDirectory() as raw_dir:
+                root = Path(raw_dir)
+                decision = root / "dexscreener.db"
+                margin = root / "margin-book.db"
+                ledger = root / "cross-margin-exec.db"
+                stamped = _stamp_explicit_account_route(
+                    produced,
+                    {
+                        "account_domain": "binance_cross_margin",
+                        "execution_mode": "live",
+                        "spot_book_full": False,
+                        "margin_ledger_path": str(margin),
+                    },
+                )[0]
+                bus = SignalBus(decision, dry_run=False, purpose=PURPOSE_LIVE_BNB_CROSS_MARGIN)
+                try:
+                    bus.publish(stamped)
+                finally:
+                    bus.close()
+                os.environ.update(_approved_file(root, now))
+                os.environ["BINANCE_MARGIN_API_KEY"] = _TEST_API_KEY
+                os.environ["BINANCE_MARGIN_API_SECRET"] = _TEST_API_SECRET
+                os.environ["LIVE_KILL_SWITCH_PATH"] = str(root / "no-kill")
+                os.environ.pop("CROSS_MARGIN_LEDGER_PATH", None)
+                argv = [
+                    "--once",
+                    "--json",
+                    "--db",
+                    str(decision),
+                    "--ledger",
+                    str(ledger),
+                    "--accept-purpose",
+                    PURPOSE_LIVE_BNB_CROSS_MARGIN,
+                ]
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    code = execution_main(argv)
+                self.assertEqual(code, 0, buf.getvalue())
+                posts = [item for item in transport.requests if item[0] == "POST"]
+                paths = [item[1] for item in posts]
+                self.assertIn("/sapi/v1/margin/order", paths)
+                self.assertIn("/sapi/v1/margin/order/oco", paths)
+                before = len(transport.requests)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    execution_main(argv)
+                self.assertEqual(len(transport.requests), before)
+        finally:
+            hc._default_opener = saved_opener
+            socket.socket = saved_socket  # type: ignore[misc]
+            socket.create_connection = saved_create  # type: ignore[assignment]
+
+
 if __name__ == "__main__":
     unittest.main()

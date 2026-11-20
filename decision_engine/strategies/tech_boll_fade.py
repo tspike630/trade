@@ -54,6 +54,21 @@ from decision_engine.strategies.live_bnb_size_floor import (
 
 log = get_logger("decision_engine.tech_boll_fade")
 
+
+def _cross_margin_pair(row: dict[str, Any]) -> str | None:
+    """Same identity the seven regime producers use when the hot row has no pair."""
+    for key in (
+        "primary_pair_address",
+        "pair_address",
+        "ccxt_symbol",
+        "binance_symbol",
+        "symbol",
+    ):
+        raw = row.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
+
 RULE_VERSION = "tech_boll_fade_v1_2026-11-01"
 STRATEGY_ID = "tech_boll_fade_v1"
 # Twins of execution.exits.DEFAULT_TP_PCT / DEFAULT_SL_PCT / DEFAULT_MAX_HOLD_MIN.
@@ -275,10 +290,20 @@ class TechBollFadeStrategy(BaseStrategy):
                         "market_row": dict(row),
                     }
                 )
+            pair_address = row.get("primary_pair_address")
+            if cross_margin_book:
+                pair_address = _cross_margin_pair(row)
+                if pair_address is None:
+                    self.rejected["pair_address_missing"] = (
+                        self.rejected.get("pair_address_missing", 0) + 1
+                    )
+                    continue
+                if isinstance(row.get("clocks"), dict):
+                    lift_extra["clocks"] = dict(row["clocks"])
             self.buy(
                 chain_id=str(row.get("chain_id") or ""),
                 token_address=str(row.get("token_address") or ""),
-                pair_address=row.get("primary_pair_address"),
+                pair_address=pair_address,
                 size_pct=size_pct,
                 size_tier=sized["size_tier"],
                 entry_r3=sized["entry_r3"],

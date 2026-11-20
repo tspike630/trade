@@ -206,7 +206,12 @@ class DecisionEngine:
                     self.adapter.conn,
                     hot,
                     now_ms=now_ms,
+                    strict_bar=self.bus.purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN,
                 )
+                if self.bus.purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
+                    for item in hot:
+                        if isinstance(item, dict):
+                            item["_freshness_now_ms"] = now_ms
                 from decision_engine.core.cityu_institutional_alpha import (
                     attach_cityu_institutional_context,
                 )

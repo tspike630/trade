@@ -221,6 +221,10 @@ def _symbol_of(row: dict[str, Any]) -> str | None:
     return None
 
 
+# Cross-margin bar age. Older than this is not a pricing bar. Equal to 900s is still fresh.
+_CROSS_MARGIN_BAR_MAX_AGE_MS = 900_000
+
+
 def _match_bar(bars: Sequence[ZoneBar], row: dict[str, Any]) -> ZoneBar | None:
     target = _finite(row.get("kline_close_time_ms"))
     if target is None:
@@ -232,13 +236,42 @@ def _match_bar(bars: Sequence[ZoneBar], row: dict[str, Any]) -> ZoneBar | None:
     return None
 
 
+def _bar_for_row(
+    bars: Sequence[ZoneBar], row: dict[str, Any], *, strict_bar: bool
+) -> ZoneBar | None:
+    """Spot may use the latest closed bar. Cross margin must name the close time."""
+    if not strict_bar:
+        return _match_bar(bars, row)
+    target = _finite(row.get("kline_close_time_ms"))
+    if target is None:
+        return None
+    target_ms = int(target)
+    for bar in bars:
+        if _bar_matches(bar, target_ms):
+            return bar
+    return None
+
+
+def _cross_margin_bar_clock(close_ms: int, now_ms: int) -> str | None:
+    age = int(now_ms) - int(close_ms)
+    if age < -120_000 or age > _CROSS_MARGIN_BAR_MAX_AGE_MS:
+        return "entry_5m_kline_stale"
+    return None
+
+
 def attach_live_entry_coordinates(
     conn: sqlite3.Connection,
     rows: list[dict[str, Any]],
     *,
     now_ms: int,
+    strict_bar: bool = False,
 ) -> list[dict[str, Any]]:
-    """Fill missing entry-zone fields in place. Existing finite values stay."""
+    """Fill missing entry-zone fields in place. Existing finite values stay.
+
+    ``strict_bar`` is the cross-margin book. It does not reuse the latest
+    closed bar, does not keep a pre-existing ``kline_high``, and rejects a
+    bar older than 900 seconds even when the regime-v2 contract is off.
+    """
     if not rows:
         return rows
     symbols = {spot for row in rows if (spot := _symbol_of(row)) is not None}
@@ -254,16 +287,30 @@ def attach_live_entry_coordinates(
         if spot is None:
             continue
         bars = bars_by_symbol.get(spot) or []
+        if strict_bar:
+            row.pop("kline_high", None)
         if not bars:
+            if strict_bar:
+                row["entry_zone_coord_error"] = "kline_bar_missing"
             continue
-        if row.get("kline_close_time_ms") is not None and _match_bar(bars, row) is None:
+        if strict_bar and _finite(row.get("kline_close_time_ms")) is None:
             row["entry_zone_coord_error"] = "kline_bar_missing"
             continue
-        bar = _match_bar(bars, row)
+        if row.get("kline_close_time_ms") is not None and _bar_for_row(
+            bars, row, strict_bar=strict_bar
+        ) is None:
+            row["entry_zone_coord_error"] = "kline_bar_missing"
+            continue
+        bar = _bar_for_row(bars, row, strict_bar=strict_bar)
         if bar is None:
             continue
         row["entry_kline_5m_close_ms"] = int(bar.close_ms)
-        if str(os.environ.get("REGIME_V2_CONTRACT", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        if strict_bar:
+            clock_problem = _cross_margin_bar_clock(int(bar.close_ms), int(now_ms))
+            if clock_problem is not None:
+                row["entry_zone_coord_error"] = clock_problem
+                continue
+        elif str(os.environ.get("REGIME_V2_CONTRACT", "")).strip().lower() in {"1", "true", "yes", "on"}:
             raw_max_5m = str(os.environ.get("REGIME_V2_ENTRY_KLINE_5M_MAX_AGE_SEC", "900")).strip()
             max_5m_ms = (int(raw_max_5m) if raw_max_5m.isdigit() and int(raw_max_5m) > 0 else 900) * 1000
             if int(bar.close_ms) > int(now_ms) + 120_000 or int(now_ms) - int(bar.close_ms) > max_5m_ms:
@@ -281,7 +328,10 @@ def attach_live_entry_coordinates(
             continue
         if _finite(row.get("kline_low")) is None and _finite(row.get("low")) is None:
             row["kline_low"] = bar.low
-        if bar.high is not None and _finite(row.get("kline_high")) is None:
+        if strict_bar:
+            if bar.high is not None and bar.high > 0:
+                row["kline_high"] = bar.high
+        elif bar.high is not None and _finite(row.get("kline_high")) is None:
             row["kline_high"] = bar.high
         if _finite(row.get("boll_mid")) is None and len(window) >= BOLL_LENGTH:
             mid = boll_mid_from_closes([item.close for item in window])

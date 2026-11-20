@@ -56,6 +56,22 @@ def _first(row: dict[str, Any], names: tuple[str, ...]) -> float | None:
     return None
 
 
+def _pricing_bar_clock(row: dict[str, Any]) -> str | None:
+    """900s applies whenever the caller supplied now. It does not depend on regime-v2."""
+    now = _finite(row.get("_freshness_now_ms"))
+    if now is None:
+        return None
+    close_ms = _finite(row.get("kline_close_time_ms"))
+    if close_ms is None:
+        close_ms = _finite(row.get("entry_kline_5m_close_ms"))
+    if close_ms is None:
+        return "kline_bar_missing"
+    age = now - close_ms
+    if age < -120_000 or age > 900_000:
+        return "entry_5m_kline_stale"
+    return None
+
+
 def closed_bar(row: dict[str, Any]) -> tuple[dict[str, float] | None, str | None]:
     """P, L, M and, when present, H from one closed 5m bar. High is never the close."""
     price = _first(row, ("price_usd", "close", "price"))
@@ -145,6 +161,12 @@ def order_for_strategy(
     row: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Structural limit, take-profit, and stop. The plan applies tp_multiplier once."""
+    coord_error = row.get("entry_zone_coord_error")
+    if isinstance(coord_error, str) and coord_error.strip():
+        return None, coord_error.strip()
+    clock_reason = _pricing_bar_clock(row)
+    if clock_reason is not None:
+        return None, clock_reason
     bar, reason = closed_bar(row)
     if bar is None:
         return None, reason
