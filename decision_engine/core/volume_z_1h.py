@@ -449,7 +449,18 @@ def attach_stored_volume_z(
             continue
         if not _stored_matches_source(conn, symbol, saved, now_ms=now_ms):
             continue
-        candidate[VOLUME_Z_KEY] = _finite(saved["volume_z"])
+        score = _finite(saved["volume_z"])
+        candidate[VOLUME_Z_KEY] = score
+        # The execution freshness clock reads volume_z_source_close_ms, not
+        # the table column name. A finite score without this stamp is rejected
+        # as volume_z_close_stale_or_absent.
+        if score is not None and not isinstance(saved.get("source_close_time_ms"), bool):
+            close_raw = saved.get("source_close_time_ms")
+            if close_raw not in (None, ""):
+                try:
+                    candidate["volume_z_source_close_ms"] = int(close_raw)
+                except (TypeError, ValueError):
+                    pass
     return rows
 
 

@@ -39,6 +39,7 @@ if str(_ROOT) not in sys.path:
 
 from logging_setup import get_logger, setup_logging  # noqa: E402
 
+from decision_engine.core.signal_bus import PURPOSE_LIVE_BNB_CROSS_MARGIN  # noqa: E402
 from execution.executors.binance_spot_gate import (  # noqa: E402
     LIVE_BNB_SPOT_PURPOSES,
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
@@ -47,6 +48,7 @@ from execution.executors.binance_spot_gate import (  # noqa: E402
 )
 from execution.live_bnb_dispatch import live_bnb_paper_env_block  # noqa: E402
 from execution.gateway import ExecutionGateway, _env_bool  # noqa: E402
+from execution.margin_cross.entry import maintain_live_margin  # noqa: E402
 from execution.ledger import resolve_ledger_path  # noqa: E402
 
 log = get_logger("execution.run")
@@ -133,6 +135,17 @@ def _peer_isolation_guard(
         return None
     if not accept_purposes:
         return "EXECUTION_ACCEPT_PURPOSE / --accept-purpose resolved empty"
+    if accept_purposes == frozenset({PURPOSE_LIVE_BNB_CROSS_MARGIN}):
+        main_ledger = _default_main_ledger_path()
+        if ledger_path.resolve() == main_ledger.resolve():
+            return "cross-margin purpose requires an isolated --ledger"
+        if ledger_path.name in {
+            "execution_ledger.db",
+            "execution_ledger_live_bnb_boll_fade.db",
+            "execution_ledger_live_bnb_boll_classic.db",
+        }:
+            return "cross-margin purpose must not use a spot ledger name"
+        return None
     live = accept_purposes & LIVE_BNB_SPOT_PURPOSES
     if live:
         if accept_purposes != live or len(live) != 1:
@@ -422,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def tick(since_id: int | None) -> dict:
             stats = gw.process_pending(since_id=since_id, limit=args.limit)
+            margin_maintenance = maintain_live_margin()
             tick_actions: list = []
             if paper_tick:
                 paper = gw._get_paper()
@@ -444,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
                     sorted(accept_purposes) if accept_purposes is not None else None
                 ),
                 "paper_tick_closed": tick_actions,
+                "margin_maintenance": margin_maintenance,
                 "protective_exits": [
                     {
                         "symbol": item.get("symbol"),

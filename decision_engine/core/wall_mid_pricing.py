@@ -9,9 +9,13 @@ Inspired by global top-2 algorithmic market-making microstructure practice:
       ``wall_mid = 0.5 * (bid_wall_price + ask_wall_price)``
 - For passive ``LIMIT_MAKER`` buy execution, ``maker_buy_price`` quotes 1 tick ahead of
   the whale Bid Wall (``bid_wall_price + tick_size``), strictly clamped to
-  ``<= best_ask - tick_size`` (and ``<= best_bid`` when ``post_only_at_or_below_best_bid``
-  is False, allowed up to ``best_ask - tick_size`` inside the spread) so the order never
-  crosses the ask and enjoys downside protection from the whale wall immediately behind it.
+  ``<= best_ask - tick_size`` so the order never crosses the ask and enjoys downside
+  protection from the whale wall immediately behind it.
+- Optional ``max_wall_distance_bps`` (default ``None``, disabled for strict backward
+  compatibility) bounds passive quote retreat from top-of-book with a 1-tick floor
+  safeguard (``max(1, floor(best_px * bps / 10000 / tick_size))``), preventing distant
+  deep-book orders from starving fill rates on thick fine-tick books while preserving
+  1-tick defense on coarse-tick books and thin top-of-book spoofs.
 
 The top N levels are the N best prices after the whole book is ranked. The raw
 list is not cut first. ``qty`` is base-asset size, and notional is ``price * qty``.
@@ -25,6 +29,8 @@ from dataclasses import dataclass
 import math
 import statistics
 from typing import Any, Sequence
+
+_THIN_TOP_LEVEL_MEDIAN_RATIO = 0.20
 
 
 @dataclass(frozen=True)
@@ -96,6 +102,7 @@ def compute_wall_mid_from_book(
     tick_size: float | None = None,
     wall_multiple: float = 2.0,
     max_levels: int = 20,
+    max_wall_distance_bps: float | None = None,
 ) -> WallMidQuote | None:
     """Computes WallMid and 1-tick wall-frontrun LIMIT_MAKER prices from L2 bids & asks."""
     cap = max(0, int(max_levels))
@@ -132,10 +139,9 @@ def compute_wall_mid_from_book(
 
     if ask_wall_px <= bid_wall_px:
         bid_wall_px, ask_wall_px = best_bid, best_ask
+        bid_wall_notional, ask_wall_notional = bid_notionals[0], ask_notionals[0]
         used_bid_wall = False
         used_ask_wall = False
-
-    wall_mid = 0.5 * (bid_wall_px + ask_wall_px)
 
     # Place passive buy 1 tick ahead of the whale Bid Wall, strictly below best_ask
     max_passive_buy = best_ask - tick if (best_ask - tick) > 0 else best_bid
@@ -147,6 +153,104 @@ def compute_wall_mid_from_book(
     min_passive_sell = best_bid + tick
     candidate_sell = ask_wall_px - tick if used_ask_wall else best_ask
     maker_sell = max(min_passive_sell, candidate_sell)
+
+    cap_bps = _finite_pos(max_wall_distance_bps)
+    if cap_bps is not None:
+        # Buy-side bounded retreat with 1-tick coarse-tick / thin-L1 floor safeguard
+        if maker_buy < best_bid - 1e-12:
+            raw_bid_ticks = int(math.floor((best_bid * (cap_bps / 10_000.0) + 1e-12) / tick))
+            max_bid_retreat_ticks = max(1, raw_bid_ticks)
+            min_allowed_buy = best_bid - max_bid_retreat_ticks * tick
+            if maker_buy < min_allowed_buy - 1e-12:
+                local_bid_cands = [
+                    i for i, (px, _) in enumerate(parsed_bids)
+                    if px >= (min_allowed_buy - tick - 1e-12)
+                ]
+                best_local_bid = (
+                    max(local_bid_cands, key=lambda i: bid_notionals[i])
+                    if local_bid_cands
+                    else 0
+                )
+                if (
+                    len(parsed_bids) >= 2
+                    and bid_notionals[best_local_bid] >= wall_multiple * max(med_bid, 1e-9)
+                ):
+                    bid_wall_px = parsed_bids[best_local_bid][0]
+                    bid_wall_notional = bid_notionals[best_local_bid]
+                    used_bid_wall = True
+                    maker_buy = max(min_allowed_buy, min(max_passive_buy, bid_wall_px + tick))
+                elif bid_notionals[0] < _THIN_TOP_LEVEL_MEDIAN_RATIO * med_bid:
+                    sup_bid_cands = [
+                        i for i, (px, _) in enumerate(parsed_bids)
+                        if px >= (min_allowed_buy - 1e-12)
+                    ]
+                    best_sup_bid = (
+                        max(sup_bid_cands, key=lambda i: bid_notionals[i])
+                        if sup_bid_cands
+                        else 0
+                    )
+                    bid_wall_px = parsed_bids[best_sup_bid][0]
+                    bid_wall_notional = bid_notionals[best_sup_bid]
+                    used_bid_wall = False
+                    maker_buy = min(max_passive_buy, max(min_allowed_buy, bid_wall_px))
+                else:
+                    bid_wall_px = best_bid
+                    bid_wall_notional = bid_notionals[0]
+                    used_bid_wall = False
+                    maker_buy = min(max_passive_buy, best_bid)
+            if maker_buy <= 0:
+                maker_buy = best_bid
+
+        # Sell-side symmetric bounded retreat with 1-tick floor safeguard
+        if maker_sell > best_ask + 1e-12:
+            raw_ask_ticks = int(math.floor((best_ask * (cap_bps / 10_000.0) + 1e-12) / tick))
+            max_ask_retreat_ticks = max(1, raw_ask_ticks)
+            max_allowed_sell = best_ask + max_ask_retreat_ticks * tick
+            if maker_sell > max_allowed_sell + 1e-12:
+                local_ask_cands = [
+                    i for i, (px, _) in enumerate(parsed_asks)
+                    if px <= (max_allowed_sell + tick + 1e-12)
+                ]
+                best_local_ask = (
+                    max(local_ask_cands, key=lambda i: ask_notionals[i])
+                    if local_ask_cands
+                    else 0
+                )
+                if (
+                    len(parsed_asks) >= 2
+                    and ask_notionals[best_local_ask] >= wall_multiple * max(med_ask, 1e-9)
+                ):
+                    ask_wall_px = parsed_asks[best_local_ask][0]
+                    ask_wall_notional = ask_notionals[best_local_ask]
+                    used_ask_wall = True
+                    maker_sell = min(max_allowed_sell, max(min_passive_sell, ask_wall_px - tick))
+                elif ask_notionals[0] < _THIN_TOP_LEVEL_MEDIAN_RATIO * med_ask:
+                    sup_ask_cands = [
+                        i for i, (px, _) in enumerate(parsed_asks)
+                        if px <= (max_allowed_sell + 1e-12)
+                    ]
+                    best_sup_ask = (
+                        max(sup_ask_cands, key=lambda i: ask_notionals[i])
+                        if sup_ask_cands
+                        else 0
+                    )
+                    ask_wall_px = parsed_asks[best_sup_ask][0]
+                    ask_wall_notional = ask_notionals[best_sup_ask]
+                    used_ask_wall = False
+                    maker_sell = max(min_passive_sell, min(max_allowed_sell, ask_wall_px))
+                else:
+                    ask_wall_px = best_ask
+                    ask_wall_notional = ask_notionals[0]
+                    used_ask_wall = False
+                    maker_sell = max(min_passive_sell, best_ask)
+
+        if ask_wall_px <= bid_wall_px:
+            bid_wall_px, ask_wall_px = best_bid, best_ask
+            bid_wall_notional, ask_wall_notional = bid_notionals[0], ask_notionals[0]
+            used_bid_wall = False
+            used_ask_wall = False
+
+    wall_mid = 0.5 * (bid_wall_px + ask_wall_px)
 
     return WallMidQuote(
         wall_mid_price=round(wall_mid, 8),
@@ -162,15 +266,29 @@ def compute_wall_mid_from_book(
     )
 
 
-def extract_wall_mid_from_row(row: dict[str, Any]) -> WallMidQuote | None:
+def extract_wall_mid_from_row(
+    row: dict[str, Any],
+    *,
+    max_wall_distance_bps: float | None = None,
+) -> WallMidQuote | None:
     """Extracts WallMidQuote from either raw L2 book arrays or pre-summarized wall fields."""
     if not isinstance(row, dict):
         return None
     bids = row.get("l2_bids") or row.get("bids")
     asks = row.get("l2_asks") or row.get("asks")
     tick = _finite_pos(row.get("tick_size"))
+    resolved_cap = (
+        _finite_pos(max_wall_distance_bps)
+        if max_wall_distance_bps is not None
+        else _finite_pos(row.get("max_wall_distance_bps"))
+    )
     if bids and asks:
-        return compute_wall_mid_from_book(bids, asks, tick_size=tick)
+        return compute_wall_mid_from_book(
+            bids,
+            asks,
+            tick_size=tick,
+            max_wall_distance_bps=resolved_cap,
+        )
 
     bid_wall = _finite_pos(row.get("bid_wall_price"))
     ask_wall = _finite_pos(row.get("ask_wall_price"))
@@ -183,13 +301,20 @@ def extract_wall_mid_from_row(row: dict[str, Any]) -> WallMidQuote | None:
         max_passive_buy = b_ask - t if (b_ask - t) > 0 else b_bid
         maker_buy = min(max_passive_buy, bid_wall + t)
         maker_sell = max(b_bid + t, ask_wall - t)
+        if resolved_cap is not None:
+            if maker_buy < b_bid - 1e-12:
+                max_bid_ticks = max(1, int(math.floor((b_bid * (resolved_cap / 10_000.0) + 1e-12) / t)))
+                maker_buy = min(max_passive_buy, max(b_bid - max_bid_ticks * t, maker_buy))
+            if maker_sell > b_ask + 1e-12:
+                max_ask_ticks = max(1, int(math.floor((b_ask * (resolved_cap / 10_000.0) + 1e-12) / t)))
+                maker_sell = max(b_bid + t, min(b_ask + max_ask_ticks * t, maker_sell))
         return WallMidQuote(
             wall_mid_price=round(0.5 * (bid_wall + ask_wall), 8),
             raw_mid_price=round(0.5 * (b_bid + b_ask), 8),
             bid_wall_price=round(bid_wall, 8),
             ask_wall_price=round(ask_wall, 8),
-        bid_wall_notional_usd=_finite_pos(row.get("bid_wall_notional_usd")),
-        ask_wall_notional_usd=_finite_pos(row.get("ask_wall_notional_usd")),
+            bid_wall_notional_usd=_finite_pos(row.get("bid_wall_notional_usd")),
+            ask_wall_notional_usd=_finite_pos(row.get("ask_wall_notional_usd")),
             maker_buy_price=round(maker_buy, 8),
             maker_sell_price=round(maker_sell, 8),
             used_true_bid_wall=True,

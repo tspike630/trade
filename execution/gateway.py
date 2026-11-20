@@ -43,6 +43,7 @@ from execution.config import (
     EXECUTION_RISK_ENABLED,
 )
 from execution.binance_account_snapshot import default_live_bnb_adapter
+from decision_engine.core.signal_bus import PURPOSE_LIVE_BNB_CROSS_MARGIN
 from execution.executors.binance_spot_gate import (
     REST_BOOK,
     consumer_read_cursor,
@@ -60,6 +61,13 @@ from execution.live_bnb_dispatch import (
     CatalogProbe,
     dispatch_live_bnb,
     parent_queue_view,
+)
+from decision_engine.core.execution_account_route import route_request_from_signal
+from execution.account_dispatch import dispatch_account_route
+from execution.reservation_lifecycle import (
+    bind_reservation_before_submit,
+    settle_reservation_after_execute,
+    settle_reservation_for_position,
 )
 from execution.ledger import (
     ExecutionLedger,
@@ -177,6 +185,7 @@ def _binance_public_result(result: dict[str, Any]) -> dict[str, Any]:
             result.get("size_plan") if isinstance(result.get("size_plan"), dict) else None
         ),
         "consumer_allowed": result.get("consumer_allowed") is True,
+        "order_post_attempted": result.get("order_post_attempted") is True,
         "arm_position": (
             result.get("arm_position") if isinstance(result.get("arm_position"), dict) else None
         ),
@@ -506,9 +515,17 @@ class ExecutionGateway:
             sql = (
                 "SELECT "
                 + ", ".join(columns)
-                + " FROM decision_log WHERE id > ? ORDER BY id ASC"
+                + " FROM decision_log WHERE id > ?"
             )
             params: list[Any] = [int(since_id)]
+            # Spot arms do not claim or watermark the cross-margin purpose.
+            if "purpose" in columns and sole_live_bnb_purpose(self.accept_purposes) is not None:
+                sql += " AND IFNULL(purpose, '') != ?"
+                params.append(PURPOSE_LIVE_BNB_CROSS_MARGIN)
+            elif self.accept_purposes == frozenset({PURPOSE_LIVE_BNB_CROSS_MARGIN}):
+                sql += " AND purpose = ?"
+                params.append(PURPOSE_LIVE_BNB_CROSS_MARGIN)
+            sql += " ORDER BY id ASC"
             if limit is not None:
                 sql += " LIMIT ?"
                 params.append(int(limit))
@@ -1142,6 +1159,78 @@ class ExecutionGateway:
         }
         exec_result["held_position"] = receipt_body["held_position"]
 
+    def _explicit_account_result(
+        self,
+        sig: dict[str, Any],
+        receipt_body: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Route one explicit account domain. Missing domain stays on spot.
+
+        Cross-margin reaches ``CrossMarginTrack.open_position`` only for an
+        offline fixture whose caller supplied an approval object and a ledger
+        path. Any other explicit domain is refused and does not call the spot
+        adapter.
+        """
+        extras = sig.get("extras") if isinstance(sig.get("extras"), dict) else {}
+        raw_domain = extras.get("account_domain", None)
+        if raw_domain in (None, "") and extras.get("submit_margin") is not True:
+            return None
+        payload = dict(extras)
+        payload.setdefault("strategy_id", sig.get("strategy_id"))
+        if sig.get("decision_log_id") is not None:
+            payload.setdefault("decision_log_id", sig.get("decision_log_id"))
+        request = route_request_from_signal(payload)
+        if request["account_domain"] == "binance_spot" and not request["submit_margin"]:
+            return None
+        ledger = extras.get("margin_ledger_path")
+        if request["account_domain"] == "binance_cross_margin" and (
+            not isinstance(ledger, str) or not str(ledger).strip()
+        ):
+            result: dict[str, Any] = {
+                "ok": False,
+                "reason": "margin_ledger_unspecified",
+                "venue": None,
+                "spot_called": False,
+                "margin_called": False,
+                "entry": None,
+            }
+        else:
+            result = dispatch_account_route(
+                request,
+                ledger_path=str(ledger or ""),
+                spot_submit=lambda _ignored: {"ok": False, "error": "spot_not_used"},
+            )
+        opened = bool(result.get("ok")) and bool(result.get("margin_called"))
+        open_body = result.get("open") if isinstance(result.get("open"), dict) else {}
+        resting = str(open_body.get("state") or "") == "entry_resting"
+        error = None if opened else str(result.get("reason") or "cross_margin_refused")
+        if resting:
+            receipt_body["status"] = "cross_margin_resting"
+        elif opened:
+            receipt_body["status"] = "cross_margin_opened"
+        else:
+            receipt_body["status"] = "cross_margin_refused"
+        receipt_body["note"] = (
+            "cross-margin entry still resting; ledger keeps the order"
+            if resting
+            else (
+                "offline cross-margin open_position"
+                if opened
+                else "account route refused; spot adapter not called"
+            )
+        )
+        receipt_body["step"] = "account_route"
+        receipt_body["exec_result"] = result
+        if error:
+            receipt_body["error"] = error
+        return {
+            "executor": "cross_margin_track" if result.get("margin_called") else "account_route",
+            "executed": 1 if opened else 0,
+            "error": error,
+            "order_status": "entry_resting" if resting else ("executed" if opened else "rejected"),
+            "exec_result": result,
+        }
+
     def process_one(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         sig: dict[str, Any] | None = None
         try:
@@ -1210,6 +1299,7 @@ class ExecutionGateway:
         exec_error: str | None = None
         risk_reasons: list[dict[str, Any]] | None = None
         submitted_to_executor = False
+        reservation_block: str | None = None
 
         step_label = self._step_label()
 
@@ -1225,9 +1315,79 @@ class ExecutionGateway:
 
         pm_result: dict[str, Any] | None = None
 
-        if not ok:
+        if str(sig.get("purpose") or "") == PURPOSE_LIVE_BNB_CROSS_MARGIN and ok:
+            routed = self._explicit_account_result(sig, receipt_body)
+            if routed is None:
+                receipt_body["status"] = "cross_margin_refused"
+                receipt_body["note"] = "cross-margin purpose without an explicit route"
+                receipt_body["error"] = "account_route_required"
+                return self._finalize(
+                    execution_log_id=exec_id,
+                    sig=sig,
+                    strategy_id=strategy_id,
+                    action=action,
+                    size_pct_f=size_pct_f,
+                    ok=ok,
+                    errors=errors,
+                    executed=0,
+                    executor="account_route",
+                    exec_error="account_route_required",
+                    risk_reasons=None,
+                    submitted=False,
+                    exec_result={
+                        "ok": False,
+                        "reason": "account_route_required",
+                        "spot_called": False,
+                        "margin_called": False,
+                    },
+                    pm_result=None,
+                    receipt_body=receipt_body,
+                    order_status="rejected",
+                )
+            return self._finalize(
+                execution_log_id=exec_id,
+                sig=sig,
+                strategy_id=strategy_id,
+                action=action,
+                size_pct_f=size_pct_f,
+                ok=ok,
+                errors=errors,
+                executed=int(routed["executed"]),
+                executor=str(routed["executor"]),
+                exec_error=routed["error"],
+                risk_reasons=None,
+                submitted=False,
+                exec_result=routed["exec_result"],
+                pm_result=None,
+                receipt_body=receipt_body,
+                order_status=str(routed["order_status"]),
+            )
+        elif not ok:
             receipt_body["status"] = "validation_failed"
             receipt_body["note"] = "validation_failed; not executed"
+        elif is_live_bnb_spot_purpose(sig.get("purpose")) and (
+            routed := self._explicit_account_result(sig, receipt_body)
+        ) is not None:
+            # An explicit account route is not a spot live row. The spot
+            # protection skip below stays in place when this returns None.
+            return self._finalize(
+                execution_log_id=exec_id,
+                sig=sig,
+                strategy_id=strategy_id,
+                action=action,
+                size_pct_f=size_pct_f,
+                ok=ok,
+                errors=errors,
+                executed=int(routed["executed"]),
+                executor=str(routed["executor"]),
+                exec_error=routed["error"],
+                risk_reasons=None,
+                submitted=False,
+                exec_result=routed["exec_result"],
+                pm_result=None,
+                receipt_body=receipt_body,
+                order_status=str(routed["order_status"]),
+            )
         elif (
             is_live_bnb_spot_purpose(sig.get("purpose"))
             and mode != "dry_run"
@@ -1280,71 +1440,84 @@ class ExecutionGateway:
             # open on this arm blocks only the same symbol. The other arm's
             # same symbol blocks too. Live buys share one lock so both arms
             # cannot spend the sealed free balance twice.
+            reservation_block = (
+                bind_reservation_before_submit(sig) if action == "buy" else None
+            )
             adapter = self._binance_spot or default_live_bnb_adapter()
             self._binance_spot = adapter
-            live_buy = action == "buy" and mode != "dry_run"
-            reserve = buy_reservation_lock(self.ledger.path) if live_buy else nullcontext()
-            with reserve:
-                if live_buy:
-                    purpose = str(sig.get("purpose") or "")
-                    own = self.ledger.list_binance_spot_buy_blocks(purpose=purpose)
-                    own_ids = {row.get("id") for row in own}
-                    same_book = [
-                        row
-                        for row in self.ledger.list_binance_spot_buy_blocks(purpose=None)
-                        if row.get("id") not in own_ids
-                    ]
-                    peer_path = peer_live_bnb_ledger_path(self.ledger.path)
-                    other_book = (
-                        read_spot_buy_blocks_readonly(peer_path)
-                        if peer_path is not None
-                        else []
-                    )
-                    adapter.buy_blocks = own
-                    adapter.peer_buy_blocks = same_book + other_book
-                    book = self.ledger.mcp_book()
-                    canonical = book.get("canonical_positions")
-                    adapter.canonical_rows = canonical if isinstance(canonical, list) else []
-                exec_result = _binance_public_result(adapter.execute(sig))
-                if (
-                    live_buy
-                    and not exec_result.get("dry_run")
-                    and exec_result.get("arm_position")
-                ):
-                    self._arm_binance_position(sig, exec_result, receipt_body)
-            executor = BINANCE_SPOT_EXECUTOR
-            submitted_to_executor = bool(exec_result.get("submitted"))
-            receipt_body["step"] = "binance_spot"
-            receipt_body["exec_result"] = exec_result
-            reported = exec_result.get("exchange_error")
-            if isinstance(reported, dict):
-                receipt_body["exchange_error"] = reported
-            if exec_result.get("dry_run"):
+            if reservation_block is not None:
+                executor = BINANCE_SPOT_EXECUTOR
                 executed = 0
-                if exec_result.get("ok"):
-                    receipt_body["status"] = "dry_run_acked"
-                    receipt_body["note"] = (
-                        "binance spot dry-run; newOrder not called"
-                    )
-                else:
-                    exec_error = str(exec_result.get("error") or "binance_spot_refused")
-                    receipt_body["status"] = "dry_run_rejected"
-                    receipt_body["note"] = "binance spot dry-run rejected; newOrder not called"
-                    receipt_body["error"] = exec_error
-            elif (
-                exec_result.get("consumer_allowed") is True
-                and exec_result.get("ok")
-                and int(exec_result.get("executed") or 0) == 1
-            ):
-                executed = 1
-                receipt_body["status"] = "binance_spot_submitted"
-                receipt_body["note"] = "binance spot buy covered by a verified native OCO"
+                submitted_to_executor = False
+                exec_error = reservation_block
+                receipt_body["status"] = "reservation_refused"
+                receipt_body["note"] = "reservation identity or mode refused the buy"
+                receipt_body["error"] = reservation_block
+                receipt_body["step"] = "binance_spot"
             else:
-                executed = 0
-                exec_error = str(exec_result.get("error") or "binance_spot_refused")
-                receipt_body["status"] = "live_refused"
-                receipt_body["note"] = "binance spot live fill refused; no retry"
-                receipt_body["error"] = exec_error
+                live_buy = action == "buy" and mode != "dry_run"
+                reserve = buy_reservation_lock(self.ledger.path) if live_buy else nullcontext()
+                with reserve:
+                    if live_buy:
+                        purpose = str(sig.get("purpose") or "")
+                        own = self.ledger.list_binance_spot_buy_blocks(purpose=purpose)
+                        own_ids = {row.get("id") for row in own}
+                        same_book = [
+                            row
+                            for row in self.ledger.list_binance_spot_buy_blocks(purpose=None)
+                            if row.get("id") not in own_ids
+                        ]
+                        peer_path = peer_live_bnb_ledger_path(self.ledger.path)
+                        other_book = (
+                            read_spot_buy_blocks_readonly(peer_path)
+                            if peer_path is not None
+                            else []
+                        )
+                        adapter.buy_blocks = own
+                        adapter.peer_buy_blocks = same_book + other_book
+                        book = self.ledger.mcp_book()
+                        canonical = book.get("canonical_positions")
+                        adapter.canonical_rows = canonical if isinstance(canonical, list) else []
+                    exec_result = _binance_public_result(adapter.execute(sig))
+                    if (
+                        live_buy
+                        and not exec_result.get("dry_run")
+                        and exec_result.get("arm_position")
+                    ):
+                        self._arm_binance_position(sig, exec_result, receipt_body)
+                executor = BINANCE_SPOT_EXECUTOR
+                submitted_to_executor = bool(exec_result.get("submitted"))
+                receipt_body["step"] = "binance_spot"
+                receipt_body["exec_result"] = exec_result
+                reported = exec_result.get("exchange_error")
+                if isinstance(reported, dict):
+                    receipt_body["exchange_error"] = reported
+                if exec_result.get("dry_run"):
+                    executed = 0
+                    if exec_result.get("ok"):
+                        receipt_body["status"] = "dry_run_acked"
+                        receipt_body["note"] = (
+                            "binance spot dry-run; newOrder not called"
+                        )
+                    else:
+                        exec_error = str(exec_result.get("error") or "binance_spot_refused")
+                        receipt_body["status"] = "dry_run_rejected"
+                        receipt_body["note"] = "binance spot dry-run rejected; newOrder not called"
+                        receipt_body["error"] = exec_error
+                elif (
+                    exec_result.get("consumer_allowed") is True
+                    and exec_result.get("ok")
+                    and int(exec_result.get("executed") or 0) == 1
+                ):
+                    executed = 1
+                    receipt_body["status"] = "binance_spot_submitted"
+                    receipt_body["note"] = "binance spot buy covered by a verified native OCO"
+                else:
+                    executed = 0
+                    exec_error = str(exec_result.get("error") or "binance_spot_refused")
+                    receipt_body["status"] = "live_refused"
+                    receipt_body["note"] = "binance spot live fill refused; no retry"
+                    receipt_body["error"] = exec_error
         else:
             # Step C: PM gate after validation, before executor (buy only)
             pm = self._get_pm()
@@ -1410,6 +1583,15 @@ class ExecutionGateway:
             order_status = "rejected"
         if exec_error:
             order_status = "rejected"
+
+        if (
+            action == "buy"
+            and is_live_bnb_spot_purpose(sig.get("purpose"))
+            and reservation_block is None
+        ):
+            reservation_note = settle_reservation_after_execute(sig, exec_result)
+            if reservation_note:
+                receipt_body["reservation"] = reservation_note
 
         return self._finalize(
             execution_log_id=exec_id,
@@ -1549,5 +1731,8 @@ class ExecutionGateway:
                 outcome["position_status"] = saved.get("status")
                 outcome["protection"] = saved.get("protection")
                 outcome["coverage"] = saved.get("protection")
+                position_note = settle_reservation_for_position(saved)
+                if position_note:
+                    outcome["reservation"] = position_note
             outcomes.append(outcome)
         return outcomes

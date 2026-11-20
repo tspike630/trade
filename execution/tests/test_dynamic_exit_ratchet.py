@@ -8,6 +8,7 @@ import unittest
 from decimal import Decimal
 from typing import Any
 from unittest.mock import patch
+from urllib.parse import parse_qs
 
 from execution.executors.binance_spot import (
     BinanceSpotAdapter,
@@ -86,6 +87,7 @@ class _FakeRatchetClient:
                     "orderId": 6001,
                     "clientOrderId": "bnbfade-tp-42",
                     "type": "LIMIT_MAKER",
+                    "side": "SELL",
                     "status": "NEW",
                     "executedQty": "0.00",
                 },
@@ -94,6 +96,7 @@ class _FakeRatchetClient:
                     "orderId": 6002,
                     "clientOrderId": "bnbfade-sl-42",
                     "type": "STOP_LOSS_LIMIT",
+                    "side": "SELL",
                     "status": "NEW",
                     "executedQty": "0.00",
                 },
@@ -165,7 +168,56 @@ class _FakeRatchetClient:
             "status": "FILLED",
             "executedQty": "1.50",
             "cummulativeQuoteQty": "151.50",
+            "side": "SELL",
         }
+
+    def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        form = parse_qs(signed_query)
+        if form.get("origClientOrderId"):
+            raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+        order_id = (form.get("orderId") or [""])[0]
+        if str(order_id) in {"6001", "6002", "7001", "7002"}:
+            return {
+                "symbol": "BNBUSDT",
+                "orderId": int(order_id),
+                "side": "SELL",
+                "type": "LIMIT_MAKER" if str(order_id) in {"6001", "7001"} else "STOP_LOSS_LIMIT",
+                "status": "NEW",
+                "executedQty": "0",
+                "origQty": "1.50",
+            }
+        if str(order_id) == "8888":
+            return {
+                "symbol": "BNBUSDT",
+                "orderId": 8888,
+                "side": "SELL",
+                "status": "FILLED",
+                "executedQty": "1.50",
+                "origQty": "1.50",
+            }
+        return {
+            "symbol": "BNBUSDT",
+            "orderId": 91001,
+            "side": "BUY",
+            "status": "FILLED",
+            "executedQty": "1.50",
+        }
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        order_id = (form.get("orderId") or ["91001"])[0]
+        sell = str(order_id) == "8888"
+        return [{
+            "symbol": "BNBUSDT",
+            "id": 2 if sell else 1,
+            "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+            "qty": "1.50",
+            "commission": "0",
+            "commissionAsset": "USDT" if sell else "BNB",
+            "isBuyer": not sell,
+        }]
 
 
 class TestDynamicExitRatchet(unittest.TestCase):
@@ -282,6 +334,7 @@ class TestDynamicExitRatchet(unittest.TestCase):
             "status": "oco_working",
             "protection": PROTECTION_EXCHANGE,
             "quantity": "1.50",
+            "entry_order_id": "91001",
             "entry_price": "100.00",
             "stop_price": "96.00",
             "take_profit_price": "104.00",

@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from decision_engine.strategies.live_bnb_entry_zone import evaluate_entry_zone
 from execution.executors.binance_spot import BinanceSpotAdapter
@@ -69,7 +70,7 @@ class _MakerAndSorMockClient:
             "executedQty": "1.00",
             "cummulativeQuoteQty": "99.95",
             "time": 1_700_000_000_000,
-            "fills": [],
+            "fills": [{"tradeId": 1, "qty": "1.00", "commission": "0", "commissionAsset": "SOL", "isBuyer": True}],
         }
         self.new_order_queries: list[str] = []
         self.cancel_order_queries: list[str] = []
@@ -101,17 +102,40 @@ class _MakerAndSorMockClient:
             "status": "FILLED",
             "executedQty": "1.00",
             "cummulativeQuoteQty": "99.95",
-            "fills": [],
+            "fills": [{"tradeId": 1, "qty": "1.00", "commission": "0", "commissionAsset": "SOL", "isBuyer": True}],
         }
 
     def get_order(self, signed_query: str, *, api_key: str) -> dict:
         return self.order_on_get
 
+    def my_trades(self, signed_query: str, *, api_key: str) -> list:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        payload = self.order_on_get if isinstance(self.order_on_get, dict) else {}
+        qty = str(payload.get("executedQty") or "0")
+        if qty in {"", "0", "0.0", "0.00"}:
+            return []
+        symbol = (form.get("symbol") or ["SOLUSDT"])[0]
+        order_id = (form.get("orderId") or ["91001"])[0]
+        return [{
+            "symbol": symbol,
+            "id": 1,
+            "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+            "qty": qty,
+            "commission": "0",
+            "commissionAsset": "SOL",
+            "isBuyer": True,
+        }]
+
     def cancel_order(self, signed_query: str, *, api_key: str) -> dict:
         self.cancel_order_queries.append(signed_query)
+        form = parse_qs(signed_query)
+        raw_oid = (form.get("orderId") or ["91001"])[0]
+        oid: int | str = int(raw_oid) if str(raw_oid).isdigit() else raw_oid
         canceled = {
-            "symbol": "SOLUSDT",
-            "orderId": 91001,
+            "symbol": (form.get("symbol") or ["SOLUSDT"])[0],
+            "orderId": oid,
             "status": "CANCELED",
             "executedQty": "0.00",
             "cummulativeQuoteQty": "0.00",
@@ -200,6 +224,7 @@ class LimitMakerAndSorTests(unittest.TestCase):
                 production_book=REST_BOOK,
                 rest_expected={"account_type": "SPOT", "usdt_free": "500"},
                 post_only_limit=True,
+                auto_flatten_on_oco_fail=True,
             )
             res = adapter.execute(sig)
             self.assertTrue(res["ok"], res.get("error"))
@@ -244,6 +269,7 @@ class LimitMakerAndSorTests(unittest.TestCase):
                 rest_expected={"account_type": "SPOT", "usdt_free": "500"},
                 orderbook_gate=True,
                 sor_maker_fallback=True,
+                auto_flatten_on_oco_fail=True,
             )
             res = adapter.execute(sig)
             self.assertTrue(res["ok"], res.get("error"))
@@ -272,7 +298,7 @@ class LimitMakerAndSorTests(unittest.TestCase):
                 "executedQty": "1.00",
                 "cummulativeQuoteQty": "99.95",
                 "time": 1_700_000_000_000,
-                "fills": [],
+                "fills": [{"tradeId": 1, "qty": "1.00", "commission": "0", "commissionAsset": "SOL", "isBuyer": True}],
             }
         )
         with tempfile.TemporaryDirectory() as tmp:

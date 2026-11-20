@@ -39,6 +39,7 @@ from execution.executors.binance_spot_protect import PROTECTION_EXCHANGE  # noqa
 from decision_engine.core.regime_strategy_router import evaluate_five_state_regime  # noqa: E402
 from decision_engine.core.data_adapter import IndicatorDataAdapter  # noqa: E402
 from decision_engine.core.engine import DecisionEngine  # noqa: E402
+from decision_engine.tests.quiet_macro import write_quiet_macro  # noqa: E402
 from decision_engine.core.risk_manager import RiskManager  # noqa: E402
 from decision_engine.core.signal_bus import SignalBus  # noqa: E402
 from decision_engine.strategies import get_strategy  # noqa: E402
@@ -80,8 +81,8 @@ def _working(list_id: int, above: int, below: int, client: str) -> dict[str, Any
         "symbol": "BNBUSDT",
         "orders": [{"orderId": above}, {"orderId": below}],
         "orderReports": [
-            {"orderId": above, "type": "LIMIT_MAKER", "status": "NEW", "executedQty": "0"},
-            {"orderId": below, "type": "STOP_LOSS_LIMIT", "status": "NEW", "executedQty": "0"},
+            {"orderId": above, "type": "LIMIT_MAKER", "side": "SELL", "status": "NEW", "executedQty": "0"},
+            {"orderId": below, "type": "STOP_LOSS_LIMIT", "side": "SELL", "status": "NEW", "executedQty": "0"},
         ],
     }
 
@@ -112,6 +113,7 @@ class _Exchange:
             "price": "99.95",
             "time": 1_700_000_000_000,
         }
+        self.last_reports: list[dict[str, Any]] = []
         self.exit_order: dict[str, Any] | None = None
         self.exit_lookup = "absent"
 
@@ -131,13 +133,42 @@ class _Exchange:
         if self.list_mode == "timeout":
             raise TimeoutError("list timed out")
         if self.list_mode == "working_unverified_ack":
-            return _working(5002, 11, 12, "bnbfade-ol-44")
+            return {
+                "symbol": "BNBUSDT",
+                "orderListId": 5001,
+                "listClientOrderId": "bnbfade-ol-44",
+                "listOrderStatus": "EXECUTING",
+                "listStatusType": "EXEC_STARTED",
+                "orders": [{"orderId": 6001}, {"orderId": 6002}],
+                "orderReports": [
+                    {
+                        "symbol": "BNBUSDT",
+                        "orderId": 6001,
+                        "side": "SELL",
+                        "type": "LIMIT_MAKER",
+                        "status": "NEW",
+                        "origQty": "1.00",
+                        "executedQty": "0",
+                    },
+                    {
+                        "symbol": "BNBUSDT",
+                        "orderId": 6002,
+                        "side": "SELL",
+                        "type": "STOP_LOSS_LIMIT",
+                        "status": "NEW",
+                        "origQty": "1.00",
+                        "executedQty": "0",
+                    },
+                ],
+            }
         return _working(5001, 6001, 6002, "bnbfade-ol-42")
 
     def cancel_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.cancels.append(signed_query)
         if self.cancel_list_once is not None:
             body = self.cancel_list_once
+            reports = body.get("orderReports")
+            self.last_reports = [item for item in reports if isinstance(item, dict)] if isinstance(reports, list) else []
             self.cancel_list_once = None
             return body
         if self.hold_list_timeout_after_cancel:
@@ -196,7 +227,68 @@ class _Exchange:
             if self.exit_lookup == "absent" or self.exit_order is None:
                 raise BinanceRequestError(400, code=-2013, message="Order does not exist.")
             return self.exit_order
+        order_id = (form.get("orderId") or [""])[0]
+        reports: list[dict[str, Any]] = []
+        if isinstance(self.cancel_list_once, dict) and isinstance(self.cancel_list_once.get("orderReports"), list):
+            reports.extend(item for item in self.cancel_list_once["orderReports"] if isinstance(item, dict))
+        reports.extend(self.last_reports)
+        for report in reports:
+            if str(report.get("orderId")) == str(order_id):
+                body = dict(report)
+                body.setdefault("symbol", "BNBUSDT")
+                body.setdefault("side", "SELL")
+                return body
+        if str(order_id) == "9":
+            symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+            return {
+                "symbol": symbol,
+                "orderId": 9,
+                "side": "BUY",
+                "status": "FILLED",
+                "executedQty": "1.50",
+                "origQty": "1.50",
+            }
         return self.entry
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        symbol = (form.get("symbol") or ["BNBUSDT"])[0]
+        order_id = (form.get("orderId") or ["99"])[0]
+        if str(order_id) == "9":
+            qty = "1.50"
+            buyer = True
+        else:
+            qty = str(self.entry.get("executedQty") or "0")
+            buyer = True
+        exit_order = self.exit_order if isinstance(self.exit_order, dict) else None
+        if exit_order is not None and str(exit_order.get("orderId")) == str(order_id):
+            qty = str(exit_order.get("executedQty") or qty)
+            buyer = False
+        else:
+            reports = list(self.last_reports)
+            if isinstance(self.cancel_list_once, dict) and isinstance(self.cancel_list_once.get("orderReports"), list):
+                reports.extend(item for item in self.cancel_list_once["orderReports"] if isinstance(item, dict))
+            for report in reports:
+                if isinstance(report, dict) and str(report.get("orderId")) == str(order_id):
+                    qty = str(report.get("executedQty") or "0")
+                    buyer = False
+                    break
+        if qty in {"", "0", "0.0", "0.00"}:
+            return []
+        base = symbol[:-4] if symbol.endswith("USDT") else "BNB"
+        return [
+            {
+                "symbol": symbol,
+                "id": 1,
+                "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+                "qty": qty,
+                "commission": "0",
+                "commissionAsset": base,
+                "isBuyer": buyer,
+            }
+        ]
 
     def cancel_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.entry_cancels.append(signed_query)
@@ -391,14 +483,33 @@ class PersistenceSafetyTests(unittest.TestCase):
         naked = self._held(ledger, 45)
         nid = int(naked["id"])
         ledger.update_binance_spot_position(nid, {"status": "open", "protection": "oco_pending"})
-        flat = adapter.maintain_held_position(
+        posts_before = len(client.ocos)
+        held = adapter.maintain_held_position(
             dict(ledger.binance_spot_position_by_id(nid) or {}),
             "100",
             persist=lambda fields: ledger.update_binance_spot_position(nid, fields),
         )
-        self.assertEqual(flat["book"], "closed")
-        self.assertEqual(len(client.sells), 1)
-        self.assertIn("oco_failed_auto_flattened", str(flat.get("error")))
+        stored = ledger.binance_spot_position_by_id(nid)
+        assert stored is not None
+        self.assertEqual(held["book"], "oco_unknown", held)
+        self.assertEqual(held["error"], "oco_list_absent:-2018")
+        self.assertEqual(client.sells, [])
+        self.assertEqual(stored["status"], "oco_unknown")
+        self.assertEqual(stored["stop_price"], "96")
+        self.assertEqual(stored["take_profit_price"], "104")
+        self.assertEqual(len(client.ocos), posts_before)
+        client.list_mode = "working"
+        claimed = adapter.maintain_held_position(
+            dict(stored),
+            "100",
+            persist=lambda fields: ledger.update_binance_spot_position(nid, fields),
+        )
+        claimed_row = ledger.binance_spot_position_by_id(nid)
+        assert claimed_row is not None
+        self.assertEqual(claimed["book"], "oco_unknown", claimed)
+        self.assertEqual(claimed_row["status"], "oco_unknown")
+        self.assertEqual(len(client.ocos), posts_before)
+        self.assertEqual(client.sells, [])
 
     def test_resting_maker_reserves_partial_qty_and_ttl_is_terminal(self) -> None:
         client = _Exchange()
@@ -422,6 +533,7 @@ class PersistenceSafetyTests(unittest.TestCase):
             rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
             post_only_limit=True,
             entry_ttl_sec=180,
+            auto_flatten_on_oco_fail=True,
         )
         result = adapter.execute(
             {
@@ -803,6 +915,7 @@ class PersistenceSafetyTests(unittest.TestCase):
             production_book=REST_BOOK,
             rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
             post_only_limit=True,
+            auto_flatten_on_oco_fail=True,
         )
         result = adapter.execute(
             {
@@ -868,6 +981,7 @@ class PersistenceSafetyTests(unittest.TestCase):
             production_book=REST_BOOK,
             rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
             post_only_limit=False,
+            auto_flatten_on_oco_fail=True,
         )
         result = adapter.execute(
             self._buy({"recommended_order_type": "LIMIT_MAKER", "enable_trailing_ratchet": True})
@@ -889,7 +1003,8 @@ class PersistenceSafetyTests(unittest.TestCase):
         )
         self.assertEqual(parse_qs(client.orders[-1]).get("type"), ["LIMIT"])
         self.assertEqual(parse_qs(client.orders[-1]).get("timeInForce"), ["GTC"])
-        self.assertNotEqual(explicit["error"], "maker_entry_resting")
+        self.assertEqual(explicit["error"], "maker_entry_resting")
+        self.assertEqual(client.ocos, [])
 
         none = adapter.execute(
             self._buy({"recommended_order_type": "NONE", "quote_order_qty": "20"}, 72, limit=False)
@@ -959,6 +1074,7 @@ class PersistenceSafetyTests(unittest.TestCase):
                 bus,
                 [get_strategy("tech_boll_fade_v1")],
                 risk=RiskManager(cooldown_sec=0),
+                macro_db=write_quiet_macro(db.with_name("quiet_macro.db"), now_ms),
             ).tick()
         finally:
             bus.close()
@@ -994,6 +1110,21 @@ class PersistenceSafetyTests(unittest.TestCase):
             rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
             post_only_limit=False,
         )
+        blocked = adapter.execute(
+            {
+                "decision_log_id": 81,
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                "mode": "live_stub",
+                "action": stored["action"],
+                "token_address": "FADEUSDT",
+                "size_pct": stored["size_pct"],
+                "extras": extras,
+            }
+        )
+        self.assertEqual(blocked["error"], "resting_protection_unconfigured")
+        self.assertEqual(client.orders, [])
+        self.assertEqual(client.ocos, [])
+        adapter.auto_flatten_on_oco_fail = True
         result = adapter.execute(
             {
                 "decision_log_id": int(stored["id"]) if "id" in stored.keys() else 80,
@@ -1039,6 +1170,9 @@ class PersistenceSafetyTests(unittest.TestCase):
         pid = int(row["id"])
         ledger.update_binance_spot_position(pid, {"quantity": qty})
         client = _Exchange()
+        client.entry["status"] = "FILLED"
+        client.entry["executedQty"] = qty
+        client.entry["side"] = "BUY"
         adapter = BinanceSpotAdapter(
             client=client,
             api_key="k",
@@ -1136,7 +1270,18 @@ class PersistenceSafetyTests(unittest.TestCase):
         client.list_mode = "absent"
         client.oco_mode = "reject"
         client.sell_ack = {"orderId": 78, "status": "NEW", "executedQty": "0.00", "origQty": "1.50"}
-        ledger.update_binance_spot_position(pid, {"status": "open", "protection": "oco_pending"})
+        ledger.update_binance_spot_position(
+            pid,
+            {
+                "status": "open",
+                "protection": "oco_pending",
+                "oco_order_list_id": None,
+                "oco_list_client_id": None,
+                "oco_above_order_id": None,
+                "oco_below_order_id": None,
+                "last_error": None,
+            },
+        )
         self._tick(ledger, adapter, "100")
         self._tick(ledger, adapter, "100")
         stored = ledger.binance_spot_position_by_id(pid)
@@ -1157,7 +1302,18 @@ class PersistenceSafetyTests(unittest.TestCase):
             "executedQty": "0.40",
             "origQty": "1.50",
         }
-        ledger.update_binance_spot_position(pid, {"status": "open", "protection": "oco_pending"})
+        ledger.update_binance_spot_position(
+            pid,
+            {
+                "status": "open",
+                "protection": "oco_pending",
+                "oco_order_list_id": None,
+                "oco_list_client_id": None,
+                "oco_above_order_id": None,
+                "oco_below_order_id": None,
+                "last_error": None,
+            },
+        )
         self._tick(ledger, adapter, "100")
         self._tick(ledger, adapter, "100")
         stored = ledger.binance_spot_position_by_id(pid)
@@ -1179,6 +1335,7 @@ class PersistenceSafetyTests(unittest.TestCase):
             rest_expected={"account_type": "SPOT", "usdt_free": "1000.00"},
             post_only_limit=False,
             ws_cache=ws,
+            auto_flatten_on_oco_fail=True,
         )
 
     def test_stale_ws_bid_does_not_override_a_fresh_rest_book(self) -> None:

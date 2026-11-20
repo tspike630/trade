@@ -13,6 +13,7 @@ import sys
 import time
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -28,11 +29,21 @@ from execution.executors.binance_spot import (  # noqa: E402
     BinanceRequestError,
     BinanceSpotAdapter,
     floor_base_qty,
+    order_list_absent,
     protective_exit_reason,
+    single_order_absent,
     size_exit_quantity,
 )
+from execution.executors.binance_spot_gate import (  # noqa: E402
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+    buy_exposure_block,
+)
 from execution.gateway import ExecutionGateway  # noqa: E402
-from execution.ledger import ExecutionLedger  # noqa: E402
+from execution.ledger import (  # noqa: E402
+    ExecutionLedger,
+    bind_registry_membership,
+    initialize_spot_ledger_binding,
+)
 from execution.run import tick_live_bnb_exits  # noqa: E402
 
 _INFO = {
@@ -74,8 +85,48 @@ def _working_oco() -> dict[str, Any]:
             {"orderId": 10},
         ],
         "orderReports": [
-            {"orderId": 11, "type": "LIMIT_MAKER", "status": "NEW", "executedQty": "0"},
-            {"orderId": 10, "type": "STOP_LOSS_LIMIT", "status": "NEW", "executedQty": "0"},
+            {"orderId": 11, "type": "LIMIT_MAKER", "side": "SELL", "status": "NEW", "executedQty": "0"},
+            {"orderId": 10, "type": "STOP_LOSS_LIMIT", "side": "SELL", "status": "NEW", "executedQty": "0"},
+        ],
+    }
+
+
+def _live_cover(
+    *,
+    symbol: str = "BNBUSDT",
+    list_id: int = 42,
+    client_id: str = "bnbfade-ol-11",
+    above: int = 11,
+    below: int = 10,
+    qty: str = "1.23",
+    list_status: str = "EXECUTING",
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "orderListId": list_id,
+        "listClientOrderId": client_id,
+        "listOrderStatus": list_status,
+        "listStatusType": "EXEC_STARTED" if list_status == "EXECUTING" else "ALL_DONE",
+        "orders": [{"orderId": above}, {"orderId": below}],
+        "orderReports": [
+            {
+                "symbol": symbol,
+                "orderId": above,
+                "side": "SELL",
+                "type": "LIMIT_MAKER",
+                "status": "NEW",
+                "origQty": qty,
+                "executedQty": "0",
+            },
+            {
+                "symbol": symbol,
+                "orderId": below,
+                "side": "SELL",
+                "type": "STOP_LOSS_LIMIT",
+                "status": "NEW",
+                "origQty": qty,
+                "executedQty": "0",
+            },
         ],
     }
 
@@ -86,6 +137,8 @@ class _Client:
         self.info = _INFO if info is None else info
         self.fail_sells = fail_sells
         self._failed = 0
+        self.trades: dict[str, tuple[str, bool]] = {}
+        self.last_sell_qty = "1.23"
 
     def exchange_info(self, symbol: str) -> dict[str, Any]:
         self.calls.append(("exchange_info", symbol))
@@ -97,12 +150,61 @@ class _Client:
             self._failed += 1
             raise BinanceRequestError(500)
         if "side=BUY" in signed_query:
+            self.trades["99"] = ("1.239", True)
             return {
                 "orderId": "99",
                 "status": "FILLED",
                 "executedQty": "1.239",
+                "side": "BUY",
+                "symbol": "BNBUSDT",
             }
-        return {"orderId": "77", "status": "FILLED"}
+        form = parse_qs(signed_query)
+        qty = (form.get("quantity") or ["1.23"])[0]
+        self.last_sell_qty = qty
+        self.trades["77"] = (qty, False)
+        return {"orderId": "77", "status": "FILLED", "executedQty": qty, "side": "SELL", "symbol": "BNBUSDT"}
+
+    def my_trades(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+        form = parse_qs(signed_query)
+        if form.get("fromId"):
+            return []
+        order_id = (form.get("orderId") or ["99"])[0]
+        known = self.trades.get(str(order_id))
+        if known is None:
+            return []
+        qty, buyer = known
+        return [{
+            "symbol": "BNBUSDT",
+            "id": int(order_id) if str(order_id).isdigit() else 1,
+            "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+            "qty": qty,
+            "commission": "0",
+            "commissionAsset": "BNB",
+            "isBuyer": buyer,
+        }]
+
+    def get_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+        form = parse_qs(signed_query)
+        if form.get("origClientOrderId"):
+            raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+        order_id = (form.get("orderId") or ["99"])[0]
+        known = self.trades.get(str(order_id))
+        if known is None:
+            return {
+                "symbol": "BNBUSDT",
+                "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+                "side": "BUY",
+                "status": "NEW",
+                "executedQty": "0",
+            }
+        qty, buyer = known
+        return {
+            "symbol": "BNBUSDT",
+            "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+            "side": "SELL" if buyer is False else "BUY",
+            "status": "FILLED",
+            "executedQty": qty,
+        }
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_oco", signed_query, api_key))
@@ -203,6 +305,7 @@ class ProtectiveExitTests(unittest.TestCase):
             api_key="test-key",
             api_secret="test-secret",
             clock_ms=lambda: 1_700_000_000_000,
+            auto_flatten_on_oco_fail=True,
             account_snapshot={
                 "accountType": "SPOT",
                 "canTrade": True,
@@ -213,6 +316,7 @@ class ProtectiveExitTests(unittest.TestCase):
                     "ipRestrict": True,
                 },
                 "balances": [{"asset": "USDT", "free": "1000", "locked": "0"}],
+                "uid": 424242,
             },
             production_book="rest_api_key",
             rest_expected={"account_type": "SPOT", "usdt_free": "1000"},
@@ -222,15 +326,45 @@ class ProtectiveExitTests(unittest.TestCase):
         self._net.stop()
         self._tmp.cleanup()
 
-    def _gateway(self) -> ExecutionGateway:
-        return ExecutionGateway(
+    @contextmanager
+    def _gateway(self) -> Any:
+        ledger_path = self.root / "execution_ledger_live_bnb_boll_fade.db"
+        classic = self.root / "execution_ledger_live_bnb_boll_classic.db"
+        if not classic.is_file():
+            ExecutionLedger(classic).close()
+        initialize_spot_ledger_binding(classic, "424242")
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps(
+                {
+                    "required_purposes": [
+                        "live_bnb_boll_fade",
+                        "live_bnb_boll_classic",
+                    ],
+                    "purpose_ledgers": {
+                        "live_bnb_boll_fade": str(ledger_path.resolve()),
+                        "live_bnb_boll_classic": str(classic.resolve()),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.environ["BINANCE_SPOT_LEDGER_REGISTRY"] = str(registry)
+        with ExecutionGateway(
             decision_db=self.root / "decision.db",
-            ledger_path=self.root / "execution_ledger_live_bnb_boll_fade.db",
+            ledger_path=ledger_path,
             paper_enabled=False,
             pm_enabled=False,
             accept_purposes=frozenset({PURPOSE_LIVE_BNB_BOLL_FADE}),
             binance_spot=self.adapter,
-        )
+        ) as gw:
+            bound = initialize_spot_ledger_binding(ledger_path, "424242")
+            if bound:
+                raise RuntimeError(bound)
+            membership = bind_registry_membership("424242")
+            if membership:
+                raise RuntimeError(membership)
+            yield gw
 
     def test_dry_run_submits_nothing_and_does_not_arm(self) -> None:
         env = _env(self.root, enabled="1")
@@ -337,12 +471,14 @@ class ProtectiveExitTests(unittest.TestCase):
         kill = self.root / "LIVE_TRADING_DISABLED"
         kill.write_text("keep live off\n", encoding="utf-8")
         env = _env(self.root, enabled="1")
+        self.client.trades["99"] = ("1.239", True)
         position = {
             "id": 1,
             "decision_log_id": 11,
             "symbol": "BNBUSDT",
             "status": "open",
             "quantity": "1.239",
+            "entry_order_id": "99",
             "stop_price": "99",
             "take_profit_price": "110",
         }
@@ -374,6 +510,7 @@ class ProtectiveExitTests(unittest.TestCase):
 
     def test_unconfirmed_fill_and_bad_precision_do_not_sell(self) -> None:
         self.client = _Client()
+        self.client.trades.clear()
         self.client.new_order = _buy_without_qty(self.client)  # type: ignore[method-assign]
         self.adapter.client = self.client
         env = _env(self.root, enabled="1")
@@ -442,16 +579,42 @@ class ProtectiveExitTests(unittest.TestCase):
         def new_order(signed_query: str, *, api_key: str) -> dict[str, Any]:
             self.client.calls.append(("new_order", signed_query, api_key))
             if "side=SELL" in signed_query:
-                return {"orderId": "77", "status": "FILLED"}
+                qty = parse_qs(signed_query).get("quantity", ["1.23"])[0]
+                return {"orderId": "77", "status": "FILLED", "executedQty": qty, "origQty": qty}
             return {"orderId": "99", "status": "NEW"}
 
         def get_order(signed_query: str, *, api_key: str) -> dict[str, Any]:
             self.client.calls.append(("get_order", signed_query, api_key))
             self.assertNotIn("test-secret", signed_query)
-            return {"orderId": "99", "status": "FILLED", "executedQty": "1.239"}
+            if "origClientOrderId" in signed_query:
+                raise BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+            return {"orderId": "99", "symbol": "BNBUSDT", "side": "BUY", "status": "FILLED", "executedQty": "1.239", "origQty": "1.239"}
 
         self.client.new_order = new_order  # type: ignore[method-assign]
         self.client.get_order = get_order  # type: ignore[method-assign]
+
+        def my_trades(signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+            form = parse_qs(signed_query)
+            if form.get("fromId"):
+                return []
+            order_id = (form.get("orderId") or ["99"])[0]
+            if str(order_id) == "77":
+                qty, buyer = "1.23", False
+            else:
+                qty, buyer = "1.239", True
+            return [
+                {
+                    "symbol": "BNBUSDT",
+                    "id": 2 if str(order_id) == "77" else 1,
+                    "orderId": int(order_id) if str(order_id).isdigit() else order_id,
+                    "qty": qty,
+                    "commission": "0",
+                    "commissionAsset": "BNB",
+                    "isBuyer": buyer,
+                }
+            ]
+
+        self.client.my_trades = my_trades  # type: ignore[method-assign]
         self.adapter.client = self.client
         env = _env(self.root, enabled="1")
         with mock.patch.dict(os.environ, env):
@@ -465,17 +628,19 @@ class ProtectiveExitTests(unittest.TestCase):
                     {"BNBUSDT": "98"},
                 )
                 row = gw.ledger.binance_spot_position_by_decision(11)
-        self.assertEqual(exits[0]["position_status"], "oco_failed")
-        self.assertEqual(exits[0]["error"], "oco_price_restriction")
-        self.assertFalse(exits[0]["submitted"])
-        self.assertFalse(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
+        self.assertEqual(exits[0]["position_status"], "closed_dust", exits[0])
         assert row is not None
-        self.assertEqual(row["status"], "oco_failed")
+        self.assertEqual(row["protection"], "dust_abandon")
+        self.assertTrue(any(call[0] == "new_order" and "side=SELL" in call[1] for call in self.client.calls))
+        self.assertEqual(row["status"], "closed_dust")
+        self.assertEqual(row["unprotected_qty"], "0.009")
+        self.assertEqual(row["manual_action"], "residual_below_min_is_not_a_complete_exit")
         self.assertIn("orderId=99", next(call[1] for call in self.client.calls if call[0] == "get_order"))
-        self.assertEqual(_sell_forms(self.client), [])
+        self.assertEqual(_sell_forms(self.client)[0]["side"], ["SELL"])
 
     def test_http_failure_keeps_the_position_open_and_retries_one_client_id(self) -> None:
         self.client = _Client(fail_sells=1)
+        self.client.trades["99"] = ("1.239", True)
         self.adapter.client = self.client
         env = _env(self.root, enabled="1")
         position = {
@@ -484,6 +649,7 @@ class ProtectiveExitTests(unittest.TestCase):
             "symbol": "BNBUSDT",
             "status": "open",
             "quantity": "1.239",
+            "entry_order_id": "99",
             "stop_price": "99",
             "take_profit_price": "110",
         }
@@ -512,6 +678,7 @@ class ProtectiveExitTests(unittest.TestCase):
         self.assertIsNone(small)
         self.assertEqual(small_error, "exit_below_min_notional")
         self.client.info = naked
+        self.client.trades["99"] = ("1.239", True)
         env = _env(self.root, enabled="1")
         position = {
             "id": 1,
@@ -519,6 +686,7 @@ class ProtectiveExitTests(unittest.TestCase):
             "symbol": "BNBUSDT",
             "status": "open",
             "quantity": "1.239",
+            "entry_order_id": "99",
             "stop_price": "99",
             "take_profit_price": "110",
         }
@@ -764,16 +932,46 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, env):
             filled = adapter.execute(self._dash_buy())
-        self.assertEqual(filled["error"], "oco_unprotectable:oco_price_restriction")
-        self.assertEqual(filled["arm_position"]["status"], "oco_failed")
-        self.assertEqual(filled["arm_position"]["stop_price"], "48.02605")
-        self.assertEqual(filled["arm_position"]["take_profit_price"], "48.2895")
-        self.assertEqual(filled["executed"], 0)
-        self.assertEqual(sum(1 for call in client.calls if call[0] == "new_order"), 1)
+        self.assertEqual(filled["error"], "buy_protection_unconfigured")
+        self.assertIsNone(filled.get("arm_position"))
+        self.assertFalse(any(call[0] == "new_order" for call in client.calls))
         self.assertFalse(any(call[0] == "new_oco" for call in client.calls))
-        adapter.buy_blocks = [filled["arm_position"]]
+
+        # With auto-flatten enabled (and sell blocked on kill during flatten),
+        # a fill average below stop_price (48.02 < 48.02605) refuses OCO and blocks next buy.
+        slipped_client = _DashBook(mark="48.10")
+        slipped_client.my_trades = lambda signed_query, *, api_key: [  # type: ignore[attr-defined]
+            {"id": 1, "symbol": "DASHUSDT", "orderId": 2953042815, "qty": "1.082", "commission": "0", "commissionAsset": "USDT", "isBuyer": True}
+        ]
+        slipped_adapter = self._adapter(slipped_client)
+        slipped_adapter.auto_flatten_on_oco_fail = True
+        kill_file = self.root / "temp-kill"
+        kill_file.write_text("halt\n", encoding="utf-8")
+        slipped_adapter.kill_switch_path = kill_file
+        with mock.patch.dict(os.environ, {**env, "BINANCE_SPOT_BLOCK_SELL_ON_KILL": "1"}):
+            slipped = slipped_adapter._buy_with_native_oco(
+                self._dash_buy(),
+                plan={"stop_price": "48.02605", "take_profit_price": "48.2895", "entry_price": "48.10"},
+                gates={"kill_switch_active": True, "kill_switch": "LIVE_TRADING_DISABLED", "live_enabled": True, "block_sell_on_kill": True},
+                intent=None,
+                pairs=[("symbol", "DASHUSDT"), ("side", "BUY"), ("type", "MARKET")],
+                order_id="2953042815",
+                filled="1.082",
+                sellable="1.082",
+                info=_DASH_INFO,
+                symbol="DASHUSDT",
+                placed={"orderId": "2953042815", "status": "FILLED", "executedQty": "1.082", "cummulativeQuoteQty": "51.957640", "symbol": "DASHUSDT"},
+            )
+        kill_file.unlink()
+        slipped_adapter.kill_switch_path = self.root / "absent-kill"
+        self.assertIn("oco_unprotectable:oco_price_restriction", str(slipped["error"]))
+        self.assertEqual(slipped["arm_position"]["status"], "oco_failed")
+        self.assertEqual(slipped["arm_position"]["stop_price"], "48.02605")
+        self.assertEqual(slipped["arm_position"]["take_profit_price"], "48.2895")
+        self.assertFalse(any(call[0] == "new_oco" for call in slipped_client.calls))
+        slipped_adapter.buy_blocks = [slipped["arm_position"]]
         with mock.patch.dict(os.environ, env):
-            blocked = adapter.execute(
+            blocked = slipped_adapter.execute(
                 {
                     **self._dash_buy(),
                     "decision_log_id": 148593,
@@ -844,28 +1042,50 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
         self.assertNotIn("new_order", client.calls)
         self.assertIn("get_order_list", client.calls)
 
-    def test_unknown_submit_retries_once_when_the_list_is_absent(self) -> None:
+    def test_official_list_miss_is_not_a_single_order_miss(self) -> None:
+        # Confirmed GET /api/v3/orderList miss body. It does not authorize a resubmit.
+        miss = BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+        one_order = BinanceRequestError(400, code=-2013, msg="Order does not exist.")
+        self.assertEqual(miss.status, 400)
+        self.assertEqual(miss.code, -2018)
+        self.assertEqual(miss.msg, "Order list does not exist.")
+        self.assertTrue(order_list_absent(miss))
+        self.assertFalse(single_order_absent(miss))
+        self.assertEqual(one_order.msg, "Order does not exist.")
+        self.assertFalse(order_list_absent(one_order))
+        self.assertTrue(single_order_absent(one_order))
+        bare_404 = BinanceRequestError(404, code=-2018, msg="Order list does not exist.")
+        other_msg = BinanceRequestError(400, code=-2018, msg="Unknown order sent.")
+        bare_400 = BinanceRequestError(400)
+        self.assertFalse(order_list_absent(bare_404))
+        self.assertFalse(order_list_absent(other_msg))
+        self.assertFalse(order_list_absent(bare_400))
+
+    def test_unknown_submit_official_list_miss_does_not_repost(self) -> None:
         class _Retry:
             def __init__(self) -> None:
-                self.calls: list[str] = []
-                self.placed = False
+                self.calls: list[tuple[str, str]] = []
 
             def exchange_info(self, symbol: str) -> dict[str, Any]:
                 return _INFO
 
             def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
-                self.calls.append("get_order_list")
-                if not self.placed:
-                    raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
-                return _working_oco()
+                self.calls.append(("get_order_list", signed_query))
+                raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
 
             def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
-                self.calls.append("new_oco")
-                self.placed = True
-                return _working_oco()
+                self.calls.append(("new_oco", signed_query))
+                raise AssertionError("official -2018 must not post another OCO")
 
             def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
-                raise AssertionError("retry must not buy or market-sell")
+                self.calls.append(("new_order", signed_query))
+                raise AssertionError("official -2018 must not buy or market-sell")
+
+            def ticker_price(self, symbol: str) -> dict[str, Any]:
+                return {"symbol": symbol, "price": "102"}
+
+        def _kinds(calls: list[tuple[str, str]]) -> list[str]:
+            return [call[0] for call in calls]
 
         client = _Retry()
         adapter = self._adapter(client)
@@ -880,6 +1100,7 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
             "take_profit_price": "110",
             "entry_order_id": "99",
             "oco_list_client_id": "bnbfade-ol-11",
+            "last_error": "oco_submit_timeout",
             "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
         }
         saved: dict[str, Any] = dict(row)
@@ -895,12 +1116,836 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             first = adapter.maintain_held_position(dict(saved), "102", persist=persist)
             second = adapter.maintain_held_position(dict(saved), "102", persist=persist)
-        self.assertEqual(first["book"], "oco_working", first)
-        self.assertEqual(second["book"], "oco_working", second)
-        self.assertEqual(client.calls.count("new_oco"), 1)
-        self.assertEqual(saved.get("status"), "oco_working")
-        self.assertEqual(saved.get("oco_above_order_id"), "11")
-        self.assertEqual(saved.get("oco_below_order_id"), "10")
+        self.assertEqual(first["book"], "oco_unknown", first)
+        self.assertEqual(second["book"], "oco_unknown", second)
+        self.assertFalse(first["ok"], first)
+        self.assertFalse(first["submitted"], first)
+        self.assertEqual(first["error"], "oco_list_absent:-2018")
+        self.assertEqual(second["error"], "oco_list_absent:-2018")
+        self.assertNotIn("new_oco", _kinds(client.calls))
+        self.assertNotIn("new_order", _kinds(client.calls))
+        self.assertGreaterEqual(_kinds(client.calls).count("get_order_list"), 2)
+        for kind, query in client.calls:
+            if kind != "get_order_list":
+                continue
+            form = parse_qs(query)
+            self.assertEqual(form.get("origClientOrderId"), ["bnbfade-ol-11"])
+        self.assertEqual(saved.get("status"), "oco_unknown")
+        self.assertEqual(saved.get("protection"), "oco_pending")
+        self.assertEqual(saved.get("stop_price"), "99")
+        self.assertEqual(saved.get("take_profit_price"), "110")
+        self.assertEqual(saved.get("oco_list_client_id"), "bnbfade-ol-11")
+        self.assertEqual(saved.get("last_error"), "oco_list_absent:-2018")
+        self.assertEqual(
+            saved.get("manual_action"),
+            "halt_new_buys_and_manually_close_or_protect_the_fill",
+        )
+        self.assertNotIn("oco_above_order_id", saved)
+        self.assertNotIn("oco_below_order_id", saved)
+
+        fresh = _Retry()
+        restarted = self._adapter(fresh)
+        with mock.patch.dict(os.environ, env):
+            resumed = restarted.maintain_held_position(dict(saved), "102", persist=persist)
+            resumed_again = restarted.maintain_held_position(dict(saved), "102", persist=persist)
+        self.assertEqual(resumed["book"], "oco_unknown", resumed)
+        self.assertEqual(resumed_again["error"], "oco_list_absent:-2018")
+        self.assertNotIn("new_oco", _kinds(fresh.calls))
+        self.assertNotIn("new_order", _kinds(fresh.calls))
+        self.assertEqual(saved.get("stop_price"), "99")
+        self.assertEqual(saved.get("take_profit_price"), "110")
+        self.assertEqual(saved.get("status"), "oco_unknown")
+
+        restarted.buy_blocks = [dict(saved)]
+        with mock.patch.dict(os.environ, env):
+            blocked = restarted.execute(
+                {
+                    "decision_log_id": 12,
+                    "strategy_id": "tech_boll_fade_v1",
+                    "action": "buy",
+                    "chain_id": "binance",
+                    "token_address": "BNBUSDT",
+                    "pair_address": "BNB/USDT",
+                    "size_pct": 0.05,
+                    "mode": "live_stub",
+                    "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                    "extras": {
+                        "binance_symbol": "BNBUSDT",
+                        "order_type": "MARKET",
+                        "quote_order_qty": "25",
+                        "price_usd": "102",
+                        "stop_price": "99",
+                        "take_profit_price": "110",
+                        "entry_reason": "large_trade_market",
+                    },
+                }
+            )
+        self.assertEqual(blocked["error"], "oco_failed_blocks_buy", blocked)
+        self.assertEqual(blocked["executed"], 0)
+        self.assertNotIn("new_oco", _kinds(fresh.calls))
+        self.assertNotIn("new_order", _kinds(fresh.calls))
+
+    def test_unknown_list_miss_outside_the_band_does_not_fail_or_sell(self) -> None:
+        class _Miss:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _INFO
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("get_order_list", signed_query))
+                raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_oco", signed_query))
+                raise AssertionError("a band exit must not post another OCO")
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_order", signed_query))
+                raise AssertionError("a band exit must not market-sell")
+
+        client = _Miss()
+        adapter = self._adapter(client)
+        adapter.auto_flatten_on_oco_fail = True
+        row = {
+            "id": 5,
+            "decision_log_id": 11,
+            "symbol": "BNBUSDT",
+            "status": "oco_unknown",
+            "protection": "oco_pending",
+            "quantity": "1.23",
+            "stop_price": "99",
+            "take_profit_price": "110",
+            "entry_order_id": "99",
+            "oco_list_client_id": "bnbfade-ol-11",
+            "last_error": "oco_submit_timeout",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+        saved: dict[str, Any] = dict(row)
+
+        def persist(fields: dict[str, Any]) -> dict[str, Any]:
+            saved.update(fields)
+            return dict(saved)
+
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+        }
+        with mock.patch.dict(os.environ, env):
+            outside = adapter.maintain_held_position(dict(saved), "90", persist=persist)
+            inside = adapter.maintain_held_position(dict(saved), "102", persist=persist)
+        self.assertEqual(outside["book"], "oco_unknown", outside)
+        self.assertEqual(outside["error"], "oco_list_absent:-2018")
+        self.assertFalse(outside["submitted"], outside)
+        self.assertEqual(inside["book"], "oco_unknown", inside)
+        self.assertEqual([call[0] for call in client.calls].count("get_order_list"), 2)
+        self.assertNotIn("new_oco", [call[0] for call in client.calls])
+        self.assertNotIn("new_order", [call[0] for call in client.calls])
+        self.assertEqual(saved["status"], "oco_unknown")
+        self.assertNotEqual(saved["status"], "oco_failed")
+        self.assertEqual(saved["stop_price"], "99")
+        self.assertEqual(saved["take_profit_price"], "110")
+        self.assertEqual(saved["oco_list_client_id"], "bnbfade-ol-11")
+        self.assertEqual(saved["last_error"], "oco_list_absent:-2018")
+
+    def test_confirmed_list_miss_holds_then_http_200_claims_the_same_list(self) -> None:
+        class _ThenFound:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+                self.found = False
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _INFO
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("get_order_list", signed_query))
+                if not self.found:
+                    self.found = True
+                    raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+                return _live_cover()
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_oco", signed_query))
+                raise AssertionError("a later HTTP 200 must claim the list, not post another")
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append(("new_order", signed_query))
+                raise AssertionError("a list miss must not sell")
+
+        def _run(status: str) -> None:
+            client = _ThenFound()
+            adapter = self._adapter(client)
+            adapter.auto_flatten_on_oco_fail = True
+            row = {
+                "id": 6,
+                "decision_log_id": 11,
+                "symbol": "BNBUSDT",
+                "status": status,
+                "protection": "exchange_oco",
+                "quantity": "1.23",
+                "stop_price": "99",
+                "take_profit_price": "110",
+                "entry_order_id": "99",
+                "oco_order_list_id": "42",
+                "oco_list_client_id": "bnbfade-ol-11",
+                "oco_above_order_id": "11",
+                "oco_below_order_id": "10",
+                "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+            }
+            saved: dict[str, Any] = dict(row)
+
+            def persist(fields: dict[str, Any]) -> dict[str, Any]:
+                saved.update(fields)
+                return dict(saved)
+
+            env = {
+                "BINANCE_SPOT_LIVE_ENABLED": "1",
+                "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+            }
+            with mock.patch.dict(os.environ, env):
+                held = adapter.maintain_held_position(dict(saved), "102", persist=persist)
+                claimed = adapter.maintain_held_position(dict(saved), "102", persist=persist)
+            kinds = [call[0] for call in client.calls]
+            self.assertEqual(held["book"], "oco_unknown", (status, held))
+            self.assertEqual(held["error"], "oco_list_absent:-2018", status)
+            self.assertFalse(held["submitted"], status)
+            self.assertEqual(kinds.count("get_order_list"), 2, status)
+            self.assertNotIn("new_oco", kinds, status)
+            self.assertNotIn("new_order", kinds, status)
+            self.assertEqual(saved["stop_price"], "99", status)
+            self.assertEqual(saved["take_profit_price"], "110", status)
+            self.assertEqual(saved["oco_order_list_id"], "42", status)
+            self.assertEqual(saved["oco_list_client_id"], "bnbfade-ol-11", status)
+            queries = [call[1] for call in client.calls if call[0] == "get_order_list"]
+            for query in queries:
+                self.assertEqual(parse_qs(query).get("orderListId"), ["42"], status)
+                self.assertNotIn("bnbfade-ol-11-r", query, status)
+            self.assertEqual(claimed["book"], "oco_working", (status, claimed))
+            self.assertEqual(saved["status"], "oco_working", status)
+            self.assertNotIn("new_oco", kinds, status)
+
+        _run("oco_working")
+        _run("oco_partial")
+
+    def test_non_miss_reads_do_not_repost_or_sell(self) -> None:
+        cases = [
+            BinanceRequestError(404, code=-2018, msg="Order list does not exist."),
+            BinanceRequestError(400, code=-2018, msg="Unknown order sent."),
+            BinanceRequestError(400, code=-2013, msg="Order does not exist."),
+        ]
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+        }
+        for exc in cases:
+            class _Err:
+                def __init__(self, boom: Exception) -> None:
+                    self.boom = boom
+                    self.calls: list[str] = []
+
+                def exchange_info(self, symbol: str) -> dict[str, Any]:
+                    return _INFO
+
+                def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                    self.calls.append("get_order_list")
+                    raise self.boom
+
+                def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                    self.calls.append("new_oco")
+                    raise AssertionError(f"must not post after {self.boom}")
+
+                def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                    self.calls.append("new_order")
+                    raise AssertionError(f"must not sell after {self.boom}")
+
+            for status in ("oco_unknown", "oco_working"):
+                client = _Err(exc)
+                adapter = self._adapter(client)
+                adapter.auto_flatten_on_oco_fail = True
+                row = {
+                    "id": 7,
+                    "decision_log_id": 11,
+                    "symbol": "BNBUSDT",
+                    "status": status,
+                    "protection": "oco_pending" if status == "oco_unknown" else "exchange_oco",
+                    "quantity": "1.23",
+                    "stop_price": "99",
+                    "take_profit_price": "110",
+                    "entry_order_id": "99",
+                    "oco_order_list_id": "42",
+                    "oco_list_client_id": "bnbfade-ol-11",
+                    "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                }
+                written: dict[str, Any] = {}
+
+                def persist(fields: dict[str, Any], holder: dict[str, Any] = written) -> dict[str, Any]:
+                    holder.clear()
+                    holder.update(fields)
+                    return {**row, **holder}
+
+                with mock.patch.dict(os.environ, env):
+                    outcome = adapter.maintain_held_position(dict(row), "102", persist=persist)
+                self.assertFalse(order_list_absent(exc) if isinstance(exc, BinanceRequestError) else False)
+                self.assertNotIn("new_oco", client.calls, (exc, status))
+                self.assertNotIn("new_order", client.calls, (exc, status))
+                self.assertNotEqual(outcome["book"], "oco_failed", (exc, status))
+                self.assertEqual(written.get("status"), "oco_unknown", (exc, status))
+                self.assertEqual(
+                    written.get("manual_action"),
+                    "halt_new_buys_and_manually_close_or_protect_the_fill",
+                    (exc, status),
+                )
+                self.assertNotIn("stop_price", written, (exc, status))
+                self.assertNotIn("take_profit_price", written, (exc, status))
+                self.assertNotIn("oco_list_absent", str(outcome.get("error")), (exc, status))
+                self.assertNotEqual(outcome.get("error"), "oco_unknown_readback_not_resubmit", (exc, status))
+
+    def test_readback_failure_blocks_same_purpose_buy_across_restart(self) -> None:
+        """A lost list read must block this purpose even when the row was working.
+
+        The block is the persisted row. A new process reading the same SQLite
+        file still refuses that purpose, and a different purpose is left alone.
+        """
+        boom = BinanceRequestError(404, code=-2018, msg="Order list does not exist.")
+        self.assertFalse(order_list_absent(boom))
+
+        class _Once:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _INFO
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("get_order_list")
+                raise boom
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_oco")
+                raise AssertionError("readback failure must not post")
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_order")
+                raise AssertionError("readback failure must not sell")
+
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+        }
+        with tempfile.TemporaryDirectory(prefix="readback-hold-") as tmp:
+            path = Path(tmp) / "ledger.db"
+            ledger = ExecutionLedger(path)
+            armed = ledger.arm_binance_spot_position(
+                {
+                    "decision_log_id": 11,
+                    "symbol": "BNBUSDT",
+                    "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                    "status": "oco_working",
+                    "protection": "exchange_oco",
+                    "quantity": "1.23",
+                    "stop_price": "99",
+                    "take_profit_price": "110",
+                    "entry_price": "102",
+                    "entry_order_id": "99",
+                    "oco_order_list_id": "42",
+                    "oco_list_client_id": "bnbfade-ol-11",
+                    "oco_above_order_id": "11",
+                    "oco_below_order_id": "10",
+                }
+            )
+            pid = int(armed["id"])
+            kept = ledger.update_binance_spot_position(
+                pid,
+                {
+                    "status": "oco_working",
+                    "protection": "exchange_oco",
+                    "oco_order_list_id": "42",
+                    "oco_list_client_id": "bnbfade-ol-11",
+                    "oco_above_order_id": "11",
+                    "oco_below_order_id": "10",
+                },
+            )
+            assert kept is not None
+            self.assertEqual(kept["oco_order_list_id"], "42")
+            client = _Once()
+            adapter = self._adapter(client)
+            adapter.auto_flatten_on_oco_fail = True
+
+            def persist(fields: dict[str, Any]) -> dict[str, Any] | None:
+                return ledger.update_binance_spot_position(pid, fields)
+
+            with mock.patch.dict(os.environ, env):
+                outside = adapter.maintain_held_position(
+                    dict(ledger.binance_spot_position_by_id(pid) or {}),
+                    "90",
+                    persist=persist,
+                )
+                inside = adapter.maintain_held_position(
+                    dict(ledger.binance_spot_position_by_id(pid) or {}),
+                    "102",
+                    persist=persist,
+                )
+            self.assertEqual(outside["book"], "oco_unknown", outside)
+            self.assertNotIn("new_oco", client.calls)
+            self.assertNotIn("new_order", client.calls)
+            self.assertEqual(client.calls.count("get_order_list"), 2)
+            stored = ledger.binance_spot_position_by_id(pid)
+            assert stored is not None
+            self.assertEqual(stored["status"], "oco_unknown")
+            self.assertIn("404", str(stored["last_error"]))
+            self.assertNotIn("oco_list_absent", str(stored["last_error"]))
+            self.assertEqual(stored["stop_price"], "99")
+            self.assertEqual(stored["take_profit_price"], "110")
+            self.assertEqual(stored["oco_order_list_id"], "42")
+            self.assertEqual(
+                stored["manual_action"],
+                "halt_new_buys_and_manually_close_or_protect_the_fill",
+            )
+            ledger.close()
+
+            reopened = ExecutionLedger(path)
+            row = reopened.binance_spot_position_by_id(pid)
+            assert row is not None
+            self.assertEqual(row["status"], "oco_unknown")
+            fade = reopened.list_binance_spot_buy_blocks(PURPOSE_LIVE_BNB_BOLL_FADE)
+            classic = reopened.list_binance_spot_buy_blocks(PURPOSE_LIVE_BNB_BOLL_CLASSIC)
+            self.assertEqual(
+                buy_exposure_block(fade, [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+                "oco_failed_blocks_buy",
+            )
+            self.assertIsNone(
+                buy_exposure_block(classic, [], purpose=PURPOSE_LIVE_BNB_BOLL_CLASSIC, symbol="ETHUSDT")
+            )
+            fresh = _Once()
+            restarted = self._adapter(fresh)
+            restarted.auto_flatten_on_oco_fail = True
+            with mock.patch.dict(os.environ, env):
+                resumed = restarted.maintain_held_position(
+                    dict(row),
+                    "102",
+                    persist=lambda fields: reopened.update_binance_spot_position(pid, fields),
+                )
+            self.assertEqual(resumed["book"], "oco_unknown", resumed)
+            self.assertNotIn("new_oco", fresh.calls)
+            self.assertNotIn("new_order", fresh.calls)
+            self.assertEqual(inside["book"], "oco_unknown")
+            self.assertEqual(stored["unprotected_qty"], "1.23")
+            reopened.close()
+
+    def test_bounded_reread_claims_a_matching_list_without_a_second_post(self) -> None:
+        miss = BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+
+        class _Window:
+            def __init__(self, reads: list[object]) -> None:
+                self.reads = list(reads)
+                self.calls: list[str] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _INFO
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("get_order_list")
+                if not self.reads:
+                    raise AssertionError("the bounded window must stop")
+                item = self.reads.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                return item  # type: ignore[return-value]
+
+            def open_orders(self, signed_query: str, *, api_key: str) -> list[dict[str, Any]]:
+                self.calls.append("open_orders")
+                return []
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_oco")
+                raise AssertionError("a bounded read must not post another OCO")
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_order")
+                raise AssertionError("a bounded read must not sell")
+
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+        }
+        row = {
+            "id": 21,
+            "decision_log_id": 11,
+            "symbol": "BNBUSDT",
+            "status": "oco_unknown",
+            "protection": "oco_pending",
+            "quantity": "1.23",
+            "stop_price": "99",
+            "take_profit_price": "110",
+            "entry_order_id": "99",
+            "oco_order_list_id": "42",
+            "oco_list_client_id": "bnbfade-ol-11",
+            "oco_above_order_id": "11",
+            "oco_below_order_id": "10",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+        found = _Window([miss, _live_cover()])
+        adapter = self._adapter(found)
+        adapter.auto_flatten_on_oco_fail = True
+        saved = dict(row)
+
+        def persist(fields: dict[str, Any]) -> dict[str, Any]:
+            saved.update(fields)
+            return dict(saved)
+
+        with mock.patch.dict(os.environ, env):
+            claimed = adapter.maintain_held_position(dict(row), "102", persist=persist)
+        self.assertEqual(claimed["book"], "oco_working", claimed)
+        self.assertEqual(found.calls.count("get_order_list"), 2)
+        self.assertNotIn("open_orders", found.calls)
+        self.assertNotIn("new_oco", found.calls)
+        self.assertNotIn("new_order", found.calls)
+        self.assertEqual(saved["status"], "oco_working")
+        self.assertIsNone(saved.get("unprotected_qty"))
+        self.assertIsNone(saved.get("manual_action"))
+        self.assertEqual(saved["stop_price"], "99")
+        self.assertEqual(saved["take_profit_price"], "110")
+
+        still = _Window([miss, miss, AssertionError("window already ended")])
+        held_adapter = self._adapter(still)
+        held_adapter.auto_flatten_on_oco_fail = True
+        frozen = dict(row)
+
+        def persist_frozen(fields: dict[str, Any]) -> dict[str, Any]:
+            frozen.update(fields)
+            return dict(frozen)
+
+        with mock.patch.dict(os.environ, env):
+            stayed = held_adapter.maintain_held_position(dict(row), "90", persist=persist_frozen)
+        self.assertEqual(stayed["book"], "oco_unknown", stayed)
+        self.assertEqual(still.calls.count("get_order_list"), 2)
+        self.assertEqual(still.calls.count("open_orders"), 1)
+        self.assertNotIn("new_oco", still.calls)
+        self.assertNotIn("new_order", still.calls)
+        self.assertEqual(frozen["status"], "oco_unknown")
+        self.assertEqual(frozen["unprotected_qty"], "1.23")
+        self.assertEqual(frozen["last_error"], "oco_list_absent:-2018")
+        self.assertEqual(
+            frozen["manual_action"],
+            "halt_new_buys_and_manually_close_or_protect_the_fill",
+        )
+        self.assertEqual(frozen["stop_price"], "99")
+        self.assertEqual(
+            buy_exposure_block(
+                [dict(frozen)],
+                [],
+                purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                symbol="ETHUSDT",
+            ),
+            "oco_failed_blocks_buy",
+        )
+        with tempfile.TemporaryDirectory(prefix="bounded-hold-") as tmp:
+            path = Path(tmp) / "ledger.db"
+            ledger = ExecutionLedger(path)
+            armed = ledger.arm_binance_spot_position(
+                {
+                    "decision_log_id": 11,
+                    "symbol": "BNBUSDT",
+                    "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+                    "status": "oco_unknown",
+                    "protection": "oco_pending",
+                    "quantity": "1.23",
+                    "stop_price": "99",
+                    "take_profit_price": "110",
+                    "entry_price": "102",
+                    "entry_order_id": "99",
+                }
+            )
+            pid = int(armed["id"])
+            ledger.update_binance_spot_position(
+                pid,
+                {
+                    "status": "oco_unknown",
+                    "protection": "oco_pending",
+                    "oco_order_list_id": "42",
+                    "oco_list_client_id": "bnbfade-ol-11",
+                    "oco_above_order_id": "11",
+                    "oco_below_order_id": "10",
+                },
+            )
+            durable = _Window([miss, miss])
+            durable_adapter = self._adapter(durable)
+            durable_adapter.auto_flatten_on_oco_fail = True
+            with mock.patch.dict(os.environ, env):
+                ledger_out = durable_adapter.maintain_held_position(
+                    dict(ledger.binance_spot_position_by_id(pid) or {}),
+                    "102",
+                    persist=lambda fields: ledger.update_binance_spot_position(pid, fields),
+                )
+            self.assertEqual(ledger_out["book"], "oco_unknown", ledger_out)
+            self.assertEqual(durable.calls.count("get_order_list"), 2)
+            self.assertNotIn("new_oco", durable.calls)
+            ledger.close()
+            reopened = ExecutionLedger(path)
+            kept_row = reopened.binance_spot_position_by_id(pid)
+            assert kept_row is not None
+            self.assertEqual(kept_row["status"], "oco_unknown")
+            self.assertEqual(kept_row["unprotected_qty"], "1.23")
+            self.assertEqual(kept_row["last_error"], "oco_list_absent:-2018")
+            self.assertEqual(
+                kept_row["manual_action"],
+                "halt_new_buys_and_manually_close_or_protect_the_fill",
+            )
+            fade = reopened.list_binance_spot_buy_blocks(PURPOSE_LIVE_BNB_BOLL_FADE)
+            self.assertEqual(
+                buy_exposure_block(fade, [], purpose=PURPOSE_LIVE_BNB_BOLL_FADE, symbol="ETHUSDT"),
+                "oco_failed_blocks_buy",
+            )
+            reopened.close()
+
+        singles = [
+            BinanceRequestError(404, code=-2018, msg="Order list does not exist."),
+            TimeoutError("timed out"),
+            BinanceRequestError(429, code=-1003, msg="Too many requests"),
+            BinanceRequestError(418, code=-1003, msg="Way too many requests"),
+            BinanceRequestError(500, code=-1001, msg="Internal error"),
+            BinanceRequestError(400, code=-2013, msg="Order does not exist."),
+        ]
+        for exc in singles:
+            client = _Window([exc, AssertionError(f"must not reread after {exc}")])
+            one = self._adapter(client)
+            one.auto_flatten_on_oco_fail = True
+            kept = dict(row)
+
+            def persist_one(fields: dict[str, Any], holder: dict[str, Any] = kept) -> dict[str, Any]:
+                holder.clear()
+                holder.update(fields)
+                return {**row, **holder}
+
+            with mock.patch.dict(os.environ, env):
+                outcome = one.maintain_held_position(dict(row), "102", persist=persist_one)
+            self.assertEqual(client.calls.count("get_order_list"), 1, exc)
+            self.assertNotIn("open_orders", client.calls, exc)
+            self.assertNotIn("new_oco", client.calls, exc)
+            self.assertNotIn("new_order", client.calls, exc)
+            self.assertEqual(outcome["book"], "oco_unknown", (exc, outcome))
+            self.assertNotIn("oco_list_absent", str(outcome.get("error")), exc)
+            self.assertEqual(kept.get("unprotected_qty"), "1.23", exc)
+            self.assertEqual(kept.get("status"), "oco_unknown", exc)
+            if isinstance(exc, BinanceRequestError) and exc.code == -2013:
+                self.assertIn("-2013", str(outcome.get("error")))
+                self.assertIn("Order does not exist.", str(outcome.get("error")))
+                self.assertFalse(order_list_absent(exc))
+
+    def test_only_a_matching_live_list_clears_the_readback_block(self) -> None:
+        class _Seq:
+            def __init__(self, bodies: list[dict[str, Any]]) -> None:
+                self.bodies = list(bodies)
+                self.calls: list[str] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _INFO
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("get_order_list")
+                return self.bodies.pop(0)
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_oco")
+                raise AssertionError("a readback body must not post another list")
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_order")
+                raise AssertionError("a readback body must not sell")
+
+        row = {
+            "id": 8,
+            "decision_log_id": 11,
+            "symbol": "BNBUSDT",
+            "status": "oco_unknown",
+            "protection": "oco_pending",
+            "quantity": "1.23",
+            "stop_price": "99",
+            "take_profit_price": "110",
+            "entry_order_id": "99",
+            "oco_order_list_id": "42",
+            "oco_list_client_id": "bnbfade-ol-11",
+            "oco_above_order_id": "11",
+            "oco_below_order_id": "10",
+            "last_error": "binance_http_error:404:-2018:Order list does not exist.",
+            "manual_action": "halt_new_buys_and_manually_close_or_protect_the_fill",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+        rejects = [
+            _working_oco(),
+            _live_cover(symbol="ETHUSDT"),
+            _live_cover(list_id=99),
+            _live_cover(client_id="bnbfade-ol-other"),
+            {
+                "symbol": "BNBUSDT",
+                "orderListId": 42,
+                "listClientOrderId": "bnbfade-ol-11",
+                "listOrderStatus": "ALL_DONE",
+                "listStatusType": "ALL_DONE",
+            },
+        ]
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+        }
+        saved = dict(row)
+        client = _Seq(rejects + [_live_cover()])
+        adapter = self._adapter(client)
+        adapter.auto_flatten_on_oco_fail = True
+
+        def persist(fields: dict[str, Any]) -> dict[str, Any]:
+            saved.update(fields)
+            return dict(saved)
+
+        with mock.patch.dict(os.environ, env):
+            for _ in rejects:
+                held = adapter.maintain_held_position(dict(saved), "102", persist=persist)
+                self.assertEqual(held["book"], "oco_unknown", held)
+                self.assertEqual(saved["status"], "oco_unknown")
+                self.assertEqual(
+                    buy_exposure_block(
+                        [dict(saved)],
+                        [],
+                        purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                        symbol="ETHUSDT",
+                    ),
+                    "oco_failed_blocks_buy",
+                )
+            lifted = adapter.maintain_held_position(dict(saved), "102", persist=persist)
+        self.assertEqual(lifted["book"], "oco_working", lifted)
+        self.assertEqual(saved["status"], "oco_working")
+        self.assertIsNone(saved.get("manual_action"))
+        self.assertNotIn("new_oco", client.calls)
+        self.assertNotIn("new_order", client.calls)
+        self.assertEqual(saved["stop_price"], "99")
+        self.assertEqual(saved["take_profit_price"], "110")
+        self.assertIsNone(
+            buy_exposure_block(
+                [dict(saved)],
+                [],
+                purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                symbol="ETHUSDT",
+            )
+        )
+        self.assertEqual(
+            buy_exposure_block(
+                [dict(saved)],
+                [],
+                purpose=PURPOSE_LIVE_BNB_BOLL_FADE,
+                symbol="BNBUSDT",
+            ),
+            "position_open_blocks_buy",
+        )
+
+    def test_open_with_a_list_id_is_not_a_fresh_first_oco(self) -> None:
+        class _Book:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def exchange_info(self, symbol: str) -> dict[str, Any]:
+                return _INFO
+
+            def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("get_order_list")
+                raise BinanceRequestError(400, code=-2018, msg="Order list does not exist.")
+
+            def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_oco")
+                return _live_cover()
+
+            def new_order(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
+                self.calls.append("new_order")
+                raise AssertionError("must not sell")
+
+        env = {
+            "BINANCE_SPOT_LIVE_ENABLED": "1",
+            "LIVE_KILL_SWITCH_PATH": str(self.root / "absent-kill"),
+        }
+        tracked = _Book()
+        adapter = self._adapter(tracked)
+        adapter.auto_flatten_on_oco_fail = True
+        saved: dict[str, Any] = {
+            "id": 9,
+            "decision_log_id": 11,
+            "symbol": "BNBUSDT",
+            "status": "open",
+            "protection": "oco_pending",
+            "quantity": "1.23",
+            "stop_price": "99",
+            "take_profit_price": "110",
+            "entry_order_id": "99",
+            "oco_list_client_id": "bnbfade-ol-11",
+            "last_error": "oco_submit_timeout",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+
+        def persist(fields: dict[str, Any]) -> dict[str, Any]:
+            saved.update(fields)
+            return dict(saved)
+
+        with mock.patch.dict(os.environ, env):
+            held = adapter.maintain_held_position(dict(saved), "90", persist=persist)
+            again = adapter.maintain_held_position(dict(saved), "102", persist=persist)
+        self.assertEqual(held["book"], "oco_unknown", held)
+        self.assertEqual(again["book"], "oco_unknown", again)
+        self.assertNotIn("new_oco", tracked.calls)
+        self.assertNotIn("new_order", tracked.calls)
+        self.assertEqual(saved["status"], "oco_unknown")
+        self.assertEqual(saved["oco_list_client_id"], "bnbfade-ol-11")
+        self.assertEqual(saved["stop_price"], "99")
+
+        fresh = _Book()
+        first = self._adapter(fresh)
+        blank: dict[str, Any] = {
+            "id": 10,
+            "decision_log_id": 12,
+            "symbol": "BNBUSDT",
+            "status": "open",
+            "protection": "oco_pending",
+            "quantity": "1.23",
+            "stop_price": "99",
+            "take_profit_price": "110",
+            "entry_order_id": "99",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+        placed: dict[str, Any] = dict(blank)
+
+        def persist_first(fields: dict[str, Any]) -> dict[str, Any]:
+            placed.update(fields)
+            return dict(placed)
+
+        with mock.patch.dict(os.environ, env):
+            opened = first.maintain_held_position(dict(blank), "102", persist=persist_first)
+        self.assertEqual(fresh.calls.count("new_oco"), 1, opened)
+        self.assertNotIn("new_order", fresh.calls)
+
+        rejected = _Book()
+        retry = self._adapter(rejected)
+        failed: dict[str, Any] = {
+            "id": 11,
+            "decision_log_id": 13,
+            "symbol": "BNBUSDT",
+            "status": "oco_failed",
+            "protection": "oco_pending",
+            "quantity": "1.23",
+            "stop_price": "99",
+            "take_profit_price": "110",
+            "entry_order_id": "99",
+            "oco_list_client_id": "bnbfade-ol-13",
+            "last_error": "oco_rejected:binance_http_error:400:-2010:Account has insufficient balance",
+            "purpose": PURPOSE_LIVE_BNB_BOLL_FADE,
+        }
+        kept: dict[str, Any] = dict(failed)
+
+        def persist_failed(fields: dict[str, Any]) -> dict[str, Any]:
+            kept.update(fields)
+            return dict(kept)
+
+        with mock.patch.dict(os.environ, env):
+            retried = retry.maintain_held_position(dict(failed), "102", persist=persist_failed)
+        self.assertEqual(rejected.calls.count("new_oco"), 1, retried)
+        self.assertNotIn("new_order", rejected.calls)
 
     def test_missing_or_bad_mark_refuses_the_live_buy(self) -> None:
         class _NoTicker(_DashBook):
@@ -997,6 +2042,20 @@ class DashUnprotectedGeometryTests(unittest.TestCase):
             self.assertNotIn("new_oco", client.calls, exc)
             self.assertNotIn("new_order", client.calls, exc)
             self.assertNotIn("oco_list_absent", str(outcome.get("error")), exc)
+            self.assertNotEqual(outcome.get("error"), "oco_unknown_readback_not_resubmit", exc)
+            self.assertNotIn("stop_price", saved, exc)
+            self.assertNotIn("take_profit_price", saved, exc)
+            self.assertEqual(saved.get("status"), "oco_unknown", exc)
+            self.assertEqual(
+                saved.get("manual_action"),
+                "halt_new_buys_and_manually_close_or_protect_the_fill",
+                exc,
+            )
+            if isinstance(exc, BinanceRequestError) and exc.code == -2013:
+                self.assertEqual(outcome["book"], "oco_unknown", exc)
+                self.assertIn("-2013", str(outcome.get("error")), exc)
+                self.assertIn("Order does not exist.", str(outcome.get("error")), exc)
+                self.assertFalse(order_list_absent(exc), exc)
 
     def test_leg_not_found_does_not_drop_a_working_list(self) -> None:
         class _Legs:
@@ -1080,7 +2139,7 @@ class _RecordingHttp:
 
     def get_order_list(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("get_order_list", signed_query, api_key))
-        return _working_oco()
+        return _live_cover()
 
     def new_oco(self, signed_query: str, *, api_key: str) -> dict[str, Any]:
         self.calls.append(("new_oco", signed_query, api_key))

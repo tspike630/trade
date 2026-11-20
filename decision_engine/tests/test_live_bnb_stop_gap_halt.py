@@ -16,6 +16,7 @@ from unittest.mock import patch
 import decision_engine  # noqa: F401 — crawler/ on path for logging_setup
 from decision_engine.core.data_adapter import IndicatorDataAdapter
 from decision_engine.core.engine import DecisionEngine
+from decision_engine.tests.quiet_macro import write_quiet_macro
 from decision_engine.core.live_buy_guards import apply_live_buy_guards
 from decision_engine.core.protection_halt import (
     ProtectionBook,
@@ -469,6 +470,7 @@ class EngineHaltTests(unittest.TestCase):
                 risk=RiskManager(cooldown_sec=0, min_liq_usd=50_000),
                 protection_book=book,
                 protection_ledger=ledger,
+                macro_db=write_quiet_macro(db.with_name("quiet_macro.db")),
             )
             try:
                 with patch.object(

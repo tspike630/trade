@@ -26,9 +26,11 @@ That purpose never writes the indicator db. live_candidate admission is unchange
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
+from typing import Any
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -42,6 +44,9 @@ from decision_engine.core.engine import DecisionEngine, scan_limit_for_purpose  
 from decision_engine.core.risk_manager import RiskManager  # noqa: E402
 from decision_engine.core.token_cooldown import DEFAULT_TOKEN_COOLDOWN_MIN, TokenCooldown  # noqa: E402
 from decision_engine.core.signal_bus import (  # noqa: E402
+    PURPOSE_LIVE_BNB_BOLL_CLASSIC,
+    PURPOSE_LIVE_BNB_BOLL_FADE,
+    PURPOSE_LIVE_BNB_CROSS_MARGIN,
     PURPOSE_LIVE_CANDIDATE,
     PURPOSE_SAMPLE,
     PURPOSE_SHADOW_010,
@@ -253,8 +258,19 @@ class ShadowCohortRisk(RiskManager):
 
 def build_strategies(args: argparse.Namespace) -> list:
     ids: list[str]
+    strategy_set = getattr(args, "strategy_set", None)
+    if args.all and strategy_set:
+        raise SystemExit("--strategy-set cannot be combined with --all")
+    if strategy_set and args.strategy:
+        raise SystemExit("--strategy-set cannot be combined with --strategy")
     if args.all:
         ids = list_strategies()
+    elif strategy_set == "live_bnb_cross_margin":
+        from decision_engine.strategies.regime_cross_margin import (
+            CROSS_MARGIN_APPROVED_STRATEGIES,
+        )
+
+        ids = list(CROSS_MARGIN_APPROVED_STRATEGIES)
     elif args.strategy:
         ids = [args.strategy]
     else:
@@ -308,6 +324,52 @@ def _entry_ih_min_hours(
     return None
 
 
+def load_explicit_account_route(
+    path: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return a caller-supplied route, or None when no path was given.
+
+    A path that cannot be read, or that is not a non-empty object, is an
+    error. This does not add a domain, a topology, or an approval.
+    """
+    if path is None or str(path).strip() == "":
+        return None, None
+    file = Path(path).expanduser()
+    try:
+        raw = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"account route config unreadable: {exc}"
+    if not isinstance(raw, dict) or not raw:
+        return None, "account route config must be a non-empty object"
+    return dict(raw), None
+
+
+def build_production_engine(
+    adapter: IndicatorDataAdapter,
+    bus: SignalBus,
+    strategies: list,
+    *,
+    risk: RiskManager,
+    hot_limit: int | None,
+    token_cooldown: TokenCooldown,
+    entry_ih_min_hours: float | None,
+    account_route: dict[str, Any] | None = None,
+    macro_db: str | Path | None = None,
+) -> DecisionEngine:
+    """Same construction ``main`` uses. ``account_route`` stays None unless given."""
+    return DecisionEngine(
+        adapter,
+        bus,
+        strategies,
+        risk=risk,
+        hot_limit=hot_limit,
+        token_cooldown=token_cooldown,
+        entry_ih_min_hours=entry_ih_min_hours,
+        account_route=account_route,
+        macro_db=macro_db,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Decision engine Step 1 (dry-run signals; no execution)"
@@ -316,6 +378,12 @@ def main(argv: list[str] | None = None) -> int:
         "--strategy",
         default=None,
         help=f"strategy_id (default {de_config.DEFAULT_STRATEGY}); known: {', '.join(list_strategies())}",
+    )
+    parser.add_argument(
+        "--strategy-set",
+        choices=["live_bnb_cross_margin"],
+        default=None,
+        help="run the approved cross-margin set of 8 strategies; refused with --all",
     )
     parser.add_argument(
         "--all",
@@ -390,6 +458,15 @@ def main(argv: list[str] | None = None) -> int:
         "(indicators still read from --db). Default: same as --db.",
     )
     parser.add_argument(
+        "--regime-v2-isolated-purpose",
+        action="store_true",
+        help=(
+            "Dry-run only. Keep purpose live_bnb_boll_fade or "
+            "live_bnb_boll_classic when --output-db is a different file, "
+            "instead of rewriting it to shadow_010. Does not start execution."
+        ),
+    )
+    parser.add_argument(
         "--shadow-liq-cohorts",
         action="store_true",
         help="opt-in shadow: tag buys with liq_bucket (present/missing) and "
@@ -409,6 +486,14 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=de_config.JEV_POSITION_PCT,
         help=f"JEV buy size_pct (default {de_config.JEV_POSITION_PCT})",
+    )
+    parser.add_argument(
+        "--account-route-json",
+        default=None,
+        help=(
+            "Optional JSON object copied onto buys as the account route. "
+            "Unset leaves the spot path. This flag does not supply defaults."
+        ),
     )
     parser.add_argument(
         "--entry-ih-min-hours",
@@ -478,7 +563,37 @@ def main(argv: list[str] | None = None) -> int:
     if args.shadow_liq_cohorts and out_db == db_path:
         log.error("--shadow-liq-cohorts requires --output-db != --db (isolation)")
         return 2
-    if args.shadow_liq_cohorts or out_db != db_path:
+    keep_live_purpose = False
+    if purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
+        if Path(out_db).name != "dexscreener.db":
+            log.error(
+                "cross-margin purpose requires decision basename dexscreener.db"
+            )
+            return 2
+        keep_live_purpose = True
+        log.info(
+            "cross-margin emitter keeps purpose=%s output_db=%s indicator_db=%s",
+            purpose,
+            out_db,
+            db_path,
+        )
+    if args.regime_v2_isolated_purpose:
+        if not dry_run:
+            log.error("--regime-v2-isolated-purpose requires dry-run")
+            return 2
+        if out_db == db_path:
+            log.error("--regime-v2-isolated-purpose requires a different --output-db")
+            return 2
+        if purpose not in {PURPOSE_LIVE_BNB_BOLL_FADE, PURPOSE_LIVE_BNB_BOLL_CLASSIC}:
+            log.error("--regime-v2-isolated-purpose refuses purpose=%s", purpose)
+            return 2
+        keep_live_purpose = True
+        log.info(
+            "regime_v2 isolated dry-run keeps purpose=%s output_db=%s",
+            purpose,
+            out_db,
+        )
+    if not keep_live_purpose and (args.shadow_liq_cohorts or out_db != db_path):
         # Keep an explicit shadow_* purpose (e.g. shadow_selfbuilt_a); otherwise
         # isolate to shadow_010 so output-db never writes paper-eligible rows.
         if str(purpose).startswith("shadow_"):
@@ -514,7 +629,14 @@ def main(argv: list[str] | None = None) -> int:
     log.info("token_cooldown_min=%s", token_cooldown.cooldown_min)
     bus = SignalBus(out_db, dry_run=dry_run, purpose=purpose)
     try:
-        engine = DecisionEngine(
+        if str(purpose).startswith("shadow") and args.account_route_json:
+            log.error("account route is refused for a shadow purpose")
+            return 2
+        account_route, route_error = load_explicit_account_route(args.account_route_json)
+        if route_error:
+            log.error("%s", route_error)
+            return 2
+        engine = build_production_engine(
             adapter,
             bus,
             strategies,
@@ -522,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
             hot_limit=hot_limit,
             token_cooldown=token_cooldown,
             entry_ih_min_hours=entry_ih_min_hours,
+            account_route=account_route,
         )
         results = engine.run(
             once=args.once,

@@ -21,6 +21,7 @@ import decision_engine  # noqa: F401 — crawler/ on path for logging_setup
 from decision_engine import config as de_config
 from decision_engine.core.data_adapter import IndicatorDataAdapter
 from decision_engine.core.engine import DecisionEngine, scan_limit_for_purpose
+from decision_engine.tests.quiet_macro import write_quiet_macro
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
@@ -514,6 +515,7 @@ class ClassicScanTests(unittest.TestCase):
                     bus,
                     [get_strategy("tech_boll_fade_v1")],
                     risk=RiskManager(cooldown_sec=0),
+                    macro_db=write_quiet_macro(db.with_name("quiet_macro.db")),
                 )
                 self.assertGreaterEqual(engine.hot_limit, 600)
                 payload = engine.tick()

@@ -31,6 +31,7 @@ import sqlite3
 import sys
 from collections import Counter
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -38,6 +39,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from execution.markout_tca import read_markout_summary_ro  # noqa: E402
 from execution.slippage_report import percentile, summarize  # noqa: E402
 
 DEFAULT_ROUND_TRIP_FEE_BPS = 20.0  # 10 bps entry + 10 bps exit
@@ -202,6 +204,7 @@ def build_tca_report(
     oco_working_count = 0
     oco_filled_count = 0
     unprotected_open_count = 0
+    dust_residual_count = 0
 
     exit_counts: Counter[str] = Counter()
     gross_returns_bps: list[float] = []
@@ -224,6 +227,19 @@ def build_tca_report(
         elif status in {"open", "oco_failed", "oco_unknown", "qty_unconfirmed", "held_naked"}:
             if protection != "exchange_oco":
                 unprotected_open_count += 1
+        elif status == "closed_dust":
+            residual = pos.get("residual_qty")
+            sold = pos.get("exit_filled_qty")
+            try:
+                if (
+                    residual not in (None, "")
+                    and sold not in (None, "")
+                    and Decimal(str(residual)) > 0
+                    and Decimal(str(sold)) > 0
+                ):
+                    dust_residual_count += 1
+            except Exception:
+                dust_residual_count += 1
 
         if protection == "auto_flatten" or str(pos.get("exit_reason") or "") == "oco_failed_auto_flatten":
             auto_flattened_count += 1
@@ -314,6 +330,7 @@ def build_tca_report(
     sl_total = exit_counts.get("stop_loss", 0)
     decided_total = tp_total + sl_total
     ob_source_total = ws_l2_hits + rest_fallback_hits
+    markout_summary = read_markout_summary_ro(ledger_path)
 
     return {
         "report": "binance_spot_tca",
@@ -329,6 +346,7 @@ def build_tca_report(
             "exchange_error_codes": dict(sorted(exchange_error_codes.items())),
         },
         "implementation_shortfall_bps": summarize(shortfall_bps_list),
+        "markout_toxicity": markout_summary,
         "pre_trade_orderbook": {
             "spread_bps": summarize(orderbook_spreads),
             "impact_bps": summarize(orderbook_impacts),
@@ -343,7 +361,8 @@ def build_tca_report(
             "oco_reanchored_saves": reanchored_count,
             "auto_flatten_rescues": auto_flattened_count,
             "unprotected_open_count": unprotected_open_count,
-            "zero_naked_exposure": unprotected_open_count == 0,
+            "dust_residual_count": dust_residual_count,
+            "zero_naked_exposure": unprotected_open_count == 0 and dust_residual_count == 0,
         },
         "realized_performance": {
             "closed_with_price": len(net_returns_bps),
@@ -389,6 +408,18 @@ def format_tca_markdown(report: dict[str, Any]) -> str:
         f"- **Take-Profit**: `{perf['take_profit_count']}` | **Stop-Loss**: `{perf['stop_loss_count']}` | **Win Rate**: `{_f(perf['win_rate'] * 100.0 if perf['win_rate'] is not None else None)}%`",
         f"- **Mean Net Return**: `{_f(net_stats['mean'])} bps` | **P50 Net Return**: `{_f(net_stats['p50'])} bps`",
     ]
+    mk = report.get("markout_toxicity")
+    if isinstance(mk, dict) and int(mk.get("observations_total") or 0) > 0:
+        m5 = mk.get("markout_5s_bps") or {}
+        m60 = mk.get("markout_60s_bps") or {}
+        tox = mk.get("toxic_fill_rate_5s")
+        lines.extend(
+            [
+                "",
+                "## 4. Post-Fill Markout & Adverse Selection (5s / 60s)",
+                f"- **Observations**: `{mk['observations_total']}` | **Mean 5s Markout**: `{_f(m5.get('mean'))} bps` | **Mean 60s Markout**: `{_f(m60.get('mean'))} bps` | **5s Toxic Fill Rate**: `{_f(tox * 100.0 if tox is not None else None)}%`",
+            ]
+        )
     return "\n".join(lines) + "\n"
 
 

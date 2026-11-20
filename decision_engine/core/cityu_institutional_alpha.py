@@ -100,6 +100,8 @@ class CityUInstitutionalSnapshot:
     smh_1h_ret_pct: float | None
     cme_btc_term_spread_bps: float | None
     size_multiplier: float
+    cot_max_date: str | None = None
+    lseg_cross_asset_ts_ms: int | None = None
 
 
 def cftc_publication_utc(tuesday: date) -> datetime:
@@ -112,6 +114,59 @@ def cftc_publication_utc(tuesday: date) -> datetime:
     friday = tuesday + timedelta(days=3)
     local = datetime(friday.year, friday.month, friday.day, 15, 30, tzinfo=ZoneInfo("America/New_York"))
     return local.astimezone(timezone.utc)
+
+
+# NYSE full-day closures. These are the exchange holiday dates, not LSEG prints.
+# A weekday inside 09:30–16:00 whose year is absent from this table is unknown.
+_NYSE_FULL_DAY_HOLIDAYS = frozenset(
+    {
+        date(2025, 1, 1),
+        date(2025, 1, 20),
+        date(2025, 2, 17),
+        date(2025, 4, 18),
+        date(2025, 5, 26),
+        date(2025, 6, 19),
+        date(2025, 7, 4),
+        date(2025, 9, 1),
+        date(2025, 11, 27),
+        date(2025, 12, 25),
+        date(2026, 1, 1),
+        date(2026, 1, 19),
+        date(2026, 2, 16),
+        date(2026, 4, 3),
+        date(2026, 5, 25),
+        date(2026, 6, 19),
+        date(2026, 7, 3),
+        date(2026, 9, 7),
+        date(2026, 11, 26),
+        date(2026, 12, 25),
+    }
+)
+_NYSE_HOLIDAY_YEARS = frozenset(day.year for day in _NYSE_FULL_DAY_HOLIDAYS)
+
+
+def lseg_us_cash_market_open(now_ms: int) -> bool | None:
+    """New York regular cash session, 09:30 inclusive to 16:00 exclusive.
+
+    Weekends and hours outside that window are closed. A full-day holiday in
+    the table above is closed. A weekday inside the window whose year is not
+    in the table is unknown (``None``); the caller must not treat that as open.
+    This is not the CME Sunday session.
+    """
+    try:
+        moment = datetime.fromtimestamp(int(now_ms) / 1000.0, tz=ZoneInfo("America/New_York"))
+    except (OverflowError, OSError, ValueError):
+        return None
+    if moment.weekday() >= 5:
+        return False
+    minutes = moment.hour * 60 + moment.minute
+    if minutes < 9 * 60 + 30 or minutes >= 16 * 60:
+        return False
+    if moment.year not in _NYSE_HOLIDAY_YEARS:
+        return None
+    if moment.date() in _NYSE_FULL_DAY_HOLIDAYS:
+        return False
+    return True
 
 
 def due_cftc_asof(now: datetime) -> date:
@@ -188,6 +243,7 @@ def load_cityu_institutional_snapshot(
     btc_am_z = None
     cot_regime = "neutral"
     cot_mult = 1.0
+    cot_max_date: str | None = None
     avg_si_pct = None
     trace_buy_ratio = None
     ois_spread = None
@@ -228,6 +284,8 @@ def load_cityu_institutional_snapshot(
                 # has arrived is current. A later holiday file is ignored
                 # until that instant, so the previous published week is not
                 # dropped early. 2020 is outside that week.
+                if points:
+                    cot_max_date = points[-1][0].isoformat()
                 current_cot = bool(points) and points[-1][0] == due
                 if current_cot:
                     lev_series = [item[1] for item in points]
@@ -314,12 +372,19 @@ def load_cityu_institutional_snapshot(
     nvda_1h = None
     smh_1h = None
     cme_term_bps = None
+    lseg_latest_ms: int | None = None
 
     if lseg_p.is_file():
         try:
             lconn = sqlite3.connect(f"file:{lseg_p.resolve().as_posix()}?mode=ro", uri=True, timeout=3.0)
             lconn.row_factory = sqlite3.Row
             upper_ms = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+            max_bar_r = lconn.execute(
+                "SELECT MAX(utc_ms) AS m FROM cross_asset_bars WHERE interval = '5min' AND utc_ms <= ?",
+                (upper_ms,),
+            ).fetchone()
+            if max_bar_r is not None and max_bar_r["m"] is not None:
+                lseg_latest_ms = int(max_bar_r["m"])
             oldest_ms = upper_ms - MAX_CROSS_ASSET_AGE_MS
 
             def _ret_1h(ric: str) -> float | None:
@@ -387,6 +452,8 @@ def load_cityu_institutional_snapshot(
         smh_1h_ret_pct=smh_1h,
         cme_btc_term_spread_bps=cme_term_bps,
         size_multiplier=mult,
+        cot_max_date=cot_max_date,
+        lseg_cross_asset_ts_ms=lseg_latest_ms,
     )
 
 
@@ -410,7 +477,12 @@ def attach_cityu_institutional_context(
         row.setdefault("avg_miner_short_interest_pct", snap.avg_miner_short_interest_pct)
         row.setdefault("trace_conv_bond_buy_ratio", snap.trace_conv_bond_buy_ratio)
         row.setdefault("cme_btc_term_spread_bps", snap.cme_btc_term_spread_bps)
-        if cluster == "ai_compute":
+        v2_on = str(os.environ.get("REGIME_V2_CONTRACT", "")).strip().lower() in {"1", "true", "yes", "on"}
+        if cluster == "ai_compute" or v2_on:
             row.setdefault("nvda_1h_ret_pct", snap.nvda_1h_ret_pct)
             row.setdefault("smh_1h_ret_pct", snap.smh_1h_ret_pct)
+        if snap.cot_max_date is not None:
+            row.setdefault("_cot_max_date", snap.cot_max_date)
+        if snap.lseg_cross_asset_ts_ms is not None:
+            row.setdefault("_lseg_cross_asset_ts_ms", snap.lseg_cross_asset_ts_ms)
     return rows

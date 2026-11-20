@@ -40,6 +40,9 @@ from decision_engine.strategies.rs_fade_10d import RsFade10dStrategy
 from decision_engine.strategies.vol_spike_fade import VolSpikeFadeStrategy
 from decision_engine.strategies.rsi_bounce_fade import RsiBounceFadeStrategy
 from decision_engine.strategies.tech_boll_fade import TechBollFadeStrategy
+from decision_engine.strategies.regime_cross_margin import (
+    REGIME_CROSS_MARGIN_STRATEGY_CLASSES,
+)
 from decision_engine.strategies.rsi_boll_fade import RsiBollFadeStrategy
 from decision_engine.strategies.vol_squeeze_fade import VolSqueezeFadeStrategy
 from decision_engine.strategies.cs_mom_1w_r90 import CsMom1wR90Strategy
@@ -81,6 +84,7 @@ STRATEGY_REGISTRY: dict[str, type] = {
     VolSpikeFadeStrategy.strategy_id: VolSpikeFadeStrategy,
     RsiBounceFadeStrategy.strategy_id: RsiBounceFadeStrategy,
     TechBollFadeStrategy.strategy_id: TechBollFadeStrategy,
+    **{cls.strategy_id: cls for cls in REGIME_CROSS_MARGIN_STRATEGY_CLASSES},
     RsiBollFadeStrategy.strategy_id: RsiBollFadeStrategy,
     VolSqueezeFadeStrategy.strategy_id: VolSqueezeFadeStrategy,
     CsMom1wR90Strategy.strategy_id: CsMom1wR90Strategy,

@@ -14,6 +14,7 @@ native OCO can read them. This module does not place that order.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from logging_setup import get_logger
@@ -32,7 +33,9 @@ from decision_engine.core.portfolio_clusters import (
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
     PURPOSE_LIVE_BNB_BOLL_FADE,
+    PURPOSE_LIVE_BNB_CROSS_MARGIN,
 )
+from decision_engine.core.regime_v2_policy import merge_cross_margin_clocks, v2_contract_active
 from decision_engine.core.stop_gap import stop_distance_reason
 from decision_engine.strategies.base_strategy import BaseStrategy
 from decision_engine.strategies.entry_sizing import buy_size_fields
@@ -50,6 +53,22 @@ from decision_engine.strategies.live_bnb_size_floor import (
 )
 
 log = get_logger("decision_engine.tech_boll_fade")
+
+
+def _cross_margin_pair(row: dict[str, Any]) -> str | None:
+    """Same identity the seven regime producers use when the hot row has no pair."""
+    for key in (
+        "primary_pair_address",
+        "pair_address",
+        "ccxt_symbol",
+        "binance_symbol",
+        "symbol",
+    ):
+        raw = row.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
+
 
 RULE_VERSION = "tech_boll_fade_v1_2026-11-01"
 STRATEGY_ID = "tech_boll_fade_v1"
@@ -99,11 +118,15 @@ class TechBollFadeStrategy(BaseStrategy):
         purpose = str(data.get("purpose") or "")
         if purpose == PURPOSE_LIVE_BNB_BOLL_FADE:
             return self._on_tick_entry_zone(data)
+        if purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
+            return self._on_tick_entry_zone(data, cross_margin_book=True)
         if purpose == PURPOSE_LIVE_BNB_BOLL_CLASSIC:
             return self._on_tick_classic_cex(data)
         return self._on_tick_paper(data)
 
-    def _on_tick_entry_zone(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+    def _on_tick_entry_zone(
+        self, data: dict[str, Any], *, cross_margin_book: bool = False
+    ) -> list[dict[str, Any]]:
         """Live arm only. Paper ``race_tech_boll_fade`` stays on ``_on_tick_paper``.
 
         Neutral keeps multiplier 0.5. If that quote is under 20 USDT,
@@ -125,6 +148,7 @@ class TechBollFadeStrategy(BaseStrategy):
                 row,
                 min_change_5m=self.min_change_5m,
                 min_volume_strength=self.min_volume_strength,
+                cross_margin_book=cross_margin_book,
             )
             if not decision.emit:
                 reason = decision.reject_reason or "entry_zone_rejected"
@@ -148,7 +172,11 @@ class TechBollFadeStrategy(BaseStrategy):
                         decision.alpha,
                     )
                 continue
-            sized = buy_size_fields(row, floor_pct=self.position_pct)
+            if v2_contract_active():
+                v2_pct = _finite(os.environ.get("REGIME_V2_POSITION_PCT")) or self.position_pct
+                sized = {"size_pct": float(v2_pct), "size_tier": "regime_v2_base", "entry_r3": 0, "size_blockers": ()}
+            else:
+                sized = buy_size_fields(row, floor_pct=self.position_pct)
             tier_multiplier = float(decision.position_size_multiplier or 1.0)
             entry_ref = (
                 decision.limit_price
@@ -237,10 +265,39 @@ class TechBollFadeStrategy(BaseStrategy):
                 lift_extra["orderflow_regime"] = decision.orderflow_regime
             hits += 1
             order_type = decision.order_type or "MARKET"
+            limit_price = decision.limit_price
+            if cross_margin_book and limit_price is None and order_type == "MARKET":
+                limit_price = decision.price
+                order_type = "LIMIT"
+            if cross_margin_book:
+                symbol = str(row.get("binance_symbol") or "")
+                base = symbol[:-4] if symbol.endswith("USDT") and len(symbol) > 4 else symbol
+                lift_extra.update(
+                    {
+                        "cross_margin_price_contract": "t447",
+                        "symbol": symbol,
+                        "base_asset": base,
+                        "quote_asset": "USDT",
+                        "requested_action": "OPEN_LONG",
+                        "closed_bar_close": decision.price,
+                        "market_row": dict(row),
+                    }
+                )
+            pair_address = row.get("primary_pair_address")
+            if cross_margin_book:
+                pair_address = _cross_margin_pair(row)
+                if pair_address is None:
+                    self.rejected["pair_address_missing"] = (
+                        self.rejected.get("pair_address_missing", 0) + 1
+                    )
+                    continue
+                lift_extra["clocks"] = merge_cross_margin_clocks(
+                    row, row.get("clocks") if isinstance(row.get("clocks"), dict) else None
+                )
             self.buy(
                 chain_id=str(row.get("chain_id") or ""),
                 token_address=str(row.get("token_address") or ""),
-                pair_address=row.get("primary_pair_address"),
+                pair_address=pair_address,
                 size_pct=size_pct,
                 size_tier=sized["size_tier"],
                 entry_r3=sized["entry_r3"],
@@ -262,7 +319,7 @@ class TechBollFadeStrategy(BaseStrategy):
                 stop_price=decision.stop_price,
                 take_profit_price=decision.take_profit_price,
                 order_type=order_type,
-                limit_price=decision.limit_price,
+                limit_price=limit_price,
                 position_size_multiplier=multiplier,
                 position_size_note=size_note,
                 entry_reason=decision.entry_reason,

@@ -646,6 +646,15 @@ def cap_live_bnb_buys(
         chosen.append(sig)
         if len(chosen) >= limit:
             break
+    if str(os.environ.get("REGIME_V2_CONTRACT", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        unchecked = [s for s in chosen if not s.get("_regime_v2_caps_checked")]
+        if unchecked:
+            from decision_engine.core.regime_v2_policy import enforce_regime_v2_sizing_and_caps
+            chosen, cap_extra = enforce_regime_v2_sizing_and_caps(chosen, now_ms=clock)
+            for drop_k, drop_n in (cap_extra.get("dropped") or {}).items():
+                reasons[drop_k] += int(drop_n)
+        for s in chosen:
+            s.pop("_regime_v2_caps_checked", None)
     chosen_ids = {id(sig) for sig in chosen}
     kept: list[dict[str, Any]] = []
     for sig in signals:
