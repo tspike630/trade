@@ -519,7 +519,89 @@ class WatchdogBodyTest(unittest.TestCase):
         self.assertEqual(second.consecutive_lockout_bars, 0)
         self.assertIsNone(second.source_bucket)
         self.assertNotEqual(second.event_type, "ESCALATED_SILENT_LOCKOUT")
-        self.assertTrue(second.should_push)
+        self.assertEqual(second.consecutive_observation_cycles, 2)
+        self.assertEqual(second.event_type, "ESCALATED_OBSERVATION_CYCLE")
+        self.assertIn("观察周期", second.body_text)
+        self.assertIn("不是源K线", second.body_text)
+
+    def test_frozen_source_observation_cycles_are_not_source_bars(self) -> None:
+        stamp = 1_800_000_000_000 // watchdog.FIVE_MIN_MS * watchdog.FIVE_MIN_MS
+        prior = watchdog._empty_state()
+        events = []
+        for step in range(4):
+            decision, obs = watchdog.evaluate_alert_transition(
+                Report(
+                    stamp + step * watchdog.FIVE_MIN_MS,
+                    [Finding(
+                        "volume_z_source_close_stale",
+                        detail={
+                            "source_close_time_ms": stamp,
+                            "computed_at_ms": stamp + step * watchdog.FIVE_MIN_MS,
+                        },
+                    )],
+                ),
+                prior,
+            )
+            events.append(decision)
+            prior = {
+                **watchdog._empty_state(),
+                **obs,
+                "notified_red_fingerprints": list(decision.red_fingerprints),
+                "last_success_ms": stamp,
+            }
+        self.assertEqual([item.consecutive_lockout_bars for item in events], [1, 1, 1, 1])
+        self.assertEqual([item.source_bucket for item in events], [stamp // watchdog.FIVE_MIN_MS] * 4)
+        self.assertEqual([item.consecutive_observation_cycles for item in events], [1, 2, 3, 4])
+        self.assertEqual(events[0].event_type, "NEW_ALERT")
+        self.assertEqual(events[1].event_type, "ESCALATED_OBSERVATION_CYCLE")
+        self.assertEqual(events[2].event_type, "QUIET")
+        self.assertEqual(events[3].event_type, "QUIET")
+        self.assertIn("观察周期", events[1].body_text)
+        self.assertNotIn("相邻源K线", events[1].body_text)
+
+        same_slot, _ = watchdog.evaluate_alert_transition(
+            Report(
+                stamp + 3 * watchdog.FIVE_MIN_MS + 10_000,
+                [Finding("volume_z_source_close_stale", detail={"source_close_time_ms": stamp})],
+            ),
+            prior,
+        )
+        self.assertEqual(same_slot.consecutive_observation_cycles, 4)
+
+        missed, missed_obs = watchdog.evaluate_alert_transition(
+            Report(
+                stamp + 6 * watchdog.FIVE_MIN_MS,
+                [Finding("volume_z_source_close_stale", detail={"source_close_time_ms": stamp})],
+            ),
+            prior,
+        )
+        self.assertEqual(missed.consecutive_observation_cycles, 1)
+        self.assertNotEqual(missed.event_type, "ESCALATED_OBSERVATION_CYCLE")
+
+        backward, _ = watchdog.evaluate_alert_transition(
+            Report(
+                stamp + 2 * watchdog.FIVE_MIN_MS,
+                [Finding("volume_z_source_close_stale", detail={"source_close_time_ms": stamp, "computed_at_ms": stamp})],
+            ),
+            {**prior, **missed_obs},
+        )
+        self.assertEqual(backward.consecutive_observation_cycles, 1)
+
+        cleared, cleared_obs = watchdog.evaluate_alert_transition(
+            Report(stamp + 7 * watchdog.FIVE_MIN_MS, [], overall_status="GREEN"),
+            {**prior, **missed_obs, "notified_red_fingerprints": ["volume_z_source_close_stale"]},
+        )
+        self.assertEqual(cleared.consecutive_observation_cycles, 0)
+        self.assertIsNone(cleared_obs["last_observation_slot"])
+        restarted, _ = watchdog.evaluate_alert_transition(
+            Report(
+                stamp + 8 * watchdog.FIVE_MIN_MS,
+                [Finding("volume_z_source_close_stale", detail={"source_close_time_ms": stamp})],
+            ),
+            {**watchdog._empty_state(), **cleared_obs},
+        )
+        self.assertEqual(restarted.consecutive_observation_cycles, 1)
+        self.assertEqual(restarted.consecutive_lockout_bars, 1)
 
     def test_quote_clock_uses_proven_schema_only(self) -> None:
         now = 1_800_000_000_000

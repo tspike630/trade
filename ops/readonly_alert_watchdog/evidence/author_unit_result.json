@@ -1,28 +1,18 @@
 {
   "install_allowed": false,
   "independent_verification": "NOT_DONE",
-  "previous_independent_verification": "FAIL at 4dbaede; missing_volume_source_stamp_does_not_escalate_on_polls",
   "author_unit_tests": {
-    "ran": 15,
+    "ran": 16,
     "failed": 0
   },
-  "original_unmodified_suite": "test_07 FAIL (unchanged originals)",
-  "fixed_modules_with_original_tests": "test_07 FAIL at consecutive_lockout_bars 0 != 1 because deribit detail has no 5m/1h source close and now_ms is no longer a poll bucket",
-  "quote_schema": [
-    "ccxt_ticks.ts",
-    "symbols.quoteVolume_collected_at"
-  ],
-  "quote_not_read": "quote_turnover.quote_ts_ms is not a production table",
+  "observation_cycles": "separate from source bars",
   "sha256": {
-    "readonly_alert_watchdog.py": "9be15810ffc95507e02779a4e7142597aefeb6952e5a99ffcabb10adf2b37c2d",
+    "readonly_alert_watchdog.py": "b4deb00b0dd510dc98902e191abf58fa8f39cd9857823651a6c41483698bb036",
     "readonly_live_preflight.py": "0a74bf7d1095975bd6a6d558f1f0e1ff74494a5e7b3323c496a031f5a4a3e628",
-    "test_watchdog_unit.py": "c28bb9b929abf692d6cd9e08a071eaa245c8871df59b27c5a5fbaa942145c77e",
-    "README.md": "6e8c693ca52e8c325ddb75028552e2984a41965f81d34363b0570078ca67e5cf",
+    "test_watchdog_unit.py": "b0710a8c6598483125d5d3421d5c3a6001bf7e09c40696724b8d3c55987fa2e1",
+    "README.md": "33254ca365418ea597431b5abc0a6424ce2c08d08ada94bbb537cac114834049",
+    "patches/watchdog.patch": "e8e48d6068141faaf2de60b0435c39478c9c1dcfb08e1c659f7874295f2ca4e6",
     "originals/readonly_alert_watchdog.py": "0e42dba33ee1ba3235f5bbacdfabe39332afa40fb371689f03764c8adb671357",
-    "originals/readonly_live_preflight.py": "02acd508e6e3fb4c0dc938295b9aedea194071857ac2a3c9c11969672be347f0",
-    "originals/test_proactive_watchdog.py": "eaddeeeee67cdef264b2b21b0dc969a341ae4ddc47a0d983ed6f960164686920",
-    "originals/repro.json": "fc71fd760ff41df14b8f4add1a6dee7941bdea6f83c02f0531b81bcc18d14d67",
-    "patches/watchdog.patch": "7a7b6c99d4197056e49e99a3533e0027ee217899e059ac91908047b8194d7d0a",
-    "patches/preflight.patch": "32165bd3913d6dadb863d03f09c310e80ef008909c70b065721d9e35ac2e244d"
+    "originals/readonly_live_preflight.py": "02acd508e6e3fb4c0dc938295b9aedea194071857ac2a3c9c11969672be347f0"
   }
 }

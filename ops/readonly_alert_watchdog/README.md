@@ -43,7 +43,9 @@
 - `obi_top5_source_ts_gap`、`obi_top5_source_ts_missing`：采集错误；`main` 上缺 OBI 仍可放行
 - 上传原件里的 `lseg_nvda_smh_stale_market_open`、`deribit_gamma_stale_or_invalid`、`whitelist_news_stale` 与 policy 字符串不是同一个名字。原名前缀保留，避免旧预检词汇漏报；这不表示 `main` 正在发出这些码
 
-连续桶只认明细里的源戳：`source_bar_close_ms`、`entry_kline_5m_close_ms`、`kline_5m_close_ts_ms`、`source_close_time_ms`、`volume_z_source_close_ms`、`quote_source_stamp_ms`。同一根不累加，相邻下一根才加，中间缺桶重置。`now_ms` 不再充当轮询槽。只有 `computed_at_ignored`、没有 `source_close_time_ms` 的 `volume_z_source_close_absent` 仍然告警，连续桶是 0，不会升成连续闭锁。
+源棒只认明细里的源戳：`source_bar_close_ms`、`entry_kline_5m_close_ms`、`kline_5m_close_ts_ms`、`source_close_time_ms`、`volume_z_source_close_ms`、`quote_source_stamp_ms`。同一根不累加，相邻下一根才加，中间缺桶重置。没有这些源戳时源棒数是 0。`computed_at_ms` 不改变源棒，也不证明数据新鲜。
+
+观察周期是另一档：一次真实轮询占一个 5 分钟槽。同一槽不累加，下一槽加 1，漏槽或时钟倒退重置为 1，红灯消失后归零。冻结的同一根源收盘、以及缺源戳的持续红灯，源棒可以一直是 1 或 0，但相邻观察满 2 次会发 `ESCALATED_OBSERVATION_CYCLE`。文案写观察周期，不写成源 K 线连根。这不是「离上次送达满 1800 秒就连续」；中间漏掉的观察会把这条计数清掉，1800 秒后的再提醒仍是 `RENOTIFY`。
 
 空 `decision_log` 且没有数据闭锁码时，漏斗态势保持 `unspecified`，不是 `no_entry_signal`，也不是健康。
 

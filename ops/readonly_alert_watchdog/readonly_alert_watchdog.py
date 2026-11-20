@@ -207,6 +207,7 @@ class AlertDecision:
     red_fingerprints: tuple[str, ...]
     yellow_fingerprints: tuple[str, ...]
     consecutive_lockout_bars: int
+    consecutive_observation_cycles: int
     source_bucket: int | None
     entry_posture: str
     event_key: str
@@ -266,6 +267,8 @@ def load_watchdog_state(state_path: Path) -> dict[str, Any]:
         state["last_delivery_outcome"] = str(raw.get("last_delivery_outcome") or "not_attempted")
         state["consecutive_lockout_bars"] = int(raw.get("consecutive_lockout_bars") or 0)
         state["last_lockout_bar_bucket"] = raw.get("last_lockout_bar_bucket")
+        state["consecutive_observation_cycles"] = int(raw.get("consecutive_observation_cycles") or 0)
+        state["last_observation_slot"] = raw.get("last_observation_slot")
     return state
 
 
@@ -324,6 +327,8 @@ def _empty_state() -> dict[str, Any]:
         "last_delivery_outcome": "not_attempted",
         "consecutive_lockout_bars": 0,
         "last_lockout_bar_bucket": None,
+        "consecutive_observation_cycles": 0,
+        "last_observation_slot": None,
         "entry_posture": "unspecified",
     }
 
@@ -427,6 +432,30 @@ def _entry_posture(findings: Sequence[Any], metrics: Mapping[str, Any]) -> str:
     return "unspecified"
 
 
+def _observation_slot(now_ms: int) -> int | None:
+    """Identity of a poll that actually ran. Not a source bar and not freshness."""
+    if now_ms < _MS_MIN:
+        return None
+    return now_ms // FIVE_MIN_MS
+
+
+def _advance_observation(active: bool, slot: int | None, prior: Mapping[str, Any]) -> int:
+    if not active or slot is None:
+        return 0
+    if int(prior.get("state_version") or 0) != STATE_VERSION:
+        return 1
+    prev = prior.get("last_observation_slot")
+    prev_n = int(prior.get("consecutive_observation_cycles") or 0)
+    if prev is None:
+        return 1
+    previous = int(prev)
+    if slot == previous:
+        return max(1, prev_n)
+    if slot == previous + 1:
+        return prev_n + 1
+    return 1
+
+
 def _advance_bars(has_lockout: bool, bucket: int | None, prior: Mapping[str, Any]) -> int:
     if not has_lockout or bucket is None:
         return 0
@@ -467,6 +496,8 @@ def evaluate_alert_transition(
     bucket = observed_source_bucket(lockout_findings) if posture == "data_lockout" else None
     now_ms = int(getattr(report, "now_ms", 0) or 0)
     consec_bars = _advance_bars(posture == "data_lockout", bucket, prior_state)
+    obs_slot = _observation_slot(now_ms) if posture == "data_lockout" else None
+    obs_cycles = _advance_observation(posture == "data_lockout", obs_slot, prior_state)
 
     effective_reds = list(red_findings)
     if consec_bars >= 2:
@@ -476,8 +507,22 @@ def evaluate_alert_transition(
                 severity="RED",
                 surface="signal_funnel",
                 code="consecutive_5m_silent_clock_lockout",
-                summary=f"策略真源时钟已连续闭锁 {consec_bars} 根观察到的相邻 5m 桶",
+                summary=f"相邻源K线桶已连续闭锁 {consec_bars} 根（这是源棒，不是观察周期）",
                 detail={"consecutive_5m_bars": consec_bars, "source_bucket": bucket},
+            ),
+        )
+    if obs_cycles >= 2:
+        effective_reds.insert(
+            0,
+            WatchFinding(
+                severity="RED",
+                surface="signal_funnel",
+                code="consecutive_observation_cycle_lockout",
+                summary=(
+                    f"同一闭锁已在相邻观察周期连续出现 {obs_cycles} 次。"
+                    "这是轮询观察计数，不是源K线连根，也不表示 computed_at 变新鲜"
+                ),
+                detail={"consecutive_observation_cycles": obs_cycles, "observation_slot": obs_slot},
             ),
         )
 
@@ -497,6 +542,9 @@ def evaluate_alert_transition(
         if any(item.startswith("consecutive_5m_silent_clock_lockout") for item in new_reds):
             should_push = True
             event_type = "ESCALATED_SILENT_LOCKOUT"
+        elif any(item.startswith("consecutive_observation_cycle_lockout") for item in new_reds):
+            should_push = True
+            event_type = "ESCALATED_OBSERVATION_CYCLE"
         elif new_reds:
             should_push = True
             event_type = "NEW_ALERT"
@@ -524,6 +572,7 @@ def evaluate_alert_transition(
         reds=effective_reds,
         yellows=yellow_findings,
         consec_bars=consec_bars,
+        obs_cycles=obs_cycles,
         posture=posture,
     )
     event_key = event_type + "|" + ",".join(red_fps) + "|" + ",".join(yel_fps)
@@ -537,6 +586,7 @@ def evaluate_alert_transition(
         red_fingerprints=red_fps,
         yellow_fingerprints=yel_fps,
         consecutive_lockout_bars=consec_bars,
+        consecutive_observation_cycles=obs_cycles,
         source_bucket=bucket,
         entry_posture=posture,
         event_key=event_key,
@@ -544,6 +594,8 @@ def evaluate_alert_transition(
     observation = {
         "consecutive_lockout_bars": consec_bars,
         "last_lockout_bar_bucket": bucket,
+        "consecutive_observation_cycles": obs_cycles,
+        "last_observation_slot": obs_slot,
         "entry_posture": posture,
         "last_checked_utc": getattr(report, "checked_at_utc", ""),
     }
@@ -565,6 +617,8 @@ def apply_delivery(
     state["last_push_ms"] = state["last_success_ms"]
     state["consecutive_lockout_bars"] = int(observation.get("consecutive_lockout_bars") or 0)
     state["last_lockout_bar_bucket"] = observation.get("last_lockout_bar_bucket")
+    state["consecutive_observation_cycles"] = int(observation.get("consecutive_observation_cycles") or 0)
+    state["last_observation_slot"] = observation.get("last_observation_slot")
     state["entry_posture"] = str(observation.get("entry_posture") or decision.entry_posture)
     state["last_checked_utc"] = observation.get("last_checked_utc")
     if not decision.should_push:
@@ -603,6 +657,7 @@ def _render_push_message(
     reds: Sequence[Any],
     yellows: Sequence[Any],
     consec_bars: int,
+    obs_cycles: int,
     posture: str,
 ) -> tuple[str, str]:
     checked = getattr(report, "checked_at_utc", "")
@@ -620,7 +675,7 @@ def _render_push_message(
     title = f"{prefix} trade 哨兵告警: 红灯 {len(reds)} 项 / 黄灯 {len(yellows)} 项 ({checked})"
     lines = [
         f"时刻: {checked} | 代码态: {getattr(report, 'code_state', '')} | "
-        f"入场态势: {posture} | 连续相邻闭锁桶: {consec_bars}",
+        f"入场态势: {posture} | 相邻源棒: {consec_bars} | 相邻观察周期: {obs_cycles}",
     ]
     for item in list(reds)[:6]:
         lines.append(f"- [RED] {item.code}: {item.summary}")
@@ -892,6 +947,7 @@ def run_watchdog_once(
         "yellow_codes": list(decision.yellow_codes),
         "red_fingerprints": list(decision.red_fingerprints),
         "consecutive_lockout_bars": decision.consecutive_lockout_bars,
+        "consecutive_observation_cycles": decision.consecutive_observation_cycles,
         "source_bucket": decision.source_bucket,
         "delivery_outcome": delivery.outcome if decision.should_push else "not_attempted",
         "delivery_attempted": bool(decision.should_push),
