@@ -36,6 +36,10 @@ from decision_engine.core.news_shock_gate import (
     load_news_snapshot,
     snapshot_observation,
 )
+from decision_engine.core.regime_v2_policy import (
+    query_latest_whitelist_news_fetched_ms,
+    stamp_cross_margin_signal_clocks,
+)
 from decision_engine.core.protection_halt import (
     ProtectionBook,
     purpose_halt_reason,
@@ -353,6 +357,15 @@ class DecisionEngine:
                 news_snapshot=news_snapshot,
             )
             passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
+            if self.bus.purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
+                news_fetched_ms = None
+                if getattr(news_snapshot, "availability", None) == "ok":
+                    news_fetched_ms = query_latest_whitelist_news_fetched_ms(
+                        getattr(news_snapshot, "db_path", None)
+                    )
+                passed = stamp_cross_margin_signal_clocks(
+                    passed, hot, news_fetched_ms=news_fetched_ms
+                )
         passed = _stamp_explicit_account_route(passed, self._account_route)
         emitted = self.bus.publish_many(passed)
         eff_macro_halt = guard_report.get("macro_halt") or macro_halt

@@ -12,7 +12,15 @@ import unittest
 from unittest.mock import patch
 
 from decision_engine.core.cityu_institutional_alpha import due_cftc_asof
+from decision_engine.core.regime_v2_policy import (
+    build_cross_margin_freshness_clocks,
+    stamp_cross_margin_signal_clocks,
+)
 from execution.margin_cross.api_semantics import make_client_id
+from execution.margin_cross.entry import (
+    _assemble_live_clocks,
+    _closed_bar_reference_drift,
+)
 from execution.margin_cross.errors import MarginExchangeError, MarginTransportTimeout
 from execution.margin_cross.fixture import NOW_MS, client_from_snapshot, short_case
 from execution.margin_cross.money import parse_decimal
@@ -458,6 +466,154 @@ class StrategySizingAndFreshnessTest(unittest.TestCase):
             )
             self.assertFalse(dec_kelly.allowed)
             self.assertIn("unruled_kelly_fraction_rejected", dec_kelly.reasons)
+
+    def test_assembled_clocks_follow_real_stamps_and_keep_fail_closed_reasons(self) -> None:
+        now = NOW_MS
+        fresh_iso = datetime.fromtimestamp((now - 27_000) / 1000.0, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        due = due_cftc_asof(datetime.fromtimestamp(now / 1000.0, tz=timezone.utc)).isoformat()
+        row = {
+            "tech_updated_at": fresh_iso,
+            "updated_at": "1970-01-01T00:00:00Z",
+            "obi_top5_source_ts_ms": now - 1_053_000,
+            "_perp_counterparty_ts_ms": now - 627_000,
+            "_deribit_gamma_ts_ms": now - 3_169_000,
+            "deribit_collected_at_ms": now - 1_000,
+            "volume_z_source_close_ms": now - 2_777_000,
+            "news_fetched_at": datetime.fromtimestamp(
+                (now - 3_938_000) / 1000.0, tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "lseg_market_open": True,
+            "_lseg_cross_asset_ts_ms": now - 300_000,
+            "_cot_max_date": due,
+        }
+        clocks = build_cross_margin_freshness_clocks(row)
+        clocks["snapshot_observed_at_ms"] = now - 1_000
+        reasons = check_data_freshness(clocks, now_ms=now, max_snapshot_age_ms=5000)
+        self.assertNotIn("indicators_stale_or_absent", reasons)
+        self.assertEqual(reasons, [])
+        self.assertEqual(clocks["deribit_gamma_ts_ms"], now - 3_169_000)
+        self.assertNotEqual(clocks["deribit_gamma_ts_ms"], now - 1_000)
+        self.assertEqual(clocks["cot_asof_date"], due)
+
+        missing = dict(row)
+        missing.pop("tech_updated_at")
+        missing_clocks = build_cross_margin_freshness_clocks(missing)
+        missing_clocks["snapshot_observed_at_ms"] = now - 1_000
+        self.assertNotIn("indicators_ts_ms", missing_clocks)
+        self.assertIn(
+            "indicators_stale_or_absent",
+            check_data_freshness(missing_clocks, now_ms=now, max_snapshot_age_ms=5000),
+        )
+
+        stale_iso = datetime.fromtimestamp((now - 3_600_001) / 1000.0, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        stale_clocks = build_cross_margin_freshness_clocks({**row, "tech_updated_at": stale_iso})
+        stale_clocks["snapshot_observed_at_ms"] = now - 1_000
+        self.assertIn(
+            "indicators_stale_or_absent",
+            check_data_freshness(stale_clocks, now_ms=now, max_snapshot_age_ms=5000),
+        )
+
+        seconds = dict(row)
+        seconds.pop("tech_updated_at")
+        seconds["indicators_ts_ms"] = now // 1000
+        self.assertNotIn("indicators_ts_ms", build_cross_margin_freshness_clocks(seconds))
+        self.assertNotIn(
+            "deribit_gamma_ts_ms",
+            build_cross_margin_freshness_clocks(
+                {"deribit_collected_at_ms": now - 1_000, "collected_at_ms": now - 1_000}
+            ),
+        )
+
+        closed = dict(clocks)
+        closed["lseg_market_open"] = False
+        closed.pop("lseg_cross_asset_ts_ms")
+        self.assertNotIn(
+            "lseg_cross_asset_bars_stale_or_absent",
+            check_data_freshness(closed, now_ms=now, max_snapshot_age_ms=5000),
+        )
+        opened = dict(clocks)
+        opened.pop("lseg_market_open")
+        opened.pop("lseg_cross_asset_ts_ms")
+        self.assertIn(
+            "lseg_cross_asset_bars_stale_or_absent",
+            check_data_freshness(opened, now_ms=now, max_snapshot_age_ms=5000),
+        )
+        opened_stale = dict(clocks)
+        opened_stale["lseg_market_open"] = True
+        opened_stale["lseg_cross_asset_ts_ms"] = now - 1_800_001
+        self.assertIn(
+            "lseg_cross_asset_bars_stale_or_absent",
+            check_data_freshness(opened_stale, now_ms=now, max_snapshot_age_ms=5000),
+        )
+
+        behind = dict(clocks)
+        behind["cot_asof_date"] = "2026-11-03"
+        self.assertIn(
+            "cot_publication_stale_or_absent",
+            check_data_freshness(behind, now_ms=now, max_snapshot_age_ms=5000),
+        )
+        absent_cot = dict(clocks)
+        absent_cot.pop("cot_asof_date")
+        self.assertIn(
+            "cot_publication_stale_or_absent",
+            check_data_freshness(absent_cot, now_ms=now, max_snapshot_age_ms=5000),
+        )
+
+        assembled = _assemble_live_clocks({"market_row": row}, now - 1_000)
+        self.assertEqual(assembled["indicators_ts_ms"], clocks["indicators_ts_ms"])
+        self.assertEqual(assembled["snapshot_observed_at_ms"], now - 1_000)
+        self.assertEqual(assembled["lseg_market_open"], True)
+        self.assertNotIn(
+            "indicators_stale_or_absent",
+            check_data_freshness(assembled, now_ms=now, max_snapshot_age_ms=5000),
+        )
+        carried = _assemble_live_clocks(
+            {"market_row": {}, "clocks": _fresh_clocks(now), "snapshot_observed_at_ms": 1},
+            now - 500,
+        )
+        self.assertEqual(carried["snapshot_observed_at_ms"], now - 500)
+        self.assertEqual(carried["indicators_ts_ms"], now - 60_000)
+
+        self.assertIsNone(
+            _closed_bar_reference_drift(
+                {"closed_bar_close": "100"}, {"reference_price": "100.3"}
+            )
+        )
+        self.assertEqual(
+            _closed_bar_reference_drift(
+                {"closed_bar_close": "100"}, {"reference_price": "100.3000001"}
+            ),
+            "closed_bar_reference_drift",
+        )
+
+        signal = {
+            "binance_symbol": "YBUSDT",
+            "market_row": {"tech_updated_at": fresh_iso, "lseg_market_open": False},
+        }
+        stamped = stamp_cross_margin_signal_clocks(
+            [signal],
+            [
+                {
+                    "binance_symbol": "YBUSDT",
+                    "volume_z_source_close_ms": now - 300_000,
+                    "_deribit_gamma_ts_ms": now - 3_169_000,
+                    "deribit_collected_at_ms": now - 1_000,
+                }
+            ],
+            news_fetched_ms=now - 600_000,
+        )
+        self.assertEqual(stamped[0]["clocks"]["lseg_market_open"], False)
+        self.assertNotIn("lseg_cross_asset_ts_ms", stamped[0]["clocks"])
+        self.assertEqual(stamped[0]["clocks"]["volume_z_source_close_ms"], now - 300_000)
+        self.assertEqual(stamped[0]["clocks"]["news_fetched_at_ms"], now - 600_000)
+        self.assertEqual(stamped[0]["clocks"]["deribit_gamma_ts_ms"], now - 3_169_000)
+        self.assertEqual(
+            stamped[0]["market_row"]["volume_z_source_close_ms"], now - 300_000
+        )
 
     def test_five_state_routing_anti_squeeze_veto_and_realtime_24pct_sizing(self) -> None:
         snap = _approved_snapshot(usdt_free="10000")

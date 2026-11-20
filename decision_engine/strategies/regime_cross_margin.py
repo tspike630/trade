@@ -11,6 +11,7 @@ import os
 from typing import Any
 
 from decision_engine.core.cross_margin_price_contract import order_for_strategy
+from decision_engine.core.regime_v2_policy import merge_cross_margin_clocks
 from execution.margin_cross.strategy_gate import evaluate_approved_regime_intent
 from decision_engine.strategies.base_strategy import BaseStrategy
 from logging_setup import get_logger
@@ -206,9 +207,10 @@ class _RegimeIntentStrategy(BaseStrategy):
                 "market_regime": decision.regime,
                 "market_row": dict(row),
                 **priced,
+                "clocks": merge_cross_margin_clocks(
+                    row, row.get("clocks") if isinstance(row.get("clocks"), dict) else None
+                ),
             }
-            if isinstance(row.get("clocks"), dict):
-                extra["clocks"] = dict(row["clocks"])
             if self.requested_action == "OPEN_SHORT":
                 sig = self.sell(
                     chain_id=chain_id,

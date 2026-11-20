@@ -23,8 +23,10 @@ from pathlib import Path
 import socket
 import sys
 import time
+from collections.abc import Mapping
 from typing import Any
 
+from decision_engine.core.regime_v2_policy import merge_cross_margin_clocks
 from execution.margin_cross.api_semantics import EVIDENCE_LINKS, make_client_id
 from execution.margin_cross.fixture import client_from_snapshot, short_case
 from execution.margin_cross.http_client import (
@@ -173,6 +175,46 @@ def _refused_plan(reason: str) -> ApprovedPositionPlan:
         intent=None,
         contract=None,
     )
+
+
+_ROW_CLOCK_KEYS = (
+    "indicators_ts_ms",
+    "_ind_ts_ms",
+    "tech_updated_at",
+    "obi_top5_source_ts_ms",
+    "_perp_counterparty_ts_ms",
+    "perp_counterparty_ts_ms",
+    "_deribit_gamma_ts_ms",
+    "deribit_gamma_source_ts_ms",
+    "volume_z_source_close_ms",
+    "news_fetched_at_ms",
+    "news_fetched_at",
+    "lseg_market_open",
+    "_lseg_cross_asset_ts_ms",
+    "lseg_cross_asset_ts_ms",
+    "_cot_max_date",
+    "cot_asof_date",
+)
+
+
+def _assemble_live_clocks(doc: Mapping[str, Any], snapshot_observed_at_ms: int) -> dict[str, Any]:
+    """Build the clocks dict the freshness gate reads.
+
+    Stamps come from ``market_row`` and any of the same fields already on the
+    document. ``snapshot_observed_at_ms`` is the live snapshot time and replaces
+    a carried snapshot clock. Missing source fields stay missing.
+    """
+    view: dict[str, Any] = {}
+    market = doc.get("market_row")
+    if isinstance(market, Mapping):
+        view.update(market)
+    for key in _ROW_CLOCK_KEYS:
+        if key not in view and key in doc and doc.get(key) not in (None, ""):
+            view[key] = doc[key]
+    prior = doc.get("clocks") if isinstance(doc.get("clocks"), Mapping) else None
+    clocks = merge_cross_margin_clocks(view, prior)
+    clocks["snapshot_observed_at_ms"] = int(snapshot_observed_at_ms)
+    return clocks
 
 
 def _closed_bar_reference_drift(
@@ -473,9 +515,9 @@ def open_live_document(
         )
 
     merged_doc = dict(doc)
-    clocks = dict(merged_doc.get("clocks") or {})
-    clocks["snapshot_observed_at_ms"] = snapshot_raw["observed_at_ms"]
-    merged_doc["clocks"] = clocks
+    merged_doc["clocks"] = _assemble_live_clocks(
+        merged_doc, snapshot_raw["observed_at_ms"]
+    )
     plan = _plan_from_signal_doc(merged_doc, snapshot_raw, now_ms)
     if not plan.allowed or plan.intent is None or plan.contract is None:
         return (

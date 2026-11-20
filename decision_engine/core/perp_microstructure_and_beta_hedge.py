@@ -780,13 +780,15 @@ def attach_counterparty_context(rows, *, db_path=None, now_ms=None):
                 row["gamma_regime"] = btc_gamma_regime
             if row.get("dvol_zscore") is None and btc_dvol_z is not None:
                 row["dvol_zscore"] = btc_dvol_z
+            # Source bar/event time. collected_at is not copied. A stale row
+            # never enters these maps, so a missing stamp stays missing.
+            if p_row is not None and "ts_ms" in p_row.keys() and p_row["ts_ms"] is not None:
+                row.setdefault("_perp_counterparty_ts_ms", int(p_row["ts_ms"]))
+            if sym in disloc_ts_by_sym:
+                row.setdefault("_cross_exchange_ts_ms", disloc_ts_by_sym[sym])
+            if btc_deribit_ts_ms is not None:
+                row.setdefault("_deribit_gamma_ts_ms", btc_deribit_ts_ms)
             if _env_true("REGIME_V2_CONTRACT"):
-                if p_row is not None and "ts_ms" in p_row.keys() and p_row["ts_ms"] is not None:
-                    row.setdefault("_perp_counterparty_ts_ms", int(p_row["ts_ms"]))
-                if sym in disloc_ts_by_sym:
-                    row.setdefault("_cross_exchange_ts_ms", disloc_ts_by_sym[sym])
-                if btc_deribit_ts_ms is not None:
-                    row.setdefault("_deribit_gamma_ts_ms", btc_deribit_ts_ms)
                 row.setdefault("_unlock_schedule_verified", unlock_schema_ok)
             # obi_top5 does not read or write volume_z / vol_z_1h. Regime 3
             # evaluates those on their own. The decision-engine kline path

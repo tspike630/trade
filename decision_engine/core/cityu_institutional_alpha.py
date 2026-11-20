@@ -428,9 +428,8 @@ def attach_cityu_institutional_context(
         if cluster == "ai_compute" or v2_on:
             row.setdefault("nvda_1h_ret_pct", snap.nvda_1h_ret_pct)
             row.setdefault("smh_1h_ret_pct", snap.smh_1h_ret_pct)
-        if v2_on:
-            if snap.cot_max_date is not None:
-                row.setdefault("_cot_max_date", snap.cot_max_date)
-            if snap.lseg_cross_asset_ts_ms is not None:
-                row.setdefault("_lseg_cross_asset_ts_ms", snap.lseg_cross_asset_ts_ms)
+        if snap.cot_max_date is not None:
+            row.setdefault("_cot_max_date", snap.cot_max_date)
+        if snap.lseg_cross_asset_ts_ms is not None:
+            row.setdefault("_lseg_cross_asset_ts_ms", snap.lseg_cross_asset_ts_ms)
     return rows

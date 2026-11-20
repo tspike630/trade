@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import math
 import os
@@ -731,6 +731,165 @@ def _source_clock_ms(raw: object) -> tuple[int | None, str | None]:
     if isinstance(raw, str) and not raw.strip().isdigit():
         return _parse_iso_ms(raw), None
     return _as_int(raw), None
+
+
+def _clock_ms_or_none(raw: object) -> int | None:
+    """Parsed millisecond stamp. A seconds-magnitude value is not rescaled."""
+    ts, unit = _source_clock_ms(raw)
+    if unit == "unit" or ts is None:
+        return None
+    return ts
+
+
+def _cot_date_text(raw: object) -> str | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()[:10]
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return None
+    return text
+
+
+def build_cross_margin_freshness_clocks(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy real source stamps onto the execution freshness clocks.
+
+    A missing, blank, or unparseable source is omitted. Nothing here fills a
+    clock from ``now``, from ``due_cftc_asof``, or from a fresher sibling
+    stamp. ``deribit_gamma_ts_ms`` is ``deribit_options_gamma.ts_ms`` (the bar
+    source time already stored as ``_deribit_gamma_ts_ms``). ``collected_at_ms``
+    is not read. ``perp_counterparty_ts_ms`` is ``binance_perp_counterparty.ts_ms``.
+    ``updated_at`` is not the indicator clock.
+    """
+    clocks: dict[str, Any] = {}
+    indicator_ms = None
+    for key in ("indicators_ts_ms", "_ind_ts_ms", "tech_updated_at"):
+        indicator_ms = _clock_ms_or_none(row.get(key))
+        if indicator_ms is not None:
+            break
+    if indicator_ms is not None:
+        clocks["indicators_ts_ms"] = indicator_ms
+
+    obi_ms = _clock_ms_or_none(row.get("obi_top5_source_ts_ms"))
+    if obi_ms is not None:
+        clocks["obi_top5_source_ts_ms"] = obi_ms
+
+    perp_ms = _clock_ms_or_none(row.get("_perp_counterparty_ts_ms"))
+    if perp_ms is None:
+        perp_ms = _clock_ms_or_none(row.get("perp_counterparty_ts_ms"))
+    if perp_ms is not None:
+        clocks["perp_counterparty_ts_ms"] = perp_ms
+
+    deribit_ms = _clock_ms_or_none(row.get("_deribit_gamma_ts_ms"))
+    if deribit_ms is None:
+        deribit_ms = _clock_ms_or_none(row.get("deribit_gamma_source_ts_ms"))
+    if deribit_ms is not None:
+        clocks["deribit_gamma_ts_ms"] = deribit_ms
+
+    volume_ms = _clock_ms_or_none(row.get("volume_z_source_close_ms"))
+    if volume_ms is not None:
+        clocks["volume_z_source_close_ms"] = volume_ms
+
+    news_ms = _clock_ms_or_none(row.get("news_fetched_at_ms"))
+    if news_ms is None:
+        news_ms = _clock_ms_or_none(row.get("news_fetched_at"))
+    if news_ms is not None:
+        clocks["news_fetched_at_ms"] = news_ms
+
+    market_open = row.get("lseg_market_open")
+    if isinstance(market_open, bool):
+        clocks["lseg_market_open"] = market_open
+    lseg_ms = _clock_ms_or_none(row.get("_lseg_cross_asset_ts_ms"))
+    if lseg_ms is None:
+        lseg_ms = _clock_ms_or_none(row.get("lseg_cross_asset_ts_ms"))
+    if lseg_ms is not None:
+        clocks["lseg_cross_asset_ts_ms"] = lseg_ms
+
+    cot = _cot_date_text(row.get("_cot_max_date"))
+    if cot is None:
+        cot = _cot_date_text(row.get("cot_asof_date"))
+    if cot is not None:
+        clocks["cot_asof_date"] = cot
+    return clocks
+
+
+def merge_cross_margin_clocks(
+    row: Mapping[str, Any],
+    existing: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Source stamps first. A non-empty explicit clock overrides that key."""
+    clocks = build_cross_margin_freshness_clocks(row)
+    if isinstance(existing, Mapping):
+        for key, value in existing.items():
+            if value not in (None, ""):
+                clocks[str(key)] = value
+    return clocks
+
+
+def stamp_cross_margin_signal_clocks(
+    signals: Sequence[dict[str, Any]],
+    hot_rows: Sequence[Mapping[str, Any]],
+    *,
+    news_fetched_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """Write execution clocks onto signals about to be published.
+
+    Hot rows can carry ``volume_z_source_close_ms`` that was attached after
+    the strategy copied ``market_row``. ``news_fetched_ms`` is the whitelist
+    ``fetched_at`` already read for this tick. A missing value is not filled.
+    """
+    by_symbol: dict[str, Mapping[str, Any]] = {}
+    for row in hot_rows:
+        if not isinstance(row, Mapping):
+            continue
+        for key in ("binance_symbol", "symbol", "token_address"):
+            symbol = str(row.get(key) or "").strip().upper()
+            if symbol:
+                by_symbol.setdefault(symbol, row)
+    news_ms = _clock_ms_or_none(news_fetched_ms)
+    carried = (
+        "volume_z_source_close_ms",
+        "_perp_counterparty_ts_ms",
+        "perp_counterparty_ts_ms",
+        "_deribit_gamma_ts_ms",
+        "deribit_gamma_source_ts_ms",
+        "_lseg_cross_asset_ts_ms",
+        "lseg_cross_asset_ts_ms",
+        "_cot_max_date",
+        "cot_asof_date",
+        "lseg_market_open",
+        "news_fetched_at_ms",
+        "news_fetched_at",
+        "tech_updated_at",
+        "indicators_ts_ms",
+        "_ind_ts_ms",
+        "obi_top5_source_ts_ms",
+    )
+    for sig in signals:
+        if not isinstance(sig, dict):
+            continue
+        market = sig.get("market_row")
+        if not isinstance(market, dict):
+            market = {}
+            sig["market_row"] = market
+        symbol = str(
+            sig.get("binance_symbol") or sig.get("symbol") or market.get("binance_symbol") or ""
+        ).strip().upper()
+        hot = by_symbol.get(symbol) or {}
+        view: dict[str, Any] = dict(hot)
+        for key, value in market.items():
+            if value not in (None, ""):
+                view[key] = value
+        if news_ms is not None and _clock_ms_or_none(view.get("news_fetched_at_ms")) is None:
+            if _clock_ms_or_none(view.get("news_fetched_at")) is None:
+                view["news_fetched_at_ms"] = news_ms
+        for key in carried:
+            if key in view and key not in market and view[key] not in (None, ""):
+                market[key] = view[key]
+        prior = sig.get("clocks") if isinstance(sig.get("clocks"), Mapping) else None
+        sig["clocks"] = merge_cross_margin_clocks(view, prior)
+    return list(signals)
 
 
 def query_latest_whitelist_news_fetched_ms(db_path: str | Path | None) -> int | None:

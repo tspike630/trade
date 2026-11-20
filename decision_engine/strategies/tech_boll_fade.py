@@ -35,7 +35,11 @@ from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_FADE,
     PURPOSE_LIVE_BNB_CROSS_MARGIN,
 )
-from decision_engine.core.regime_v2_policy import resolve_boll_z, v2_contract_active
+from decision_engine.core.regime_v2_policy import (
+    merge_cross_margin_clocks,
+    resolve_boll_z,
+    v2_contract_active,
+)
 from decision_engine.core.stop_gap import stop_distance_reason
 from decision_engine.strategies.base_strategy import BaseStrategy
 from decision_engine.strategies.entry_sizing import buy_size_fields
@@ -298,8 +302,9 @@ class TechBollFadeStrategy(BaseStrategy):
                         self.rejected.get("pair_address_missing", 0) + 1
                     )
                     continue
-                if isinstance(row.get("clocks"), dict):
-                    lift_extra["clocks"] = dict(row["clocks"])
+                lift_extra["clocks"] = merge_cross_margin_clocks(
+                    row, row.get("clocks") if isinstance(row.get("clocks"), dict) else None
+                )
             self.buy(
                 chain_id=str(row.get("chain_id") or ""),
                 token_address=str(row.get("token_address") or ""),

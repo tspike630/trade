@@ -114,6 +114,8 @@ _UNTOUCHED = {
         "e6f375318e778fc59f657499e982ee8957b824d45053096b0bc82b919f2706eb",
         # Cross-margin bars require a named close time and stamp freshness for pricing.
         "f4b6a990a63031f0929cbd34141470220561730b637c9e3658a3564e3a3bab82",
+        # Published cross-margin signals receive source freshness clocks.
+        "04913cfb73a10a00327403d19c2d361b93f708324b95970dc791f6016815b36e",
     ),
     "decision_engine/core/live_buy_guards.py": (
         "6b3023ed5bdcbb2fdd4b4372ea0d360b147be96ac68016b4d7631fc671991da7",
