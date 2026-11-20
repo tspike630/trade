@@ -145,6 +145,7 @@ _FIVE_MIN_SOURCE_KEYS = (
 _HOUR_SOURCE_KEYS = (
     "source_close_time_ms",
     "volume_z_source_close_ms",
+    "quote_source_stamp_ms",
 )
 _IGNORED_CLOCK_KEYS = frozenset({
     "now_ms",
@@ -380,21 +381,6 @@ def _funnel_view(metrics: Mapping[str, Any]) -> Mapping[str, Any]:
     return {}
 
 
-def _computation_clock_only(findings: Sequence[Any]) -> bool:
-    for finding in findings:
-        if not is_lockout_code(str(getattr(finding, "code", "") or "")):
-            continue
-        detail = _detail(finding)
-        has_source = any(
-            _source_ms(detail.get(key)) is not None
-            for key in _FIVE_MIN_SOURCE_KEYS + _HOUR_SOURCE_KEYS
-        )
-        has_ignored = any(key in detail for key in _IGNORED_CLOCK_KEYS)
-        if has_ignored and not has_source:
-            return True
-    return False
-
-
 def observed_source_bucket(findings: Sequence[Any]) -> int | None:
     """Bucket of an observed source bar. Computation clocks are ignored."""
     five: list[int] = []
@@ -478,15 +464,8 @@ def evaluate_alert_transition(
     ]
     yellow_findings = [item for item in findings if getattr(item, "severity", "") == "YELLOW"]
     lockout_findings = [item for item in red_findings if is_lockout_code(str(item.code))]
-    source_bucket = observed_source_bucket(lockout_findings) if posture == "data_lockout" else None
+    bucket = observed_source_bucket(lockout_findings) if posture == "data_lockout" else None
     now_ms = int(getattr(report, "now_ms", 0) or 0)
-    if source_bucket is not None:
-        bucket = source_bucket
-    elif posture == "data_lockout" and not _computation_clock_only(lockout_findings) and now_ms >= _MS_MIN:
-        # Poll slot of a check that actually ran. It is not a source-hour freshness stamp.
-        bucket = now_ms // FIVE_MIN_MS
-    else:
-        bucket = None
     consec_bars = _advance_bars(posture == "data_lockout", bucket, prior_state)
 
     effective_reds = list(red_findings)

@@ -502,13 +502,117 @@ class WatchdogBodyTest(unittest.TestCase):
         self.assertEqual(locked["posture"], "data_lockout")
         self.assertNotEqual(funnel["posture"], locked["posture"])
 
+        bare = watchdog._empty_state()
+        first, obs = watchdog.evaluate_alert_transition(
+            Report(1_800_000_000_000, [Finding("volume_z_source_close_absent", detail={"computed_at_ignored": True})]),
+            bare,
+        )
+        bare.update(obs)
+        second, _obs2 = watchdog.evaluate_alert_transition(
+            Report(
+                1_800_000_000_000 + watchdog.FIVE_MIN_MS,
+                [Finding("volume_z_source_close_absent", detail={"computed_at_ignored": True})],
+            ),
+            bare,
+        )
+        self.assertEqual(first.consecutive_lockout_bars, 0)
+        self.assertEqual(second.consecutive_lockout_bars, 0)
+        self.assertIsNone(second.source_bucket)
+        self.assertNotEqual(second.event_type, "ESCALATED_SILENT_LOCKOUT")
+        self.assertTrue(second.should_push)
+
+    def test_quote_clock_uses_proven_schema_only(self) -> None:
+        now = 1_800_000_000_000
+        db = self.base / "quotes.db"
+
+        def clocks() -> set[str]:
+            found, _info = preflight.inspect_data_clocks(
+                now_ms=now,
+                nyse_open=False,
+                expected_cot="2026-11-17",
+                main_db=db,
+                deriv_db=self.base / "no-deriv.db",
+                lseg_db=self.base / "no-lseg.db",
+                cityu_db=self.base / "no-cityu.db",
+                require_dbs=False,
+                repo_root=self.base / "no-repo",
+            )
+            return {item.code for item in found}
+
+        sqlite3.connect(db).close()
+        self.assertIn("quote_turnover_source_unobserved", clocks())
+        self.assertNotIn("quote_turnover_stale", clocks())
+
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE symbols (symbol TEXT, quoteVolume_24h REAL, updated_at TEXT)"
+        )
+        conn.execute("INSERT INTO symbols VALUES ('BMTUSDT', 9000000, ?)", (preflight.fmt_ms_utc(now),))
+        conn.commit()
+        conn.close()
+        self.assertIn("quote_turnover_clock_absent", clocks())
+        absent, _info = preflight.inspect_data_clocks(
+            now_ms=now,
+            nyse_open=False,
+            expected_cot="2026-11-17",
+            main_db=db,
+            deriv_db=self.base / "no-deriv.db",
+            lseg_db=self.base / "no-lseg.db",
+            cityu_db=self.base / "no-cityu.db",
+            require_dbs=False,
+        )
+        missing = next(item for item in absent if item.code == "quote_turnover_clock_absent")
+        self.assertIsNone(missing.detail["quote_source_stamp_ms"])
+
+        conn = sqlite3.connect(db)
+        conn.execute("ALTER TABLE symbols ADD COLUMN quoteVolume_collected_at TEXT")
+        conn.execute(
+            "UPDATE symbols SET quoteVolume_collected_at = ?",
+            (str(now + 121_000),),
+        )
+        conn.commit()
+        conn.close()
+        self.assertIn("quote_turnover_stale", clocks())
+
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE symbols SET quoteVolume_collected_at = ?",
+            (str(now - 3_600_001),),
+        )
+        conn.commit()
+        conn.close()
+        stale, _info = preflight.inspect_data_clocks(
+            now_ms=now,
+            nyse_open=False,
+            expected_cot="2026-11-17",
+            main_db=db,
+            deriv_db=self.base / "no-deriv.db",
+            lseg_db=self.base / "no-lseg.db",
+            cityu_db=self.base / "no-cityu.db",
+            require_dbs=False,
+        )
+        row = next(item for item in stale if item.code == "quote_turnover_stale")
+        self.assertEqual(row.detail["quote_source_stamp_ms"], now - 3_600_001)
+        self.assertNotEqual(row.detail["quote_source_stamp_ms"], now)
+
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE symbols SET quoteVolume_collected_at = ?",
+            (str(now - 3_600_000),),
+        )
+        conn.commit()
+        conn.close()
+        self.assertNotIn("quote_turnover_stale", clocks())
+
     def test_module_does_not_open_sqlite(self) -> None:
         text = (_PKG / "readonly_alert_watchdog.py").read_text(encoding="utf-8")
         self.assertNotIn("sqlite3.connect", text)
         preflight_text = (_PKG / "readonly_live_preflight.py").read_text(encoding="utf-8")
         self.assertIn("mode=ro", preflight_text)
         self.assertIn("PRAGMA query_only = ON", preflight_text)
-        self.assertNotIn("quote_turnover_stale", preflight_text)
+        self.assertNotIn("FROM quote_turnover", preflight_text)
+        self.assertIn("quoteVolume_collected_at", preflight_text)
+        self.assertIn("ccxt_ticks", preflight_text)
 
 
 if __name__ == "__main__":

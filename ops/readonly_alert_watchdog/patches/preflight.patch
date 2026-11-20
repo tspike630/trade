@@ -60,7 +60,15 @@
              )
          )
  
-@@ -694,6 +716,29 @@
+@@ -641,6 +663,7 @@
+     lseg_db: Path,
+     cityu_db: Path,
+     require_dbs: bool,
++    repo_root: Path | None = None,
+ ) -> tuple[list[Finding], dict[str, Any]]:
+     findings: list[Finding] = []
+     metrics: dict[str, Any] = {}
+@@ -694,6 +717,29 @@
                              f"{ric}({fmt_ms_utc(latest_ms)}, bars={len(rows)}, age={fmt_age_human(age_ms)})"
                          )
                  lseg_info["rics"] = ric_details
@@ -90,16 +98,23 @@
                  if stale_rics:
                      if nyse_open is False:
                          findings.append(
-@@ -1001,6 +1046,8 @@
+@@ -1001,6 +1047,15 @@
                              )
                          )
  
 +            _inspect_volume_source_hour(mconn, now_ms=now_ms, main_info=main_info, findings=findings)
++            _inspect_quote_clock(
++                mconn,
++                now_ms=now_ms,
++                main_info=main_info,
++                findings=findings,
++                repo_root=repo_root,
++            )
 +
              if table_exists(mconn, "news_events"):
                  nr = mconn.execute(
                      "SELECT MAX(fetched_at) AS mf FROM news_events WHERE lower(source_tier) = 'whitelist'"
-@@ -1030,6 +1077,78 @@
+@@ -1030,6 +1085,271 @@
      return findings, metrics
  
  
@@ -125,7 +140,7 @@
 +                surface="data_clocks",
 +                code="volume_z_source_close_absent",
 +                summary="decision_volume_z 没有 source_close_time_ms，不能用 computed_at_ms 充当 1h 源钟",
-+                detail={"computed_at_ignored": True},
++                detail={"source_close_time_ms": None, "computed_at_ignored": True},
 +            )
 +        )
 +        return
@@ -175,10 +190,211 @@
 +        )
 +
 +
++_QUOTE_FUTURE_SKEW_MS = 120_000
++
++
++def _column_map(conn: sqlite3.Connection, table_name: str) -> dict[str, str]:
++    return {name.lower(): name for name in present_columns(conn, table_name)}
++
++
++def _ccxt_source_ms(raw: object) -> tuple[int | None, str | None]:
++    """``ccxt_ticks.ts`` as used by live_bnb_turnover: ms, or seconds rescaled once."""
++    if isinstance(raw, bool) or raw is None or raw == "":
++        return None, None
++    if isinstance(raw, (int, float)):
++        if isinstance(raw, float) and not math.isfinite(raw):
++            return None, "non_finite"
++        number = int(raw)
++        if number > 10_000_000_000:
++            return number, None
++        if number > 1_000_000_000:
++            return number * 1000, "seconds_rescaled"
++        return None, "not_a_source_stamp"
++    return parse_any_ts_ms(raw)
++
++
++def _quote_feed_state(stamp_ms: int, now_ms: int) -> str:
++    age = now_ms - stamp_ms
++    if age < -_QUOTE_FUTURE_SKEW_MS:
++        return "future"
++    if age > INDICATORS_FRESH_MS:
++        return "stale"
++    return "fresh"
++
++
++def _inspect_quote_clock(
++    conn: sqlite3.Connection,
++    *,
++    now_ms: int,
++    main_info: dict[str, Any],
++    findings: list[Finding],
++    repo_root: Path | None,
++) -> None:
++    """Quote clock from proven columns only.
++
++    ``ccxt_ticks.ts`` and ``symbols.quoteVolume_collected_at`` are the source
++    stamps in live_bnb_turnover / binance_universe_quote. ``updated_at`` and
++    ``binance_indicators.quote_volume_24h`` are not this clock. A table named
++    ``quote_turnover`` is not in this repository and is not read.
++    """
++    sources: list[tuple[sqlite3.Connection, str]] = [(conn, "main")]
++    universe = None
++    if repo_root is not None:
++        candidate = repo_root / "exports" / "binance_spot_universe.db"
++        if candidate.is_file():
++            universe = connect_readonly_sqlite(candidate)
++            if universe is not None:
++                sources.append((universe, "exports/binance_spot_universe.db"))
++    try:
++        observations: list[dict[str, Any]] = []
++        saw_quote_table = False
++        missing_stamp_column = False
++        for source, origin in sources:
++            if table_exists(source, "ccxt_ticks"):
++                cols = _column_map(source, "ccxt_ticks")
++                required = ("symbol", "quote_volume_24h", "ts", "exchange")
++                if all(name in cols for name in required):
++                    saw_quote_table = True
++                    fetched = source.execute(
++                        f"""
++                        SELECT {cols['symbol']} AS symbol,
++                               {cols['quote_volume_24h']} AS quote_volume,
++                               {cols['ts']} AS ts
++                        FROM ccxt_ticks
++                        WHERE lower({cols['exchange']}) = 'binance'
++                        """
++                    ).fetchall()
++                    for row in fetched:
++                        stamp, note = _ccxt_source_ms(row["ts"])
++                        observations.append(
++                            {
++                                "origin": origin,
++                                "table": "ccxt_ticks",
++                                "symbol": str(row["symbol"] or ""),
++                                "quote_source_stamp_ms": stamp,
++                                "parse_note": note,
++                            }
++                        )
++                elif "ts" not in cols or "quote_volume_24h" not in cols:
++                    saw_quote_table = True
++                    missing_stamp_column = True
++            if table_exists(source, "symbols"):
++                cols = _column_map(source, "symbols")
++                quote_col = cols.get("quotevolume_24h") or cols.get("quote_volume_24h")
++                symbol_col = cols.get("symbol")
++                if symbol_col and quote_col:
++                    saw_quote_table = True
++                    stamp_col = cols.get("quotevolume_collected_at")
++                    if stamp_col is None:
++                        missing_stamp_column = True
++                        continue
++                    fetched = source.execute(
++                        f"""
++                        SELECT {symbol_col} AS symbol, {stamp_col} AS collected_at
++                        FROM symbols
++                        """
++                    ).fetchall()
++                    for row in fetched:
++                        stamp, note = parse_any_ts_ms(row["collected_at"])
++                        observations.append(
++                            {
++                                "origin": origin,
++                                "table": "symbols",
++                                "symbol": str(row["symbol"] or ""),
++                                "quote_source_stamp_ms": stamp,
++                                "parse_note": note,
++                                "updated_at_ignored": "updated_at" in cols,
++                            }
++                        )
++        main_info["quote_clock_observed"] = bool(observations) and not missing_stamp_column
++        main_info["quote_schema"] = [
++            "ccxt_ticks.symbol,quote_volume_24h,ts,exchange",
++            "symbols.symbol,quoteVolume_24h|quote_volume_24h,quoteVolume_collected_at",
++        ]
++        if not saw_quote_table:
++            main_info["quote_clock_observed"] = False
++            findings.append(
++                Finding(
++                    severity="YELLOW",
++                    surface="data_clocks",
++                    code="quote_turnover_source_unobserved",
++                    summary=(
++                        "主库和 exports/binance_spot_universe.db 都没有可证明的报价源表。"
++                        "quote_turnover.quote_ts_ms 不是本仓库的生产 schema，不能据此报 quote_turnover_stale"
++                    ),
++                    detail={"quote_source_stamp_ms": None, "tables_present": False},
++                )
++            )
++            return
++        if missing_stamp_column and not any(item["quote_source_stamp_ms"] is not None for item in observations):
++            findings.append(
++                Finding(
++                    severity="RED",
++                    surface="data_clocks",
++                    code="quote_turnover_clock_absent",
++                    summary="报价表在，但没有 quoteVolume_collected_at 或 ccxt_ticks.ts。updated_at 不算源钟",
++                    detail={"quote_source_stamp_ms": None, "updated_at_ignored": True},
++                )
++            )
++            return
++        bad = [
++            item
++            for item in observations
++            if item["quote_source_stamp_ms"] is None
++            or _quote_feed_state(int(item["quote_source_stamp_ms"]), now_ms) != "fresh"
++        ]
++        fresh = len(observations) - len(bad)
++        main_info["quote_rows"] = {"fresh": fresh, "not_fresh": len(bad)}
++        if not observations or (bad and fresh == 0):
++            stamp_values = [item["quote_source_stamp_ms"] for item in bad if item["quote_source_stamp_ms"] is not None]
++            code = "quote_turnover_clock_absent" if not stamp_values else "quote_turnover_stale"
++            findings.append(
++                Finding(
++                    severity="RED",
++                    surface="data_clocks",
++                    code=code,
++                    summary="报价源钟缺失、超 3600s 或落在未来 120s 以外。不用本机当前时刻填充",
++                    detail={
++                        "quote_source_stamp_ms": min(stamp_values) if stamp_values else None,
++                        "rows": bad[:8],
++                    },
++                )
++            )
++        elif bad:
++            future_or_stale = [
++                item
++                for item in bad
++                if item["quote_source_stamp_ms"] is not None
++                and _quote_feed_state(int(item["quote_source_stamp_ms"]), now_ms) != "fresh"
++            ]
++            if future_or_stale:
++                stamps = [int(item["quote_source_stamp_ms"]) for item in future_or_stale]
++                findings.append(
++                    Finding(
++                        severity="RED",
++                        surface="data_clocks",
++                        code="quote_turnover_stale",
++                        summary="部分报价源钟过期或落在未来，不能用其它行的计算时刻掩盖",
++                        detail={"quote_source_stamp_ms": min(stamps), "rows": future_or_stale[:8]},
++                    )
++                )
++    finally:
++        if universe is not None:
++            universe.close()
++
++
  # --- Surface C: Spot & Cross-Margin Execution Ledgers ---
  
  def _safe_decimal(raw: object) -> Decimal:
-@@ -1552,7 +1671,10 @@
+@@ -1531,6 +1851,7 @@
+         lseg_db=paths["lseg_db"],
+         cityu_db=paths["cityu_db"],
+         require_dbs=require_dbs,
++        repo_root=paths["repo_root"],
+     )
+     findings.extend(clock_findings)
+     all_metrics["clocks"] = clock_metrics
+@@ -1552,7 +1873,10 @@
          lookback_hours=lookback_hours,
      )
      findings.extend(funnel_findings)
@@ -189,7 +405,7 @@
  
      red_n = sum(1 for f in findings if f.severity == "RED")
      yel_n = sum(1 for f in findings if f.severity == "YELLOW")
-@@ -1631,7 +1753,61 @@
+@@ -1631,7 +1955,61 @@
      return "\n".join(lines) + "\n"
  
  

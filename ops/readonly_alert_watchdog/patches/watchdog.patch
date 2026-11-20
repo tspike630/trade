@@ -76,7 +76,7 @@
      "lseg_nvda_smh_stale_market_open",
      "deribit_gamma_stale_or_invalid",
      "perp_counterparty_stale",
-@@ -63,213 +54,602 @@
+@@ -63,213 +54,581 @@
      "cot_asof_future_timestamp",
  )
  
@@ -171,6 +171,7 @@
 +_HOUR_SOURCE_KEYS = (
 +    "source_close_time_ms",
 +    "volume_z_source_close_ms",
++    "quote_source_stamp_ms",
 +)
 +_IGNORED_CLOCK_KEYS = frozenset({
 +    "now_ms",
@@ -437,21 +438,6 @@
 -    red_codes: tuple[str, ...]
 -    yellow_codes: tuple[str, ...]
 -    consecutive_lockout_bars: int
-+def _computation_clock_only(findings: Sequence[Any]) -> bool:
-+    for finding in findings:
-+        if not is_lockout_code(str(getattr(finding, "code", "") or "")):
-+            continue
-+        detail = _detail(finding)
-+        has_source = any(
-+            _source_ms(detail.get(key)) is not None
-+            for key in _FIVE_MIN_SOURCE_KEYS + _HOUR_SOURCE_KEYS
-+        )
-+        has_ignored = any(key in detail for key in _IGNORED_CLOCK_KEYS)
-+        if has_ignored and not has_source:
-+            return True
-+    return False
-+
-+
 +def observed_source_bucket(findings: Sequence[Any]) -> int | None:
 +    """Bucket of an observed source bar. Computation clocks are ignored."""
 +    five: list[int] = []
@@ -544,6 +530,9 @@
 -        else:
 -            consec_bars = max(1, prev_bars)
 -        next_bucket: int | None = int(cur_bar_bucket)
+-    else:
+-        consec_bars = 0
+-        next_bucket = None
 +    findings = list(getattr(report, "findings", []) or [])
 +    metrics = getattr(report, "metrics", None)
 +    if not isinstance(metrics, Mapping):
@@ -557,17 +546,8 @@
 +    ]
 +    yellow_findings = [item for item in findings if getattr(item, "severity", "") == "YELLOW"]
 +    lockout_findings = [item for item in red_findings if is_lockout_code(str(item.code))]
-+    source_bucket = observed_source_bucket(lockout_findings) if posture == "data_lockout" else None
++    bucket = observed_source_bucket(lockout_findings) if posture == "data_lockout" else None
 +    now_ms = int(getattr(report, "now_ms", 0) or 0)
-+    if source_bucket is not None:
-+        bucket = source_bucket
-+    elif posture == "data_lockout" and not _computation_clock_only(lockout_findings) and now_ms >= _MS_MIN:
-+        # Poll slot of a check that actually ran. It is not a source-hour freshness stamp.
-+        bucket = now_ms // FIVE_MIN_MS
-     else:
--        consec_bars = 0
--        next_bucket = None
-+        bucket = None
 +    consec_bars = _advance_bars(posture == "data_lockout", bucket, prior_state)
  
 -    # Inject synthetic consecutive silent-lockout finding when >= 2 5m bars
@@ -787,7 +767,7 @@
  def post_json_webhook(url: str, payload: Mapping[str, Any], timeout: float = 6.0) -> tuple[bool, str]:
      body = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
      req = Request(
-@@ -284,13 +664,36 @@
+@@ -284,13 +643,36 @@
              return 200 <= code < 300, f"http_{code}"
      except HTTPError as exc:
          return False, f"http_{exc.code}"
@@ -826,7 +806,7 @@
      *,
      webhook_url: str = "",
      telegram_bot_token: str = "",
-@@ -299,73 +702,123 @@
+@@ -299,73 +681,123 @@
      macos_notify: bool = False,
      alert_jsonl: Path | None = None,
      http_poster: Callable[[str, Mapping[str, Any]], tuple[bool, str]] | None = None,
@@ -986,7 +966,7 @@
  def run_watchdog_once(
      repo_root: Path,
      *,
-@@ -388,18 +841,17 @@
+@@ -388,18 +820,17 @@
      bark_url: str = "",
      macos_notify: bool = False,
      http_poster: Callable[[str, Mapping[str, Any]], tuple[bool, str]] | None = None,
@@ -1011,7 +991,7 @@
          main_db=main_db,
          deriv_db=deriv_db,
          lseg_db=lseg_db,
-@@ -409,15 +861,26 @@
+@@ -409,15 +840,26 @@
          require_dbs=require_dbs,
          ack_dust_intents=ack_dust_intents,
      )
@@ -1042,7 +1022,7 @@
              decision,
              report,
              webhook_url=webhook_url,
-@@ -427,26 +890,81 @@
+@@ -427,26 +869,81 @@
              macos_notify=macos_notify,
              alert_jsonl=safe_jsonl,
              http_poster=http_poster,
@@ -1130,7 +1110,7 @@
      parser.add_argument("--repo-root", type=Path, default=Path.cwd())
      parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
      parser.add_argument("--alert-jsonl", type=Path, default=None)
-@@ -460,7 +978,7 @@
+@@ -460,7 +957,7 @@
      parser.add_argument("--require-dbs", action="store_true")
      parser.add_argument("--alert-on-yellow", action="store_true")
      parser.add_argument("--renotify-sec", type=int, default=DEFAULT_RENOTIFY_SEC)
@@ -1139,7 +1119,7 @@
      parser.add_argument("--interval-sec", type=int, default=DEFAULT_INTERVAL_SEC)
      parser.add_argument("--macos-notify", action="store_true")
      parser.add_argument("--now-ms", type=int, default=None)
-@@ -470,8 +988,7 @@
+@@ -470,8 +967,7 @@
      tg_token = os.environ.get("WATCHDOG_TELEGRAM_BOT_TOKEN", "").strip()
      tg_chat = os.environ.get("WATCHDOG_TELEGRAM_CHAT_ID", "").strip()
      bark_url = os.environ.get("WATCHDOG_BARK_URL", "").strip()
@@ -1149,7 +1129,7 @@
      stop = False
  
      def _handle_sig(_sig: int, _frame: Any) -> None:
-@@ -484,31 +1001,47 @@
+@@ -484,31 +980,47 @@
  
      while True:
          started = time.monotonic()

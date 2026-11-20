@@ -13,7 +13,7 @@
 - SQLite 只走 `file:...?mode=ro` 和 `PRAGMA query_only = ON`。文件不存在就不打开，不创建。
 - Deribit 新鲜度用 `ts_ms`，不用 `collected_at_ms`。未来钟（早于现在超过 120 秒的反向年龄，或 LSEG `utc_ms` 落在未来）是红灯。
 - 1h 量能读 `decision_volume_z.source_close_time_ms`。`computed_at_ms` 即使是刚才写入的也不算新鲜。表不存在时不假装已经验过。
-- 报价钟 `quote_turnover_stale` 这个预检模块没有查询，不能算已覆盖。`main` 上的 `turnover_stale` 是另一套宇宙过滤。
+- 报价钟只读两处已证明的源戳：`ccxt_ticks.ts`（`quote_volume_24h`，`exchange=binance`；秒值只按 `live_bnb_turnover` 放大一次）和 `symbols.quoteVolume_collected_at`（可在主库或已存在的 `exports/binance_spot_universe.db`）。`updated_at`、`binance_indicators.quote_volume_24h`、以及并不存在的表 `quote_turnover.quote_ts_ms` 都不算源钟。缺表是黄灯 `quote_turnover_source_unobserved`，不假装已检查新鲜，也不计连续桶。缺戳、未来（超过 120 秒）和超过 3600 秒是红灯。没有源戳时连续桶保持 0。
 - LSEG 5m 门禁用 30 分钟，与 `decision_engine/core/macro_circuit_breaker.py` 的 `MAX_CROSS_ASSET_AGE_MS` 相同。导入器开盘 15 分钟标签是另一套口径，这里没有改成 15 分钟。
 
 ## 最小依赖
@@ -43,7 +43,9 @@
 - `obi_top5_source_ts_gap`、`obi_top5_source_ts_missing`：采集错误；`main` 上缺 OBI 仍可放行
 - 上传原件里的 `lseg_nvda_smh_stale_market_open`、`deribit_gamma_stale_or_invalid`、`whitelist_news_stale` 与 policy 字符串不是同一个名字。原名前缀保留，避免旧预检词汇漏报；这不表示 `main` 正在发出这些码
 
-连续 5m 桶只认发现明细里的源 K 线收盘：`source_bar_close_ms`、`entry_kline_5m_close_ms`、`kline_5m_close_ts_ms`。只有量能小时戳时用 `source_close_time_ms` / `volume_z_source_close_ms`。同一根不累加，中间缺桶则重置。`now_ms`、`computed_at_ms`、`collected_at_ms` 不算源桶。没有源戳就不计连续闭锁。
+连续桶只认明细里的源戳：`source_bar_close_ms`、`entry_kline_5m_close_ms`、`kline_5m_close_ts_ms`、`source_close_time_ms`、`volume_z_source_close_ms`、`quote_source_stamp_ms`。同一根不累加，相邻下一根才加，中间缺桶重置。`now_ms` 不再充当轮询槽。只有 `computed_at_ignored`、没有 `source_close_time_ms` 的 `volume_z_source_close_absent` 仍然告警，连续桶是 0，不会升成连续闭锁。
+
+空 `decision_log` 且没有数据闭锁码时，漏斗态势保持 `unspecified`，不是 `no_entry_signal`，也不是健康。
 
 正常无入场信号（`signal_funnel.posture=no_entry_signal`，或已评估且 `buy_count=0` 且 `data_lockout=false`）是 `NO_SIGNAL`，不是红灯，也不累计闭锁。同一报告里若有数据闭锁拒因，态势是 `data_lockout`。
 
@@ -51,15 +53,13 @@
 
 配置的渠道全部成功才写入 `notified_*` 与 `last_success_ms`。失败、部分成功、未配置渠道都保持未确认，下一轮重试。部分成功只重试尚未成功的渠道。恢复通知失败不清除已确认红灯，下一轮仍发 `RESOLVED`。同一代码出现新的 `symbol` / `intent_id` 等对象会再次告警。
 
-## 安装与回滚（由你在本机执行，此处不部署）
+## 安装与回滚
 
-1. 确认下面的单测命令仍通过，并且你已把真实 `readonly_live_preflight.py` 放进副本。在那之前不要安装。
-2. 把整个 `ops/readonly_alert_watchdog/` 复制到仓库外，例如 `/opt/trade-readonly-watchdog`。`readonly_alert_watchdog.py` 和 `readonly_live_preflight.py` 必须在同一目录。不要放进交易仓库、账本目录或密钥目录。
-3. 状态和 JSONL 放在另一个目录，例如 `/var/lib/trade-readonly-watchdog/`。路径不能是指向仓库的符号链接，也不能以 `.db`、`.sqlite`、`.py`、`.env`、`.pem` 结尾。
-4. 不要设置 `WATCHDOG_*` 渠道变量，直到你自己要接通通知。不要把 `--main-db` 指到生产库，直到预检被非作者验收。
-5. 手工启动示例：`python3 /opt/trade-readonly-watchdog/readonly_alert_watchdog.py --repo-root <repo> --state-file /var/lib/trade-readonly-watchdog/state.json --alert-jsonl /var/lib/trade-readonly-watchdog/alerts.jsonl`。缺预检时进程应以状态 RED 退出码 2，而不是 0。
+`run_watchdog_once` 的 `install_allowed` 固定为 false。本目录没有 systemd 单元，也不能当成已经可以启用。真实接收渠道还没有指定，不要设置 `WATCHDOG_WEBHOOK_URL`、`WATCHDOG_TELEGRAM_BOT_TOKEN`、`WATCHDOG_TELEGRAM_CHAT_ID`、`WATCHDOG_BARK_URL`。
 
-回滚：停掉你手工启动的进程，删除 `/opt/trade-readonly-watchdog` 和 `/var/lib/trade-readonly-watchdog`。本变更没有 systemd 单元，也没有写入交易进程、采集器或账本。若尚未合并，丢弃本分支即可。
+非作者对这一提交重新独验通过之后，才由你在本机安装到仓库外的独立目录，例如 `/opt/trade-readonly-watchdog`。两个模块必须在同一目录。状态和 JSONL 放在另一个目录，例如 `/var/lib/trade-readonly-watchdog/`。路径不能是指向仓库的符号链接，也不能以 `.db`、`.sqlite`、`.py`、`.env`、`.pem` 结尾。不要写开机服务，不要把 `--main-db` 指到生产库，除非你自己决定这么做。
+
+回滚：停掉你手工启动的进程，删除 `/opt/trade-readonly-watchdog` 和 `/var/lib/trade-readonly-watchdog`。没有交易进程、采集器或账本可回滚。若尚未合并，丢弃本分支即可。
 
 ## 作者自测（不是独验）
 

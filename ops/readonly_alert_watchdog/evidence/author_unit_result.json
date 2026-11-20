@@ -1,55 +1,28 @@
 {
   "install_allowed": false,
   "independent_verification": "NOT_DONE",
-  "v3_byte_match_is_not_deploy_approval": true,
-  "notification_channels": "unspecified; none sent",
+  "previous_independent_verification": "FAIL at 4dbaede; missing_volume_source_stamp_does_not_escalate_on_polls",
   "author_unit_tests": {
-    "command": "python3 ops/readonly_alert_watchdog/test_watchdog_unit.py",
-    "ran": 14,
-    "failed": 0,
-    "network": "socket.connect blocked"
-  },
-  "original_unmodified_suite": {
-    "command": "python3 ops/readonly_alert_watchdog/originals/test_proactive_watchdog.py",
-    "passed": [
-      "test_01",
-      "test_02",
-      "test_04",
-      "test_05",
-      "test_06"
-    ],
-    "skipped": [
-      "test_03 pr224_worktree absent"
-    ],
-    "failed": [
-      "test_07 should_push false after refresh because missing code files stay RED"
-    ]
-  },
-  "fixed_modules_with_original_tests": {
-    "ran": 7,
-    "passed": 6,
-    "skipped": 1,
+    "ran": 15,
     "failed": 0
   },
-  "main_vs_hash_baseline": {
-    "main": "f75761ded20804b4e4b3fb181a431de4b6610e39",
-    "live_match": 0,
-    "v3_match": 0,
-    "missing": 16,
-    "drift": 9
-  },
-  "quote_clock": "not emitted by readonly_live_preflight.py",
-  "volume_clock": "source_close_time_ms; computed_at_ms ignored; age 3600000 inclusive fresh",
+  "original_unmodified_suite": "test_07 FAIL (unchanged originals)",
+  "fixed_modules_with_original_tests": "test_07 FAIL at consecutive_lockout_bars 0 != 1 because deribit detail has no 5m/1h source close and now_ms is no longer a poll bucket",
+  "quote_schema": [
+    "ccxt_ticks.ts",
+    "symbols.quoteVolume_collected_at"
+  ],
+  "quote_not_read": "quote_turnover.quote_ts_ms is not a production table",
   "sha256": {
-    "readonly_alert_watchdog.py": "300671d5b0a4aca1de45322b8961e48550972a54a46b49665745737b7a18d27b",
-    "readonly_live_preflight.py": "c049e9f5b7a92c827ef7a3580ba964739274147e9cb4f7842c239ec75bdb9d44",
-    "test_watchdog_unit.py": "2d4c2d4e8d9e1ba8dd0dd1734b02013fab2e6087283336c8a1edc8422c63d723",
-    "README.md": "3f1098126a133ff5f8c1abbe9703db3ea71ffe17eeeff3ab4dabe995193f3e96",
+    "readonly_alert_watchdog.py": "9be15810ffc95507e02779a4e7142597aefeb6952e5a99ffcabb10adf2b37c2d",
+    "readonly_live_preflight.py": "0a74bf7d1095975bd6a6d558f1f0e1ff74494a5e7b3323c496a031f5a4a3e628",
+    "test_watchdog_unit.py": "c28bb9b929abf692d6cd9e08a071eaa245c8871df59b27c5a5fbaa942145c77e",
+    "README.md": "6e8c693ca52e8c325ddb75028552e2984a41965f81d34363b0570078ca67e5cf",
     "originals/readonly_alert_watchdog.py": "0e42dba33ee1ba3235f5bbacdfabe39332afa40fb371689f03764c8adb671357",
     "originals/readonly_live_preflight.py": "02acd508e6e3fb4c0dc938295b9aedea194071857ac2a3c9c11969672be347f0",
     "originals/test_proactive_watchdog.py": "eaddeeeee67cdef264b2b21b0dc969a341ae4ddc47a0d983ed6f960164686920",
     "originals/repro.json": "fc71fd760ff41df14b8f4add1a6dee7941bdea6f83c02f0531b81bcc18d14d67",
-    "patches/watchdog.patch": "8fd34ff02636ced16738e42ebf70dfd5019767e63d5bd6d88b685396f1ba3156",
-    "patches/preflight.patch": "d6aaafc9d188a34991cd79892ceafe28c7e0ef1a89c7cd7994dc3feb3bd8aca8"
+    "patches/watchdog.patch": "7a7b6c99d4197056e49e99a3533e0027ee217899e059ac91908047b8194d7d0a",
+    "patches/preflight.patch": "32165bd3913d6dadb863d03f09c310e80ef008909c70b065721d9e35ac2e244d"
   }
 }
