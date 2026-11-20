@@ -47,10 +47,16 @@ from execution.margin_cross.risk import parse_contract
 from execution.margin_cross.strategy_gate import (
     UNRULED_KELLY_FRACTIONS,
     apply_formula_b_take_profit,
-    build_approved_position_plan,
+    build_approved_position_plan as _build_approved_position_plan,
     check_data_freshness,
     evaluate_approved_regime_intent,
+    verified_empty_exposure,
 )
+
+
+def build_approved_position_plan(*args, **kwargs):
+    kwargs.setdefault("exposure_book", verified_empty_exposure())
+    return _build_approved_position_plan(*args, **kwargs)
 from execution.margin_cross.track import CrossMarginTrack
 
 

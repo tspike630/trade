@@ -420,7 +420,7 @@ class DecisionEngine:
                     passed, hot, news_fetched_ms=news_fetched_ms
                 )
                 before_clocks = len(passed)
-                passed = drop_cross_margin_signals_missing_clocks(passed)
+                passed = drop_cross_margin_signals_missing_clocks(passed, now_ms=now_ms)
                 if len(passed) != before_clocks:
                     log.info(
                         "tick#%s cross_margin_clock_withheld before=%s after=%s",

@@ -516,6 +516,8 @@ class OfflineFixtureClient:
             else:
                 raise MarginExchangeError(-2010, "insufficient balance")
             self.asset(base)["free"] += quantity
+            if self.fee_asset == base:
+                self.asset(base)["free"] -= fee
         previous, _ = parse_decimal(order["executedQty"], "executedQty")
         executed = (previous or Decimal(0)) + quantity
         order["executedQty"] = api_amount(executed)

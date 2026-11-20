@@ -21,6 +21,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
+import json
+import sqlite3
+from pathlib import Path
 from typing import Any
 
 from decision_engine.core.binance_indicators import binance_indicators_fresh_sec
@@ -29,6 +32,13 @@ from decision_engine.core.conviction_whitelist import get_conviction_tier
 from decision_engine.core.macro_circuit_breaker import MAX_CROSS_ASSET_AGE_MS
 from decision_engine.core.news_shock_gate import NEWS_WINDOW_MIN
 from decision_engine.core.perp_short_alpha_engine import is_short_squeeze_veto
+from decision_engine.core.portfolio_clusters import cluster_exposure_key
+from decision_engine.core.regime_v2_policy import (
+    DEFAULT_BASE_POSITION_PCT,
+    DEFAULT_MAX_SINGLE_EXPOSURE_PCT,
+    DEFAULT_MAX_TOTAL_EXPOSURE_PCT,
+    DEFAULT_STATE4_MAX_TOTAL_EXPOSURE_PCT,
+)
 from decision_engine.core.regime_strategy_router import (
     REGIME_1_POSITIVE_GAMMA_PINNED,
     REGIME_2_SHORT_SQUEEZE_BREAKOUT,
@@ -673,6 +683,151 @@ def _ruled_stop_limit(action: str, snapped_stop: Decimal, tick: Decimal) -> Deci
     return buffered
 
 
+CASH_BASE_POSITION_PCT = Decimal(str(DEFAULT_BASE_POSITION_PCT))
+SINGLE_NAME_EXPOSURE_CAP = Decimal(str(DEFAULT_MAX_SINGLE_EXPOSURE_PCT))
+TOTAL_GROSS_EXPOSURE_CAP = Decimal(str(DEFAULT_MAX_TOTAL_EXPOSURE_PCT))
+STATE4_TOTAL_GROSS_EXPOSURE_CAP = Decimal(str(DEFAULT_STATE4_MAX_TOTAL_EXPOSURE_PCT))
+_STATE4_STRATEGY_PREFIX = "regime4_"
+_EXPOSURE_TERMINAL_STATES = frozenset(
+    {
+        "clean_flat",
+        "protection_failed_flattened",
+        "entry_rejected_unwound",
+        "risk_dropped_unwound",
+        "emergency_unwound",
+        "locked",
+        "borrow_rejected",
+        "entry_rejected",
+        "otoco_not_submitted",
+        "live_network_disabled",
+        "emergency_stop_blocks_new_risk",
+        "intent_conflict",
+    }
+)
+
+
+def verified_empty_exposure() -> dict[str, Any]:
+    """A caller-verified book with no open or resting exposure. Not a default."""
+    return {
+        "verified": True,
+        "gross_notional_quote": "0",
+        "symbol_notional_quote": "0",
+        "open_count": 0,
+        "state4_open_count": 0,
+        "cluster_open_count": 0,
+    }
+
+
+def read_cross_margin_exposure_book(
+    ledger_path: str | None,
+    *,
+    symbol: str,
+    intent_id: str,
+) -> dict[str, Any]:
+    """Sum other working intents. Unreadable or unpriced rows are unverified, not zero."""
+    if not ledger_path:
+        return {"verified": False, "reason": "exposure_ledger_absent"}
+    path = Path(ledger_path)
+    if not path.is_file():
+        return {"verified": False, "reason": "exposure_ledger_absent"}
+    try:
+        conn = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT intent_id, state, payload_json FROM intents").fetchall()
+        conn.close()
+    except (OSError, sqlite3.Error, json.JSONDecodeError, TypeError, ValueError):
+        return {"verified": False, "reason": "exposure_ledger_unreadable"}
+    gross = Decimal(0)
+    symbol_notional = Decimal(0)
+    open_count = 0
+    state4_open = 0
+    cluster_open = 0
+    this_cluster = cluster_exposure_key(symbol) or ""
+    seen: set[str] = set()
+    target = str(symbol or "").strip().upper()
+    for item in rows:
+        other_id = str(item["intent_id"])
+        if other_id == intent_id or other_id in seen:
+            continue
+        seen.add(other_id)
+        if str(item["state"]) in _EXPOSURE_TERMINAL_STATES:
+            continue
+        try:
+            stored = json.loads(str(item["payload_json"]))
+            intent = stored["intent"]
+            qty, qty_err = parse_decimal(str(intent.get("quantity")), "quantity")
+            px, px_err = parse_decimal(str(intent.get("limit_price") or ""), "limit_price")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return {"verified": False, "reason": "exposure_intent_unreadable"}
+        if qty_err or px_err or qty is None or px is None or qty < 0 or px <= 0:
+            return {"verified": False, "reason": "exposure_intent_unpriced"}
+        notional = qty * px
+        other_symbol = str(intent.get("symbol") or "").strip().upper()
+        strategy_id = str(intent.get("strategy_id") or "")
+        gross += notional
+        open_count += 1
+        if other_symbol == target:
+            symbol_notional += notional
+        if strategy_id.startswith(_STATE4_STRATEGY_PREFIX):
+            state4_open += 1
+        other_cluster = cluster_exposure_key(other_symbol) or ""
+        if this_cluster and other_cluster == this_cluster:
+            cluster_open += 1
+    return {
+        "verified": True,
+        "gross_notional_quote": api_amount(gross),
+        "symbol_notional_quote": api_amount(symbol_notional),
+        "open_count": open_count,
+        "state4_open_count": state4_open,
+        "cluster_open_count": cluster_open,
+    }
+
+
+def _exposure_rooms(
+    book: Mapping[str, Any] | None,
+    *,
+    net_asset_q: Decimal,
+    is_state4: bool,
+) -> tuple[Decimal, Decimal] | str:
+    if not isinstance(book, Mapping) or book.get("verified") is not True:
+        return "exposure_unverified"
+    needed = (
+        "gross_notional_quote",
+        "symbol_notional_quote",
+        "open_count",
+        "state4_open_count",
+        "cluster_open_count",
+    )
+    if any(key not in book for key in needed):
+        return "exposure_unverified"
+    gross, gross_err = parse_decimal(str(book.get("gross_notional_quote")), "gross_notional_quote")
+    named, named_err = parse_decimal(str(book.get("symbol_notional_quote")), "symbol_notional_quote")
+    try:
+        open_count = int(book.get("open_count"))
+        state4_count = int(book.get("state4_open_count"))
+        cluster_count = int(book.get("cluster_open_count"))
+    except (TypeError, ValueError):
+        return "exposure_unverified"
+    if (
+        gross_err
+        or named_err
+        or gross is None
+        or named is None
+        or gross < 0
+        or named < 0
+        or open_count < 0
+        or state4_count < 0
+        or cluster_count < 0
+    ):
+        return "exposure_unverified"
+    if is_state4 and (state4_count >= 1 or cluster_count >= 1):
+        return "state4_exposure_cap"
+    single_room = net_asset_q * SINGLE_NAME_EXPOSURE_CAP - named
+    total_cap = STATE4_TOTAL_GROSS_EXPOSURE_CAP if is_state4 else TOTAL_GROSS_EXPOSURE_CAP
+    total_room = net_asset_q * total_cap - gross
+    return max(Decimal(0), single_room), max(Decimal(0), total_room)
+
+
 def build_approved_position_plan(
     *,
     intent_id: str,
@@ -695,6 +850,7 @@ def build_approved_position_plan(
     risk_config: ApprovedRiskConfig | Mapping[str, Any] | None = None,
     macro_halt: str | None = None,
     environ: Mapping[str, str] | None = None,
+    exposure_book: Mapping[str, Any] | None = None,
 ) -> ApprovedPositionPlan:
     """Validate operator approval, zero-default risk config, freshness, and 5-state sizing."""
     if not parameters_approved_by_env(environ):
@@ -833,12 +989,31 @@ def build_approved_position_plan(
             contract=None,
         )
 
-    # Approved contract: net * base_position_pct * entry_tier * strategy multiplier.
-    # decision_log.size_pct and optimal_pyramid_ceiling_pct are not this factor.
-    # 0.35 is an unruled Kelly fraction and a pyramid-ceiling field, not a
-    # substitute for base_position_pct. Whether that ceiling should cap the
-    # cash long is unresolved and is not applied here.
-    raw_notional = net_asset_q * cfg.base_position_pct * entry_tier * strat.size_multiplier
+    # Cash base is the ruled equity fraction, not the approved file's full-cash
+    # base and not size_pct. The name cap and the gross long+short cap are
+    # ceilings. State 4 keeps its tighter total cap. Neither cap is a target.
+    is_state4 = strat.regime == REGIME_4_CROWDED_LONG_DEFENSIVE or strat.strategy_id.startswith(
+        _STATE4_STRATEGY_PREFIX
+    )
+    rooms = _exposure_rooms(exposure_book, net_asset_q=net_asset_q, is_state4=is_state4)
+    if isinstance(rooms, str):
+        return ApprovedPositionPlan(
+            allowed=False,
+            reasons=(rooms,),
+            regime=strat.regime,
+            strategy_id=strat.strategy_id,
+            net_asset_quote=net_asset_q,
+            effective_leverage_after=Decimal(0),
+            target_notional_quote=Decimal(0),
+            quantity=Decimal(0),
+            intent=None,
+            contract=None,
+        )
+    single_room, total_room = rooms
+    if requested_action == "OPEN_SHORT":
+        raw_notional = net_asset_q * cfg.base_position_pct * entry_tier * strat.size_multiplier
+    else:
+        raw_notional = net_asset_q * CASH_BASE_POSITION_PCT * entry_tier * strat.size_multiplier
     max_single_borrow_notional = net_asset_q * cfg.max_single_borrow_net_ratio
     max_additional_liab = max(
         Decimal(0), net_asset_q * cfg.max_total_liability_net_ratio - total_liab_q
@@ -858,6 +1033,8 @@ def build_approved_position_plan(
             max_single_borrow_notional,
             max_additional_liab,
             max_lev_headroom,
+            single_room,
+            total_room,
         )
         borrowable = snapshot.max_borrowable.get(base_asset, Decimal(0))
         pool_cap_qty = _floor_to_grid(borrowable * cfg.max_borrowable_pool_ratio, eff_borrow_step)
@@ -884,7 +1061,12 @@ def build_approved_position_plan(
         new_borrow_quote = quantity * snapped_entry
     else:
         quote_free = snapshot.assets.get(quote_asset).free if quote_asset in snapshot.assets else Decimal(0)
-        capped_notional = min(raw_notional, quote_free / (Decimal(1) + snapshot.fee_rate))
+        capped_notional = min(
+            raw_notional,
+            quote_free / (Decimal(1) + snapshot.fee_rate),
+            single_room,
+            total_room,
+        )
         quantity = _floor_to_grid(capped_notional / chosen_entry, step)
         contract_cap_qty = max(quantity, step)
         snapped_entry = _snap_price_down(chosen_entry, tick)

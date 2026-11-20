@@ -116,6 +116,59 @@ def cftc_publication_utc(tuesday: date) -> datetime:
     return local.astimezone(timezone.utc)
 
 
+# NYSE full-day closures. These are the exchange holiday dates, not LSEG prints.
+# A weekday inside 09:30–16:00 whose year is absent from this table is unknown.
+_NYSE_FULL_DAY_HOLIDAYS = frozenset(
+    {
+        date(2025, 1, 1),
+        date(2025, 1, 20),
+        date(2025, 2, 17),
+        date(2025, 4, 18),
+        date(2025, 5, 26),
+        date(2025, 6, 19),
+        date(2025, 7, 4),
+        date(2025, 9, 1),
+        date(2025, 11, 27),
+        date(2025, 12, 25),
+        date(2026, 1, 1),
+        date(2026, 1, 19),
+        date(2026, 2, 16),
+        date(2026, 4, 3),
+        date(2026, 5, 25),
+        date(2026, 6, 19),
+        date(2026, 7, 3),
+        date(2026, 9, 7),
+        date(2026, 11, 26),
+        date(2026, 12, 25),
+    }
+)
+_NYSE_HOLIDAY_YEARS = frozenset(day.year for day in _NYSE_FULL_DAY_HOLIDAYS)
+
+
+def lseg_us_cash_market_open(now_ms: int) -> bool | None:
+    """New York regular cash session, 09:30 inclusive to 16:00 exclusive.
+
+    Weekends and hours outside that window are closed. A full-day holiday in
+    the table above is closed. A weekday inside the window whose year is not
+    in the table is unknown (``None``); the caller must not treat that as open.
+    This is not the CME Sunday session.
+    """
+    try:
+        moment = datetime.fromtimestamp(int(now_ms) / 1000.0, tz=ZoneInfo("America/New_York"))
+    except (OverflowError, OSError, ValueError):
+        return None
+    if moment.weekday() >= 5:
+        return False
+    minutes = moment.hour * 60 + moment.minute
+    if minutes < 9 * 60 + 30 or minutes >= 16 * 60:
+        return False
+    if moment.year not in _NYSE_HOLIDAY_YEARS:
+        return None
+    if moment.date() in _NYSE_FULL_DAY_HOLIDAYS:
+        return False
+    return True
+
+
 def due_cftc_asof(now: datetime) -> date:
     """Latest Tuesday as-of whose Friday 15:30 New York publication is <= now."""
     if now.tzinfo is None:

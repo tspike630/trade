@@ -113,12 +113,10 @@ def stamp_cross_margin_classifier_inputs(
     """
     from decision_engine.core.cityu_institutional_alpha import (
         load_cityu_institutional_snapshot,
+        lseg_us_cash_market_open,
     )
-    from decision_engine.core.regime_v2_policy import is_cme_or_us_cross_asset_open
 
-    # The packed runtime called lseg_us_cash_market_open. That name is the
-    # same session calendar already used when the row omits the flag.
-    open_now = is_cme_or_us_cross_asset_open(now_ms)
+    open_now = lseg_us_cash_market_open(now_ms)
     if snap is None:
         snap = load_cityu_institutional_snapshot(now_ms=now_ms)
     nvda = getattr(snap, "nvda_1h_ret_pct", None) if snap is not None else None
@@ -135,7 +133,8 @@ def stamp_cross_margin_classifier_inputs(
         if not isinstance(row, dict):
             continue
         item = dict(row)
-        item.setdefault("lseg_market_open", open_now)
+        if open_now is not None:
+            item.setdefault("lseg_market_open", open_now)
         if item.get("nvda_1h_ret_pct") is None and nvda is not None:
             item["nvda_1h_ret_pct"] = nvda
         if item.get("smh_1h_ret_pct") is None and smh is not None:

@@ -120,6 +120,8 @@ _UNTOUCHED = {
         "04913cfb73a10a00327403d19c2d361b93f708324b95970dc791f6016815b36e",
         # Runtime t494 align loop, plus withhold when a real execution clock is absent.
         "94caa8e655d11cbd8d106870cf96eb4890045880c34c9793f387cc1fa4d28b6c",
+        # Future source clocks are withheld with the missing-clock check.
+        "9b01f526ad9ee1bbed494fae71b345203781de5e1b6b9d3f84c697260a1b4de4",
     ),
     "decision_engine/core/live_buy_guards.py": (
         "6b3023ed5bdcbb2fdd4b4372ea0d360b147be96ac68016b4d7631fc671991da7",

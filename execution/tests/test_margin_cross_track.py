@@ -27,6 +27,7 @@ from execution.margin_cross.api_semantics import (  # noqa: E402
 from execution.margin_cross.errors import LiveNetworkDisabled  # noqa: E402
 from execution.margin_cross.fixture import NOW_MS, client_from_snapshot, long_case, short_case  # noqa: E402
 from execution.margin_cross.offline_client import OfflineFixtureClient  # noqa: E402
+from execution.margin_cross.risk import parse_intent  # noqa: E402
 from execution.margin_cross.track import CrossMarginTrack  # noqa: E402
 from execution.tests.isolated_env import isolated_environ  # noqa: E402
 
@@ -514,6 +515,186 @@ class MarginCrossTrackTest(unittest.TestCase):
         self.assertEqual(repeated.state, "protected")
         self.assertEqual(_names(case["client"]).count("new_order"), 1)
         self.assertEqual(_names(case["client"]).count("new_oco"), 1)
+
+    def test_dual_base_fee_floors_the_oco_and_keeps_the_residual(self) -> None:
+        case = long_case()
+        case["intent"]["quantity"] = "13828.6"
+        case["intent"]["limit_price"] = "0.02070"
+        case["intent"]["take_profit_price"] = "0.02152"
+        case["intent"]["stop_price"] = "0.02056"
+        case["intent"]["stop_limit_price"] = "0.02051"
+        case["snapshot"]["reference_price"] = "0.02078"
+        case["snapshot"]["bid_qty"] = "100000000"
+        case["snapshot"]["ask_qty"] = "100000000"
+        case["snapshot"]["filters"]["step_size"] = "0.1"
+        case["snapshot"]["filters"]["tick_size"] = "0.00001"
+        case["client"].market_price = Decimal("0.02078")
+        case["client"].bid_qty = Decimal("100000000")
+        case["client"].ask_qty = Decimal("100000000")
+        track, opened = self._open(case)
+        self.assertEqual(opened.state, "entry_resting", opened.reason)
+        entry_key = make_client_id(case["intent"]["intent_id"], "entry")
+        order = case["client"]._orders[entry_key]
+        order["status"] = "FILLED"
+        order["executedQty"] = "13828.6"
+        case["client"]._trades[int(order["orderId"])] = [
+            {
+                "id": 1,
+                "orderId": order["orderId"],
+                "symbol": "BTCUSDT",
+                "price": "0.02078",
+                "qty": "692",
+                "commission": "0.692",
+                "commissionAsset": "BTC",
+                "isBuyer": True,
+                "isMaker": True,
+                "isIsolated": False,
+            },
+            {
+                "id": 2,
+                "orderId": order["orderId"],
+                "symbol": "BTCUSDT",
+                "price": "0.02078",
+                "qty": "13136.6",
+                "commission": "13.1366",
+                "commissionAsset": "BTC",
+                "isBuyer": True,
+                "isMaker": True,
+                "isIsolated": False,
+            },
+        ]
+        case["client"].asset("USDT")["locked"] = Decimal("0")
+        case["client"].asset("USDT")["free"] = Decimal("0.37305035")
+        case["client"].asset("BTC")["free"] = Decimal("13814.7714")
+        resumed = track.open_position(
+            case["intent"], case["snapshot"], case["contract"], case["gate"]
+        )
+        self.assertEqual(resumed.state, "protected", resumed.reason)
+        self.assertEqual(resumed.detail["oco_lot_residual_qty"], "0.0714")
+        oco = [payload for name, payload in case["client"].write_log if name == "new_oco"]
+        self.assertEqual(len(oco), 1)
+        self.assertEqual(oco[0]["quantity"], "13814.7")
+        self.assertNotIn("oco_lot_residual_qty", oco[0])
+        again = track.open_position(
+            case["intent"], case["snapshot"], case["contract"], case["gate"]
+        )
+        self.assertEqual(again.state, "protected")
+        self.assertEqual(again.detail["oco_lot_residual_qty"], "0.0714")
+        self.assertEqual(_names(case["client"]).count("new_order"), 1)
+        self.assertEqual(_names(case["client"]).count("new_oco"), 1)
+        for order in case["client"]._orders.values():
+            order["status"] = "FILLED"
+        case["client"].asset("BTC")["locked"] = Decimal("0")
+        case["client"].asset("USDT")["locked"] = Decimal("0")
+        case["client"].asset("BTC")["free"] = Decimal("0.0714")
+        parsed, reasons = parse_intent(case["intent"])
+        self.assertEqual(reasons, [])
+        assert parsed is not None
+        self.assertTrue(track._is_flat(parsed))
+        case["client"].asset("BTC")["free"] = Decimal("0.1")
+        self.assertFalse(track._is_flat(parsed))
+
+    def test_free_equal_to_floor_is_enough_and_dust_alone_is_not(self) -> None:
+        case = long_case()
+        case["intent"]["quantity"] = "10"
+        case["intent"]["limit_price"] = "100"
+        case["snapshot"]["reference_price"] = "100"
+        case["snapshot"]["bid_qty"] = "100"
+        case["snapshot"]["ask_qty"] = "100"
+        case["snapshot"]["filters"]["step_size"] = "0.1"
+        case["snapshot"]["filters"]["tick_size"] = "0.01"
+        case["snapshot"]["filters"]["min_notional"] = "5"
+        case["intent"]["take_profit_price"] = "101"
+        case["intent"]["stop_price"] = "99"
+        case["intent"]["stop_limit_price"] = "98.9"
+        case["client"].market_price = Decimal("101")
+        case["client"].bid_qty = Decimal("100")
+        case["client"].ask_qty = Decimal("100")
+        track, opened = self._open(case)
+        self.assertEqual(opened.state, "entry_resting")
+        entry_key = make_client_id(case["intent"]["intent_id"], "entry")
+        order = case["client"]._orders[entry_key]
+        order["status"] = "FILLED"
+        order["executedQty"] = "10"
+        case["client"]._trades[int(order["orderId"])] = [
+            {
+                "id": 1,
+                "orderId": order["orderId"],
+                "symbol": "BTCUSDT",
+                "price": "100",
+                "qty": "10",
+                "commission": "0.05",
+                "commissionAsset": "BTC",
+                "isBuyer": True,
+                "isMaker": True,
+                "isIsolated": False,
+            }
+        ]
+        case["client"].asset("USDT")["locked"] = Decimal("0")
+        case["client"].asset("BTC")["free"] = Decimal("9.9")
+        exact = track.open_position(
+            case["intent"], case["snapshot"], case["contract"], case["gate"]
+        )
+        self.assertEqual(exact.state, "protected", exact.reason)
+        self.assertEqual(
+            next(payload["quantity"] for name, payload in case["client"].write_log if name == "new_oco"),
+            "9.9",
+        )
+
+    def test_quote_or_bnb_fee_does_not_shrink_the_base_lot(self) -> None:
+        for asset in ("USDT", "BNB"):
+            case = long_case()
+            case["client"].fee_rate = Decimal("0.001")
+            case["client"].fee_asset = asset
+            track, opened = self._open(case)
+            self.assertEqual(opened.state, "protected", opened.reason)
+            oco = next(payload for name, payload in case["client"].write_log if name == "new_oco")
+            self.assertEqual(oco["quantity"], "0.01")
+
+    def test_bid_qty_still_blocks_a_floored_long(self) -> None:
+        case = long_case()
+        case["intent"]["quantity"] = "13828.6"
+        case["intent"]["limit_price"] = "0.02070"
+        case["intent"]["take_profit_price"] = "0.02152"
+        case["intent"]["stop_price"] = "0.02056"
+        case["intent"]["stop_limit_price"] = "0.02051"
+        case["snapshot"]["reference_price"] = "0.02078"
+        case["snapshot"]["bid_qty"] = "5042.1"
+        case["snapshot"]["ask_qty"] = "100000000"
+        case["snapshot"]["filters"]["step_size"] = "0.1"
+        case["snapshot"]["filters"]["tick_size"] = "0.00001"
+        case["client"].market_price = Decimal("0.02078")
+        case["client"].bid_qty = Decimal("5042.1")
+        case["client"].ask_qty = Decimal("100000000")
+        track, opened = self._open(case)
+        self.assertEqual(opened.state, "entry_resting")
+        entry_key = make_client_id(case["intent"]["intent_id"], "entry")
+        order = case["client"]._orders[entry_key]
+        order["status"] = "FILLED"
+        order["executedQty"] = "13828.6"
+        case["client"]._trades[int(order["orderId"])] = [
+            {
+                "id": 1,
+                "orderId": order["orderId"],
+                "symbol": "BTCUSDT",
+                "price": "0.02078",
+                "qty": "13828.6",
+                "commission": "13.8286",
+                "commissionAsset": "BTC",
+                "isBuyer": True,
+                "isMaker": True,
+                "isIsolated": False,
+            }
+        ]
+        case["client"].asset("USDT")["locked"] = Decimal("0")
+        case["client"].asset("BTC")["free"] = Decimal("13814.7714")
+        blocked = track.open_position(
+            case["intent"], case["snapshot"], case["contract"], case["gate"]
+        )
+        self.assertEqual(blocked.state, "protection_blocked")
+        self.assertEqual(blocked.reason, "sell_liquidity_insufficient")
+        self.assertFalse(blocked.protection_confirmed)
+        self.assertNotIn("new_oco", _names(case["client"]))
 
     def test_resting_entry_is_cancelled_on_emergency_not_while_working(self) -> None:
         case = short_case()

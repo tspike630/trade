@@ -48,6 +48,7 @@ from execution.margin_cross.proposal import unapproved_threshold_proposal
 from execution.margin_cross.strategy_gate import (
     ApprovedPositionPlan,
     build_approved_position_plan,
+    read_cross_margin_exposure_book,
 )
 from execution.margin_cross.track import CrossMarginTrack
 
@@ -265,6 +266,7 @@ def _plan_from_signal_doc(
     doc: dict[str, Any],
     snapshot_raw: dict[str, Any],
     now_ms: int,
+    ledger_path: str | None = None,
 ):
     doc = bind_document_intent_id(doc)
     ruled = doc.get("cross_margin_price_contract") == "t447"
@@ -303,6 +305,11 @@ def _plan_from_signal_doc(
         derive_ruled_stop_limit=ruled,
         risk_config=doc.get("approved_risk_config"),
         macro_halt=doc.get("macro_halt"),
+        exposure_book=read_cross_margin_exposure_book(
+            ledger_path,
+            symbol=symbol,
+            intent_id=str(doc["intent_id"]),
+        ),
     )
 
 
@@ -310,7 +317,7 @@ def run_strategy_dry_run(ledger_path: str, signal_path: str) -> tuple[int, dict[
     doc = json.loads(Path(signal_path).read_text(encoding="utf-8"))
     now_ms = int(doc.get("now_ms") or int(time.time() * 1000))
     snapshot_raw = dict(doc["snapshot"])
-    plan = _plan_from_signal_doc(doc, snapshot_raw, now_ms)
+    plan = _plan_from_signal_doc(doc, snapshot_raw, now_ms, ledger_path)
     if not plan.allowed or plan.intent is None or plan.contract is None:
         return 1, {
             "mode": APPROVED_DRY_RUN_MODE,
@@ -518,7 +525,7 @@ def open_live_document(
     merged_doc["clocks"] = _assemble_live_clocks(
         merged_doc, snapshot_raw["observed_at_ms"]
     )
-    plan = _plan_from_signal_doc(merged_doc, snapshot_raw, now_ms)
+    plan = _plan_from_signal_doc(merged_doc, snapshot_raw, now_ms, ledger_path)
     if not plan.allowed or plan.intent is None or plan.contract is None:
         return (
             1,

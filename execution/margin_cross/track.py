@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR
 import json
 import os
 from typing import Any
@@ -954,6 +954,7 @@ class CrossMarginTrack:
         assets, _level = view
         list_id = make_client_id(intent.intent_id, "oco-list")
         existing = self.ledger.peek(intent.intent_id, "oco", list_id)
+        lot_residual = Decimal(0)
         if existing is not None:
             stored_qty, qty_problem = parse_decimal(
                 json.loads(str(existing["request_json"])).get("quantity"), "quantity"
@@ -966,6 +967,11 @@ class CrossMarginTrack:
                     snapshot=snapshot,
                 )
             quantity = stored_qty
+            stored_residual, residual_err = parse_decimal(
+                json.loads(str(existing["request_json"])).get("oco_lot_residual_qty") or "0",
+                "oco_lot_residual_qty",
+            )
+            lot_residual = stored_residual if not residual_err and stored_residual is not None else Decimal(0)
         elif intent.action == "OPEN_SHORT":
             quantity, reason = self._short_cover(intent, snapshot, contract, assets)
             if quantity is None:
@@ -981,17 +987,30 @@ class CrossMarginTrack:
                     "long_base_fee_unconfirmed",
                     snapshot=snapshot,
                 )
+            floored, residual = _floor_lot(net, snapshot.filters.step_size)
             base = assets.get(intent.base_asset)
-            # Base-asset commission leaves free base below executedQty.
-            # The OCO sells that net amount. A shortfall is not marked protected.
-            if base is None or net <= 0 or base.free < net:
+            baseline = self._baseline_base_qty(intent.intent_id)
+            held = None if base is None or baseline is None else base.free - baseline
+            # Free must cover the floored lot, not the pre-floor net.
+            # Held above the fill's own net is someone else's base.
+            if (
+                base is None
+                or baseline is None
+                or held is None
+                or floored <= 0
+                or residual < 0
+                or residual >= snapshot.filters.step_size
+                or held < floored
+                or held > net
+            ):
                 return self._result(
                     intent.intent_id,
                     "protection_blocked",
                     "long_free_base_mismatch",
                     snapshot=snapshot,
                 )
-            quantity = net
+            quantity = floored
+            lot_residual = residual
         rate_problem = self._interest_matches(snapshot, contract)
         if intent.action == "OPEN_SHORT" and rate_problem:
             return self._result(
@@ -1037,8 +1056,10 @@ class CrossMarginTrack:
                 )
             return self._flatten(intent, snapshot, contract, quantity, "oco_rejected")
         if existing is None:
+            stored_request = dict(plan.payload)
+            stored_request["oco_lot_residual_qty"] = api_amount(lot_residual)
             self.ledger.begin_operation(
-                intent.intent_id, "oco", plan.list_client_order_id, plan.payload
+                intent.intent_id, "oco", plan.list_client_order_id, stored_request
             )
             try:
                 self.client.new_oco(plan.payload)
@@ -1088,6 +1109,7 @@ class CrossMarginTrack:
                 "protection_qty": api_amount(quantity),
                 "take_profit_price": plan.payload["price"],
                 "stop_price": plan.payload["stopPrice"],
+                "oco_lot_residual_qty": api_amount(lot_residual),
             },
         )
 
@@ -1357,6 +1379,10 @@ class CrossMarginTrack:
                     snapshot=snapshot,
                 )
             flat = self._is_flat(intent)
+            residual = self._stored_lot_residual(intent.intent_id)
+            detail = None
+            if flat and residual is not None:
+                detail = {"oco_lot_residual_qty": api_amount(residual)}
             return self._result(
                 intent.intent_id,
                 "clean_flat" if flat else "not_flat",
@@ -1364,6 +1390,7 @@ class CrossMarginTrack:
                 phase_ok=flat,
                 account_flat=flat,
                 snapshot=snapshot,
+                detail=detail,
             )
 
         base = assets[intent.base_asset]
@@ -2219,6 +2246,39 @@ class CrossMarginTrack:
             return self._result("", "locked", "margin_level_invalid")
         return assets, level
 
+    def _stored_step(self, intent_id: str) -> Decimal | None:
+        row = self.ledger.intent_row(intent_id)
+        if row is None:
+            return None
+        try:
+            stored = json.loads(str(row["payload_json"]))
+            step, err = parse_decimal(
+                str(stored.get("snapshot", {}).get("filters", {}).get("step_size")),
+                "step_size",
+            )
+        except (TypeError, ValueError, KeyError):
+            return None
+        if err or step is None or step <= 0:
+            return None
+        return step
+
+    def _stored_lot_residual(self, intent_id: str) -> Decimal | None:
+        client_key = make_client_id(intent_id, "oco-list")
+        row = self.ledger.peek(intent_id, "oco", client_key)
+        if row is None:
+            return None
+        try:
+            request = json.loads(str(row["request_json"]))
+        except (TypeError, ValueError):
+            return None
+        raw = request.get("oco_lot_residual_qty")
+        if raw in (None, ""):
+            return Decimal(0)
+        residual, err = parse_decimal(str(raw), "oco_lot_residual_qty")
+        if err or residual is None or residual < 0:
+            return None
+        return residual
+
     def _is_flat(self, intent: Intent) -> bool:
         row = self.ledger.intent_row(intent.intent_id)
         if row is None or row["baseline_base"] is None:
@@ -2236,8 +2296,16 @@ class CrossMarginTrack:
             if asset_row.locked != 0:
                 return False
         base = assets.get(intent.base_asset)
-        if base is None or base.free != baseline:
+        if base is None:
             return False
+        gap = base.free - baseline
+        if gap < 0:
+            return False
+        if gap > 0:
+            step = self._stored_step(intent.intent_id)
+            # A remainder equal to one step is still a lot, not dust.
+            if step is None or gap >= step:
+                return False
         try:
             open_orders = self.client.query_open_orders(
                 build_query_open_orders_payload(intent.symbol)
@@ -2372,6 +2440,14 @@ def _unknown_state(state: str) -> bool:
 
 def _is_cross(value: object) -> bool:
     return value in (False, "FALSE", "false")
+
+
+def _floor_lot(quantity: Decimal, step: Decimal) -> tuple[Decimal, Decimal]:
+    """Floor to the lot step. The residual is what remains below one step."""
+    if step <= 0:
+        return quantity, Decimal(0)
+    floored = (quantity / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    return floored, quantity - floored
 
 
 def _unexpected_borrow(payload: Mapping[str, Any]) -> bool:

@@ -52,36 +52,62 @@ def _complete_clocks() -> dict[str, object]:
 class CrossMarginClockWiringTests(unittest.TestCase):
     def test_missing_volume_or_obi_clock_withholds_the_signal(self) -> None:
         complete = _complete_clocks()
-        self.assertIsNone(cross_margin_emit_clock_gap(complete))
+        now = 1_795_171_200_000
+        self.assertIsNone(cross_margin_emit_clock_gap(complete, now_ms=now))
         missing_volume = dict(complete)
         missing_volume.pop("volume_z_source_close_ms")
         missing_obi = dict(complete)
         missing_obi.pop("obi_top5_source_ts_ms")
         self.assertEqual(
-            cross_margin_emit_clock_gap(missing_volume), "volume_z_source_close_ms"
+            cross_margin_emit_clock_gap(missing_volume, now_ms=now),
+            "volume_z_source_close_ms",
         )
-        self.assertEqual(cross_margin_emit_clock_gap(missing_obi), "obi_top5_source_ts_ms")
+        self.assertEqual(
+            cross_margin_emit_clock_gap(missing_obi, now_ms=now), "obi_top5_source_ts_ms"
+        )
         kept = drop_cross_margin_signals_missing_clocks(
             [
                 {"binance_symbol": "MMTUSDT", "clocks": missing_volume},
                 {"binance_symbol": "RAREUSDT", "clocks": missing_obi},
                 {"binance_symbol": "BMTUSDT", "clocks": complete},
-            ]
+            ],
+            now_ms=now,
         )
         self.assertEqual([row["binance_symbol"] for row in kept], ["BMTUSDT"])
         open_book = dict(complete)
         open_book["lseg_market_open"] = True
         self.assertEqual(
-            cross_margin_emit_clock_gap(open_book), "lseg_cross_asset_ts_ms"
+            cross_margin_emit_clock_gap(open_book, now_ms=now), "lseg_cross_asset_ts_ms"
+        )
+        future = dict(complete)
+        future["obi_top5_source_ts_ms"] = now + 3_600_000
+        self.assertEqual(
+            cross_margin_emit_clock_gap(future, now_ms=now), "obi_top5_source_ts_ms"
+        )
+        self.assertEqual(
+            drop_cross_margin_signals_missing_clocks(
+                [{"binance_symbol": "MMTUSDT", "strategy_id": sid, "clocks": future} for sid in (
+                    "regime1_positive_gamma_fade",
+                    "regime2_short_squeeze_breakout",
+                    "regime3_xs_leader_pullback",
+                    "regime4_crowded_long_carry_short",
+                    "regime4_defensive_deep_fade",
+                    "regime5_crisis_contagion_short",
+                    "regime5_unlock_cliff_short",
+                    "tech_boll_fade_v1",
+                )],
+                now_ms=now,
+            ),
+            [],
         )
 
-    def test_cash_long_formula_does_not_treat_kelly_ceiling_as_approved_size(self) -> None:
+    def test_cash_long_uses_ruled_base_not_full_cash_or_kelly(self) -> None:
         net = Decimal("287.73135835")
-        raw = net * Decimal("1.00") * Decimal("1") * Decimal("1.20")
-        capped = min(raw, net / (Decimal(1) + Decimal("0.001")))
-        self.assertGreater(raw, net)
-        self.assertEqual(capped, net / Decimal("1.001"))
-        self.assertNotEqual(capped, net * Decimal("0.35"))
+        raw = net * Decimal("0.24") * Decimal("1") * Decimal("1.20")
+        self.assertEqual(raw, net * Decimal("0.288"))
+        self.assertLess(raw, net * Decimal("0.30"))
+        self.assertNotEqual(raw, net * Decimal("0.35"))
+        self.assertNotEqual(raw, min(net * Decimal("1.20"), net / Decimal("1.001")))
 
 
 class CrossMarginEmitterClockTests(unittest.TestCase):
