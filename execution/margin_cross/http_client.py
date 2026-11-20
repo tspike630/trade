@@ -947,17 +947,30 @@ def fetch_live_cross_margin_snapshot(
     fee_rate: str = "0.001",
     fee_asset: str = "USDT",
     observed_at_ms: int | None = None,
+    borrow_required: bool = True,
 ) -> tuple[dict[str, Any] | None, str]:
-    """Read signed margin account + restrictions + market filters into a canonical Snapshot dict."""
+    """Read signed margin account + restrictions + market filters into a canonical Snapshot dict.
+
+    A cash long does not borrow. ``borrow_required=False`` skips max-borrow,
+    hourly interest, and the borrowable flag for ``borrow_asset``. A venue
+    ``-3045`` or ``borrowable=false`` on that unused coin must not fail the
+    snapshot. A path that borrows still reads them, and a terminal borrow code
+    still fails the snapshot with no retry.
+    """
     try:
         restrictions = client.query_api_restrictions()
         spot_account = client.query_spot_account()
         margin_account = client.query_account()
-        max_borrow = client.query_max_borrow({"asset": borrow_asset})
-        hourly_rates = client.query_hourly_interest(
-            {"assets": borrow_asset, "isIsolated": CROSS_ISOLATED_FLAG}
-        )
-        margin_coin_rows = client.query_cross_margin_data(borrow_asset)
+        if borrow_required:
+            max_borrow = client.query_max_borrow({"asset": borrow_asset})
+            hourly_rates = client.query_hourly_interest(
+                {"assets": borrow_asset, "isIsolated": CROSS_ISOLATED_FLAG}
+            )
+            margin_coin_rows = client.query_cross_margin_data(borrow_asset)
+        else:
+            max_borrow = {"amount": "0", "borrowLimit": "0"}
+            hourly_rates = [{"asset": borrow_asset, "nextHourlyInterestRate": "0"}]
+            margin_coin_rows = []
         info = client.query_exchange_info(symbol)
         depth = client.query_depth(symbol, limit=5)
         ticker = client.query_ticker_price(symbol)

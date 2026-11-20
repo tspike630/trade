@@ -1,7 +1,9 @@
-"""Decision rows without intent_id, and a -3045 snapshot, stay refused.
+"""Decision rows without intent_id stay refused.
 
 The intent id is the decision row when the emitter did not send one.
--3045 stays a terminal snapshot refusal and does not borrow again.
+A short -3045 snapshot stays a terminal borrow refusal and does not borrow
+again. A cash long borrows nothing, so the same code on the unused base
+does not refuse the open.
 """
 
 from __future__ import annotations
@@ -31,7 +33,10 @@ from execution.margin_cross.errors import MarginExchangeError
 from execution.margin_cross.http_client import fetch_live_cross_margin_snapshot
 from execution.margin_cross.policy import SUPPORTED_REGIME_STRATEGIES
 from execution.run import main as execution_main
-from execution.tests.test_margin_cross_http_and_live import _InMemoryMarginTransport
+from execution.tests.test_margin_cross_http_and_live import (
+    _InMemoryMarginTransport,
+    _fresh_clocks,
+)
 from execution.tests.test_margin_live_production_path import (
     _ENV_KEYS,
     _TEST_API_KEY,
@@ -56,6 +61,36 @@ class _MaxBorrow3045(_InMemoryMarginTransport):
             ).encode("utf-8")
             return 400, body
         return super().__call__(req, timeout)
+
+
+class _BaseNotBorrowable(_InMemoryMarginTransport):
+    """The base coin is listed and the pool query succeeds, but it cannot be borrowed."""
+
+    def _dispatch(self, method: str, path: str, params: dict[str, str]) -> Any:
+        if method == "GET" and path == "/sapi/v1/margin/crossMarginData":
+            return [{"coin": params.get("coin", ""), "borrowable": False, "transferIn": True}]
+        return super()._dispatch(method, path, params)
+
+
+def _cash_long_squeeze_row() -> dict[str, Any]:
+    """Regime 2 inputs that already pass the state-2 long gate. No threshold changes."""
+    return {
+        "funding_z": -2.2,
+        "funding_rate": -0.0004,
+        "global_account_ls_ratio": 1.15,
+        "whale_retail_divergence": 1.05,
+        "xs_breadth_1h": 0.45,
+        "xs_rank_pct_1h": 0.70,
+        "obi_top5": 0.12,
+        "taker_buy_ratio": 0.54,
+        "volume_z": 0.90,
+        "cot_regime": "cot_neutral",
+        "gamma_regime": "positive_gamma_pinned",
+        "dvol_zscore": 0.20,
+        "nvda_1h_ret_pct": 0.25,
+        "smh_1h_ret_pct": 0.20,
+        "lseg_market_open": True,
+    }
 
 
 def _evidence_extras(strategy_id: str, *, ledger: Path, intent_id: str | None = None) -> dict[str, Any]:
@@ -216,6 +251,55 @@ class IntentContractTests(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    def test_cash_long_is_not_refused_when_unused_base_max_borrow_is_3045(self) -> None:
+        """A cash OPEN_LONG borrows nothing. -3045 on the base must not kill it.
+
+        The venue text is the in-repo fixture: the system does not have enough
+        of that asset. A short that must borrow the same asset stays terminal.
+        """
+        transport = _MaxBorrow3045(cred_id=_TEST_API_KEY, sign_id=_TEST_API_SECRET, uid=int(_UID))
+        sample = self._consume_live(transport, self._cash_long_extras)
+        self.assertTrue(sample["exec_result"]["ok"], sample["exec_result"])
+        self.assertFalse(sample["exec_result"].get("terminal_borrow_reject", False))
+        self.assertNotIn("live_snapshot_exchange_error", str(sample["exec_result"].get("reason")))
+        self.assertNotEqual(sample["exec_result"].get("reason"), "asset_not_borrowable")
+        posts = [item for item in transport.requests if item[0] == "POST"]
+        self.assertEqual(
+            [item for item in posts if item[1] == "/sapi/v1/margin/borrow-repay"],
+            [],
+        )
+        self.assertEqual(
+            [item[1] for item in posts],
+            ["/sapi/v1/margin/order", "/sapi/v1/margin/order/oco"],
+        )
+
+    def test_cash_long_is_not_refused_when_unused_base_is_not_borrowable(self) -> None:
+        transport = _BaseNotBorrowable(
+            cred_id=_TEST_API_KEY, sign_id=_TEST_API_SECRET, uid=int(_UID)
+        )
+        sample = self._consume_live(transport, self._cash_long_extras)
+        self.assertTrue(sample["exec_result"]["ok"], sample["exec_result"])
+        self.assertNotEqual(sample["exec_result"].get("reason"), "asset_not_borrowable")
+        self.assertFalse(sample["exec_result"].get("terminal_borrow_reject", False))
+        posts = [item for item in transport.requests if item[0] == "POST"]
+        self.assertEqual(
+            [item for item in posts if item[1] == "/sapi/v1/margin/borrow-repay"],
+            [],
+        )
+        self.assertIn("/sapi/v1/margin/order", [item[1] for item in posts])
+
+    def test_short_still_refuses_when_the_base_is_not_borrowable(self) -> None:
+        transport = _BaseNotBorrowable(
+            cred_id=_TEST_API_KEY, sign_id=_TEST_API_SECRET, uid=int(_UID)
+        )
+        sample = self._consume_live(
+            transport,
+            lambda _ledger: _evidence_extras("regime4_crowded_long_carry_short", ledger=_ledger),
+        )
+        self.assertEqual(sample["executed"], 0)
+        self.assertEqual(sample["exec_result"]["reason"], "asset_not_borrowable")
+        self.assertEqual([item for item in transport.requests if item[0] == "POST"], [])
 
     def test_consumer_passes_the_stable_id_into_the_plan_and_keeps_a_risk_refusal(self) -> None:
         saved_env = {key: os.environ.get(key) for key in _ENV_KEYS}
@@ -399,6 +483,73 @@ class IntentContractTests(unittest.TestCase):
         )
         conn.commit()
         conn.close()
+
+    def _cash_long_extras(self, ledger: Path) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        extras = _evidence_extras(
+            "regime2_short_squeeze_breakout",
+            ledger=ledger,
+        )
+        extras.update(
+            {
+                "symbol": "BTCUSDT",
+                "binance_symbol": "BTCUSDT",
+                "base_asset": "BTC",
+                "requested_action": "OPEN_LONG",
+                "entry_tier": "1",
+                "limit_price": "99990",
+                "take_profit_price": "102000",
+                "stop_price": "98000",
+                "stop_limit_price": "97900",
+                "expected_uid": _UID,
+                "fee_rate": "0.001",
+                "fee_asset": "USDT",
+                "market_row": _cash_long_squeeze_row(),
+                "clocks": _fresh_clocks(now_ms),
+            }
+        )
+        return extras
+
+    def _consume_live(self, transport: _InMemoryMarginTransport, extras_for) -> dict[str, Any]:
+        saved_env = {key: os.environ.get(key) for key in _ENV_KEYS}
+        saved_socket = socket.socket
+        saved_create = socket.create_connection
+        saved_opener = hc._default_opener
+        socket.socket = _Blocked  # type: ignore[misc]
+        socket.create_connection = lambda *a, **k: (_ for _ in ()).throw(OSError("blocked"))  # type: ignore[assignment]
+        hc._default_opener = transport
+        try:
+            with self._workspace() as raw_root:
+                root = Path(raw_root)
+                decision = root / "dexscreener.db"
+                exec_ledger = root / "cross-margin-exec.db"
+                margin_ledger = root / "margin-book.db"
+                now_ms = int(time.time() * 1000)
+                os.environ.update(_approved_file(root, now_ms))
+                os.environ["BINANCE_MARGIN_API_KEY"] = _TEST_API_KEY
+                os.environ["BINANCE_MARGIN_API_SECRET"] = _TEST_API_SECRET
+                os.environ["LIVE_KILL_SWITCH_PATH"] = str(root / "no-kill-switch")
+                os.environ.pop("CROSS_MARGIN_LEDGER_PATH", None)
+                extras = extras_for(margin_ledger)
+                self._insert(
+                    decision,
+                    149655,
+                    str(extras.get("strategy_id") or "regime2_short_squeeze_breakout"),
+                    "buy",
+                    extras,
+                )
+                summary = self._once(decision, exec_ledger)
+                self.assertEqual(summary["processed"], 1, summary)
+                return summary["sample"][0]
+        finally:
+            hc._default_opener = saved_opener
+            socket.socket = saved_socket  # type: ignore[misc]
+            socket.create_connection = saved_create  # type: ignore[assignment]
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def _once(self, decision: Path, ledger: Path) -> dict[str, Any]:
         buf = io.StringIO()

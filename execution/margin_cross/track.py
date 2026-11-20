@@ -252,7 +252,7 @@ class CrossMarginTrack:
                 return self._result(
                     intent.intent_id, "locked", "existing_liability_blocks_new_open"
                 )
-            mismatch = self._match_fresh_account(snapshot, contract)
+            mismatch = self._match_fresh_account(snapshot, contract, intent)
             if mismatch:
                 return self._result(intent.intent_id, "locked", mismatch)
             self.ledger.insert_intent(
@@ -2101,17 +2101,23 @@ class CrossMarginTrack:
             return "margin_level_below_contract"
         return ""
 
-    def _match_fresh_account(self, snapshot: Snapshot, contract: Contract) -> str:
+    def _match_fresh_account(self, snapshot: Snapshot, contract: Contract, intent: Intent) -> str:
         if getattr(self.client, "account_uid", None) != snapshot.uid:
             return "uid_not_bound_on_client"
         if getattr(self.client, "margin_mode", None) != "CROSS":
             return "client_mode_not_cross"
+        # Only a short borrows the base. Re-reading max borrow for a cash long
+        # repeats the unused-asset -3045 and refuses the open before the order.
+        borrows_base = intent.action == "OPEN_SHORT"
         try:
             account = self.client.query_account()
-            borrow = self.client.query_max_borrow(build_max_borrow_payload(contract.borrow_asset))
-            rates = self.client.query_hourly_interest(
-                build_hourly_interest_payload(contract.borrow_asset)
-            )
+            borrow: Mapping[str, Any] | None = None
+            rates: list[Mapping[str, Any]] | None = None
+            if borrows_base:
+                borrow = self.client.query_max_borrow(build_max_borrow_payload(contract.borrow_asset))
+                rates = self.client.query_hourly_interest(
+                    build_hourly_interest_payload(contract.borrow_asset)
+                )
         except (MarginExchangeError, MarginTransportTimeout):
             return "account_read_failed"
         if account.get("tradeEnabled") is not snapshot.trade_enabled:
@@ -2140,7 +2146,11 @@ class CrossMarginTrack:
                 right.interest,
             ):
                 return "account_readback_mismatch"
-        amount, amount_problem = parse_decimal(borrow.get("amount"), "amount")
+        if not borrows_base:
+            return ""
+        amount, amount_problem = parse_decimal(
+            None if borrow is None else borrow.get("amount"), "amount"
+        )
         expected = snapshot.max_borrowable.get(contract.borrow_asset)
         if amount_problem or expected is None or amount != expected:
             return "asset_borrow_readback_mismatch"

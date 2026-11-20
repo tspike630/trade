@@ -410,6 +410,9 @@ def open_live_document(
     base_asset = str(doc["base_asset"])
     quote_asset = str(doc.get("quote_asset") or "USDT")
     borrow_asset = base_asset
+    # OPEN_LONG sizes from free quote and does not borrow the base. OPEN_SHORT
+    # and any other action still require a live borrow read of that asset.
+    borrow_required = str(doc.get("action") or "").strip() != "OPEN_LONG"
     snapshot_raw, snap_err = fetch_live_cross_margin_snapshot(
         client,
         symbol=symbol,
@@ -420,6 +423,7 @@ def open_live_document(
         fee_rate=str(doc.get("fee_rate") or "0.001"),
         fee_asset=str(doc.get("fee_asset") or "USDT"),
         observed_at_ms=now_ms,
+        borrow_required=borrow_required,
     )
     if snap_err or snapshot_raw is None:
         return 1, _snapshot_failure_payload(action, str(snap_err or "snapshot_missing")), ""
