@@ -1,0 +1,32 @@
+{
+  "install_allowed": false,
+  "full_suite": "BLOCKED",
+  "independent_verification": "NOT_DONE",
+  "author_unit_tests": {
+    "command": "python3 ops/readonly_alert_watchdog/test_watchdog_unit.py",
+    "ran": 13,
+    "failed": 0,
+    "network": "socket.connect blocked; post_json_webhook -> network_err"
+  },
+  "original_suite": {
+    "command": "python3 ops/readonly_alert_watchdog/originals/test_proactive_watchdog.py",
+    "exit_code": 1,
+    "error": "ModuleNotFoundError: readonly_live_preflight"
+  },
+  "preflight_search": {
+    "main": "f75761ded20804b4e4b3fb181a431de4b6610e39",
+    "git_log_S": "no commit adds readonly_live_preflight",
+    "github_filename_search": 0,
+    "uploads": "watchdog, original test, repro.json only"
+  },
+  "notification": "no channel env set; no external message sent",
+  "sha256": {
+    "readonly_alert_watchdog.py": "86aeafb16469b259e89874cff3fd19dc23a6fe3f572ce1198c6ec406f76bc151",
+    "test_watchdog_unit.py": "48e7b1a32e4742ff4c243961763d1a5acb63c2bccfb58ccc9e2571f0c3dd08a1",
+    "README.md": "712245c4c271e0a8afc48764b59752f4e708bb3b17ceb8d8771e72203b0ec8c2",
+    "originals/readonly_alert_watchdog.py": "0e42dba33ee1ba3235f5bbacdfabe39332afa40fb371689f03764c8adb671357",
+    "originals/test_proactive_watchdog.py": "eaddeeeee67cdef264b2b21b0dc969a341ae4ddc47a0d983ed6f960164686920",
+    "originals/repro.json": "fc71fd760ff41df14b8f4add1a6dee7941bdea6f83c02f0531b81bcc18d14d67",
+    "patches/watchdog.patch": "0bc20464ca23fd8fc97458536a6e181579de72b49320d177ab28360f3de40f10"
+  }
+}

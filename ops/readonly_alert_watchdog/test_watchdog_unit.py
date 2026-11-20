@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""Network-blocked unit tests for the watchdog body.
+
+These tests do not import or imitate readonly_live_preflight. A passing run
+is not acceptance of the full preflight suite and is not an install approval.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import hashlib
+import json
+from pathlib import Path
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+import warnings
+
+_REAL_SOCKET = socket.socket
+
+
+class _BlockedSocket(_REAL_SOCKET):  # type: ignore[misc]
+    def connect(self, address: object, /) -> None:
+        raise RuntimeError(f"offline test blocked socket connect to {address!r}")
+
+    def connect_ex(self, address: object, /) -> int:
+        raise RuntimeError(f"offline test blocked socket connect_ex to {address!r}")
+
+
+socket.socket = _BlockedSocket  # type: ignore[misc]
+
+_PKG = Path(__file__).resolve().parent
+sys.path.insert(0, str(_PKG))
+import readonly_alert_watchdog as watchdog  # noqa: E402
+
+
+@dataclass
+class Finding:
+    code: str
+    severity: str = "RED"
+    summary: str = ""
+    detail: dict = field(default_factory=dict)
+    surface: str = "clock"
+
+    def __post_init__(self) -> None:
+        if not self.summary:
+            self.summary = self.code
+
+
+@dataclass
+class Report:
+    now_ms: int
+    findings: list
+    overall_status: str = "RED"
+    metrics: dict = field(default_factory=dict)
+    checked_at_utc: str = "2026-11-20T12:00:00Z"
+    code_state: str = "UNIT"
+    nyse_cash_open: bool = False
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class WatchdogBodyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.repo = self.base / "repo"
+        self.repo.mkdir()
+        self.state = self.base / "state" / "watchdog_state.json"
+        self.ledger = self.repo / "execution_ledger_live_bnb_cross_margin.db"
+        self.ledger.write_bytes(b"not-a-real-ledger")
+        self.ledger_hash = _sha(self.ledger)
+
+    def tearDown(self) -> None:
+        self.assertEqual(_sha(self.ledger), self.ledger_hash)
+        self.assertFalse(self.repo.joinpath("readonly_live_preflight.py").exists())
+        self.tmp.cleanup()
+
+    def _run(self, report: Report, poster=None, **kwargs):
+        def inspect_fn(_root, **_kw):
+            return report
+
+        return watchdog.run_watchdog_once(
+            self.repo,
+            state_file=self.state,
+            now_ms=report.now_ms,
+            inspect_fn=inspect_fn,
+            http_poster=poster,
+            webhook_url=kwargs.get("webhook_url", "https://hooks.example.invalid/quant"),
+            bark_url=kwargs.get("bark_url", ""),
+            telegram_bot_token=kwargs.get("telegram_bot_token", ""),
+            telegram_chat_id=kwargs.get("telegram_chat_id", ""),
+            alert_jsonl=kwargs.get("alert_jsonl"),
+            renotify_sec=kwargs.get("renotify_sec", 1800),
+        )
+
+    def _state(self) -> dict:
+        return json.loads(self.state.read_text(encoding="utf-8"))
+
+    def test_original_upload_hashes_and_volume_code_was_absent(self) -> None:
+        original = _PKG / "originals" / "readonly_alert_watchdog.py"
+        self.assertEqual(
+            _sha(original),
+            "0e42dba33ee1ba3235f5bbacdfabe39332afa40fb371689f03764c8adb671357",
+        )
+        self.assertEqual(
+            _sha(_PKG / "originals" / "test_proactive_watchdog.py"),
+            "eaddeeeee67cdef264b2b21b0dc969a341ae4ddc47a0d983ed6f960164686920",
+        )
+        text = original.read_text(encoding="utf-8")
+        self.assertNotIn("volume_z_source_close_stale", text)
+        self.assertIn("volume_z_source_close_stale", watchdog.CLOCK_FAMILY_CODES["1h_volume_source_bar"])
+        for code in watchdog.NOT_LOCKOUT_CODES:
+            self.assertFalse(watchdog.is_lockout_code(code), code)
+        for family, codes in watchdog.CLOCK_FAMILY_CODES.items():
+            self.assertTrue(codes, family)
+            for code in codes:
+                self.assertTrue(watchdog.is_lockout_code(code), code)
+
+    def test_failed_alert_is_not_acked_and_retries(self) -> None:
+        calls: list[str] = []
+
+        def poster(url: str, _payload: object) -> tuple[bool, str]:
+            calls.append(url)
+            return False, "simulated_network_failure"
+
+        report = Report(
+            1_800_000_000_000,
+            [Finding("deribit_options_gamma_stale", detail={"source_bar_close_ms": 1_800_000_000_000})],
+        )
+        first = self._run(report, poster)
+        self.assertTrue(first["should_push"])
+        self.assertEqual(first["event_type"], "NEW_ALERT")
+        self.assertEqual(first["delivery_outcome"], "failed")
+        self.assertFalse(first["delivery_succeeded"])
+        self.assertTrue(first["pending_retry"])
+        self.assertEqual(self._state()["notified_red_fingerprints"], [])
+        self.assertEqual(self._state()["last_success_ms"], 0)
+        self.assertEqual(self._state()["last_attempt_ms"], report.now_ms)
+        second = self._run(report, poster)
+        self.assertEqual(second["event_type"], "NEW_ALERT")
+        self.assertEqual(second["delivery_outcome"], "failed")
+        self.assertEqual(len(calls), 2)
+
+    def test_partial_channel_success_retries_only_the_failed_channel(self) -> None:
+        calls: list[str] = []
+
+        def poster(url: str, _payload: object) -> tuple[bool, str]:
+            calls.append(url)
+            if "bark.example" in url:
+                return True, "http_200"
+            return False, "simulated_network_failure"
+
+        report = Report(1_800_000_000_000, [Finding("entry_5m_kline_stale", detail={"entry_kline_5m_close_ms": 1_800_000_000_000})])
+        first = self._run(report, poster, bark_url="https://bark.example.invalid/device")
+        self.assertEqual(first["delivery_outcome"], "partial")
+        self.assertFalse(first["delivery_succeeded"])
+        self.assertEqual(self._state()["notified_red_fingerprints"], [])
+        self.assertIn("bark", self._state()["pending_channel_ok"])
+        calls.clear()
+
+        def recover(url: str, _payload: object) -> tuple[bool, str]:
+            calls.append(url)
+            return True, "http_200"
+
+        second = self._run(report, recover, bark_url="https://bark.example.invalid/device")
+        self.assertEqual(second["delivery_outcome"], "delivered")
+        self.assertTrue(second["delivery_succeeded"])
+        self.assertEqual(calls, ["https://hooks.example.invalid/quant"])
+        self.assertFalse(self._state()["pending_retry"])
+
+    def test_recovery_failure_retries_on_the_next_round(self) -> None:
+        phase = {"fail_clear": False}
+
+        def poster(_url: str, _payload: object) -> tuple[bool, str]:
+            if phase["fail_clear"]:
+                return False, "simulated_network_failure"
+            return True, "http_200"
+
+        stamp = 1_800_000_000_000
+        red = Report(stamp, [Finding("obi_top5_source_stale", detail={"obi_top5_source_ts_ms": stamp, "symbol": "BTCUSDT"})])
+        opened = self._run(red, poster)
+        self.assertEqual(opened["delivery_outcome"], "delivered")
+        self.assertTrue(self._state()["notified_red_fingerprints"])
+        phase["fail_clear"] = True
+        clear = Report(stamp + 300_000, [], overall_status="GREEN")
+        failed = self._run(clear, poster)
+        self.assertEqual(failed["event_type"], "RESOLVED")
+        self.assertEqual(failed["delivery_outcome"], "failed")
+        self.assertTrue(self._state()["notified_red_fingerprints"])
+        phase["fail_clear"] = False
+        retried = self._run(clear, poster)
+        self.assertEqual(retried["event_type"], "RESOLVED")
+        self.assertEqual(retried["delivery_outcome"], "delivered")
+        self.assertEqual(self._state()["notified_red_fingerprints"], [])
+        quiet = self._run(clear, poster)
+        self.assertEqual(quiet["event_type"], "QUIET")
+        self.assertFalse(quiet["should_push"])
+
+    def test_same_bucket_gap_and_adjacent_source_bars(self) -> None:
+        def poster(_url: str, _payload: object) -> tuple[bool, str]:
+            return True, "http_200"
+
+        start = 1_800_000_000_000
+        hold = {"renotify_sec": 86_400}
+        first = self._run(
+            Report(start, [Finding("entry_5m_kline_stale", detail={"source_bar_close_ms": start})]),
+            poster,
+            **hold,
+        )
+        self.assertEqual(first["consecutive_lockout_bars"], 1)
+        self.assertEqual(first["event_type"], "NEW_ALERT")
+        same = self._run(
+            Report(start + 45_000, [Finding("entry_5m_kline_stale", detail={"source_bar_close_ms": start})]),
+            poster,
+            **hold,
+        )
+        self.assertEqual(same["consecutive_lockout_bars"], 1)
+        self.assertFalse(same["should_push"])
+        gapped = self._run(
+            Report(
+                start + 3_600_000,
+                [Finding("entry_5m_kline_stale", detail={"source_bar_close_ms": start + 3_600_000})],
+            ),
+            poster,
+            **hold,
+        )
+        self.assertEqual(gapped["consecutive_lockout_bars"], 1)
+        self.assertNotEqual(gapped["event_type"], "ESCALATED_SILENT_LOCKOUT")
+        self.assertFalse(gapped["should_push"])
+        adjacent = self._run(
+            Report(
+                start + 3_900_000,
+                [Finding("entry_5m_kline_stale", detail={"source_bar_close_ms": start + 3_900_000})],
+            ),
+            poster,
+            **hold,
+        )
+        self.assertEqual(adjacent["consecutive_lockout_bars"], 2)
+        self.assertEqual(adjacent["event_type"], "ESCALATED_SILENT_LOCKOUT")
+
+    def test_computed_time_does_not_count_as_source_hour(self) -> None:
+        def poster(_url: str, _payload: object) -> tuple[bool, str]:
+            return True, "http_200"
+
+        source_hour = 1_800_000_000_000
+        first = self._run(
+            Report(
+                source_hour + 3_600_000,
+                [Finding(
+                    "volume_z_source_close_stale",
+                    detail={"source_close_time_ms": source_hour, "computed_at_ms": source_hour + 3_600_000},
+                )],
+            ),
+            poster,
+        )
+        self.assertEqual(first["source_bucket"], source_hour // watchdog.FIVE_MIN_MS)
+        second = self._run(
+            Report(
+                source_hour + 7_200_000,
+                [Finding(
+                    "volume_z_source_close_stale",
+                    detail={"volume_z_source_close_ms": source_hour, "computed_at_ms": source_hour + 7_200_000, "now_ms": source_hour + 7_200_000},
+                )],
+            ),
+            poster,
+        )
+        self.assertEqual(second["consecutive_lockout_bars"], 1)
+        self.assertNotEqual(second["event_type"], "ESCALATED_SILENT_LOCKOUT")
+        unstamped = self._run(
+            Report(source_hour + 10_800_000, [Finding("volume_z_source_close_stale", detail={"computed_at_ms": source_hour + 10_800_000})]),
+            poster,
+        )
+        self.assertIsNone(unstamped["source_bucket"])
+        self.assertEqual(unstamped["consecutive_lockout_bars"], 0)
+
+    def test_no_entry_signal_is_not_a_lockout_and_data_lock_is_not_healthy(self) -> None:
+        quiet = self._run(
+            Report(
+                1_800_000_000_000,
+                [],
+                overall_status="GREEN",
+                metrics={"signal_funnel": {"posture": "no_entry_signal", "evaluated": True, "buy_count": 0, "data_lockout": False}},
+            ),
+            webhook_url="",
+        )
+        self.assertEqual(quiet["entry_posture"], "no_entry_signal")
+        self.assertEqual(quiet["watchdog_status"], "NO_SIGNAL")
+        self.assertFalse(quiet["fault"])
+        self.assertFalse(quiet["should_push"])
+        self.assertEqual(quiet["consecutive_lockout_bars"], 0)
+        self.assertNotIn("consecutive_5m_silent_clock_lockout", quiet["red_codes"])
+        locked = self._run(
+            Report(
+                1_800_000_000_000,
+                [Finding("volume_z_source_close_stale", detail={"source_close_time_ms": 1_796_400_000_000})],
+                overall_status="GREEN",
+                metrics={"signal_funnel": {"posture": "no_entry_signal", "evaluated": True, "buy_count": 0}},
+            ),
+            webhook_url="",
+        )
+        self.assertEqual(locked["entry_posture"], "data_lockout")
+        self.assertTrue(locked["fault"])
+        self.assertEqual(locked["watchdog_status"], "RED")
+        self.assertNotEqual(locked["watchdog_status"], quiet["watchdog_status"])
+
+    def test_same_code_new_symbol_is_not_deduped(self) -> None:
+        def poster(_url: str, _payload: object) -> tuple[bool, str]:
+            return True, "http_200"
+
+        stamp = 1_800_000_000_000
+        first = self._run(Report(stamp, [Finding("obi_top5_source_stale", detail={"symbol": "BTCUSDT", "obi_top5_source_ts_ms": stamp})]), poster)
+        self.assertEqual(first["event_type"], "NEW_ALERT")
+        second = self._run(Report(stamp + 10_000, [Finding("obi_top5_source_stale", detail={"symbol": "ETHUSDT", "obi_top5_source_ts_ms": stamp})]), poster)
+        self.assertTrue(second["should_push"])
+        self.assertEqual(second["event_type"], "NEW_ALERT")
+
+    def test_missing_preflight_sql_error_and_unsafe_path_are_faults(self) -> None:
+        missing = watchdog.run_watchdog_once(self.repo, state_file=self.state, now_ms=1_800_000_000_000)
+        self.assertEqual(missing["red_codes"], ["watchdog_preflight_missing"])
+        self.assertTrue(missing["fault"])
+        self.assertFalse(missing["preflight_present"])
+        self.assertFalse(missing["install_allowed"])
+        self.assertNotEqual(missing["watchdog_status"], "NO_SIGNAL")
+        proc_missing = subprocess.run(
+            [
+                sys.executable,
+                str(_PKG / "readonly_alert_watchdog.py"),
+                "--repo-root",
+                str(self.repo),
+                "--state-file",
+                str(self.base / "state" / "cli_state.json"),
+                "--now-ms",
+                "1800000000000",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(_PKG)},
+        )
+        self.assertEqual(proc_missing.returncode, 2, proc_missing.stderr)
+        self.assertIn("watchdog_preflight_missing", proc_missing.stdout)
+        self.assertNotIn("NO_SIGNAL", proc_missing.stdout)
+
+        def boom(_root, **_kw):
+            raise sqlite3.OperationalError("no such table: cross_asset_bars")
+
+        failed = watchdog.run_watchdog_once(
+            self.repo,
+            state_file=self.state,
+            now_ms=1_800_000_300_000,
+            inspect_fn=boom,
+        )
+        self.assertEqual(failed["red_codes"], ["watchdog_sql_error"])
+        self.assertTrue(failed["fault"])
+        self.assertEqual(list(self.repo.glob("*.db")), [self.ledger])
+
+        proc = subprocess.run(
+            [sys.executable, str(_PKG / "readonly_alert_watchdog.py"), "--repo-root", str(self.repo), "--state-file", str(self.repo / "inside.json"), "--now-ms", "1800000000000"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("watchdog_unsafe_path", proc.stdout)
+        self.assertFalse((self.repo / "inside.json").exists())
+
+    def test_symlink_into_repo_and_protected_suffix_are_refused(self) -> None:
+        link = self.base / "into_repo"
+        link.symlink_to(self.repo)
+        with self.assertRaises(watchdog.UnsafeWatchdogPathError):
+            watchdog.validate_external_state_path(link / "state.json", self.repo)
+        with self.assertRaises(watchdog.UnsafeWatchdogPathError):
+            watchdog.validate_external_state_path(self.base / "bad.db", self.repo)
+        swapped = self.base / "state.json"
+        swapped.symlink_to(self.ledger)
+        with self.assertRaises(watchdog.UnsafeWatchdogPathError):
+            watchdog.validate_external_state_path(swapped, self.repo)
+
+    def test_webhook_helper_cannot_open_a_socket(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            ok, detail = watchdog.post_json_webhook(
+                "http://127.0.0.1:9/watchdog",
+                {"title": "offline"},
+                timeout=1.0,
+            )
+        self.assertFalse(ok)
+        self.assertTrue(detail.startswith("network_err:"))
+
+    def test_summary_does_not_echo_a_channel_secret(self) -> None:
+        def poster(_url: str, _payload: object) -> tuple[bool, str]:
+            return False, "simulated_network_failure"
+
+        result = self._run(
+            Report(1_800_000_000_000, [Finding("quote_turnover_clock_absent")]),
+            poster,
+            telegram_bot_token="unit-secret-token",
+            telegram_chat_id="1",
+        )
+        self.assertNotIn("unit-secret-token", json.dumps(result))
+        self.assertEqual(result["delivery_outcome"], "failed")
+
+    def test_module_does_not_open_sqlite(self) -> None:
+        text = (_PKG / "readonly_alert_watchdog.py").read_text(encoding="utf-8")
+        self.assertNotIn("sqlite3.connect", text)
+        self.assertFalse((_PKG / "readonly_live_preflight.py").exists())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,0 +1,22 @@
+{
+  "attachment_sha256": "0e42dba33ee1ba3235f5bbacdfabe39332afa40fb371689f03764c8adb671357",
+  "scope": "original AST function bodies; fixture preflight only, no production data, no actual network",
+  "delivery_failure": {
+    "first_delivery": [
+      {
+        "channel": "webhook",
+        "ok": false,
+        "detail": "simulated_network_failure"
+      }
+    ],
+    "retry_after_60s": false,
+    "poster_calls": 1,
+    "saved_last_push_ms": 1800000000000
+  },
+  "one_hour_unobserved_gap": {
+    "prior_bars": 1,
+    "later_bars": 2,
+    "later_event": "ESCALATED_SILENT_LOCKOUT"
+  },
+  "whole_suite": "not run: readonly_live_preflight.py absent from supplied bundle and searched local paths"
+}
