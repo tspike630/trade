@@ -76,7 +76,7 @@
      "lseg_nvda_smh_stale_market_open",
      "deribit_gamma_stale_or_invalid",
      "perp_counterparty_stale",
-@@ -63,213 +54,571 @@
+@@ -63,213 +54,602 @@
      "cot_asof_future_timestamp",
  )
  
@@ -109,6 +109,7 @@
 +    "news_fetched_at_absent",
 +    "lseg_cross_asset_bars_stale",
 +    "lseg_cross_asset_bars_absent",
++    "lseg_nvda_smh_future_bar",
 +    "cot_publication_not_current",
 +    "cot_publication_absent",
 +    "token_unlock_schedule_unverified",
@@ -287,13 +288,6 @@
 -            return raw
      except (OSError, ValueError):
 -        pass
--    return {
--        "active_red_codes": [],
--        "active_yellow_codes": [],
--        "last_push_ms": 0,
--        "consecutive_lockout_bars": 0,
--        "last_lockout_bar_bucket": None,
--    }
 +        return empty
 +    if not isinstance(raw, dict):
 +        return empty
@@ -313,13 +307,11 @@
 +        state["consecutive_lockout_bars"] = int(raw.get("consecutive_lockout_bars") or 0)
 +        state["last_lockout_bar_bucket"] = raw.get("last_lockout_bar_bucket")
 +    return state
- 
- 
- def save_watchdog_state(state_path: Path, state: Mapping[str, Any]) -> None:
-     state_path.parent.mkdir(parents=True, exist_ok=True)
-     tmp = state_path.with_name(f".{state_path.name}.tmp.{os.getpid()}")
--    tmp.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
--    tmp.replace(state_path)
++
++
++def save_watchdog_state(state_path: Path, state: Mapping[str, Any]) -> None:
++    state_path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = state_path.with_name(f".{state_path.name}.tmp.{os.getpid()}")
 +    payload = json.dumps(dict(state), ensure_ascii=False, indent=2) + "\n"
 +    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 +    fd = os.open(tmp, flags, 0o600)
@@ -334,17 +326,8 @@
 +        tmp.unlink(missing_ok=True)
 +        raise UnsafeWatchdogPathError(f"refusing to replace symlink state file: {state_path}")
 +    os.replace(tmp, state_path)
- 
- 
--@dataclass(frozen=True)
--class AlertDecision:
--    should_push: bool
--    event_type: str  # "NEW_ALERT", "ESCALATED_SILENT_LOCKOUT", "RENOTIFY", "RESOLVED", "QUIET"
--    title: str
--    body_text: str
--    red_codes: tuple[str, ...]
--    yellow_codes: tuple[str, ...]
--    consecutive_lockout_bars: int
++
++
 +def load_preflight() -> Any:
 +    try:
 +        import readonly_live_preflight as preflight
@@ -368,23 +351,30 @@
 +
 +
 +def _empty_state() -> dict[str, Any]:
-+    return {
+     return {
+-        "active_red_codes": [],
+-        "active_yellow_codes": [],
 +        "state_version": STATE_VERSION,
 +        "notified_red_fingerprints": [],
 +        "notified_yellow_fingerprints": [],
 +        "last_success_ms": 0,
 +        "last_attempt_ms": 0,
-+        "last_push_ms": 0,
+         "last_push_ms": 0,
 +        "pending_retry": False,
 +        "pending_event_key": None,
 +        "pending_channel_ok": [],
 +        "last_delivery_outcome": "not_attempted",
-+        "consecutive_lockout_bars": 0,
-+        "last_lockout_bar_bucket": None,
+         "consecutive_lockout_bars": 0,
+         "last_lockout_bar_bucket": None,
 +        "entry_posture": "unspecified",
-+    }
-+
-+
+     }
+ 
+ 
+-def save_watchdog_state(state_path: Path, state: Mapping[str, Any]) -> None:
+-    state_path.parent.mkdir(parents=True, exist_ok=True)
+-    tmp = state_path.with_name(f".{state_path.name}.tmp.{os.getpid()}")
+-    tmp.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+-    tmp.replace(state_path)
 +def _detail(finding: Any) -> Mapping[str, Any]:
 +    raw = getattr(finding, "detail", None)
 +    if isinstance(raw, Mapping):
@@ -430,6 +420,38 @@
 +    return code + "|" + ",".join(objects)
 +
 +
++def _funnel_view(metrics: Mapping[str, Any]) -> Mapping[str, Any]:
++    for key in ("signal_funnel", "funnel"):
++        raw = metrics.get(key)
++        if isinstance(raw, Mapping):
++            return raw
++    return {}
+ 
+ 
+-@dataclass(frozen=True)
+-class AlertDecision:
+-    should_push: bool
+-    event_type: str  # "NEW_ALERT", "ESCALATED_SILENT_LOCKOUT", "RENOTIFY", "RESOLVED", "QUIET"
+-    title: str
+-    body_text: str
+-    red_codes: tuple[str, ...]
+-    yellow_codes: tuple[str, ...]
+-    consecutive_lockout_bars: int
++def _computation_clock_only(findings: Sequence[Any]) -> bool:
++    for finding in findings:
++        if not is_lockout_code(str(getattr(finding, "code", "") or "")):
++            continue
++        detail = _detail(finding)
++        has_source = any(
++            _source_ms(detail.get(key)) is not None
++            for key in _FIVE_MIN_SOURCE_KEYS + _HOUR_SOURCE_KEYS
++        )
++        has_ignored = any(key in detail for key in _IGNORED_CLOCK_KEYS)
++        if has_ignored and not has_source:
++            return True
++    return False
++
++
 +def observed_source_bucket(findings: Sequence[Any]) -> int | None:
 +    """Bucket of an observed source bar. Computation clocks are ignored."""
 +    five: list[int] = []
@@ -467,7 +489,7 @@
 +        return "data_lockout"
 +    if red_codes:
 +        return "unspecified"
-+    funnel = metrics.get("signal_funnel") if isinstance(metrics.get("signal_funnel"), Mapping) else {}
++    funnel = _funnel_view(metrics)
 +    posture = str(funnel.get("posture") or "")
 +    evaluated = funnel.get("evaluated") is True and funnel.get("data_lockout") is False
 +    no_buys = evaluated and int(funnel.get("buy_count") or 0) == 0
@@ -522,9 +544,6 @@
 -        else:
 -            consec_bars = max(1, prev_bars)
 -        next_bucket: int | None = int(cur_bar_bucket)
--    else:
--        consec_bars = 0
--        next_bucket = None
 +    findings = list(getattr(report, "findings", []) or [])
 +    metrics = getattr(report, "metrics", None)
 +    if not isinstance(metrics, Mapping):
@@ -538,7 +557,17 @@
 +    ]
 +    yellow_findings = [item for item in findings if getattr(item, "severity", "") == "YELLOW"]
 +    lockout_findings = [item for item in red_findings if is_lockout_code(str(item.code))]
-+    bucket = observed_source_bucket(lockout_findings) if posture == "data_lockout" else None
++    source_bucket = observed_source_bucket(lockout_findings) if posture == "data_lockout" else None
++    now_ms = int(getattr(report, "now_ms", 0) or 0)
++    if source_bucket is not None:
++        bucket = source_bucket
++    elif posture == "data_lockout" and not _computation_clock_only(lockout_findings) and now_ms >= _MS_MIN:
++        # Poll slot of a check that actually ran. It is not a source-hour freshness stamp.
++        bucket = now_ms // FIVE_MIN_MS
+     else:
+-        consec_bars = 0
+-        next_bucket = None
++        bucket = None
 +    consec_bars = _advance_bars(posture == "data_lockout", bucket, prior_state)
  
 -    # Inject synthetic consecutive silent-lockout finding when >= 2 5m bars
@@ -575,7 +604,6 @@
 +    prev_red = set(str(item) for item in (prior_state.get("notified_red_fingerprints") or []))
 +    prev_yel = set(str(item) for item in (prior_state.get("notified_yellow_fingerprints") or []))
 +    last_success_ms = int(prior_state.get("last_success_ms") or 0)
-+    now_ms = int(getattr(report, "now_ms", 0) or 0)
 +    new_reds = [item for item in red_fps if item not in prev_red]
 +    new_yels = [item for item in yel_fps if item not in prev_yel]
  
@@ -759,7 +787,7 @@
  def post_json_webhook(url: str, payload: Mapping[str, Any], timeout: float = 6.0) -> tuple[bool, str]:
      body = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
      req = Request(
-@@ -284,13 +633,36 @@
+@@ -284,13 +664,36 @@
              return 200 <= code < 300, f"http_{code}"
      except HTTPError as exc:
          return False, f"http_{exc.code}"
@@ -798,7 +826,7 @@
      *,
      webhook_url: str = "",
      telegram_bot_token: str = "",
-@@ -299,73 +671,123 @@
+@@ -299,73 +702,123 @@
      macos_notify: bool = False,
      alert_jsonl: Path | None = None,
      http_poster: Callable[[str, Mapping[str, Any]], tuple[bool, str]] | None = None,
@@ -958,7 +986,7 @@
  def run_watchdog_once(
      repo_root: Path,
      *,
-@@ -388,18 +810,17 @@
+@@ -388,18 +841,17 @@
      bark_url: str = "",
      macos_notify: bool = False,
      http_poster: Callable[[str, Mapping[str, Any]], tuple[bool, str]] | None = None,
@@ -983,7 +1011,7 @@
          main_db=main_db,
          deriv_db=deriv_db,
          lseg_db=lseg_db,
-@@ -409,15 +830,26 @@
+@@ -409,15 +861,26 @@
          require_dbs=require_dbs,
          ack_dust_intents=ack_dust_intents,
      )
@@ -1014,7 +1042,7 @@
              decision,
              report,
              webhook_url=webhook_url,
-@@ -427,26 +859,81 @@
+@@ -427,26 +890,81 @@
              macos_notify=macos_notify,
              alert_jsonl=safe_jsonl,
              http_poster=http_poster,
@@ -1102,7 +1130,7 @@
      parser.add_argument("--repo-root", type=Path, default=Path.cwd())
      parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
      parser.add_argument("--alert-jsonl", type=Path, default=None)
-@@ -460,7 +947,7 @@
+@@ -460,7 +978,7 @@
      parser.add_argument("--require-dbs", action="store_true")
      parser.add_argument("--alert-on-yellow", action="store_true")
      parser.add_argument("--renotify-sec", type=int, default=DEFAULT_RENOTIFY_SEC)
@@ -1111,7 +1139,7 @@
      parser.add_argument("--interval-sec", type=int, default=DEFAULT_INTERVAL_SEC)
      parser.add_argument("--macos-notify", action="store_true")
      parser.add_argument("--now-ms", type=int, default=None)
-@@ -470,8 +957,7 @@
+@@ -470,8 +988,7 @@
      tg_token = os.environ.get("WATCHDOG_TELEGRAM_BOT_TOKEN", "").strip()
      tg_chat = os.environ.get("WATCHDOG_TELEGRAM_CHAT_ID", "").strip()
      bark_url = os.environ.get("WATCHDOG_BARK_URL", "").strip()
@@ -1121,7 +1149,7 @@
      stop = False
  
      def _handle_sig(_sig: int, _frame: Any) -> None:
-@@ -484,31 +970,47 @@
+@@ -484,31 +1001,47 @@
  
      while True:
          started = time.monotonic()

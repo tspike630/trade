@@ -83,6 +83,7 @@ _POLICY_CLOCK_CODES = (
     "news_fetched_at_absent",
     "lseg_cross_asset_bars_stale",
     "lseg_cross_asset_bars_absent",
+    "lseg_nvda_smh_future_bar",
     "cot_publication_not_current",
     "cot_publication_absent",
     "token_unlock_schedule_unverified",
@@ -371,6 +372,29 @@ def finding_fingerprint(finding: Any) -> str:
     return code + "|" + ",".join(objects)
 
 
+def _funnel_view(metrics: Mapping[str, Any]) -> Mapping[str, Any]:
+    for key in ("signal_funnel", "funnel"):
+        raw = metrics.get(key)
+        if isinstance(raw, Mapping):
+            return raw
+    return {}
+
+
+def _computation_clock_only(findings: Sequence[Any]) -> bool:
+    for finding in findings:
+        if not is_lockout_code(str(getattr(finding, "code", "") or "")):
+            continue
+        detail = _detail(finding)
+        has_source = any(
+            _source_ms(detail.get(key)) is not None
+            for key in _FIVE_MIN_SOURCE_KEYS + _HOUR_SOURCE_KEYS
+        )
+        has_ignored = any(key in detail for key in _IGNORED_CLOCK_KEYS)
+        if has_ignored and not has_source:
+            return True
+    return False
+
+
 def observed_source_bucket(findings: Sequence[Any]) -> int | None:
     """Bucket of an observed source bar. Computation clocks are ignored."""
     five: list[int] = []
@@ -408,7 +432,7 @@ def _entry_posture(findings: Sequence[Any], metrics: Mapping[str, Any]) -> str:
         return "data_lockout"
     if red_codes:
         return "unspecified"
-    funnel = metrics.get("signal_funnel") if isinstance(metrics.get("signal_funnel"), Mapping) else {}
+    funnel = _funnel_view(metrics)
     posture = str(funnel.get("posture") or "")
     evaluated = funnel.get("evaluated") is True and funnel.get("data_lockout") is False
     no_buys = evaluated and int(funnel.get("buy_count") or 0) == 0
@@ -454,7 +478,15 @@ def evaluate_alert_transition(
     ]
     yellow_findings = [item for item in findings if getattr(item, "severity", "") == "YELLOW"]
     lockout_findings = [item for item in red_findings if is_lockout_code(str(item.code))]
-    bucket = observed_source_bucket(lockout_findings) if posture == "data_lockout" else None
+    source_bucket = observed_source_bucket(lockout_findings) if posture == "data_lockout" else None
+    now_ms = int(getattr(report, "now_ms", 0) or 0)
+    if source_bucket is not None:
+        bucket = source_bucket
+    elif posture == "data_lockout" and not _computation_clock_only(lockout_findings) and now_ms >= _MS_MIN:
+        # Poll slot of a check that actually ran. It is not a source-hour freshness stamp.
+        bucket = now_ms // FIVE_MIN_MS
+    else:
+        bucket = None
     consec_bars = _advance_bars(posture == "data_lockout", bucket, prior_state)
 
     effective_reds = list(red_findings)
@@ -477,7 +509,6 @@ def evaluate_alert_transition(
     prev_red = set(str(item) for item in (prior_state.get("notified_red_fingerprints") or []))
     prev_yel = set(str(item) for item in (prior_state.get("notified_yellow_fingerprints") or []))
     last_success_ms = int(prior_state.get("last_success_ms") or 0)
-    now_ms = int(getattr(report, "now_ms", 0) or 0)
     new_reds = [item for item in red_fps if item not in prev_red]
     new_yels = [item for item in yel_fps if item not in prev_yel]
 

@@ -4,18 +4,17 @@
 
 ## 结论
 
-哨兵本体的通知确认、相邻源桶和入场态势已有离线单测。`readonly_live_preflight.py` 不在本仓库 `main`（`f75761d`）、全部 git 历史和已上传附件里。原套件因此不能通过，**不允许安装**。作者跑过的单测不是非作者独验。
+真实预检原件已放入 `originals/readonly_live_preflight.py`（SHA256 `02acd508e6e3fb4c0dc938295b9aedea194071857ac2a3c9c11969672be347f0`）。组件内的副本补了三件事：1h 量能只认 `source_close_time_ms`、漏斗把「正常无入场」和「数据闭锁」分开、没有代码树时不再把整份哈希清单报成红灯。`code_integrity_v3_verified` 只表示字节相同，v3 未验收、未部署，**不是上线许可**。通知渠道仍未指定，**不允许安装**。这里的测试是作者自测，不是非作者独验。
 
-## 仍须补传
+当前 git `main`（`f75761d`）对这 25 个基线：0 个命中现网哈希，0 个命中 v3 哈希，16 个文件不在树上，9 个漂移。不要把这次比对说成现网已是 `V3_PATCHED`。
 
-把真实模块放在本脚本同一目录，且至少导出：
+## 预检边界
 
-- `Finding`
-- `PreflightReport`
-- `fmt_ms_utc`
-- `inspect_system`
-
-原套件还会调用 `eval_due_cftc_asof`、`eval_nyse_cash_market_open`、`KNOWN_FILE_HASHES`。不要用测试替身充当这个模块。预检必须自己保证 `mode=ro` 与 `PRAGMA query_only`，并且不得创建缺失数据库。本哨兵不打开 SQLite。
+- SQLite 只走 `file:...?mode=ro` 和 `PRAGMA query_only = ON`。文件不存在就不打开，不创建。
+- Deribit 新鲜度用 `ts_ms`，不用 `collected_at_ms`。未来钟（早于现在超过 120 秒的反向年龄，或 LSEG `utc_ms` 落在未来）是红灯。
+- 1h 量能读 `decision_volume_z.source_close_time_ms`。`computed_at_ms` 即使是刚才写入的也不算新鲜。表不存在时不假装已经验过。
+- 报价钟 `quote_turnover_stale` 这个预检模块没有查询，不能算已覆盖。`main` 上的 `turnover_stale` 是另一套宇宙过滤。
+- LSEG 5m 门禁用 30 分钟，与 `decision_engine/core/macro_circuit_breaker.py` 的 `MAX_CROSS_ASSET_AGE_MS` 相同。导入器开盘 15 分钟标签是另一套口径，这里没有改成 15 分钟。
 
 ## 最小依赖
 
@@ -33,7 +32,7 @@
 | 5m | `entry_5m_kline_stale` / `entry_5m_kline_clock_absent` / `entry_5m_kline_clock_unit_mismatch` | policy blob `43a49cde1a6a1e2fac166342626660c99e50f182` |
 | 1h 量能源棒 | `volume_z_source_close_stale` / `volume_z_source_close_absent` | 同上；新鲜度看 `source_close_time_ms` |
 | 量能缺钟 | `volume_z_close_clock_absent` | acceptance blob `9222ef12493313a5b5a610339dacd68beab4e4fd` |
-| 报价 | `quote_turnover_stale` / `quote_turnover_clock_absent` | policy，同上 blob |
+| 报价 | 预检不发出 `quote_turnover_stale` | 未覆盖。policy 字符串只留在哨兵名单里，避免以后有发现码时漏报 |
 | OBI | `obi_top5_source_stale` / `obi_top5_source_clock_absent` | policy，同上 blob |
 
 `main` 的 `decision_engine/core/volume_z_1h.py`（blob `be1a5553b970a841e0a3cc2d4e66c0ab9668f752`）用 `source_close_is_fresh(source_close_time_ms)`，窗口默认 3600 秒。`computed_at_ms` 只是写入时刻。acceptance 把 `volume_z_computed_at_not_the_reader_clock` 记为观察，哨兵不把它当闭锁。
@@ -55,7 +54,7 @@
 ## 安装与回滚（由你在本机执行，此处不部署）
 
 1. 确认下面的单测命令仍通过，并且你已把真实 `readonly_live_preflight.py` 放进副本。在那之前不要安装。
-2. 把整个 `ops/readonly_alert_watchdog/` 复制到仓库外，例如 `/opt/trade-readonly-watchdog`。不要放进交易仓库、账本目录或密钥目录。
+2. 把整个 `ops/readonly_alert_watchdog/` 复制到仓库外，例如 `/opt/trade-readonly-watchdog`。`readonly_alert_watchdog.py` 和 `readonly_live_preflight.py` 必须在同一目录。不要放进交易仓库、账本目录或密钥目录。
 3. 状态和 JSONL 放在另一个目录，例如 `/var/lib/trade-readonly-watchdog/`。路径不能是指向仓库的符号链接，也不能以 `.db`、`.sqlite`、`.py`、`.env`、`.pem` 结尾。
 4. 不要设置 `WATCHDOG_*` 渠道变量，直到你自己要接通通知。不要把 `--main-db` 指到生产库，直到预检被非作者验收。
 5. 手工启动示例：`python3 /opt/trade-readonly-watchdog/readonly_alert_watchdog.py --repo-root <repo> --state-file /var/lib/trade-readonly-watchdog/state.json --alert-jsonl /var/lib/trade-readonly-watchdog/alerts.jsonl`。缺预检时进程应以状态 RED 退出码 2，而不是 0。
@@ -69,4 +68,4 @@ python3 ops/readonly_alert_watchdog/test_watchdog_unit.py
 python3 ops/readonly_alert_watchdog/originals/test_proactive_watchdog.py
 ```
 
-第二条会因缺少 `readonly_live_preflight` 失败。这是阻断，不是哨兵本体回归。
+作者结果：第一套 14 项通过。第二条是未修改的原件配对，7 项里 `test_07` 失败：没有代码树时原预检把缺失文件报成红灯，数据恢复后 `should_push` 仍为假。`test_03` 因本机没有 `pr224_worktree` 跳过。把修正后的两个模块和原测试放在同一临时目录再跑，7 项里 6 项通过、1 项跳过。网络在测试里被阻断，没有外发通知。

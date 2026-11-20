@@ -1,0 +1,254 @@
+--- a/readonly_live_preflight.py
++++ b/readonly_live_preflight.py
+@@ -41,7 +41,7 @@
+ import sqlite3
+ import sys
+ import time
+-from typing import Any, Mapping, Sequence
++from typing import Any, Iterable, Mapping, Sequence
+ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+ 
+ # --- Verified Production SHA256 Baselines (tspike630/trade PR #224 + T535 v3) ---
+@@ -552,7 +552,22 @@
+     else:
+         code_state = "UNKNOWN_EMPTY"
+ 
+-    if missing_files:
++    code_tree_present = (code_root / "decision_engine").is_dir()
++    if missing_files and not code_tree_present:
++        code_state = "NO_CODE_TREE"
++        findings.append(
++            Finding(
++                severity="YELLOW",
++                surface="code_integrity",
++                code="code_tree_not_in_root",
++                summary=(
++                    "该目录没有 decision_engine 代码树，不能把「文件缺失」报成现网红灯，"
++                    "也不能把它当成已验收的代码基线"
++                ),
++                detail={"missing_files": missing_files, "install_approval": False},
++            )
++        )
++    elif missing_files:
+         # In runtime-source snapshot, cityu_institutional_alpha.py was omitted from archive.
+         sev = (
+             "YELLOW"
+@@ -565,7 +580,7 @@
+                 surface="code_integrity",
+                 code="monitored_code_files_missing",
+                 summary=f"监控清单中有 {len(missing_files)} 个代码文件在当前目录缺失：{', '.join(missing_files[:5])}",
+-                detail={"missing_files": missing_files},
++                detail={"missing_files": missing_files, "install_approval": False},
+             )
+         )
+ 
+@@ -611,8 +626,15 @@
+                 severity="GREEN",
+                 surface="code_integrity",
+                 code="code_integrity_v3_verified",
+-                summary="全部核心代码文件 SHA256 与 PR224 v3 目标哈希完全一致，无漂移",
+-                detail={"verified_count": len(v3_only_matches) + len(unchanged_matches)},
++                summary=(
++                    "核心代码 SHA256 与 PR224 v3 目标哈希一致。这只是字节比对："
++                    "v3 整体未验收、未部署，不能当作上线许可"
++                ),
++                detail={
++                    "verified_count": len(v3_only_matches) + len(unchanged_matches),
++                    "install_approval": False,
++                    "v3_deployed": False,
++                },
+             )
+         )
+ 
+@@ -694,6 +716,29 @@
+                             f"{ric}({fmt_ms_utc(latest_ms)}, bars={len(rows)}, age={fmt_age_human(age_ms)})"
+                         )
+                 lseg_info["rics"] = ric_details
++                future_rows = lconn.execute(
++                    """
++                    SELECT ric, MIN(utc_ms) AS m, COUNT(*) AS n
++                    FROM cross_asset_bars
++                    WHERE interval = '5min' AND ric IN ('NVDA.O', 'SMH.O') AND utc_ms > ?
++                    GROUP BY ric
++                    """,
++                    (now_ms + 120_000,),
++                ).fetchall()
++                if future_rows:
++                    lseg_info["future_bars"] = [
++                        {"ric": str(row["ric"]), "min_utc_ms": int(row["m"]), "count": int(row["n"])}
++                        for row in future_rows
++                    ]
++                    findings.append(
++                        Finding(
++                            severity="RED",
++                            surface="data_clocks",
++                            code="lseg_nvda_smh_future_bar",
++                            summary="LSEG 5m 源出现未来时间戳，不能用计算时刻把它看成新鲜",
++                            detail={"future_bars": lseg_info["future_bars"], "source_bar_close_ms": int(future_rows[0]["m"])},
++                        )
++                    )
+                 if stale_rics:
+                     if nyse_open is False:
+                         findings.append(
+@@ -1001,6 +1046,8 @@
+                             )
+                         )
+ 
++            _inspect_volume_source_hour(mconn, now_ms=now_ms, main_info=main_info, findings=findings)
++
+             if table_exists(mconn, "news_events"):
+                 nr = mconn.execute(
+                     "SELECT MAX(fetched_at) AS mf FROM news_events WHERE lower(source_tier) = 'whitelist'"
+@@ -1030,6 +1077,78 @@
+     return findings, metrics
+ 
+ 
++def _inspect_volume_source_hour(
++    conn: sqlite3.Connection,
++    *,
++    now_ms: int,
++    main_info: dict[str, Any],
++    findings: list[Finding],
++) -> None:
++    """1h volume freshness is source_close_time_ms. computed_at_ms is not the clock."""
++    if not table_exists(conn, "decision_volume_z"):
++        main_info["volume_z_table_present"] = False
++        main_info["volume_z_source_hour_observed"] = False
++        return
++    cols = present_columns(conn, "decision_volume_z")
++    main_info["volume_z_table_present"] = True
++    if "source_close_time_ms" not in cols:
++        main_info["volume_z_source_hour_observed"] = False
++        findings.append(
++            Finding(
++                severity="RED",
++                surface="data_clocks",
++                code="volume_z_source_close_absent",
++                summary="decision_volume_z 没有 source_close_time_ms，不能用 computed_at_ms 充当 1h 源钟",
++                detail={"computed_at_ignored": True},
++            )
++        )
++        return
++    computed_sql = ", computed_at_ms" if "computed_at_ms" in cols else ""
++    rows = conn.execute(
++        f"SELECT symbol, source_close_time_ms{computed_sql} FROM decision_volume_z"
++    ).fetchall()
++    stale: list[dict[str, Any]] = []
++    fresh = 0
++    for row in rows:
++        close_ms, err = parse_any_ts_ms(row["source_close_time_ms"])
++        computed = row["computed_at_ms"] if "computed_at_ms" in cols else None
++        age = (now_ms - close_ms) if close_ms is not None else None
++        item = {
++            "symbol": str(row["symbol"] or ""),
++            "source_close_time_ms": close_ms,
++            "computed_at_ms": computed,
++            "age_ms": age,
++            "parse_error": err,
++        }
++        if err or close_ms is None or age is None or age < 0 or age > INDICATORS_FRESH_MS:
++            stale.append(item)
++        else:
++            fresh += 1
++    main_info["volume_z"] = {"fresh_rows": fresh, "stale_rows": len(stale), "computed_at_ignored": True}
++    main_info["volume_z_source_hour_observed"] = True
++    if not rows or stale:
++        code = "volume_z_source_close_absent" if not rows else "volume_z_source_close_stale"
++        worst = min((item["source_close_time_ms"] or 0) for item in stale) if stale else None
++        symbols = [item["symbol"] for item in stale if item["symbol"]]
++        findings.append(
++            Finding(
++                severity="RED",
++                surface="data_clocks",
++                code=code,
++                summary=(
++                    "1h 量能源钟 source_close_time_ms 缺失、超 3600s 或落在未来；"
++                    "computed_at_ms 不参与新鲜度"
++                ),
++                detail={
++                    "symbols": symbols,
++                    "source_close_time_ms": worst,
++                    "stale": stale[:8],
++                    "computed_at_ignored": True,
++                },
++            )
++        )
++
++
+ # --- Surface C: Spot & Cross-Margin Execution Ledgers ---
+ 
+ def _safe_decimal(raw: object) -> Decimal:
+@@ -1552,7 +1671,10 @@
+         lookback_hours=lookback_hours,
+     )
+     findings.extend(funnel_findings)
++    annotate_funnel_posture(clock_findings, funnel_metrics)
+     all_metrics["funnel"] = funnel_metrics
++    all_metrics["signal_funnel"] = funnel_metrics
++    all_metrics["install_approval"] = False
+ 
+     red_n = sum(1 for f in findings if f.severity == "RED")
+     yel_n = sum(1 for f in findings if f.severity == "YELLOW")
+@@ -1631,7 +1753,61 @@
+     return "\n".join(lines) + "\n"
+ 
+ 
+-from typing import Iterable  # noqa: E402
++_DATA_LOCKOUT_CODES = frozenset(
++    {
++        "lseg_nvda_smh_stale_market_open",
++        "lseg_nvda_smh_future_bar",
++        "deribit_gamma_stale_or_invalid",
++        "perp_counterparty_stale",
++        "perp_counterparty_column_missing",
++        "obi_top5_source_stale",
++        "obi_top5_source_column_missing",
++        "binance_indicators_stale",
++        "entry_5m_kline_stale",
++        "whitelist_news_stale",
++        "cot_publication_not_current",
++        "cot_asof_future_timestamp",
++        "volume_z_source_close_stale",
++        "volume_z_source_close_absent",
++    }
++)
++
++
++def annotate_funnel_posture(clock_findings: Sequence[Finding], funnel: dict[str, Any]) -> None:
++    """Separate a normal no-entry result from a data-clock lockout.
++
++    An empty decision_log is not a no-entry signal: the process may simply
++    not have written. Quote turnover is not judged here; this module does not
++    read that clock.
++    """
++    lock_codes = sorted(
++        {
++            item.code
++            for item in clock_findings
++            if item.severity == "RED" and item.code in _DATA_LOCKOUT_CODES
++        }
++    )
++    passed = funnel.get("risk_passed_by_purpose") or {}
++    buy_count = sum(int(value) for value in passed.values()) if isinstance(passed, Mapping) else 0
++    rows = int(funnel.get("decision_rows_in_window") or 0)
++    funnel["buy_count"] = buy_count
++    funnel["data_lock_codes"] = lock_codes
++    if lock_codes:
++        funnel["posture"] = "data_lockout"
++        funnel["data_lockout"] = True
++        funnel["evaluated"] = rows > 0
++        return
++    funnel["data_lockout"] = False
++    if rows > 0 and buy_count == 0:
++        funnel["posture"] = "no_entry_signal"
++        funnel["evaluated"] = True
++        return
++    if rows > 0:
++        funnel["posture"] = "entries_present"
++        funnel["evaluated"] = True
++        return
++    funnel["posture"] = "unspecified"
++    funnel["evaluated"] = False
+ 
+ 
+ def main(argv: Sequence[str] | None = None) -> int:

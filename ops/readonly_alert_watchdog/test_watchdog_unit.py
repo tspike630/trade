@@ -35,6 +35,7 @@ socket.socket = _BlockedSocket  # type: ignore[misc]
 _PKG = Path(__file__).resolve().parent
 sys.path.insert(0, str(_PKG))
 import readonly_alert_watchdog as watchdog  # noqa: E402
+import readonly_live_preflight as preflight  # noqa: E402
 
 
 @dataclass
@@ -321,18 +322,27 @@ class WatchdogBodyTest(unittest.TestCase):
         self.assertEqual(second["event_type"], "NEW_ALERT")
 
     def test_missing_preflight_sql_error_and_unsafe_path_are_faults(self) -> None:
-        missing = watchdog.run_watchdog_once(self.repo, state_file=self.state, now_ms=1_800_000_000_000)
+        saved = sys.modules.get("readonly_live_preflight")
+        sys.modules["readonly_live_preflight"] = None
+        try:
+            missing = watchdog.run_watchdog_once(self.repo, state_file=self.state, now_ms=1_800_000_000_000)
+        finally:
+            if saved is None:
+                sys.modules.pop("readonly_live_preflight", None)
+            else:
+                sys.modules["readonly_live_preflight"] = saved
         self.assertEqual(missing["red_codes"], ["watchdog_preflight_missing"])
         self.assertTrue(missing["fault"])
         self.assertFalse(missing["preflight_present"])
         self.assertFalse(missing["install_allowed"])
         self.assertNotEqual(missing["watchdog_status"], "NO_SIGNAL")
+        (self.base / "empty_root").mkdir(exist_ok=True)
         proc_missing = subprocess.run(
             [
                 sys.executable,
                 str(_PKG / "readonly_alert_watchdog.py"),
                 "--repo-root",
-                str(self.repo),
+                str(self.base / "empty_root"),
                 "--state-file",
                 str(self.base / "state" / "cli_state.json"),
                 "--now-ms",
@@ -343,9 +353,11 @@ class WatchdogBodyTest(unittest.TestCase):
             text=True,
             env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(_PKG)},
         )
-        self.assertEqual(proc_missing.returncode, 2, proc_missing.stderr)
-        self.assertIn("watchdog_preflight_missing", proc_missing.stdout)
+        self.assertEqual(proc_missing.returncode, 0, proc_missing.stdout + proc_missing.stderr)
+        self.assertIn("code_tree_not_in_root", proc_missing.stdout)
+        self.assertIn('"install_allowed": false', proc_missing.stdout)
         self.assertNotIn("NO_SIGNAL", proc_missing.stdout)
+        self.assertFalse((self.base / "empty_root" / "dexscreener.db").exists())
 
         def boom(_root, **_kw):
             raise sqlite3.OperationalError("no such table: cross_asset_bars")
@@ -406,10 +418,97 @@ class WatchdogBodyTest(unittest.TestCase):
         self.assertNotIn("unit-secret-token", json.dumps(result))
         self.assertEqual(result["delivery_outcome"], "failed")
 
+    def test_real_preflight_readonly_volume_hour_and_funnel(self) -> None:
+        empty = self.base / "empty_root"
+        empty.mkdir(exist_ok=True)
+        absent = empty / "missing.db"
+        report = preflight.inspect_system(
+            empty,
+            now_ms=1_800_000_000_000,
+            main_db=str(absent),
+            deriv_db=str(empty / "no-deriv.db"),
+            lseg_db=str(empty / "no-lseg.db"),
+            cityu_db=str(empty / "no-cityu.db"),
+            cross_margin_ledger=str(empty / "no-cm.db"),
+            spot_ledgers=[],
+            require_dbs=True,
+        )
+        self.assertFalse(absent.exists())
+        self.assertIn("main_decision_db_absent", {item.code for item in report.findings})
+        self.assertFalse(report.metrics["install_approval"])
+        self.assertEqual(report.metrics["funnel"]["posture"], "unspecified")
+        self.assertNotIn("quote_turnover_stale", {item.code for item in report.findings})
+
+        db = self.base / "volume.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """
+            CREATE TABLE decision_volume_z (
+                symbol TEXT, source_close_time_ms INTEGER, computed_at_ms INTEGER
+            )
+            """
+        )
+        source_close = 1_800_000_000_000 - 3_600_001
+        conn.execute(
+            "INSERT INTO decision_volume_z VALUES ('BTCUSDT', ?, ?)",
+            (source_close, 1_800_000_000_000),
+        )
+        conn.commit()
+        conn.close()
+        ro = preflight.connect_readonly_sqlite(db)
+        self.assertIsNotNone(ro)
+        with self.assertRaises(sqlite3.OperationalError):
+            ro.execute("INSERT INTO decision_volume_z VALUES ('ETHUSDT', 1, 1)")
+        ro.close()
+        clocks, _metrics = preflight.inspect_data_clocks(
+            now_ms=1_800_000_000_000,
+            nyse_open=False,
+            expected_cot="2026-11-17",
+            main_db=db,
+            deriv_db=self.base / "no-deriv.db",
+            lseg_db=self.base / "no-lseg.db",
+            cityu_db=self.base / "no-cityu.db",
+            require_dbs=False,
+        )
+        codes = {item.code for item in clocks}
+        self.assertIn("volume_z_source_close_stale", codes)
+        volume = next(item for item in clocks if item.code == "volume_z_source_close_stale")
+        self.assertEqual(volume.detail["source_close_time_ms"], source_close)
+        self.assertTrue(volume.detail["computed_at_ignored"])
+        self.assertFalse((self.base / "no-deriv.db").exists())
+
+        fresh_close = 1_800_000_000_000 - 3_600_000
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE decision_volume_z SET source_close_time_ms = ?", (fresh_close,))
+        conn.commit()
+        conn.close()
+        fresh_clocks, _ = preflight.inspect_data_clocks(
+            now_ms=1_800_000_000_000,
+            nyse_open=False,
+            expected_cot="2026-11-17",
+            main_db=db,
+            deriv_db=self.base / "no-deriv.db",
+            lseg_db=self.base / "no-lseg.db",
+            cityu_db=self.base / "no-cityu.db",
+            require_dbs=False,
+        )
+        self.assertNotIn("volume_z_source_close_stale", {item.code for item in fresh_clocks})
+
+        funnel: dict = {"decision_rows_in_window": 4, "risk_passed_by_purpose": {}}
+        preflight.annotate_funnel_posture([], funnel)
+        self.assertEqual(funnel["posture"], "no_entry_signal")
+        locked: dict = {"decision_rows_in_window": 4, "risk_passed_by_purpose": {}}
+        preflight.annotate_funnel_posture([volume], locked)
+        self.assertEqual(locked["posture"], "data_lockout")
+        self.assertNotEqual(funnel["posture"], locked["posture"])
+
     def test_module_does_not_open_sqlite(self) -> None:
         text = (_PKG / "readonly_alert_watchdog.py").read_text(encoding="utf-8")
         self.assertNotIn("sqlite3.connect", text)
-        self.assertFalse((_PKG / "readonly_live_preflight.py").exists())
+        preflight_text = (_PKG / "readonly_live_preflight.py").read_text(encoding="utf-8")
+        self.assertIn("mode=ro", preflight_text)
+        self.assertIn("PRAGMA query_only = ON", preflight_text)
+        self.assertNotIn("quote_turnover_stale", preflight_text)
 
 
 if __name__ == "__main__":
