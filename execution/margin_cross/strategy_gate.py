@@ -66,6 +66,62 @@ UNRULED_KELLY_FRACTIONS = (
 )
 
 
+# Stable missing-input keys for diagnostics. External reason_code stays
+# "regime_required_inputs_missing"; these names are additive only.
+MISSING_INPUT_KEYS: tuple[str, ...] = (
+    "funding",
+    "breadth",
+    "obi_top5",
+    "volume_z",
+    "cot_state",
+    "options_gamma_dvol",
+    "lseg_returns",
+    "lseg_market_open",
+)
+
+_MISSING_INPUT_CODE_MAP: dict[str, str] = {
+    "funding_missing": "funding",
+    "xs_breadth_1h_missing": "breadth",
+    "obi_top5_missing": "obi_top5",
+    "volume_z_missing": "volume_z",
+    "cot_regime_missing": "cot_state",
+    "options_gamma_dvol_missing": "options_gamma_dvol",
+    "lseg_cross_asset_returns_missing": "lseg_returns",
+    "lseg_market_open_missing": "lseg_market_open",
+}
+
+REGIME_REQUIRED_INPUTS_REASON = "regime_required_inputs_missing"
+
+
+def canonical_missing_inputs(internal_codes: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    """Map internal *_missing reason fragments to the stable diagnostic keys."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for code in internal_codes:
+        key = _MISSING_INPUT_CODE_MAP.get(code)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return tuple(out)
+
+
+def missing_inputs_histogram(rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...]) -> dict[str, int]:
+    """Per-tick field histogram over a universe of rows (unique row counts)."""
+    hist = {key: 0 for key in MISSING_INPUT_KEYS}
+    symbols_missing = 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        keys = canonical_missing_inputs(check_required_regime_inputs(row))
+        if keys:
+            symbols_missing += 1
+        for key in keys:
+            hist[key] += 1
+    hist["symbols_missing"] = symbols_missing
+    return hist
+
+
 @dataclass(frozen=True)
 class StrategyGateDecision:
     allowed: bool
@@ -75,6 +131,7 @@ class StrategyGateDecision:
     size_multiplier: Decimal
     tp_multiplier: Decimal
     reasons: tuple[str, ...]
+    missing_inputs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -188,7 +245,11 @@ def check_required_regime_inputs(row: Mapping[str, Any]) -> list[str]:
         missing.append("cot_regime_missing")
     if not str(row.get("gamma_regime") or "").strip() or not _has_finite(row, "dvol_zscore"):
         missing.append("options_gamma_dvol_missing")
-    if row.get("lseg_market_open", True) is not False:
+    # Calendar status explicitly None: fail-closed and name the gap.
+    # Missing key still defaults to True (do not flip the default to False).
+    if "lseg_market_open" in row and row.get("lseg_market_open") is None:
+        missing.append("lseg_market_open_missing")
+    elif row.get("lseg_market_open", True) is not False:
         if not (_has_finite(row, "nvda_1h_ret_pct") and _has_finite(row, "smh_1h_ret_pct")):
             missing.append("lseg_cross_asset_returns_missing")
     return missing
@@ -250,7 +311,8 @@ def evaluate_approved_regime_intent(
             requested_action,
             Decimal(0),
             Decimal(1),
-            ("regime_required_inputs_missing", *missing),
+            (REGIME_REQUIRED_INPUTS_REASON, *missing),
+            missing_inputs=canonical_missing_inputs(missing),
         )
 
     plain_row = {str(k): v for k, v in row.items()}
@@ -771,6 +833,11 @@ def build_approved_position_plan(
             contract=None,
         )
 
+    # Approved contract: net * base_position_pct * entry_tier * strategy multiplier.
+    # decision_log.size_pct and optimal_pyramid_ceiling_pct are not this factor.
+    # 0.35 is an unruled Kelly fraction and a pyramid-ceiling field, not a
+    # substitute for base_position_pct. Whether that ceiling should cap the
+    # cash long is unresolved and is not applied here.
     raw_notional = net_asset_q * cfg.base_position_pct * entry_tier * strat.size_multiplier
     max_single_borrow_notional = net_asset_q * cfg.max_single_borrow_net_ratio
     max_additional_liab = max(

@@ -2,6 +2,22 @@
 
 Numbers below are the t447 ruling. They are not a backtest and not a
 claim about returns. A missing or illegal coordinate refuses the order.
+
+t494 addendum (contract text only; t447 geometry is unchanged):
+    The live BUY 50bps minimum entry-to-stop gap is part of this contract.
+    For action=buy with a stop_price present, LIMIT uses limit_price as the
+    intended entry and MARKET uses the signal price. The stop must be at
+    least LONG_MIN_ENTRY_STOP_GAP (50 bps, 0.005) below that entry. A gap
+    equal to 50 bps passes; a tighter gap is refused as
+    stop_too_close_to_entry. This floor is not replaced by strategy
+    geometry. It applies only to buys; shorts are not placed under the
+    live buy guard.
+
+    Unchanged alongside this floor: the stop-limit remains 20 bps and not
+    less than 2 ticks, long below and short above, with no re-anchoring,
+    and the rest of the t447 formulas, odds floors, and spans.
+
+    This addendum does not approve a position-size figure.
 """
 
 from __future__ import annotations
@@ -10,6 +26,11 @@ import math
 from typing import Any
 
 CONTRACT_ID = "t447"
+CONTRACT_ADDENDUM_ID = "t494_long_min_stop_gap"
+# Formal contract floor for live BUY stops. Must stay equal to
+# decision_engine.core.stop_gap.MIN_ENTRY_STOP_GAP. Do not lower it.
+# Shorts are not covered by this buy-side guard.
+LONG_MIN_ENTRY_STOP_GAP = 0.005
 _LIMIT_ALPHA_CAP = 0.30
 _S2_ALPHA_SPLIT = 0.10
 _S2_LIMIT_ALPHA_FLOOR = 0.06

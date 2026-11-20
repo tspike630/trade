@@ -22,7 +22,16 @@ from decision_engine.core.live_bnb_turnover import (
     filter_live_bnb_hot,
     stamp_turnover,
 )
-from decision_engine.core.live_buy_guards import apply_live_buy_guards
+from decision_engine.core.live_buy_guards import (
+    apply_live_buy_guards,
+    recheck_portfolio_beta_after_sizing,
+)
+from decision_engine.core.cross_margin_emit_align import (
+    CrossMarginEmitState,
+    apply_cross_margin_emit_filters,
+    filter_hot_to_pending_ready,
+    next_cross_margin_scan_batch,
+)
 from decision_engine.core.volume_z_1h import (
     attach_stored_volume_z,
     persist_volume_z_for_decision_tick,
@@ -37,6 +46,7 @@ from decision_engine.core.news_shock_gate import (
     snapshot_observation,
 )
 from decision_engine.core.regime_v2_policy import (
+    drop_cross_margin_signals_missing_clocks,
     query_latest_whitelist_news_fetched_ms,
     stamp_cross_margin_signal_clocks,
 )
@@ -54,7 +64,6 @@ from decision_engine.core.bnb_spot_map import (
     stamp_bnb_spot_signals,
 )
 from decision_engine.core.data_adapter import IndicatorDataAdapter
-from decision_engine.strategies.regime_cross_margin import drop_opposite_side_conflicts
 from decision_engine.core.risk_manager import RiskManager
 from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_CLASSIC,
@@ -72,7 +81,7 @@ def _stamp_explicit_account_route(
     signals: list[dict[str, Any]],
     route: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    """Copy a caller-supplied account route onto buys that are about to publish.
+    """Copy a caller-supplied account route onto buys and explicit OPEN_LONG/OPEN_SHORT signals.
 
     ``route`` is None unless the engine was constructed with one. This does
     not invent a domain, a topology, or an approval.
@@ -82,8 +91,9 @@ def _stamp_explicit_account_route(
     stamped: list[dict[str, Any]] = []
     for sig in signals:
         action = str(sig.get("action") or "").lower()
+        requested = str(sig.get("requested_action") or "").strip()
         cross_order = sig.get("cross_margin_price_contract") == "t447"
-        if action != "buy" and not cross_order:
+        if action != "buy" and requested not in {"OPEN_LONG", "OPEN_SHORT"} and not cross_order:
             stamped.append(sig)
             continue
         out = dict(sig)
@@ -164,6 +174,7 @@ class DecisionEngine:
             else None
         )
         self._protection_unwired_logged = False
+        self._cross_margin_emit_state = CrossMarginEmitState()
         self.tick_count = 0
         resolved = getattr(adapter, "db_path", None)
         if resolved is not None:
@@ -231,6 +242,38 @@ class DecisionEngine:
                 hot,
                 now_ms=now_ms,
             )
+        if self.bus.purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
+            persist_volume_z_for_decision_tick(self.adapter.db_path, now_ms=now_ms)
+            hot = attach_stored_volume_z(self.adapter.conn, hot, now_ms=now_ms)
+            from decision_engine.core.multi_horizon_and_xs_regime import (
+                stamp_cross_sectional_metrics,
+            )
+            from decision_engine.strategies.regime_cross_margin import (
+                stamp_cross_margin_classifier_inputs,
+            )
+
+            hot, _xs_ctx = stamp_cross_sectional_metrics(hot)
+            hot = stamp_cross_margin_classifier_inputs(hot, now_ms=now_ms)
+            before_ready = len(hot)
+            hot = filter_hot_to_pending_ready(hot, self._cross_margin_emit_state)
+            if before_ready != len(hot) or self._cross_margin_emit_state.target_close_ms is not None:
+                log.info(
+                    "tick#%s ready_subset before=%s after=%s target_close_ms=%s",
+                    self.tick_count,
+                    before_ready,
+                    len(hot),
+                    self._cross_margin_emit_state.target_close_ms,
+                )
+            scanned = len(hot)
+            from execution.margin_cross.strategy_gate import missing_inputs_histogram
+
+            miss_hist = missing_inputs_histogram(hot)
+            log.info(
+                "tick#%s regime_missing_inputs symbols_missing=%s histogram=%s",
+                self.tick_count,
+                miss_hist.get("symbols_missing", 0),
+                {k: v for k, v in miss_hist.items() if k != "symbols_missing"},
+            )
         log.info(
             "tick#%s indicators_total=%s hot_loaded=%s bnb_factor_source=%s strategies=%s",
             self.tick_count,
@@ -256,6 +299,10 @@ class DecisionEngine:
                 log.exception("strategy %s failed: %s", strat.strategy_id, exc)
 
         if self.bus.purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
+            from decision_engine.strategies.regime_cross_margin import (
+                drop_opposite_side_conflicts,
+            )
+
             before_conflict = len(candidates)
             candidates = drop_opposite_side_conflicts(candidates)
             if len(candidates) != before_conflict:
@@ -322,7 +369,8 @@ class DecisionEngine:
             stamp_turnover(candidates, hot)
         passed = self.risk.filter(candidates)
         if self.token_cooldown is not None:
-            passed = self.token_cooldown.filter(passed)
+            # Check-only: do not occupy the 60-minute window until persist succeeds.
+            passed = self.token_cooldown.filter_check(passed)
         passed, guard_report = apply_live_buy_guards(
             passed,
             purpose=self.bus.purpose,
@@ -356,6 +404,11 @@ class DecisionEngine:
                 macro_halt=macro_halt,
                 news_snapshot=news_snapshot,
             )
+            passed, _beta_after = recheck_portfolio_beta_after_sizing(
+                passed,
+                purpose=self.bus.purpose,
+                book=protection_book,
+            )
             passed, top_report = cap_live_bnb_buys(passed, now_ms=now_ms)
             if self.bus.purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
                 news_fetched_ms = None
@@ -366,8 +419,24 @@ class DecisionEngine:
                 passed = stamp_cross_margin_signal_clocks(
                     passed, hot, news_fetched_ms=news_fetched_ms
                 )
+                before_clocks = len(passed)
+                passed = drop_cross_margin_signals_missing_clocks(passed)
+                if len(passed) != before_clocks:
+                    log.info(
+                        "tick#%s cross_margin_clock_withheld before=%s after=%s",
+                        self.tick_count,
+                        before_clocks,
+                        len(passed),
+                    )
         passed = _stamp_explicit_account_route(passed, self._account_route)
+        if self.bus.purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN:
+            passed = apply_cross_margin_emit_filters(
+                passed, self._cross_margin_emit_state
+            )
         emitted = self.bus.publish_many(passed)
+        if self.token_cooldown is not None:
+            # Commit cooldown only for rows that landed in decision_log.
+            self.token_cooldown.commit_published(emitted)
         eff_macro_halt = guard_report.get("macro_halt") or macro_halt
         perp_short_report = (
             self._maybe_run_perp_short(
@@ -409,14 +478,19 @@ class DecisionEngine:
         accepted_buys: list[dict[str, Any]],
         macro_halt: str | None,
     ) -> dict[str, Any] | None:
-        from decision_engine.core.perp_short_alpha_engine import (
-            is_perp_short_engine_enabled,
-            run_perp_short_tick,
-        )
-
-        if not is_perp_short_engine_enabled():
+        # Env gate stays here so a fault in the perp module cannot abort a
+        # spot tick while ENABLE_PERP_SHORT_ENGINE is left off. The import is
+        # inline for that isolation, not because of a cycle.
+        if os.environ.get("ENABLE_PERP_SHORT_ENGINE", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
             return None
         try:
+            from decision_engine.core.perp_short_alpha_engine import run_perp_short_tick
+
             sink_db = getattr(self.bus, "db_path", getattr(self.adapter, "db_path", None))
             return run_perp_short_tick(
                 hot_rows=hot,
@@ -649,7 +723,18 @@ class DecisionEngine:
             return results
 
         n = 0
+        align_live = ticks is None and self.bus.purpose == PURPOSE_LIVE_BNB_CROSS_MARGIN
+        if align_live:
+            self._cross_margin_emit_state.armed = True
+            log.info("cross-margin emitter armed for 5m close-landing align")
         while True:
+            if align_live:
+                conn = getattr(self.adapter, "conn", None)
+                if conn is None:
+                    log.warning("5m align skipped this cycle: adapter has no conn")
+                else:
+                    batch = next_cross_margin_scan_batch(conn, self._cross_margin_emit_state)
+                    self._cross_margin_emit_state.scan_symbols = set(batch)
             try:
                 results.append(self.tick())
             except Exception as exc:  # noqa: BLE001
@@ -658,5 +743,7 @@ class DecisionEngine:
             n += 1
             if ticks is not None and n >= ticks:
                 break
+            if align_live:
+                continue
             time.sleep(max(1.0, float(interval_sec)))
         return results

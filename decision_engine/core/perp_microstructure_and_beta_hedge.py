@@ -794,10 +794,11 @@ def attach_counterparty_context(rows, *, db_path=None, now_ms=None):
             # evaluates those on their own. The decision-engine kline path
             # owns that writer. Do not overwrite an obi already present, and
             # do not touch taker_buy_ratio (owned by the kline order-flow feed).
-            if _finite(row.get("obi_top5")) is None and _finite(row.get("spot_obi_top5")) is None:
-                obi_row = obi_by_sym.get(sym)
-                if obi_row is not None and _finite(obi_row["obi_top5"]) is not None:
+            obi_row = obi_by_sym.get(sym)
+            if obi_row is not None and _finite(obi_row["obi_top5"]) is not None:
+                if _finite(row.get("obi_top5")) is None and _finite(row.get("spot_obi_top5")) is None:
                     row["obi_top5"] = obi_row["obi_top5"]
+                if row.get("obi_top5_source_ts_ms") in (None, ""):
                     row["obi_top5_source_ts_ms"] = obi_row["obi_top5_source_ts_ms"]
     except sqlite3.Error:
         pass

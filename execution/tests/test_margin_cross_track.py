@@ -452,6 +452,69 @@ class MarginCrossTrackTest(unittest.TestCase):
         self.assertNotIn("repay", _names(case["client"]))
         self.assertNotIn("borrow", _names(case["client"]))
 
+    def test_base_fee_long_fill_places_one_oco_for_the_net_base(self) -> None:
+        case = long_case()
+        case["client"].fee_rate = Decimal("0.0000001")
+        case["client"].fee_asset = "BTC"
+        track, opened = self._open(case)
+        self.assertEqual(opened.state, "protected", opened.reason)
+        self.assertTrue(opened.protection_confirmed)
+        oco = [payload for name, payload in case["client"].write_log if name == "new_oco"]
+        self.assertEqual(len(oco), 1)
+        self.assertEqual(oco[0]["side"], "SELL")
+        self.assertEqual(oco[0]["quantity"], "0.0099")
+        orders = [name for name in _names(case["client"]) if name == "new_order"]
+        again = track.open_position(
+            case["intent"], case["snapshot"], case["contract"], case["gate"]
+        )
+        self.assertEqual(again.state, "protected")
+        self.assertEqual(_names(case["client"]).count("new_order"), len(orders))
+        self.assertEqual(_names(case["client"]).count("new_oco"), 1)
+
+    def test_resting_long_is_resumed_after_fill_without_a_second_entry(self) -> None:
+        case = long_case()
+        case["intent"]["limit_price"] = "99000"
+        case["client"].market_price = Decimal("100000")
+        track, opened = self._open(case)
+        self.assertEqual(opened.state, "entry_resting")
+        self.assertNotIn("new_oco", _names(case["client"]))
+        entry_key = make_client_id(case["intent"]["intent_id"], "entry")
+        order = case["client"]._orders[entry_key]
+        self.assertEqual(order["status"], "NEW")
+        order["status"] = "FILLED"
+        order["executedQty"] = order["origQty"]
+        case["client"]._trades[int(order["orderId"])] = [
+            {
+                "id": 1,
+                "orderId": order["orderId"],
+                "symbol": order["symbol"],
+                "price": order["price"],
+                "qty": order["origQty"],
+                "commission": "0",
+                "commissionAsset": "USDT",
+                "isBuyer": True,
+                "isMaker": True,
+                "isIsolated": False,
+            }
+        ]
+        quote = case["client"].asset("USDT")
+        quote["locked"] = Decimal("0")
+        quote["free"] = Decimal("4010")
+        case["client"].asset("BTC")["free"] = Decimal(order["origQty"])
+        resumed = track.open_position(
+            case["intent"], case["snapshot"], case["contract"], case["gate"]
+        )
+        self.assertEqual(resumed.state, "protected", resumed.reason)
+        self.assertTrue(resumed.protection_confirmed)
+        self.assertEqual(_names(case["client"]).count("new_order"), 1)
+        self.assertEqual(_names(case["client"]).count("new_oco"), 1)
+        repeated = track.open_position(
+            case["intent"], case["snapshot"], case["contract"], case["gate"]
+        )
+        self.assertEqual(repeated.state, "protected")
+        self.assertEqual(_names(case["client"]).count("new_order"), 1)
+        self.assertEqual(_names(case["client"]).count("new_oco"), 1)
+
     def test_resting_entry_is_cancelled_on_emergency_not_while_working(self) -> None:
         case = short_case()
         case["client"].interest_on_borrow = Decimal("0")

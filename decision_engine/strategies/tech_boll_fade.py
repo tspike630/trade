@@ -35,11 +35,7 @@ from decision_engine.core.signal_bus import (
     PURPOSE_LIVE_BNB_BOLL_FADE,
     PURPOSE_LIVE_BNB_CROSS_MARGIN,
 )
-from decision_engine.core.regime_v2_policy import (
-    merge_cross_margin_clocks,
-    resolve_boll_z,
-    v2_contract_active,
-)
+from decision_engine.core.regime_v2_policy import merge_cross_margin_clocks, v2_contract_active
 from decision_engine.core.stop_gap import stop_distance_reason
 from decision_engine.strategies.base_strategy import BaseStrategy
 from decision_engine.strategies.entry_sizing import buy_size_fields
@@ -72,6 +68,7 @@ def _cross_margin_pair(row: dict[str, Any]) -> str | None:
         if isinstance(raw, str) and raw.strip():
             return raw.strip()
     return None
+
 
 RULE_VERSION = "tech_boll_fade_v1_2026-11-01"
 STRATEGY_ID = "tech_boll_fade_v1"
@@ -138,7 +135,6 @@ class TechBollFadeStrategy(BaseStrategy):
         """
         self._pending.clear()
         self.rejected = {}
-        purpose = str(data.get("purpose") or "")
         hot = data.get("hot_tokens") or []
         if multi_horizon_regime_enabled() and isinstance(hot, list) and hot:
             hot, _xs_ctx = stamp_cross_sectional_metrics(hot)
@@ -218,7 +214,7 @@ class TechBollFadeStrategy(BaseStrategy):
             # After the lift. A quote that still cannot clear 20 USDT is not
             # written. A missing book fails open. Paper never reaches here.
             skip, book_warn = live_buy_notional_skip(size_pct)
-            if book_warn is not None and not book_warned and not v2_contract_active():
+            if book_warn is not None and not book_warned:
                 log.warning("%s", book_warn)
                 book_warned = True
             if skip:
@@ -232,13 +228,6 @@ class TechBollFadeStrategy(BaseStrategy):
                 "beta_vs_btc": symbol_beta_vs_btc(sym_str),
                 "risk_parity_scalar": vol_sized.risk_parity_scalar,
             }
-            if purpose:
-                lift_extra["purpose"] = purpose
-            bz_val = resolve_boll_z(row)
-            if bz_val is not None:
-                lift_extra["boll_z"] = bz_val
-            if row.get("entry_kline_5m_close_ms") is not None:
-                lift_extra["entry_kline_5m_close_ms"] = row["entry_kline_5m_close_ms"]
             if vol_sized.stop_distance_pct is not None:
                 lift_extra["stop_distance_pct"] = vol_sized.stop_distance_pct
             if decision.funding_rate is not None:

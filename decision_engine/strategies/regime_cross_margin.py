@@ -12,7 +12,10 @@ from typing import Any
 
 from decision_engine.core.cross_margin_price_contract import order_for_strategy
 from decision_engine.core.regime_v2_policy import merge_cross_margin_clocks
-from execution.margin_cross.strategy_gate import evaluate_approved_regime_intent
+from execution.margin_cross.strategy_gate import (
+    REGIME_REQUIRED_INPUTS_REASON,
+    evaluate_approved_regime_intent,
+)
 from decision_engine.strategies.base_strategy import BaseStrategy
 from logging_setup import get_logger
 
@@ -109,11 +112,13 @@ def stamp_cross_margin_classifier_inputs(
     ``lseg_market_open`` already present on a row is left unchanged.
     """
     from decision_engine.core.cityu_institutional_alpha import (
-        lseg_us_cash_market_open,
         load_cityu_institutional_snapshot,
     )
+    from decision_engine.core.regime_v2_policy import is_cme_or_us_cross_asset_open
 
-    open_now = lseg_us_cash_market_open(now_ms)
+    # The packed runtime called lseg_us_cash_market_open. That name is the
+    # same session calendar already used when the row omits the flag.
+    open_now = is_cme_or_us_cross_asset_open(now_ms)
     if snap is None:
         snap = load_cityu_institutional_snapshot(now_ms=now_ms)
     nvda = getattr(snap, "nvda_1h_ret_pct", None) if snap is not None else None
@@ -150,6 +155,7 @@ class _RegimeIntentStrategy(BaseStrategy):
     def on_tick(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         self._pending.clear()
         self.rejected = {}
+        self.missing_inputs = {}
         hot = data.get("hot_tokens") or []
         macro_halt = data.get("macro_halt")
         if macro_halt is not None:
@@ -185,6 +191,9 @@ class _RegimeIntentStrategy(BaseStrategy):
                 elif not decision.allowed:
                     reason = "not_allowed"
                 self.rejected[reason] = self.rejected.get(reason, 0) + 1
+                if reason == REGIME_REQUIRED_INPUTS_REASON:
+                    for key in decision.missing_inputs:
+                        self.missing_inputs[key] = self.missing_inputs.get(key, 0) + 1
                 continue
             priced, price_reason = order_for_strategy(self.strategy_id, row)
             if priced is None:
@@ -231,11 +240,12 @@ class _RegimeIntentStrategy(BaseStrategy):
                 )
             signals.append(sig)
         log.info(
-            "%s scanned=%s signals=%s rejected=%s",
+            "%s scanned=%s signals=%s rejected=%s missing_inputs=%s",
             self.strategy_id,
             len(hot) if isinstance(hot, list) else 0,
             len(signals),
             dict(sorted(self.rejected.items())),
+            dict(sorted(self.missing_inputs.items())),
         )
         return signals
 

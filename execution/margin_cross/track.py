@@ -702,6 +702,19 @@ class CrossMarginTrack:
                 intent.intent_id, "fill_mismatch", "entry_side_mismatch", snapshot=snapshot
             )
         status = str(order.get("status") or "")
+        if str(row["state"] if row is not None else "") == "confirmed" and status == "NEW":
+            # A confirmed fill is not put back to resting by a later NEW read.
+            stored = {}
+            try:
+                stored = json.loads(str(row["response_json"] or "{}"))
+            except (TypeError, ValueError):
+                stored = {}
+            executed, problem = parse_decimal(stored.get("executedQty"), "executedQty")
+            if problem or executed is None or executed <= 0:
+                return self._result(
+                    intent.intent_id, "fill_unconfirmed", "confirmed_qty_unreadable", snapshot=snapshot
+                )
+            return executed
         if status == "NEW":
             if gate.emergency_stop or self._resting_margin_degraded(contract):
                 return self._cancel_and_unwind(
@@ -917,6 +930,15 @@ class CrossMarginTrack:
             return None
         return total_quote / total_qty
 
+    def _long_net_base(self, intent: Intent, executed: Decimal) -> Decimal | None:
+        """Filled base minus base-asset commission. None when the fill is unconfirmed."""
+        client_key = make_client_id(intent.intent_id, "entry")
+        try:
+            order = self.client.query_order(build_query_order_payload(intent.symbol, client_key))
+        except (MarginExchangeError, MarginTransportTimeout):
+            return None
+        return self._net_base_from_order(intent.symbol, intent.base_asset, order, executed)
+
     def _ensure_protection(
         self,
         intent: Intent,
@@ -930,29 +952,51 @@ class CrossMarginTrack:
         if isinstance(view, TrackResult):
             return view
         assets, _level = view
-        if intent.action == "OPEN_SHORT":
+        list_id = make_client_id(intent.intent_id, "oco-list")
+        existing = self.ledger.peek(intent.intent_id, "oco", list_id)
+        if existing is not None:
+            stored_qty, qty_problem = parse_decimal(
+                json.loads(str(existing["request_json"])).get("quantity"), "quantity"
+            )
+            if qty_problem or stored_qty is None or stored_qty <= 0:
+                return self._result(
+                    intent.intent_id,
+                    "protection_blocked",
+                    "protection_qty_unreadable",
+                    snapshot=snapshot,
+                )
+            quantity = stored_qty
+        elif intent.action == "OPEN_SHORT":
             quantity, reason = self._short_cover(intent, snapshot, contract, assets)
             if quantity is None:
                 return self._result(
                     intent.intent_id, "protection_blocked", reason, snapshot=snapshot
                 )
         else:
+            net = self._long_net_base(intent, executed)
+            if net is None:
+                return self._result(
+                    intent.intent_id,
+                    "protection_blocked",
+                    "long_base_fee_unconfirmed",
+                    snapshot=snapshot,
+                )
             base = assets.get(intent.base_asset)
-            if base is None or base.free != executed:
+            # Base-asset commission leaves free base below executedQty.
+            # The OCO sells that net amount. A shortfall is not marked protected.
+            if base is None or net <= 0 or base.free < net:
                 return self._result(
                     intent.intent_id,
                     "protection_blocked",
                     "long_free_base_mismatch",
                     snapshot=snapshot,
                 )
-            quantity = executed
+            quantity = net
         rate_problem = self._interest_matches(snapshot, contract)
         if intent.action == "OPEN_SHORT" and rate_problem:
             return self._result(
                 intent.intent_id, "protection_blocked", rate_problem, snapshot=snapshot
             )
-        list_id = make_client_id(intent.intent_id, "oco-list")
-        existing = self.ledger.peek(intent.intent_id, "oco", list_id)
         if existing is None:
             plan_intent = self._effective_protection_intent(intent, snapshot, contract)
         else:

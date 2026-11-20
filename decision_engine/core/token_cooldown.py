@@ -12,6 +12,11 @@ Every buy row that is written gets extras:
   a written buy for the token).
 - ``is_first``: True when this row starts a new episode.
 - ``dup_of``: signal_id of the episode it repeats (None when is_first).
+
+Live emit paths must use ``filter_check`` (read-only) before emit alignment
+and ``commit_published`` only after a decision_log row is successfully
+committed (cursor advanced). ``filter()`` keeps the legacy check-and-register
+behaviour for callers that still expect in-place registration (tests, seeding).
 """
 
 from __future__ import annotations
@@ -100,15 +105,54 @@ class TokenCooldown:
         self._state[key] = (now, sid)
         return True, sid, None
 
-    def filter(self, signals: list[dict[str, Any]], now: datetime | None = None) -> list[dict[str, Any]]:
+    def is_cooling_down(self, sig: dict[str, Any], now: datetime | None = None) -> bool:
+        """Read-only cooldown query. Does not write ``_state``."""
+        if str(sig.get("action") or "").lower() != "buy":
+            return False
+        if not self.enabled:
+            return False
+        ts = _parse_ts(sig.get("ts")) or now or datetime.now(timezone.utc)
+        prev = self._state.get(_key(sig))
+        return prev is not None and (ts - prev[0]).total_seconds() < self.cooldown_min * 60
+
+    def _label_from_prev(
+        self,
+        sig: dict[str, Any],
+        ts: datetime,
+        prev: tuple[datetime, str] | None,
+    ) -> tuple[dict[str, Any], tuple[datetime, str]]:
+        key = _key(sig)
+        if prev is not None and (ts - prev[0]).total_seconds() < self.window_sec:
+            sid = prev[1]
+            is_first, dup = False, sid
+        else:
+            existing = sig.get("signal_id")
+            sid = str(existing) if existing else f"{key[0]}:{key[1]}:{_iso(ts)}"
+            is_first, dup = True, None
+        labelled = dict(sig)
+        labelled.setdefault("ts", _iso(ts))
+        labelled["signal_id"] = sid
+        labelled["is_first"] = is_first
+        labelled["dup_of"] = dup
+        return labelled, (ts, sid)
+
+    def filter_check(self, signals: list[dict[str, Any]], now: datetime | None = None) -> list[dict[str, Any]]:
+        """Selection-time check: drop cooling buys, label the rest, do not write ``_state``.
+
+        Same-tick duplicates are still suppressed using a batch-local overlay so
+        the cooldown table is unchanged if later emit/persist filters drop the
+        candidate.
+        """
         now = now or datetime.now(timezone.utc)
         out: list[dict[str, Any]] = []
+        overlay: dict[tuple[str, str], tuple[datetime, str]] = {}
         for sig in signals:
             if str(sig.get("action") or "").lower() != "buy":
                 out.append(sig)
                 continue
             ts = _parse_ts(sig.get("ts")) or now
-            prev = self._state.get(_key(sig))
+            key = _key(sig)
+            prev = overlay.get(key, self._state.get(key))
             if self.enabled and prev is not None and (ts - prev[0]).total_seconds() < self.cooldown_min * 60:
                 self.suppressed += 1
                 log.info(
@@ -116,11 +160,29 @@ class TokenCooldown:
                     sig.get("chain_id"), str(sig.get("token_address") or "")[:16],
                     (ts - prev[0]).total_seconds(), self.cooldown_min * 60, prev[1])
                 continue
-            is_first, sid, dup = self._observe(sig, ts)
-            sig = dict(sig)
-            sig.setdefault("ts", _iso(ts))
-            sig["signal_id"] = sid
-            sig["is_first"] = is_first
-            sig["dup_of"] = dup
-            out.append(sig)
+            labelled, tentative = self._label_from_prev(sig, ts, prev)
+            overlay[key] = tentative
+            out.append(labelled)
+        return out
+
+    def commit_published(self, signals: list[dict[str, Any]], now: datetime | None = None) -> None:
+        """Register cooldown only for buys that were successfully persisted."""
+        now = now or datetime.now(timezone.utc)
+        for sig in signals:
+            if str(sig.get("action") or "").lower() != "buy":
+                continue
+            ts = _parse_ts(sig.get("ts")) or now
+            known_sid = sig.get("signal_id")
+            sid = str(known_sid) if known_sid not in (None, "") else None
+            self._observe(sig, ts, sid)
+
+    def filter(self, signals: list[dict[str, Any]], now: datetime | None = None) -> list[dict[str, Any]]:
+        """Legacy check-and-register. Prefer ``filter_check`` + ``commit_published``.
+
+        Kept so existing tests and explicit seeders still register immediately.
+        Live engine emit paths must not call this before persist.
+        """
+        now = now or datetime.now(timezone.utc)
+        out = self.filter_check(signals, now)
+        self.commit_published(out, now)
         return out

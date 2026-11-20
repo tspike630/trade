@@ -1201,12 +1201,23 @@ class ExecutionGateway:
                 spot_submit=lambda _ignored: {"ok": False, "error": "spot_not_used"},
             )
         opened = bool(result.get("ok")) and bool(result.get("margin_called"))
+        open_body = result.get("open") if isinstance(result.get("open"), dict) else {}
+        resting = str(open_body.get("state") or "") == "entry_resting"
         error = None if opened else str(result.get("reason") or "cross_margin_refused")
-        receipt_body["status"] = "cross_margin_opened" if opened else "cross_margin_refused"
+        if resting:
+            receipt_body["status"] = "cross_margin_resting"
+        elif opened:
+            receipt_body["status"] = "cross_margin_opened"
+        else:
+            receipt_body["status"] = "cross_margin_refused"
         receipt_body["note"] = (
-            "offline cross-margin open_position"
-            if opened
-            else "account route refused; spot adapter not called"
+            "cross-margin entry still resting; ledger keeps the order"
+            if resting
+            else (
+                "offline cross-margin open_position"
+                if opened
+                else "account route refused; spot adapter not called"
+            )
         )
         receipt_body["step"] = "account_route"
         receipt_body["exec_result"] = result
@@ -1216,7 +1227,7 @@ class ExecutionGateway:
             "executor": "cross_margin_track" if result.get("margin_called") else "account_route",
             "executed": 1 if opened else 0,
             "error": error,
-            "order_status": "executed" if opened else "rejected",
+            "order_status": "entry_resting" if resting else ("executed" if opened else "rejected"),
             "exec_result": result,
         }
 

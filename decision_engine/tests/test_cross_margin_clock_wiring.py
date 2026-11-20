@@ -7,6 +7,10 @@ from decimal import Decimal
 import unittest
 from unittest.mock import patch
 
+from decision_engine.core.regime_v2_policy import (
+    cross_margin_emit_clock_gap,
+    drop_cross_margin_signals_missing_clocks,
+)
 from decision_engine.core.signal_bus import PURPOSE_LIVE_BNB_CROSS_MARGIN
 from decision_engine.strategies.regime_cross_margin import Regime2ShortSqueezeBreakoutStrategy
 from decision_engine.strategies.tech_boll_fade import TechBollFadeStrategy
@@ -32,7 +36,55 @@ def _decision() -> _Zone:
     )
 
 
+def _complete_clocks() -> dict[str, object]:
+    return {
+        "indicators_ts_ms": 1,
+        "obi_top5_source_ts_ms": 1,
+        "perp_counterparty_ts_ms": 1,
+        "deribit_gamma_ts_ms": 1,
+        "volume_z_source_close_ms": 1,
+        "news_fetched_at_ms": 1,
+        "cot_asof_date": "2026-11-10",
+        "lseg_market_open": False,
+    }
+
+
 class CrossMarginClockWiringTests(unittest.TestCase):
+    def test_missing_volume_or_obi_clock_withholds_the_signal(self) -> None:
+        complete = _complete_clocks()
+        self.assertIsNone(cross_margin_emit_clock_gap(complete))
+        missing_volume = dict(complete)
+        missing_volume.pop("volume_z_source_close_ms")
+        missing_obi = dict(complete)
+        missing_obi.pop("obi_top5_source_ts_ms")
+        self.assertEqual(
+            cross_margin_emit_clock_gap(missing_volume), "volume_z_source_close_ms"
+        )
+        self.assertEqual(cross_margin_emit_clock_gap(missing_obi), "obi_top5_source_ts_ms")
+        kept = drop_cross_margin_signals_missing_clocks(
+            [
+                {"binance_symbol": "MMTUSDT", "clocks": missing_volume},
+                {"binance_symbol": "RAREUSDT", "clocks": missing_obi},
+                {"binance_symbol": "BMTUSDT", "clocks": complete},
+            ]
+        )
+        self.assertEqual([row["binance_symbol"] for row in kept], ["BMTUSDT"])
+        open_book = dict(complete)
+        open_book["lseg_market_open"] = True
+        self.assertEqual(
+            cross_margin_emit_clock_gap(open_book), "lseg_cross_asset_ts_ms"
+        )
+
+    def test_cash_long_formula_does_not_treat_kelly_ceiling_as_approved_size(self) -> None:
+        net = Decimal("287.73135835")
+        raw = net * Decimal("1.00") * Decimal("1") * Decimal("1.20")
+        capped = min(raw, net / (Decimal(1) + Decimal("0.001")))
+        self.assertGreater(raw, net)
+        self.assertEqual(capped, net / Decimal("1.001"))
+        self.assertNotEqual(capped, net * Decimal("0.35"))
+
+
+class CrossMarginEmitterClockTests(unittest.TestCase):
     def test_regime_long_and_short_emit_the_row_stamps(self) -> None:
         iso = "2026-11-20T07:45:50Z"
         row = {
@@ -103,10 +155,6 @@ class CrossMarginClockWiringTests(unittest.TestCase):
             patch(
                 "decision_engine.strategies.tech_boll_fade.evaluate_entry_zone",
                 return_value=zone,
-            ),
-            patch(
-                "decision_engine.strategies.tech_boll_fade.v2_contract_active",
-                return_value=True,
             ),
             patch(
                 "decision_engine.strategies.tech_boll_fade.live_buy_notional_skip",

@@ -134,6 +134,10 @@ VENUE_STRATEGY_SYMBOL = {"1000PEPEUSDT": "PEPEUSDT"}
 VENUE_PRICE_SCALE = {"1000PEPEUSDT": 1000.0}
 
 DEFAULT_LOOP_INTERVAL_SEC = 300
+# Independent Deribit gamma/dvol cadence, split out of the serial Categories 6-9 loop.
+# 5 minutes is inside the t493 5-10 minute band. The 3600s freshness window is unchanged.
+DEFAULT_DERIBIT_INTERVAL_SEC = 300
+_DB_WRITE_LOCK = threading.Lock()
 PARTIAL_EXIT = 2
 FATAL_EXIT = 1
 LOCK_BUSY_EXIT = 3
@@ -1509,19 +1513,21 @@ def fetch_cross_exchange_spot_snapshot(symbol: str, *, now_ms: int | None = None
     }
 
 
-def fetch_deribit_options_snapshot(currency: str = "BTC", *, now_ms: int | None = None) -> dict[str, Any] | None:
-    ccy = str(currency or "BTC").strip().upper()
-    # Query bound only. The stored row time is the last DVOL candle timestamp.
-    query_end_ms = int(now_ms if now_ms is not None else _clock_ms())
-    start_ms = query_end_ms - 7 * 24 * 3600 * 1000
-
+def _deribit_dvol_points(
+    currency: str,
+    *,
+    resolution: str,
+    start_ms: int,
+    end_ms: int,
+) -> list[tuple[int, float]]:
+    """Return (source_bar_ts_ms, close) points for one DVOL resolution."""
     dvol_resp = _http_get_json(
         "https://www.deribit.com/api/v2/public/get_volatility_index_data",
         {
-            "currency": ccy,
+            "currency": currency,
             "start_timestamp": start_ms,
-            "end_timestamp": query_end_ms,
-            "resolution": "3600",
+            "end_timestamp": end_ms,
+            "resolution": resolution,
         },
     )
     dvol_rows = (
@@ -1529,13 +1535,65 @@ def fetch_deribit_options_snapshot(currency: str = "BTC", *, now_ms: int | None 
         if isinstance(dvol_resp, dict) and isinstance(dvol_resp.get("result"), dict)
         else []
     )
-    dvol_points = [
-        (int(r[0]), float(r[4]))
-        for r in dvol_rows
-        if isinstance(r, list) and len(r) >= 5 and _finite(r[0]) is not None and _finite(r[4]) is not None
-    ]
-    dvol_closes = [close for _ts, close in dvol_points]
-    dvol_source_ts = dvol_points[-1][0] if dvol_points else None
+    points: list[tuple[int, float]] = []
+    for row in dvol_rows:
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        ts = _finite(row[0])
+        close = _finite(row[4])
+        if ts is None or close is None:
+            continue
+        points.append((int(ts), float(close)))
+    return points
+
+
+def _deribit_live_volatility_index(currency: str) -> tuple[int | None, float | None]:
+    """Current DVOL snapshot. The timestamp is the source observation clock, not collected_at."""
+    resp = _http_get_json(
+        "https://www.deribit.com/api/v2/public/get_volatility_index",
+        {"currency": currency},
+    )
+    if not isinstance(resp, dict):
+        return None, None
+    result = resp.get("result")
+    payload = result if isinstance(result, dict) else {}
+    # Some responses nest the print under "data".
+    if not payload and isinstance(result, list) and result and isinstance(result[0], dict):
+        payload = result[0]
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    ts = _finite(data.get("timestamp") if isinstance(data, dict) else None)
+    vol = _finite(data.get("volatility") if isinstance(data, dict) else None)
+    if ts is None:
+        # usOut is the Deribit server send time in microseconds.
+        us_out = _finite(resp.get("usOut"))
+        if us_out is not None:
+            ts = us_out / 1000.0 if us_out > 1e15 else us_out
+    if ts is None or vol is None:
+        return (int(ts) if ts is not None else None, vol)
+    return int(ts), float(vol)
+
+
+def fetch_deribit_options_snapshot(currency: str = "BTC", *, now_ms: int | None = None) -> dict[str, Any] | None:
+    """Book + DVOL snapshot stamped with a real observation / source-bar clock.
+
+    Hourly DVOL remains the series for z-score and 24h change so those
+    definitions do not flip to 1-minute math. The row clock is never the
+    hourly bucket open and is never collected_at. Prefer the live
+    volatility-index timestamp; otherwise the latest 1-minute DVOL bar.
+    A snapshot without that observation clock is not written.
+    """
+    ccy = str(currency or "BTC").strip().upper()
+    query_end_ms = int(now_ms if now_ms is not None else _clock_ms())
+    start_ms = query_end_ms - 7 * 24 * 3600 * 1000
+
+    hourly_points = _deribit_dvol_points(
+        ccy, resolution="3600", start_ms=start_ms, end_ms=query_end_ms
+    )
+    minute_start_ms = query_end_ms - 3 * 3600 * 1000
+    minute_points = _deribit_dvol_points(
+        ccy, resolution="60", start_ms=minute_start_ms, end_ms=query_end_ms
+    )
+    live_ts, live_vol = _deribit_live_volatility_index(ccy)
 
     idx_resp = _http_get_json(
         "https://www.deribit.com/api/v2/public/get_index_price",
@@ -1556,16 +1614,24 @@ def fetch_deribit_options_snapshot(currency: str = "BTC", *, now_ms: int | None 
         if isinstance(book_resp, dict) and isinstance(book_resp.get("result"), list)
         else []
     )
-    if dvol_source_ts is None:
+
+    observation_ts = live_ts if live_ts is not None else (minute_points[-1][0] if minute_points else None)
+    live_dvol = live_vol if live_vol is not None else (minute_points[-1][1] if minute_points else None)
+    hourly_closes = [close for _ts, close in hourly_points]
+    if live_dvol is None and hourly_closes:
+        # Value only. Do not adopt the hourly open as the observation clock.
+        live_dvol = hourly_closes[-1]
+
+    if observation_ts is None:
         record_fetch_error(
             category="deribit",
             symbol=ccy,
-            endpoint="https://www.deribit.com/api/v2/public/get_volatility_index_data",
-            message="deribit_source_ts_missing",
-            error_code="deribit_source_ts_missing",
+            endpoint="https://www.deribit.com/api/v2/public/get_volatility_index",
+            message="deribit_observation_ts_missing",
+            error_code="deribit_observation_ts_missing",
         )
         return None
-    if not summaries and not dvol_closes:
+    if not summaries and live_dvol is None and not hourly_closes:
         record_fetch_error(
             category="deribit",
             symbol=ccy,
@@ -1578,13 +1644,86 @@ def fetch_deribit_options_snapshot(currency: str = "BTC", *, now_ms: int | None 
     stats = compute_deribit_option_walls_and_max_pain(
         summaries,
         spot_price=spot_px,
-        dvol_series=dvol_closes,
+        dvol_series=hourly_closes,
     )
+    if live_dvol is not None:
+        stats["dvol_close"] = live_dvol
     stats["currency"] = ccy
-    stats["ts_ms"] = dvol_source_ts
-    stats["source_ts_ms"] = dvol_source_ts
+    stats["ts_ms"] = int(observation_ts)
+    stats["source_ts_ms"] = int(observation_ts)
     stats["collected_at_ms"] = _clock_ms()
     return stats
+
+
+def collect_deribit_options_to_sqlite(
+    db_path: Path,
+    *,
+    option_currencies: Sequence[str] = ("BTC", "ETH"),
+) -> dict[str, Any]:
+    """Write Deribit snapshots only. Used by the independent 5-minute loop."""
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    errors: list[dict[str, Any]] = []
+    token = _ROUND_ERRORS.set(errors)
+    conn: sqlite3.Connection | None = None
+    opt_count = 0
+    try:
+        with _DB_WRITE_LOCK:
+            conn = sqlite3.connect(str(db_path), timeout=30.0)
+            ensure_counterparty_schema(conn)
+            for ccy in option_currencies:
+                try:
+                    opt = fetch_deribit_options_snapshot(ccy)
+                except Exception as exc:  # noqa: BLE001
+                    record_fetch_error(
+                        category="deribit",
+                        symbol=str(ccy),
+                        endpoint="https://www.deribit.com/api/v2/public/get_volatility_index",
+                        message=f"{type(exc).__name__}:{exc}",
+                        error_code=type(exc).__name__,
+                    )
+                    continue
+                if opt is None:
+                    continue
+                if _insert_snapshot(
+                    conn,
+                    """
+                    INSERT OR REPLACE INTO deribit_options_gamma (
+                        currency, ts_ms, spot_price, dvol_close, dvol_change_24h_pct,
+                        dvol_zscore, total_call_oi, total_put_oi, put_call_oi_ratio,
+                        max_pain_strike, top_call_wall_strike, top_put_wall_strike,
+                        gamma_regime, source_ts_ms, collected_at_ms
+                    ) VALUES (
+                        :currency, :ts_ms, :spot_price, :dvol_close, :dvol_change_24h_pct,
+                        :dvol_zscore, :total_call_oi, :total_put_oi, :put_call_oi_ratio,
+                        :max_pain_strike, :top_call_wall_strike, :top_put_wall_strike,
+                        :gamma_regime, :source_ts_ms, :collected_at_ms
+                    )
+                    """,
+                    opt,
+                    category="deribit",
+                    symbol=str(ccy),
+                ):
+                    opt_count += 1
+            for err in errors:
+                conn.execute(
+                    """
+                    INSERT INTO collector_fetch_errors (
+                        collected_at_ms, category, symbol, endpoint, http_status,
+                        error_code, message, fails_round
+                    ) VALUES (
+                        :collected_at_ms, :category, :symbol, :endpoint, :http_status,
+                        :error_code, :message, :fails_round
+                    )
+                    """,
+                    {**err, "fails_round": 1 if err.get("fails_round", True) else 0},
+                )
+            conn.commit()
+        return {"cat8_deribit_options": opt_count, "errors": list(errors)}
+    finally:
+        _ROUND_ERRORS.reset(token)
+        if conn is not None:
+            conn.close()
 
 
 def _fetch_fred_latest(series_id: str) -> tuple[str | None, float | None]:
@@ -1726,6 +1865,7 @@ def collect_all_to_sqlite(
     conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(str(db_path), timeout=30.0)
+        _DB_WRITE_LOCK.acquire()
         ensure_counterparty_schema(conn)
 
         perp_count = 0
@@ -1998,6 +2138,10 @@ def collect_all_to_sqlite(
             "errors": errors,
         }
     finally:
+        try:
+            _DB_WRITE_LOCK.release()
+        except RuntimeError:
+            pass
         _ROUND_ERRORS.reset(token)
         if conn is not None:
             conn.close()
@@ -2036,6 +2180,39 @@ def resolve_db_path(cli_path: Path | None) -> Path:
     return DEFAULT_DB_PATH
 
 
+def run_deribit_loop(
+    db_path: Path,
+    *,
+    option_currencies: Sequence[str] = ("BTC", "ETH"),
+    interval: int = DEFAULT_DERIBIT_INTERVAL_SEC,
+    should_stop: Callable[[], bool] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    collect: Callable[..., dict[str, Any]] | None = None,
+) -> None:
+    """Independent 5-10 minute Deribit sampler. First round runs immediately."""
+    sleeper = sleep or _SLEEP
+    collector = collect or collect_deribit_options_to_sqlite
+    pause_base = max(1, int(interval))
+    while True:
+        if should_stop is not None and should_stop():
+            return
+        started = _CLOCK()
+        try:
+            stats = collector(db_path, option_currencies=option_currencies)
+            print(
+                f"Saved independent Deribit options snapshot to {db_path}: "
+                f"count={stats.get('cat8_deribit_options')} errors={len(stats.get('errors') or [])}"
+            )
+        except Exception as exc:  # noqa: BLE001 — keep the sampler alive
+            print(f"deribit_feed_round_crash {type(exc).__name__}:{exc}", file=sys.stderr)
+        if should_stop is not None and should_stop():
+            return
+        elapsed = max(0.0, _CLOCK() - started)
+        sleeper(max(0.0, pause_base - elapsed))
+        if should_stop is not None and should_stop():
+            return
+
+
 def run_collection(
     db_path: Path,
     *,
@@ -2046,11 +2223,17 @@ def run_collection(
     max_rounds: int = 0,
     cross_symbols: Sequence[str] | None = None,
     option_currencies: Sequence[str] | None = None,
+    deribit_interval: int = DEFAULT_DERIBIT_INTERVAL_SEC,
     sleep: Callable[[float], None] | None = None,
     collect: Callable[..., dict[str, Any]] | None = None,
+    deribit_collect: Callable[..., dict[str, Any]] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> int:
-    """One shot, or a supervised loop. A round failure does not abort the next round."""
+    """One shot, or a supervised loop. A round failure does not abort the next round.
+
+    In ``--loop`` mode Deribit is sampled on its own ``deribit_interval``
+    thread, not at the end of the serial Categories 6-9 round.
+    """
     try:
         lock = acquire_collector_lock(db_path)
     except CollectorLockBusy as exc:
@@ -2061,14 +2244,41 @@ def run_collection(
     pause_base = max(1, int(interval))
     rounds = 0
     last = 0
+    deribit_thread: threading.Thread | None = None
+    currencies = tuple(option_currencies) if option_currencies is not None else ("BTC", "ETH")
+    deribit_stopped = False
+
+    def _deribit_should_stop() -> bool:
+        if deribit_stopped:
+            return True
+        return bool(should_stop is not None and should_stop())
+
     try:
+        if loop:
+            deribit_thread = threading.Thread(
+                target=run_deribit_loop,
+                name="deribit-options-gamma",
+                kwargs={
+                    "db_path": db_path,
+                    "option_currencies": currencies,
+                    "interval": max(1, int(deribit_interval)),
+                    "should_stop": _deribit_should_stop,
+                    "sleep": sleeper,
+                    "collect": deribit_collect or collect_deribit_options_to_sqlite,
+                },
+                daemon=True,
+            )
+            deribit_thread.start()
         while True:
             started = _CLOCK()
             try:
                 kwargs: dict[str, Any] = {"symbols": symbols, "spot_symbols": spot_symbols}
                 if cross_symbols is not None:
                     kwargs["cross_symbols"] = cross_symbols
-                if option_currencies is not None:
+                if loop:
+                    # Deribit runs on the independent sampler, not in this serial round.
+                    kwargs["option_currencies"] = ()
+                elif option_currencies is not None:
                     kwargs["option_currencies"] = option_currencies
                 stats = collector(db_path, **kwargs)
                 last = round_exit_code(stats)
@@ -2094,6 +2304,9 @@ def run_collection(
                 pause += min(HTTP_BACKOFF_CAP_SEC, HTTP_BACKOFF_BASE_SEC * (2 ** min(rounds, 4)))
             sleeper(pause)
     finally:
+        deribit_stopped = True
+        if deribit_thread is not None:
+            deribit_thread.join(timeout=2.0)
         lock.close()
 
 
@@ -2137,6 +2350,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Stop the loop after this many rounds. 0 runs until SIGINT/SIGTERM.",
     )
     parser.add_argument(
+        "--deribit-interval",
+        type=int,
+        default=DEFAULT_DERIBIT_INTERVAL_SEC,
+        help=(
+            "Seconds between independent Deribit gamma/dvol snapshots in --loop "
+            f"(default {DEFAULT_DERIBIT_INTERVAL_SEC}). Not used to widen freshness."
+        ),
+    )
+    parser.add_argument(
         "--http-timeout",
         type=float,
         default=DEFAULT_HTTP_TIMEOUT_SEC,
@@ -2145,6 +2367,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.interval < 1:
         parser.error("--interval must be >= 1")
+    if args.deribit_interval < 1:
+        parser.error("--deribit-interval must be >= 1")
     timeout_token = _HTTP_TIMEOUT.set(float(args.http_timeout))
     stop = False
 
@@ -2164,6 +2388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             loop=bool(args.loop),
             interval=int(args.interval),
             max_rounds=int(args.max_rounds),
+            deribit_interval=int(args.deribit_interval),
             should_stop=(lambda: stop) if args.loop else None,
         )
     finally:

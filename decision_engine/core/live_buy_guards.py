@@ -234,3 +234,48 @@ def apply_live_buy_guards(
         report["macro_halt"] = macro_halt
         report["macro_dropped"] = macro_dropped
     return kept, report
+
+
+def recheck_portfolio_beta_after_sizing(
+    signals: list[dict[str, Any]],
+    *,
+    purpose: str,
+    book: ProtectionBook,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Re-apply the existing beta block after size is known.
+
+    The running engine calls this after the router. The packed snapshot did
+    not include this function's body. It uses ``portfolio_beta_exposure_block``
+    and the same live-spot purpose set as ``apply_live_buy_guards``. No new
+    beta limit is introduced. Cross-margin is outside that set, so this
+    recheck does not drop those signals.
+    """
+    if purpose not in LIVE_BNB_SPOT_PURPOSES or not book.configured or book.error is not None:
+        return list(signals), {"beta_rechecked": False}
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for signal in signals:
+        if str(signal.get("action") or "").lower() != "buy":
+            kept.append(signal)
+            continue
+        reason = portfolio_beta_exposure_block(
+            list(book.positions),
+            purpose=purpose,
+            symbol=signal_symbol(signal),
+            candidate_size_pct=signal.get("size_pct"),
+            accepted_signals=kept,
+        )
+        if reason is not None:
+            dropped += 1
+            log.info(
+                "portfolio_beta_halt purpose=%s symbol=%s reason=%s stage=after_sizing",
+                purpose,
+                signal_symbol(signal),
+                reason,
+            )
+            continue
+        kept.append(signal)
+    report: dict[str, Any] = {"beta_rechecked": True}
+    if dropped:
+        report["beta_dropped"] = dropped
+    return kept, report

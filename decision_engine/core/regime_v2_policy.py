@@ -827,6 +827,50 @@ def merge_cross_margin_clocks(
     return clocks
 
 
+_EMIT_CLOCK_KEYS = (
+    "indicators_ts_ms",
+    "obi_top5_source_ts_ms",
+    "perp_counterparty_ts_ms",
+    "deribit_gamma_ts_ms",
+    "volume_z_source_close_ms",
+    "news_fetched_at_ms",
+    "cot_asof_date",
+)
+
+
+def cross_margin_emit_clock_gap(clocks: Mapping[str, Any]) -> str | None:
+    """Name the first execution clock that is absent. A present stale stamp is kept.
+
+    ``snapshot_observed_at_ms`` is written from the live account read, not here.
+    ``lseg_cross_asset_ts_ms`` is required only when the row did not say the
+    cash session is closed. No timestamp is synthesized.
+    """
+    for key in _EMIT_CLOCK_KEYS:
+        if clocks.get(key) in (None, ""):
+            return key
+    if clocks.get("lseg_market_open") is not False and clocks.get("lseg_cross_asset_ts_ms") in (
+        None,
+        "",
+    ):
+        return "lseg_cross_asset_ts_ms"
+    return None
+
+
+def drop_cross_margin_signals_missing_clocks(
+    signals: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Do not publish a cross-margin intent whose real clocks are incomplete."""
+    kept: list[dict[str, Any]] = []
+    for sig in signals:
+        if not isinstance(sig, dict):
+            continue
+        clocks = sig.get("clocks") if isinstance(sig.get("clocks"), Mapping) else {}
+        gap = cross_margin_emit_clock_gap(clocks)
+        if gap is None:
+            kept.append(sig)
+    return kept
+
+
 def stamp_cross_margin_signal_clocks(
     signals: Sequence[dict[str, Any]],
     hot_rows: Sequence[Mapping[str, Any]],

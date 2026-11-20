@@ -90,6 +90,8 @@ _UNTOUCHED = {
         "7c6d1ab54cccdea18c16455c8d1a06008c7c7d95d779be66d80e6bc3c24108c3",
         # The consumer copies decision_log_id so a missing intent id can be bound.
         "f7599040e024699a00c56107d8bae1bfc567103fe601f3d743986d2c5da887d7",
+        # Resting cross-margin entry is not stored as a terminal reject.
+        "72880d1f29371319b056e9f13d591a59c39790d1e2ac205d62deab53751f44c3",
     ),
     "execution/ledger.py": (
         "fa1410df2d4d1780b3206a9acc40e32ffd574e5d29aa2c7280bede4b7e7fd0d2",
@@ -116,10 +118,14 @@ _UNTOUCHED = {
         "f4b6a990a63031f0929cbd34141470220561730b637c9e3658a3564e3a3bab82",
         # Published cross-margin signals receive source freshness clocks.
         "04913cfb73a10a00327403d19c2d361b93f708324b95970dc791f6016815b36e",
+        # Runtime t494 align loop, plus withhold when a real execution clock is absent.
+        "94caa8e655d11cbd8d106870cf96eb4890045880c34c9793f387cc1fa4d28b6c",
     ),
     "decision_engine/core/live_buy_guards.py": (
         "6b3023ed5bdcbb2fdd4b4372ea0d360b147be96ac68016b4d7631fc671991da7",
         "a550474c89c120ca9243771b528a4f29caa1eead724b0b73d3f382e469b7b492",
+        # Post-size beta recheck uses the existing beta block. No new limit.
+        "9d1e3aeb0a609a7b93df19da1595fa1a4ae08ffb1a36d55d28727fd67548df06",
     ),
     "decision_engine/core/protection_halt.py": (
         "947465bca09c0f4f907d8e94f718353c84a9a8cf829a3c2db9f099bdacb4fc00",
