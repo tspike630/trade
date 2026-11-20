@@ -1,0 +1,1255 @@
+--- a/readonly_alert_watchdog.py
++++ b/readonly_alert_watchdog.py
+@@ -1,32 +1,26 @@
+ #!/usr/bin/env python3
+-"""Independent Read-Only Alert Watchdog for tspike630/trade.
++"""Read-only alert watchdog.
+ 
+-Runs completely outside ``decision_engine.run`` and ``execution.run`` so silent
+-``fail-closed`` lockouts, indeterminate ``protection_unknown`` positions, stale
+-LSEG/Deribit clocks, or runtime SHA256 drift push immediate out-of-band alerts
+-without relying on any Quant Agent being asked.
+-
+-Safety Invariants:
+-1. Reads production SQLite databases strictly via ``readonly_live_preflight``
+-   (``file:...?mode=ro`` + ``PRAGMA query_only = ON``).
+-2. Refuses any ``--state-file`` or ``--alert-jsonl`` located inside ``--repo-root``
+-   or ending in ``.db`` / ``.sqlite`` / ``.py`` so production trees and ledgers can
+-   never be touched.
+-3. Detects consecutive 5-minute bar silent clock/gate lockouts (>= 2 consecutive
+-   5m bars) and escalates persistent feed lockouts explicitly.
+-4. Deduplicates identical active alert sets within ``--renotify-sec`` (default
+-   1800s), pushes immediately whenever a NEW red/yellow code appears, and sends
+-   an explicit ``[RESOLVED]`` clear notification when red alerts recover.
++This process does not import trading gates and does not open SQLite. Market
++inspection stays in ``readonly_live_preflight`` when that module is supplied
++beside this file. A missing module, a SQL error, or an inspect failure is a
++fault alert. It is not a healthy cycle.
++
++Notification acks advance only after every configured channel succeeds.
++Recovery uses the same rule. Consecutive 5-minute lockout counts use observed
++source-bar closes only: the same bar does not increment, a missing bar resets,
++and ``now_ms`` / ``computed_at_ms`` are not freshness.
+ """
+ 
+ from __future__ import annotations
+ 
+ import argparse
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ import json
+ import os
+ from pathlib import Path
+ import signal
++import sqlite3
+ import subprocess
+ import sys
+ import time
+@@ -34,24 +28,21 @@
+ from urllib.error import HTTPError, URLError
+ from urllib.request import Request, urlopen
+ 
+-# Allow importing sibling readonly_live_preflight regardless of working directory
+ _THIS_DIR = Path(__file__).resolve().parent
+ if str(_THIS_DIR) not in sys.path:
+     sys.path.insert(0, str(_THIS_DIR))
+ 
+-from readonly_live_preflight import (  # noqa: E402
+-    Finding,
+-    PreflightReport,
+-    fmt_ms_utc,
+-    inspect_system,
+-)
+-
+ DEFAULT_STATE_FILE = Path("/tmp/trade_readonly_watchdog_state.json")
+ DEFAULT_INTERVAL_SEC = 300
+ DEFAULT_RENOTIFY_SEC = 1800
+ FIVE_MIN_MS = 300_000
++STATE_VERSION = 2
++_MS_MIN = 10_000_000_000
+ 
+-_CLOCK_LOCKOUT_PREFIXES = (
++# Uploaded prefixes. Several names are not the fail-closed strings in
++# regime_v2_policy.check_row_and_tick_freshness; they stay so an older
++# preflight vocabulary still escalates. They are not evidence that main emits them.
++_UPLOADED_CLOCK_PREFIXES = (
+     "lseg_nvda_smh_stale_market_open",
+     "deribit_gamma_stale_or_invalid",
+     "perp_counterparty_stale",
+@@ -63,213 +54,636 @@
+     "cot_asof_future_timestamp",
+ )
+ 
++# Exact reject / block codes read from
++# origin/cursor/integrate-three-blockers-d43b
++# (regime_v2_policy.py blob 43a49cde1a6a1e2fac166342626660c99e50f182,
++#  regime_v2_acceptance.py blob 9222ef12493313a5b5a610339dacd68beab4e4fd).
++# That branch is not main (f75761d). main does not contain these strings.
++_POLICY_CLOCK_CODES = (
++    "entry_5m_kline_stale",
++    "entry_5m_kline_clock_absent",
++    "entry_5m_kline_clock_unit_mismatch",
++    "volume_z_source_close_stale",
++    "volume_z_source_close_absent",
++    "volume_z_close_clock_absent",
++    "quote_turnover_stale",
++    "quote_turnover_clock_absent",
++    "obi_top5_source_stale",
++    "obi_top5_source_clock_absent",
++    "binance_indicators_stale",
++    "binance_indicators_clock_absent",
++    "binance_indicators_clock_unit_mismatch",
++    "perp_counterparty_stale",
++    "perp_counterparty_clock_absent",
++    "cross_exchange_spot_baseline_stale",
++    "cross_exchange_spot_baseline_clock_absent",
++    "deribit_options_gamma_stale",
++    "deribit_options_gamma_clock_absent",
++    "news_fetched_at_stale",
++    "news_fetched_at_absent",
++    "lseg_cross_asset_bars_stale",
++    "lseg_cross_asset_bars_absent",
++    "lseg_nvda_smh_future_bar",
++    "cot_publication_not_current",
++    "cot_publication_absent",
++    "token_unlock_schedule_unverified",
++)
++
++# Families the acceptance asked about. Membership above is the coverage claim.
++CLOCK_FAMILY_CODES = {
++    "5m": (
++        "entry_5m_kline_stale",
++        "entry_5m_kline_clock_absent",
++        "entry_5m_kline_clock_unit_mismatch",
++    ),
++    "1h_volume_source_bar": (
++        "volume_z_source_close_stale",
++        "volume_z_source_close_absent",
++        "volume_z_close_clock_absent",
++    ),
++    "quote": (
++        "quote_turnover_stale",
++        "quote_turnover_clock_absent",
++    ),
++    "obi": (
++        "obi_top5_source_stale",
++        "obi_top5_source_clock_absent",
++    ),
++    "volume_source_bar": (
++        "volume_z_source_close_stale",
++        "volume_z_source_close_absent",
++        "volume_z_close_clock_absent",
++    ),
++}
++
++# Present in the tree and intentionally not lockout escalations.
++NOT_LOCKOUT_CODES = (
++    "volume_z_computed_at_not_the_reader_clock",
++    "obi_top5_source_ts_gap",
++    "obi_top5_source_ts_missing",
++    "turnover_stale",
++    "turnover_time_missing",
++    "strategy_evaluated_no_entry",
++    "no_entry_signal",
++)
++
++_LOCKOUT_PREFIXES = tuple(dict.fromkeys(_UPLOADED_CLOCK_PREFIXES + _POLICY_CLOCK_CODES))
++_NO_SIGNAL_CODES = frozenset({"strategy_evaluated_no_entry", "no_entry_signal"})
++_SELF_FAULT_CODES = frozenset({
++    "watchdog_preflight_missing",
++    "watchdog_preflight_incomplete",
++    "watchdog_sql_error",
++    "watchdog_inspect_failed",
++    "watchdog_unsafe_path",
++})
++
++_FIVE_MIN_SOURCE_KEYS = (
++    "source_bar_close_ms",
++    "entry_kline_5m_close_ms",
++    "kline_5m_close_ts_ms",
++)
++_HOUR_SOURCE_KEYS = (
++    "source_close_time_ms",
++    "volume_z_source_close_ms",
++    "quote_source_stamp_ms",
++)
++_IGNORED_CLOCK_KEYS = frozenset({
++    "now_ms",
++    "computed_at_ms",
++    "collected_at_ms",
++    "checked_at_ms",
++    "updated_at",
++    "tech_updated_at",
++})
++_OBJECT_KEYS = (
++    "symbol",
++    "binance_symbol",
++    "token_address",
++    "intent_id",
++    "ric",
++    "object_id",
++)
++_OBJECT_LIST_KEYS = ("symbols", "intent_ids", "object_ids", "rics")
++_PROTECTED_SUFFIXES = {
++    ".db",
++    ".sqlite",
++    ".sqlite3",
++    ".py",
++    ".sh",
++    ".patch",
++    ".pem",
++    ".key",
++    ".env",
++}
++_PROTECTED_NAMES = {".env", "id_rsa", "credentials.json"}
++_PREFLIGHT_EXPORTS = ("Finding", "PreflightReport", "fmt_ms_utc", "inspect_system")
++
+ 
+ class UnsafeWatchdogPathError(ValueError):
+-    """Raised when a state/log path points inside the monitored repo or a DB file."""
++    """State or log path would touch the repo, a symlink, or a protected file."""
++
++
++class PreflightUnavailable(ImportError):
++    """The real preflight module is absent or does not export the watchdog contract."""
++
++
++@dataclass(frozen=True)
++class WatchFinding:
++    severity: str
++    surface: str
++    code: str
++    summary: str
++    detail: Mapping[str, Any] = field(default_factory=dict)
++
++
++@dataclass(frozen=True)
++class AlertDecision:
++    should_push: bool
++    event_type: str
++    title: str
++    body_text: str
++    red_codes: tuple[str, ...]
++    yellow_codes: tuple[str, ...]
++    red_fingerprints: tuple[str, ...]
++    yellow_fingerprints: tuple[str, ...]
++    consecutive_lockout_bars: int
++    consecutive_observation_cycles: int
++    source_bucket: int | None
++    entry_posture: str
++    event_key: str
++
++
++@dataclass(frozen=True)
++class DeliveryJudgement:
++    outcome: str
++    receipts: tuple[dict[str, Any], ...]
++    ok_channels: tuple[str, ...]
++    required_channels: tuple[str, ...]
+ 
+ 
+ def validate_external_state_path(target: Path, repo_root: Path) -> Path:
+-    resolved_target = target.expanduser().resolve()
+-    resolved_repo = repo_root.expanduser().resolve()
++    raw = Path(target).expanduser()
++    if raw.is_symlink():
++        raise UnsafeWatchdogPathError(f"refusing symlink state/log path: {raw}")
++    resolved_repo = Path(repo_root).expanduser().resolve()
++    resolved_target = raw.resolve()
+     if resolved_target == Path("/") or str(resolved_target) == "":
+         raise UnsafeWatchdogPathError(f"refusing root state path: {resolved_target}")
+     if resolved_target == resolved_repo or resolved_repo in resolved_target.parents:
+         raise UnsafeWatchdogPathError(
+             f"state/log file {resolved_target} must live outside monitored repo {resolved_repo}"
+         )
+-    if resolved_target.suffix.lower() in {".db", ".sqlite", ".sqlite3", ".py", ".sh", ".patch"}:
++    if resolved_target.name in _PROTECTED_NAMES or resolved_target.suffix.lower() in _PROTECTED_SUFFIXES:
+         raise UnsafeWatchdogPathError(
+-            f"refusing state/log path with protected suffix: {resolved_target}"
++            f"refusing state/log path with protected name: {resolved_target}"
+         )
++    if resolved_target.exists() and resolved_target.is_dir():
++        raise UnsafeWatchdogPathError(f"refusing directory state path: {resolved_target}")
+     return resolved_target
+ 
+ 
+ def load_watchdog_state(state_path: Path) -> dict[str, Any]:
++    empty = _empty_state()
+     if not state_path.is_file():
+-        return {
+-            "active_red_codes": [],
+-            "active_yellow_codes": [],
+-            "last_push_ms": 0,
+-            "consecutive_lockout_bars": 0,
+-            "last_lockout_bar_bucket": None,
+-        }
++        return empty
+     try:
+         raw = json.loads(state_path.read_text(encoding="utf-8"))
+-        if isinstance(raw, dict):
+-            return raw
+     except (OSError, ValueError):
+-        pass
++        return empty
++    if not isinstance(raw, dict):
++        return empty
++    state = dict(empty)
++    if int(raw.get("state_version") or 0) == STATE_VERSION:
++        for key in (
++            "notified_red_fingerprints",
++            "notified_yellow_fingerprints",
++            "pending_channel_ok",
++        ):
++            state[key] = [str(item) for item in (raw.get(key) or [])]
++        state["last_success_ms"] = int(raw.get("last_success_ms") or 0)
++        state["last_attempt_ms"] = int(raw.get("last_attempt_ms") or 0)
++        state["pending_retry"] = bool(raw.get("pending_retry"))
++        state["pending_event_key"] = raw.get("pending_event_key")
++        state["last_delivery_outcome"] = str(raw.get("last_delivery_outcome") or "not_attempted")
++        state["consecutive_lockout_bars"] = int(raw.get("consecutive_lockout_bars") or 0)
++        state["last_lockout_bar_bucket"] = raw.get("last_lockout_bar_bucket")
++        state["consecutive_observation_cycles"] = int(raw.get("consecutive_observation_cycles") or 0)
++        state["last_observation_slot"] = raw.get("last_observation_slot")
++    return state
++
++
++def save_watchdog_state(state_path: Path, state: Mapping[str, Any]) -> None:
++    state_path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = state_path.with_name(f".{state_path.name}.tmp.{os.getpid()}")
++    payload = json.dumps(dict(state), ensure_ascii=False, indent=2) + "\n"
++    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
++    fd = os.open(tmp, flags, 0o600)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as handle:
++            fd = -1
++            handle.write(payload)
++    finally:
++        if fd >= 0:
++            os.close(fd)
++    if state_path.is_symlink():
++        tmp.unlink(missing_ok=True)
++        raise UnsafeWatchdogPathError(f"refusing to replace symlink state file: {state_path}")
++    os.replace(tmp, state_path)
++
++
++def load_preflight() -> Any:
++    try:
++        import readonly_live_preflight as preflight
++    except ImportError as exc:
++        raise PreflightUnavailable(
++            "readonly_live_preflight.py is not importable beside the watchdog"
++        ) from exc
++    missing = [name for name in _PREFLIGHT_EXPORTS if not hasattr(preflight, name)]
++    if missing:
++        raise PreflightUnavailable(
++            "readonly_live_preflight is missing exports: " + ", ".join(missing)
++        )
++    return preflight
++
++
++def is_lockout_code(code: str) -> bool:
++    text = str(code or "")
++    if text in _NO_SIGNAL_CODES or text in NOT_LOCKOUT_CODES or text in _SELF_FAULT_CODES:
++        return False
++    return any(text.startswith(prefix) for prefix in _LOCKOUT_PREFIXES)
++
++
++def _empty_state() -> dict[str, Any]:
+     return {
+-        "active_red_codes": [],
+-        "active_yellow_codes": [],
++        "state_version": STATE_VERSION,
++        "notified_red_fingerprints": [],
++        "notified_yellow_fingerprints": [],
++        "last_success_ms": 0,
++        "last_attempt_ms": 0,
+         "last_push_ms": 0,
++        "pending_retry": False,
++        "pending_event_key": None,
++        "pending_channel_ok": [],
++        "last_delivery_outcome": "not_attempted",
+         "consecutive_lockout_bars": 0,
+         "last_lockout_bar_bucket": None,
++        "consecutive_observation_cycles": 0,
++        "last_observation_slot": None,
++        "entry_posture": "unspecified",
+     }
+ 
+ 
+-def save_watchdog_state(state_path: Path, state: Mapping[str, Any]) -> None:
+-    state_path.parent.mkdir(parents=True, exist_ok=True)
+-    tmp = state_path.with_name(f".{state_path.name}.tmp.{os.getpid()}")
+-    tmp.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+-    tmp.replace(state_path)
++def _detail(finding: Any) -> Mapping[str, Any]:
++    raw = getattr(finding, "detail", None)
++    if isinstance(raw, Mapping):
++        return raw
++    return {}
++
++
++def _source_ms(value: object) -> int | None:
++    if isinstance(value, bool) or value is None or isinstance(value, float):
++        return None
++    if isinstance(value, str):
++        text = value.strip()
++        if not text or not text.lstrip("-").isdigit():
++            return None
++        value = int(text)
++    if not isinstance(value, int):
++        return None
++    if value < _MS_MIN:
++        return None
++    return value
++
++
++def _objects(detail: Mapping[str, Any]) -> tuple[str, ...]:
++    found: list[str] = []
++    for key in _OBJECT_KEYS:
++        value = detail.get(key)
++        if isinstance(value, str) and value.strip():
++            found.append(f"{key}={value.strip()}")
++    for key in _OBJECT_LIST_KEYS:
++        value = detail.get(key)
++        if isinstance(value, (list, tuple)):
++            for item in value:
++                if isinstance(item, str) and item.strip():
++                    found.append(f"{key}={item.strip()}")
++    return tuple(sorted(set(found)))
++
++
++def finding_fingerprint(finding: Any) -> str:
++    code = str(getattr(finding, "code", "") or "")
++    objects = _objects(_detail(finding))
++    if not objects:
++        return code
++    return code + "|" + ",".join(objects)
++
++
++def _funnel_view(metrics: Mapping[str, Any]) -> Mapping[str, Any]:
++    for key in ("signal_funnel", "funnel"):
++        raw = metrics.get(key)
++        if isinstance(raw, Mapping):
++            return raw
++    return {}
+ 
+ 
+-@dataclass(frozen=True)
+-class AlertDecision:
+-    should_push: bool
+-    event_type: str  # "NEW_ALERT", "ESCALATED_SILENT_LOCKOUT", "RENOTIFY", "RESOLVED", "QUIET"
+-    title: str
+-    body_text: str
+-    red_codes: tuple[str, ...]
+-    yellow_codes: tuple[str, ...]
+-    consecutive_lockout_bars: int
++def observed_source_bucket(findings: Sequence[Any]) -> int | None:
++    """Bucket of an observed source bar. Computation clocks are ignored."""
++    five: list[int] = []
++    hours: list[int] = []
++    for finding in findings:
++        if not is_lockout_code(str(getattr(finding, "code", "") or "")):
++            continue
++        detail = _detail(finding)
++        for key in _FIVE_MIN_SOURCE_KEYS:
++            stamp = _source_ms(detail.get(key))
++            if stamp is not None:
++                five.append(stamp)
++        for key in _HOUR_SOURCE_KEYS:
++            stamp = _source_ms(detail.get(key))
++            if stamp is not None:
++                hours.append(stamp)
++    if five:
++        return max(five) // FIVE_MIN_MS
++    if hours:
++        return max(hours) // FIVE_MIN_MS
++    return None
++
++
++def _entry_posture(findings: Sequence[Any], metrics: Mapping[str, Any]) -> str:
++    red_codes: set[str] = set()
++    all_codes: set[str] = set()
++    for item in findings:
++        code = str(getattr(item, "code", "") or "")
++        all_codes.add(code)
++        if getattr(item, "severity", "") == "RED" and code not in _NO_SIGNAL_CODES:
++            red_codes.add(code)
++    if red_codes & _SELF_FAULT_CODES:
++        return "fault"
++    if any(is_lockout_code(code) for code in red_codes):
++        return "data_lockout"
++    if red_codes:
++        return "unspecified"
++    funnel = _funnel_view(metrics)
++    posture = str(funnel.get("posture") or "")
++    evaluated = funnel.get("evaluated") is True and funnel.get("data_lockout") is False
++    no_buys = evaluated and int(funnel.get("buy_count") or 0) == 0
++    if posture == "no_entry_signal" or (all_codes & _NO_SIGNAL_CODES) or no_buys:
++        return "no_entry_signal"
++    return "unspecified"
++
++
++def _observation_slot(now_ms: int) -> int | None:
++    """Identity of a poll that actually ran. Not a source bar and not freshness."""
++    if now_ms < _MS_MIN:
++        return None
++    return now_ms // FIVE_MIN_MS
++
++
++def _advance_observation(active: bool, slot: int | None, prior: Mapping[str, Any]) -> int:
++    if not active or slot is None:
++        return 0
++    if int(prior.get("state_version") or 0) != STATE_VERSION:
++        return 1
++    prev = prior.get("last_observation_slot")
++    prev_n = int(prior.get("consecutive_observation_cycles") or 0)
++    if prev is None:
++        return 1
++    previous = int(prev)
++    if slot == previous:
++        return max(1, prev_n)
++    if slot == previous + 1:
++        return prev_n + 1
++    return 1
++
++
++def _advance_bars(has_lockout: bool, bucket: int | None, prior: Mapping[str, Any]) -> int:
++    if not has_lockout or bucket is None:
++        return 0
++    if int(prior.get("state_version") or 0) != STATE_VERSION:
++        return 1
++    prev_bucket = prior.get("last_lockout_bar_bucket")
++    prev_bars = int(prior.get("consecutive_lockout_bars") or 0)
++    if prev_bucket is None:
++        return 1
++    previous = int(prev_bucket)
++    if bucket == previous:
++        return max(1, prev_bars)
++    if bucket == previous + 1:
++        return prev_bars + 1
++    return 1
+ 
+ 
+ def evaluate_alert_transition(
+-    report: PreflightReport,
++    report: Any,
+     prior_state: Mapping[str, Any],
+     *,
+     renotify_sec: int = DEFAULT_RENOTIFY_SEC,
+     alert_on_yellow: bool = False,
+ ) -> tuple[AlertDecision, dict[str, Any]]:
+-    now_ms = report.now_ms
+-    cur_bar_bucket = now_ms // FIVE_MIN_MS
+-
+-    red_findings = [f for f in report.findings if f.severity == "RED"]
+-    yellow_findings = [f for f in report.findings if f.severity == "YELLOW"]
+-
+-    has_clock_lockout = any(
+-        any(f.code.startswith(pfx) for pfx in _CLOCK_LOCKOUT_PREFIXES)
+-        for f in red_findings
+-    )
+-    prev_bars = int(prior_state.get("consecutive_lockout_bars") or 0)
+-    prev_bucket = prior_state.get("last_lockout_bar_bucket")
+-
+-    if has_clock_lockout:
+-        if prev_bucket is None:
+-            consec_bars = 1
+-        elif int(cur_bar_bucket) > int(prev_bucket):
+-            consec_bars = prev_bars + 1
+-        else:
+-            consec_bars = max(1, prev_bars)
+-        next_bucket: int | None = int(cur_bar_bucket)
+-    else:
+-        consec_bars = 0
+-        next_bucket = None
++    findings = list(getattr(report, "findings", []) or [])
++    metrics = getattr(report, "metrics", None)
++    if not isinstance(metrics, Mapping):
++        metrics = {}
++    posture = _entry_posture(findings, metrics)
++    red_findings = [
++        item
++        for item in findings
++        if getattr(item, "severity", "") == "RED"
++        and str(getattr(item, "code", "") or "") not in _NO_SIGNAL_CODES
++    ]
++    yellow_findings = [item for item in findings if getattr(item, "severity", "") == "YELLOW"]
++    lockout_findings = [item for item in red_findings if is_lockout_code(str(item.code))]
++    bucket = observed_source_bucket(lockout_findings) if posture == "data_lockout" else None
++    now_ms = int(getattr(report, "now_ms", 0) or 0)
++    consec_bars = _advance_bars(posture == "data_lockout", bucket, prior_state)
++    obs_slot = _observation_slot(now_ms) if posture == "data_lockout" else None
++    obs_cycles = _advance_observation(posture == "data_lockout", obs_slot, prior_state)
+ 
+-    # Inject synthetic consecutive silent-lockout finding when >= 2 5m bars
+     effective_reds = list(red_findings)
+     if consec_bars >= 2:
+         effective_reds.insert(
+             0,
+-            Finding(
++            WatchFinding(
+                 severity="RED",
+                 surface="signal_funnel",
+                 code="consecutive_5m_silent_clock_lockout",
++                summary=f"相邻源K线桶已连续闭锁 {consec_bars} 根（这是源棒，不是观察周期）",
++                detail={"consecutive_5m_bars": consec_bars, "source_bucket": bucket},
++            ),
++        )
++    if obs_cycles >= 2:
++        effective_reds.insert(
++            0,
++            WatchFinding(
++                severity="RED",
++                surface="signal_funnel",
++                code="consecutive_observation_cycle_lockout",
+                 summary=(
+-                    f"策略真源时钟已连续闭锁 {consec_bars} 根 5m K线周期（实盘新开仓静默停摆中）"
++                    f"同一闭锁已在相邻观察周期连续出现 {obs_cycles} 次。"
++                    "这是轮询观察计数，不是源K线连根，也不表示 computed_at 变新鲜"
+                 ),
+-                detail={"consecutive_5m_bars": consec_bars},
++                detail={"consecutive_observation_cycles": obs_cycles, "observation_slot": obs_slot},
+             ),
+         )
+ 
+-    cur_red_codes = tuple(sorted({f.code for f in effective_reds}))
+-    cur_yel_codes = tuple(sorted({f.code for f in yellow_findings}))
+-    prev_red_codes = set(str(x) for x in (prior_state.get("active_red_codes") or []))
+-    prev_yel_codes = set(str(x) for x in (prior_state.get("active_yellow_codes") or []))
+-    last_push_ms = int(prior_state.get("last_push_ms") or 0)
+-
+-    new_reds = [c for c in cur_red_codes if c not in prev_red_codes]
+-    new_yels = [c for c in cur_yel_codes if c not in prev_yel_codes]
++    red_fps = tuple(sorted({finding_fingerprint(item) for item in effective_reds}))
++    yel_fps = tuple(sorted({finding_fingerprint(item) for item in yellow_findings}))
++    red_codes = tuple(sorted({str(item.code) for item in effective_reds}))
++    yel_codes = tuple(sorted({str(item.code) for item in yellow_findings}))
++    prev_red = set(str(item) for item in (prior_state.get("notified_red_fingerprints") or []))
++    prev_yel = set(str(item) for item in (prior_state.get("notified_yellow_fingerprints") or []))
++    last_success_ms = int(prior_state.get("last_success_ms") or 0)
++    new_reds = [item for item in red_fps if item not in prev_red]
++    new_yels = [item for item in yel_fps if item not in prev_yel]
+ 
+     should_push = False
+     event_type = "QUIET"
+-
+-    if cur_red_codes:
+-        if "consecutive_5m_silent_clock_lockout" in new_reds:
++    if red_fps:
++        if any(item.startswith("consecutive_5m_silent_clock_lockout") for item in new_reds):
+             should_push = True
+             event_type = "ESCALATED_SILENT_LOCKOUT"
++        elif any(item.startswith("consecutive_observation_cycle_lockout") for item in new_reds):
++            should_push = True
++            event_type = "ESCALATED_OBSERVATION_CYCLE"
+         elif new_reds:
+             should_push = True
+             event_type = "NEW_ALERT"
+-        elif now_ms - last_push_ms >= int(renotify_sec) * 1000:
++        elif now_ms - last_success_ms >= int(renotify_sec) * 1000:
+             should_push = True
+             event_type = "RENOTIFY"
+-    elif prev_red_codes and not cur_red_codes:
++    elif prev_red:
+         should_push = True
+         event_type = "RESOLVED"
+-    elif alert_on_yellow and cur_yel_codes:
++    elif alert_on_yellow and yel_fps:
+         if new_yels:
+             should_push = True
+             event_type = "NEW_ALERT"
+-        elif now_ms - last_push_ms >= int(renotify_sec) * 1000:
++        elif now_ms - last_success_ms >= int(renotify_sec) * 1000:
+             should_push = True
+             event_type = "RENOTIFY"
+ 
++    if posture == "no_entry_signal" and not red_fps and not prev_red:
++        should_push = False
++        event_type = "NO_SIGNAL"
++
+     title, body = _render_push_message(
+         report=report,
+         event_type=event_type,
+         reds=effective_reds,
+         yellows=yellow_findings,
+         consec_bars=consec_bars,
++        obs_cycles=obs_cycles,
++        posture=posture,
+     )
+-
+-    next_state = {
+-        "active_red_codes": list(cur_red_codes),
+-        "active_yellow_codes": list(cur_yel_codes),
+-        "last_push_ms": now_ms if should_push else last_push_ms,
+-        "consecutive_lockout_bars": consec_bars,
+-        "last_lockout_bar_bucket": next_bucket,
+-        "last_checked_utc": report.checked_at_utc,
+-    }
++    event_key = event_type + "|" + ",".join(red_fps) + "|" + ",".join(yel_fps)
+     decision = AlertDecision(
+         should_push=should_push,
+         event_type=event_type,
+         title=title,
+         body_text=body,
+-        red_codes=cur_red_codes,
+-        yellow_codes=cur_yel_codes,
++        red_codes=red_codes,
++        yellow_codes=yel_codes,
++        red_fingerprints=red_fps,
++        yellow_fingerprints=yel_fps,
+         consecutive_lockout_bars=consec_bars,
++        consecutive_observation_cycles=obs_cycles,
++        source_bucket=bucket,
++        entry_posture=posture,
++        event_key=event_key,
+     )
+-    return decision, next_state
++    observation = {
++        "consecutive_lockout_bars": consec_bars,
++        "last_lockout_bar_bucket": bucket,
++        "consecutive_observation_cycles": obs_cycles,
++        "last_observation_slot": obs_slot,
++        "entry_posture": posture,
++        "last_checked_utc": getattr(report, "checked_at_utc", ""),
++    }
++    return decision, observation
++
++
++def apply_delivery(
++    prior_state: Mapping[str, Any],
++    decision: AlertDecision,
++    observation: Mapping[str, Any],
++    delivery: DeliveryJudgement,
++    *,
++    now_ms: int,
++) -> dict[str, Any]:
++    state = _empty_state()
++    state["notified_red_fingerprints"] = list(prior_state.get("notified_red_fingerprints") or [])
++    state["notified_yellow_fingerprints"] = list(prior_state.get("notified_yellow_fingerprints") or [])
++    state["last_success_ms"] = int(prior_state.get("last_success_ms") or 0)
++    state["last_push_ms"] = state["last_success_ms"]
++    state["consecutive_lockout_bars"] = int(observation.get("consecutive_lockout_bars") or 0)
++    state["last_lockout_bar_bucket"] = observation.get("last_lockout_bar_bucket")
++    state["consecutive_observation_cycles"] = int(observation.get("consecutive_observation_cycles") or 0)
++    state["last_observation_slot"] = observation.get("last_observation_slot")
++    state["entry_posture"] = str(observation.get("entry_posture") or decision.entry_posture)
++    state["last_checked_utc"] = observation.get("last_checked_utc")
++    if not decision.should_push:
++        state["last_delivery_outcome"] = "not_attempted"
++        state["pending_retry"] = False
++        state["pending_event_key"] = None
++        state["pending_channel_ok"] = []
++        return state
++
++    state["last_attempt_ms"] = int(now_ms)
++    state["last_delivery_outcome"] = delivery.outcome
++    state["channel_receipts"] = list(delivery.receipts)
++    if delivery.outcome == "delivered":
++        state["last_success_ms"] = int(now_ms)
++        state["last_push_ms"] = int(now_ms)
++        state["notified_red_fingerprints"] = list(decision.red_fingerprints)
++        state["notified_yellow_fingerprints"] = list(decision.yellow_fingerprints)
++        state["active_red_codes"] = list(decision.red_codes)
++        state["active_yellow_codes"] = list(decision.yellow_codes)
++        state["pending_retry"] = False
++        state["pending_event_key"] = None
++        state["pending_channel_ok"] = []
++        return state
++
++    state["pending_retry"] = True
++    state["pending_event_key"] = decision.event_key
++    state["pending_channel_ok"] = list(delivery.ok_channels)
++    state["active_red_codes"] = list(state["notified_red_fingerprints"])
++    return state
+ 
+ 
+ def _render_push_message(
+     *,
+-    report: PreflightReport,
++    report: Any,
+     event_type: str,
+-    reds: Sequence[Finding],
+-    yellows: Sequence[Finding],
++    reds: Sequence[Any],
++    yellows: Sequence[Any],
+     consec_bars: int,
++    obs_cycles: int,
++    posture: str,
+ ) -> tuple[str, str]:
++    checked = getattr(report, "checked_at_utc", "")
+     if event_type == "RESOLVED":
+-        title = f"[RESOLVED] trade 现网红灯已解除 ({report.checked_at_utc})"
++        title = f"[RESOLVED] trade 现网红灯已解除 ({checked})"
+         lines = [
+-            f"时刻: {report.checked_at_utc} | 代码态: {report.code_state}",
+-            f"当前红灯: 0 | 黄灯预警: {len(yellows)}",
++            f"时刻: {checked} | 代码态: {getattr(report, 'code_state', '')}",
++            f"当前红灯: 0 | 黄灯预警: {len(yellows)} | 入场态势: {posture}",
+         ]
+-        for y in yellows[:3]:
+-            lines.append(f"- [YELLOW] {y.code}: {y.summary}")
+         return title, "\n".join(lines)
+-
++    if event_type == "NO_SIGNAL":
++        title = f"[NO_SIGNAL] 策略已评估且无入场信号 ({checked})"
++        return title, f"时刻: {checked} | 入场态势: no_entry_signal | 连续闭锁桶: 0"
+     prefix = f"[{event_type}]" if event_type != "QUIET" else "[OK]"
+-    title = (
+-        f"{prefix} trade 哨兵告警: 红灯 {len(reds)} 项 / 黄灯 {len(yellows)} 项 "
+-        f"({report.checked_at_utc})"
+-    )
++    title = f"{prefix} trade 哨兵告警: 红灯 {len(reds)} 项 / 黄灯 {len(yellows)} 项 ({checked})"
+     lines = [
+-        f"时刻: {report.checked_at_utc} | 代码态: {report.code_state} | NYSE开市: {report.nyse_cash_open} | 连续闭锁棒数: {consec_bars}",
++        f"时刻: {checked} | 代码态: {getattr(report, 'code_state', '')} | "
++        f"入场态势: {posture} | 相邻源棒: {consec_bars} | 相邻观察周期: {obs_cycles}",
+     ]
+-    for r in reds[:6]:
+-        lines.append(f"- [RED] {r.code}: {r.summary}")
+-    for y in yellows[:3]:
+-        lines.append(f"- [YELLOW] {y.code}: {y.summary}")
++    for item in list(reds)[:6]:
++        lines.append(f"- [RED] {item.code}: {item.summary}")
++    for item in list(yellows)[:3]:
++        lines.append(f"- [YELLOW] {item.code}: {item.summary}")
+     return title, "\n".join(lines)
+ 
+ 
+-# --- Outbound Notification Sinks (Webhook / Telegram / Bark / macOS / JSONL) ---
+-
+ def post_json_webhook(url: str, payload: Mapping[str, Any], timeout: float = 6.0) -> tuple[bool, str]:
+     body = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
+     req = Request(
+@@ -284,13 +698,36 @@
+             return 200 <= code < 300, f"http_{code}"
+     except HTTPError as exc:
+         return False, f"http_{exc.code}"
+-    except (URLError, TimeoutError, OSError) as exc:
++    except (URLError, TimeoutError, OSError, RuntimeError) as exc:
+         return False, f"network_err:{type(exc).__name__}"
+ 
+ 
++def required_channels(
++    *,
++    webhook_url: str = "",
++    telegram_bot_token: str = "",
++    telegram_chat_id: str = "",
++    bark_url: str = "",
++    macos_notify: bool = False,
++    alert_jsonl: Path | None = None,
++) -> tuple[str, ...]:
++    channels: list[str] = []
++    if alert_jsonl is not None:
++        channels.append("jsonl")
++    if webhook_url:
++        channels.append("webhook")
++    if telegram_bot_token and telegram_chat_id:
++        channels.append("telegram")
++    if bark_url:
++        channels.append("bark")
++    if macos_notify and sys.platform == "darwin":
++        channels.append("macos_notification")
++    return tuple(channels)
++
++
+ def dispatch_notifications(
+     decision: AlertDecision,
+-    report: PreflightReport,
++    report: Any,
+     *,
+     webhook_url: str = "",
+     telegram_bot_token: str = "",
+@@ -299,73 +736,123 @@
+     macos_notify: bool = False,
+     alert_jsonl: Path | None = None,
+     http_poster: Callable[[str, Mapping[str, Any]], tuple[bool, str]] | None = None,
++    only_channels: Sequence[str] | None = None,
+ ) -> list[dict[str, Any]]:
+-    poster = http_poster or (lambda u, p: post_json_webhook(u, p))
++    poster = http_poster or (lambda url, payload: post_json_webhook(url, payload))
++    wanted = None if only_channels is None else set(only_channels)
+     receipts: list[dict[str, Any]] = []
+     full_text = f"{decision.title}\n{decision.body_text}"
+ 
+-    if alert_jsonl is not None:
+-        alert_jsonl.parent.mkdir(parents=True, exist_ok=True)
+-        record = {
+-            "ts_utc": report.checked_at_utc,
+-            "event_type": decision.event_type,
+-            "title": decision.title,
+-            "red_codes": list(decision.red_codes),
+-            "yellow_codes": list(decision.yellow_codes),
+-            "consecutive_lockout_bars": decision.consecutive_lockout_bars,
+-            "body": decision.body_text,
+-        }
+-        with alert_jsonl.open("a", encoding="utf-8") as handle:
+-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+-        receipts.append({"channel": "jsonl", "ok": True, "target": str(alert_jsonl)})
++    def _want(name: str) -> bool:
++        return wanted is None or name in wanted
+ 
+-    if webhook_url:
+-        # Compatible with Slack/Discord/Feishu/Generic JSON webhooks
+-        payload = {
+-            "msg_type": "text",
+-            "text": full_text,
+-            "content": full_text,
+-            " {}" if False else "title": decision.title,
+-        }
+-        ok, detail = poster(webhook_url, payload)
++    if alert_jsonl is not None and _want("jsonl"):
++        try:
++            alert_jsonl.parent.mkdir(parents=True, exist_ok=True)
++            record = {
++                "ts_utc": getattr(report, "checked_at_utc", ""),
++                "event_type": decision.event_type,
++                "title": decision.title,
++                "red_codes": list(decision.red_codes),
++                "entry_posture": decision.entry_posture,
++                "consecutive_lockout_bars": decision.consecutive_lockout_bars,
++                "body": decision.body_text,
++            }
++            with alert_jsonl.open("a", encoding="utf-8") as handle:
++                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
++            receipts.append({"channel": "jsonl", "ok": True, "target": str(alert_jsonl)})
++        except OSError as exc:
++            receipts.append({"channel": "jsonl", "ok": False, "detail": type(exc).__name__})
++
++    if webhook_url and _want("webhook"):
++        ok, detail = poster(
++            webhook_url,
++            {"msg_type": "text", "text": full_text, "content": full_text, "title": decision.title},
++        )
+         receipts.append({"channel": "webhook", "ok": ok, "detail": detail})
+ 
+-    if telegram_bot_token and telegram_chat_id:
+-        tg_url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
++    if telegram_bot_token and telegram_chat_id and _want("telegram"):
+         ok, detail = poster(
+-            tg_url,
++            f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage",
+             {"chat_id": telegram_chat_id, "text": full_text, "disable_web_page_preview": True},
+         )
+         receipts.append({"channel": "telegram", "ok": ok, "detail": detail})
+ 
+-    if bark_url:
++    if bark_url and _want("bark"):
+         ok, detail = poster(
+             bark_url.rstrip("/"),
+             {"title": decision.title, "body": decision.body_text, "group": "trade-watchdog"},
+         )
+         receipts.append({"channel": "bark", "ok": ok, "detail": detail})
+ 
+-    if macos_notify and sys.platform == "darwin":
++    if macos_notify and sys.platform == "darwin" and _want("macos_notification"):
+         safe_title = decision.title.replace("\\", "\\\\").replace('"', '\\"')
+         safe_body = decision.body_text[:220].replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+         try:
+             subprocess.run(
+-                [
+-                    "/usr/bin/osascript",
+-                    "-e",
+-                    f'display notification "{safe_body}" with title "{safe_title}"',
+-                ],
++                ["/usr/bin/osascript", "-e", f'display notification "{safe_body}" with title "{safe_title}"'],
+                 check=False,
+                 timeout=3.0,
+                 capture_output=True,
+             )
+             receipts.append({"channel": "macos_notification", "ok": True})
+         except (OSError, subprocess.SubprocessError) as exc:
+-            receipts.append({"channel": "macos_notification", "ok": False, "detail": str(exc)})
+-
++            receipts.append({"channel": "macos_notification", "ok": False, "detail": type(exc).__name__})
+     return receipts
+ 
+ 
++def judge_delivery(required: Sequence[str], receipts: Sequence[Mapping[str, Any]]) -> DeliveryJudgement:
++    by_channel = {str(item.get("channel")): bool(item.get("ok")) for item in receipts}
++    ok_channels = tuple(name for name in required if by_channel.get(name))
++    if not required:
++        outcome = "not_configured"
++    elif len(ok_channels) == len(tuple(required)):
++        outcome = "delivered"
++    elif ok_channels:
++        outcome = "partial"
++    else:
++        outcome = "failed"
++    public = tuple(
++        {"channel": str(item.get("channel")), "ok": bool(item.get("ok")), "detail": item.get("detail", "")}
++        for item in receipts
++    )
++    return DeliveryJudgement(outcome, public, ok_channels, tuple(required))
++
++
++def _channels_to_send(prior: Mapping[str, Any], decision: AlertDecision, required: Sequence[str]) -> tuple[str, ...]:
++    if not prior.get("pending_retry"):
++        return tuple(required)
++    if prior.get("pending_event_key") != decision.event_key:
++        return tuple(required)
++    done = set(str(item) for item in (prior.get("pending_channel_ok") or []))
++    return tuple(name for name in required if name not in done)
++
++
++def _fault_finding(code: str, summary: str) -> WatchFinding:
++    return WatchFinding(severity="RED", surface="watchdog", code=code, summary=summary, detail={})
++
++
++def _report_from_fault(code: str, summary: str, now_ms: int) -> Any:
++    finding = _fault_finding(code, summary)
++    return _FaultReport(now_ms=now_ms, findings=(finding,), summary=summary)
++
++
++@dataclass(frozen=True)
++class _FaultReport:
++    now_ms: int
++    findings: tuple[WatchFinding, ...]
++    summary: str
++    overall_status: str = "RED"
++    checked_at_utc: str = ""
++    code_state: str = "WATCHDOG_FAULT"
++    nyse_cash_open: bool = False
++    metrics: Mapping[str, Any] = field(default_factory=dict)
++
++    def __post_init__(self) -> None:
++        if not self.checked_at_utc:
++            object.__setattr__(self, "checked_at_utc", f"fault:{self.findings[0].code}")
++
++
+ def run_watchdog_once(
+     repo_root: Path,
+     *,
+@@ -388,18 +875,17 @@
+     bark_url: str = "",
+     macos_notify: bool = False,
+     http_poster: Callable[[str, Mapping[str, Any]], tuple[bool, str]] | None = None,
++    inspect_fn: Callable[..., Any] | None = None,
+ ) -> dict[str, Any]:
+     safe_state = validate_external_state_path(state_file, repo_root)
+-    safe_jsonl = (
+-        validate_external_state_path(alert_jsonl, repo_root)
+-        if alert_jsonl is not None
+-        else None
+-    )
+-
++    safe_jsonl = validate_external_state_path(alert_jsonl, repo_root) if alert_jsonl is not None else None
+     prior = load_watchdog_state(safe_state)
+-    report = inspect_system(
++    clock = int(now_ms if now_ms is not None else time.time() * 1000)
++    report, preflight_present = _load_report(
+         repo_root,
++        inspect_fn=inspect_fn,
+         now_ms=now_ms,
++        clock=clock,
+         main_db=main_db,
+         deriv_db=deriv_db,
+         lseg_db=lseg_db,
+@@ -409,15 +895,26 @@
+         require_dbs=require_dbs,
+         ack_dust_intents=ack_dust_intents,
+     )
+-    decision, next_state = evaluate_alert_transition(
++    decision, observation = evaluate_alert_transition(
+         report,
+         prior,
+         renotify_sec=renotify_sec,
+         alert_on_yellow=alert_on_yellow,
+     )
+-    deliveries: list[dict[str, Any]] = []
+-    if decision.should_push:
+-        deliveries = dispatch_notifications(
++    required = required_channels(
++        webhook_url=webhook_url,
++        telegram_bot_token=telegram_bot_token,
++        telegram_chat_id=telegram_chat_id,
++        bark_url=bark_url,
++        macos_notify=macos_notify,
++        alert_jsonl=safe_jsonl,
++    )
++    receipts: list[dict[str, Any]] = []
++    if decision.should_push and required:
++        pending_ok = []
++        if prior.get("pending_retry") and prior.get("pending_event_key") == decision.event_key:
++            pending_ok = [{"channel": name, "ok": True, "detail": "already_ok"} for name in prior.get("pending_channel_ok") or []]
++        fresh = dispatch_notifications(
+             decision,
+             report,
+             webhook_url=webhook_url,
+@@ -427,26 +924,82 @@
+             macos_notify=macos_notify,
+             alert_jsonl=safe_jsonl,
+             http_poster=http_poster,
++            only_channels=_channels_to_send(prior, decision, required),
+         )
++        receipts = pending_ok + fresh
++    delivery = judge_delivery(required, receipts)
++    if decision.should_push and not required:
++        delivery = DeliveryJudgement("not_configured", (), (), ())
++    next_state = apply_delivery(prior, decision, observation, delivery, now_ms=clock)
+     save_watchdog_state(safe_state, next_state)
++    fault = decision.entry_posture in {"fault", "data_lockout"} or getattr(report, "overall_status", "") == "RED"
++    status = "RED" if fault else ("NO_SIGNAL" if decision.entry_posture == "no_entry_signal" else str(getattr(report, "overall_status", "GREEN")))
+     return {
+-        "checked_at_utc": report.checked_at_utc,
+-        "overall_status": report.overall_status,
++        "checked_at_utc": getattr(report, "checked_at_utc", ""),
++        "preflight_status": getattr(report, "overall_status", ""),
++        "watchdog_status": status,
++        "fault": fault,
++        "entry_posture": decision.entry_posture,
+         "event_type": decision.event_type,
+         "should_push": decision.should_push,
+         "title": decision.title,
+         "red_codes": list(decision.red_codes),
+         "yellow_codes": list(decision.yellow_codes),
++        "red_fingerprints": list(decision.red_fingerprints),
+         "consecutive_lockout_bars": decision.consecutive_lockout_bars,
+-        "deliveries": deliveries,
++        "consecutive_observation_cycles": decision.consecutive_observation_cycles,
++        "source_bucket": decision.source_bucket,
++        "delivery_outcome": delivery.outcome if decision.should_push else "not_attempted",
++        "delivery_attempted": bool(decision.should_push),
++        "delivery_succeeded": delivery.outcome == "delivered",
++        "deliveries": list(delivery.receipts),
++        "pending_retry": bool(next_state.get("pending_retry")),
+         "state_file": str(safe_state),
++        "preflight_present": preflight_present,
++        "install_allowed": False,
++        "install_block": (
++            "readonly_live_preflight_missing"
++            if not preflight_present
++            else "awaiting_non_author_acceptance"
++        ),
+     }
+ 
+ 
++def _load_report(repo_root: Path, *, inspect_fn: Callable[..., Any] | None, now_ms: int | None, clock: int, **kwargs: Any) -> tuple[Any, bool]:
++    if inspect_fn is None:
++        try:
++            inspect_fn = load_preflight().inspect_system
++        except PreflightUnavailable as exc:
++            code = "watchdog_preflight_incomplete" if "missing exports" in str(exc) else "watchdog_preflight_missing"
++            return _report_from_fault(code, str(exc), clock), False
++    try:
++        report = inspect_fn(
++            repo_root,
++            now_ms=now_ms,
++            main_db=kwargs.get("main_db"),
++            deriv_db=kwargs.get("deriv_db"),
++            lseg_db=kwargs.get("lseg_db"),
++            cityu_db=kwargs.get("cityu_db"),
++            cross_margin_ledger=kwargs.get("cross_margin_ledger"),
++            spot_ledgers=kwargs.get("spot_ledgers"),
++            require_dbs=kwargs.get("require_dbs"),
++            ack_dust_intents=kwargs.get("ack_dust_intents"),
++        )
++    except sqlite3.Error as exc:
++        return _report_from_fault("watchdog_sql_error", f"{type(exc).__name__}: {exc}"[:200], clock), True
++    except Exception as exc:
++        return _report_from_fault("watchdog_inspect_failed", f"{type(exc).__name__}: {exc}"[:200], clock), True
++    return report, True
++
++
++def _summary_exit(summary: Mapping[str, Any]) -> int:
++    if summary.get("fault") or summary.get("watchdog_status") == "RED":
++        return 2
++    return 0
++
++
+ def main(argv: Sequence[str] | None = None) -> int:
+-    parser = argparse.ArgumentParser(
+-        description="Independent read-only watchdog sentinel for tspike630/trade."
+-    )
++    parser = argparse.ArgumentParser(description="Independent read-only watchdog sentinel for tspike630/trade.")
+     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
+     parser.add_argument("--alert-jsonl", type=Path, default=None)
+@@ -460,7 +1013,7 @@
+     parser.add_argument("--require-dbs", action="store_true")
+     parser.add_argument("--alert-on-yellow", action="store_true")
+     parser.add_argument("--renotify-sec", type=int, default=DEFAULT_RENOTIFY_SEC)
+-    parser.add_argument("--loop", action="store_true", help="Run continuously every --interval-sec")
++    parser.add_argument("--loop", action="store_true")
+     parser.add_argument("--interval-sec", type=int, default=DEFAULT_INTERVAL_SEC)
+     parser.add_argument("--macos-notify", action="store_true")
+     parser.add_argument("--now-ms", type=int, default=None)
+@@ -470,8 +1023,7 @@
+     tg_token = os.environ.get("WATCHDOG_TELEGRAM_BOT_TOKEN", "").strip()
+     tg_chat = os.environ.get("WATCHDOG_TELEGRAM_CHAT_ID", "").strip()
+     bark_url = os.environ.get("WATCHDOG_BARK_URL", "").strip()
+-    ack_set = [x.strip() for x in str(args.ack_dust_intents or "").split(",") if x.strip()]
+-
++    ack_set = [item.strip() for item in str(args.ack_dust_intents or "").split(",") if item.strip()]
+     stop = False
+ 
+     def _handle_sig(_sig: int, _frame: Any) -> None:
+@@ -484,31 +1036,47 @@
+ 
+     while True:
+         started = time.monotonic()
+-        summary = run_watchdog_once(
+-            args.repo_root,
+-            state_file=args.state_file,
+-            alert_jsonl=args.alert_jsonl,
+-            now_ms=args.now_ms,
+-            main_db=args.main_db,
+-            deriv_db=args.deriv_db,
+-            lseg_db=args.lseg_db,
+-            cityu_db=args.cityu_db,
+-            cross_margin_ledger=args.cross_margin_ledger,
+-            spot_ledgers=args.spot_ledger,
+-            require_dbs=bool(args.require_dbs),
+-            ack_dust_intents=ack_set,
+-            renotify_sec=int(args.renotify_sec),
+-            alert_on_yellow=bool(args.alert_on_yellow),
+-            webhook_url=webhook_url,
+-            telegram_bot_token=tg_token,
+-            telegram_chat_id=tg_chat,
+-            bark_url=bark_url,
+-            macos_notify=bool(args.macos_notify),
+-        )
++        try:
++            summary = run_watchdog_once(
++                args.repo_root,
++                state_file=args.state_file,
++                alert_jsonl=args.alert_jsonl,
++                now_ms=args.now_ms,
++                main_db=args.main_db,
++                deriv_db=args.deriv_db,
++                lseg_db=args.lseg_db,
++                cityu_db=args.cityu_db,
++                cross_margin_ledger=args.cross_margin_ledger,
++                spot_ledgers=args.spot_ledger,
++                require_dbs=bool(args.require_dbs),
++                ack_dust_intents=ack_set,
++                renotify_sec=int(args.renotify_sec),
++                alert_on_yellow=bool(args.alert_on_yellow),
++                webhook_url=webhook_url,
++                telegram_bot_token=tg_token,
++                telegram_chat_id=tg_chat,
++                bark_url=bark_url,
++                macos_notify=bool(args.macos_notify),
++            )
++        except UnsafeWatchdogPathError as exc:
++            summary = {
++                "watchdog_status": "RED",
++                "fault": True,
++                "entry_posture": "fault",
++                "event_type": "FAULT",
++                "should_push": False,
++                "delivery_outcome": "not_attempted",
++                "delivery_succeeded": False,
++                "red_codes": ["watchdog_unsafe_path"],
++                "title": "[FAULT] watchdog_unsafe_path",
++                "preflight_present": False,
++                "install_allowed": False,
++                "detail": str(exc),
++            }
+         sys.stdout.write(json.dumps(summary, ensure_ascii=False) + "\n")
+         sys.stdout.flush()
+         if not args.loop or stop:
+-            return 2 if summary["overall_status"] == "RED" else 0
++            return _summary_exit(summary)
+         elapsed = time.monotonic() - started
+         sleep_s = max(1.0, float(args.interval_sec) - elapsed)
+         end_at = time.monotonic() + sleep_s

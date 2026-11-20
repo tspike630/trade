@@ -1,0 +1,18 @@
+{
+  "install_allowed": false,
+  "independent_verification": "NOT_DONE",
+  "author_unit_tests": {
+    "ran": 16,
+    "failed": 0
+  },
+  "observation_cycles": "separate from source bars",
+  "sha256": {
+    "readonly_alert_watchdog.py": "b4deb00b0dd510dc98902e191abf58fa8f39cd9857823651a6c41483698bb036",
+    "readonly_live_preflight.py": "0a74bf7d1095975bd6a6d558f1f0e1ff74494a5e7b3323c496a031f5a4a3e628",
+    "test_watchdog_unit.py": "b0710a8c6598483125d5d3421d5c3a6001bf7e09c40696724b8d3c55987fa2e1",
+    "README.md": "33254ca365418ea597431b5abc0a6424ce2c08d08ada94bbb537cac114834049",
+    "patches/watchdog.patch": "e8e48d6068141faaf2de60b0435c39478c9c1dcfb08e1c659f7874295f2ca4e6",
+    "originals/readonly_alert_watchdog.py": "0e42dba33ee1ba3235f5bbacdfabe39332afa40fb371689f03764c8adb671357",
+    "originals/readonly_live_preflight.py": "02acd508e6e3fb4c0dc938295b9aedea194071857ac2a3c9c11969672be347f0"
+  }
+}
