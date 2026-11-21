@@ -88,4 +88,6 @@
 4. Tiingo v1–v4 的状态原文。脚本和报告附件仍不在授权内。
 5. AAVE t581–t585 旧候选与独立审计原文。
 
-本文件写完时，上述远端对象的分类已经固定。本分支自己的 commit SHA 与 PR URL 以推送后的结果为准，不在本文预先填写。
+## 本分支落点
+
+载荷与本核对的首次入库提交是 `a04c0e819e914d9ee5c458cd59788cd507383a37`。PR 为 https://github.com/tspike630/trade/pull/226 ，分支 `cursor/recovery-archive-20261121-0a0f`，base 是 `main` `f75761ded20804b4e4b3fb181a431de4b6610e39`。该 PR 只增加本目录，未合并，也不部署。
