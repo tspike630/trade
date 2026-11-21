@@ -1,0 +1,156 @@
+{
+  "scope": "only these ten allowlisted small files; no source directory/archive traversal for content; no candidate execution",
+  "claim_limit": "Static checks and source/fixture inspection are not a formal proof of absence of all secrets. UID constants and path literals are intentionally retained for recovery, not authentication material.",
+  "files": [
+    {
+      "path": "payload/aave-readonly-v4/aave_readonly_candidate.py",
+      "source": "/workspace/handoffs/readonly-evidence-t586/aave_readonly_candidate.py",
+      "bytes": 35417,
+      "sha256": "a283f2c23cb8ff5a450bb8d9ba3b1878adaab48c2d162870eb4fe588ab3af225",
+      "independent_frozen_bytes_match": true,
+      "review": "static source/synthetic-fixture review; no live data; no detected real credential/contact secret",
+      "secret_pattern_counts": {
+        "private_key": 0,
+        "provider_token": 0,
+        "email": 0,
+        "credentialed_url": 0,
+        "bot_token": 0
+      }
+    },
+    {
+      "path": "payload/aave-readonly-v4/pinned_ledger.py",
+      "source": "/workspace/handoffs/readonly-evidence-t586/pinned_ledger.py",
+      "bytes": 5332,
+      "sha256": "bff756a6da9b08fa3586751aaf137b6ef4cb66f441fc62c1876c8e00cd6b4c28",
+      "independent_frozen_bytes_match": true,
+      "review": "static source/synthetic-fixture review; no live data; no detected real credential/contact secret",
+      "secret_pattern_counts": {
+        "private_key": 0,
+        "provider_token": 0,
+        "email": 0,
+        "credentialed_url": 0,
+        "bot_token": 0
+      }
+    },
+    {
+      "path": "payload/aave-readonly-v4/aave_evidence_review.py",
+      "source": "/workspace/handoffs/readonly-evidence-t586/aave_evidence_review.py",
+      "bytes": 15251,
+      "sha256": "02854a2af802f50afff6e615f1f2e5fdf3fbe29400d45cbaf92a79967d6c0632",
+      "independent_frozen_bytes_match": true,
+      "review": "static source/synthetic-fixture review; no live data; no detected real credential/contact secret",
+      "secret_pattern_counts": {
+        "private_key": 0,
+        "provider_token": 0,
+        "email": 0,
+        "credentialed_url": 0,
+        "bot_token": 0
+      }
+    },
+    {
+      "path": "payload/aave-readonly-v4/synthetic_harness.py",
+      "source": "/workspace/handoffs/readonly-evidence-t586/synthetic_harness.py",
+      "bytes": 3038,
+      "sha256": "980607ba35bb24c6980e50f7567251ae81c9308b6498f375ca69d012157956da",
+      "independent_frozen_bytes_match": true,
+      "review": "static source/synthetic-fixture review; no live data; no detected real credential/contact secret",
+      "secret_pattern_counts": {
+        "private_key": 0,
+        "provider_token": 0,
+        "email": 0,
+        "credentialed_url": 0,
+        "bot_token": 0
+      }
+    },
+    {
+      "path": "payload/aave-readonly-v4/test_aave_evidence_review.py",
+      "source": "/workspace/handoffs/readonly-evidence-t586/test_aave_evidence_review.py",
+      "bytes": 12093,
+      "sha256": "90546c02d25d1c33549ae0781cd549cf43821881001fddabe26413d710e94cbf",
+      "independent_frozen_bytes_match": true,
+      "review": "static source/synthetic-fixture review; no live data; no detected real credential/contact secret",
+      "secret_pattern_counts": {
+        "private_key": 0,
+        "provider_token": 0,
+        "email": 0,
+        "credentialed_url": 0,
+        "bot_token": 0
+      }
+    },
+    {
+      "path": "payload/aave-readonly-v4/test_candidate_v3_regression.py",
+      "source": "/workspace/handoffs/readonly-evidence-t586/test_candidate_v3_regression.py",
+      "bytes": 18071,
+      "sha256": "befa74f93cb8b14ba706ede182e0eb961631c5e20871f58a690d0370a63afda5",
+      "independent_frozen_bytes_match": true,
+      "review": "static source/synthetic-fixture review; no live data; no detected real credential/contact secret",
+      "secret_pattern_counts": {
+        "private_key": 0,
+        "provider_token": 0,
+        "email": 0,
+        "credentialed_url": 0,
+        "bot_token": 0
+      }
+    },
+    {
+      "path": "payload/aave-readonly-v4/test_t584_fixes.py",
+      "source": "/workspace/handoffs/readonly-evidence-t586/test_t584_fixes.py",
+      "bytes": 13962,
+      "sha256": "39040f61342c8ccddaa93831a738b7cf94f670305e4f7cb8ed042247e282be3a",
+      "independent_frozen_bytes_match": true,
+      "review": "static source/synthetic-fixture review; no live data; no detected real credential/contact secret",
+      "secret_pattern_counts": {
+        "private_key": 0,
+        "provider_token": 0,
+        "email": 0,
+        "credentialed_url": 0,
+        "bot_token": 0
+      }
+    },
+    {
+      "path": "payload/aave-readonly-v4/test_t586_oco.py",
+      "source": "/workspace/handoffs/readonly-evidence-t586/test_t586_oco.py",
+      "bytes": 7097,
+      "sha256": "87affcdeabeaeb725d648079ba8867c6cd11d45615da076cd796e3e0d85ecc0b",
+      "independent_frozen_bytes_match": true,
+      "review": "static source/synthetic-fixture review; no live data; no detected real credential/contact secret",
+      "secret_pattern_counts": {
+        "private_key": 0,
+        "provider_token": 0,
+        "email": 0,
+        "credentialed_url": 0,
+        "bot_token": 0
+      }
+    },
+    {
+      "path": "payload/aave-readonly-v4/run_offline_tests.sh",
+      "source": "/workspace/handoffs/readonly-evidence-t586/run_offline_tests.sh",
+      "bytes": 468,
+      "sha256": "b1efa3cdf5a67d46c4e9a29f95d7cfd952edea1a5d271b91715fa61b4671d6f6",
+      "independent_frozen_bytes_match": true,
+      "review": "static source/synthetic-fixture review; no live data; no detected real credential/contact secret",
+      "secret_pattern_counts": {
+        "private_key": 0,
+        "provider_token": 0,
+        "email": 0,
+        "credentialed_url": 0,
+        "bot_token": 0
+      }
+    },
+    {
+      "path": "payload/aave-readonly-v4/approved-config.TEMPLATE.json",
+      "source": "/workspace/handoffs/readonly-evidence-t586/approved-config.TEMPLATE.json",
+      "bytes": 436,
+      "sha256": "0ac630861877113936d41e98800b455f1a8f1c6777c9c7bff3ccd76bd0686ad6",
+      "independent_frozen_bytes_match": true,
+      "review": "static source/synthetic-fixture review; no live data; no detected real credential/contact secret",
+      "secret_pattern_counts": {
+        "private_key": 0,
+        "provider_token": 0,
+        "email": 0,
+        "credentialed_url": 0,
+        "bot_token": 0
+      }
+    }
+  ]
+}
