@@ -1,0 +1,14 @@
+{
+  "approval_reference": "REPLACE_AFTER_APPROVAL",
+  "expected_uid": "1275399777",
+  "api_key_env": null,
+  "api_secret_env": null,
+  "credential_scheme": "HMAC_SHA256",
+  "start_time_ms": null,
+  "end_time_ms": null,
+  "execute_account_reads": false,
+  "output_dir": "/workspace/handoffs/readonly-evidence-t586/evidence-REQUIRES-NEW-AUTHORIZATION",
+  "approved_client_keys": [],
+  "approved_order_ids": [],
+  "approved_oco_ids": []
+}
